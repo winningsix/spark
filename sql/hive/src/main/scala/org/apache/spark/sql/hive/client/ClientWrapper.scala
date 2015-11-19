@@ -58,13 +58,13 @@ import org.apache.spark.util.{CircularBuffer, Utils}
  *                        this ClientWrapper.
  */
 private[hive] class ClientWrapper(
+    val userName: String = null,
     override val version: HiveVersion,
     config: Map[String, String],
     initClassLoader: ClassLoader,
     val clientLoader: IsolatedClientLoader)
   extends ClientInterface
   with Logging {
-
   overrideHadoopShims()
 
   // !! HACK ALERT !!
@@ -187,13 +187,14 @@ private[hive] class ClientWrapper(
         }
         initialConf.set(k, v)
       }
-      val state = new SessionState(initialConf)
+      val state = new SessionState(initialConf, userName)
       if (clientLoader.cachedHive != null) {
         Hive.set(clientLoader.cachedHive.asInstanceOf[Hive])
       }
       SessionState.start(state)
       state.out = new PrintStream(outputBuffer, true, "UTF-8")
       state.err = new PrintStream(outputBuffer, true, "UTF-8")
+      state.setIsHiveServerQuery(true)
       state
     } finally {
       Thread.currentThread().setContextClassLoader(original)
@@ -478,7 +479,7 @@ private[hive] class ClientWrapper(
       val tokens: Array[String] = cmd_trimmed.split("\\s+")
       // The remainder of the command.
       val cmd_1: String = cmd_trimmed.substring(tokens(0).length()).trim()
-      val proc = shim.getCommandProcessor(tokens(0), conf)
+      val proc = shim.getCommandProcessor(tokens, conf)
       proc match {
         case driver: Driver =>
           val response: CommandProcessorResponse = driver.run(cmd)
@@ -581,8 +582,8 @@ private[hive] class ClientWrapper(
     runSqlHive(s"ADD JAR $path")
   }
 
-  def newSession(): ClientWrapper = {
-    clientLoader.createClient().asInstanceOf[ClientWrapper]
+  def newSession(userName: String = null): ClientWrapper = {
+    clientLoader.createClient(userName).asInstanceOf[ClientWrapper]
   }
 
   def reset(): Unit = withHiveState {

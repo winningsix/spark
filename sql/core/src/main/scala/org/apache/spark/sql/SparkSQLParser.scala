@@ -68,6 +68,7 @@ private[sql] class SparkSQLParser(fallback: String => LogicalPlan) extends Abstr
   protected val TABLE = Keyword("TABLE")
   protected val TABLES = Keyword("TABLES")
   protected val UNCACHE = Keyword("UNCACHE")
+  protected val ROLE = Keyword("ROLE")
 
   override protected lazy val start: Parser[LogicalPlan] =
     cache | uncache | set | show | desc | others
@@ -86,8 +87,8 @@ private[sql] class SparkSQLParser(fallback: String => LogicalPlan) extends Abstr
     )
 
   private lazy val set: Parser[LogicalPlan] =
-    SET ~> restInput ^^ {
-      case input => SetCommandParser(input)
+    SET ~> not(ROLE) ~> restInput ^^ {
+      case roleName => SetCommandParser(roleName)
     }
 
   // It can be the following patterns:

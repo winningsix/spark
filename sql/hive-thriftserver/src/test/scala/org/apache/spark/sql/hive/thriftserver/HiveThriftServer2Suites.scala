@@ -160,24 +160,6 @@ class HiveThriftBinaryServerSuite extends HiveThriftJdbcTest {
     }
   }
 
-  test("test authorization") {
-    withJdbcStatement { statement =>
-      val queries = Seq(
-        "DROP TABLE IF EXISTS test_date",
-        "CREATE TABLE test_date(key INT, value STRING)",
-        s"LOAD DATA LOCAL INPATH '${TestData.smallKv}' OVERWRITE INTO TABLE test_date")
-
-      queries.foreach(statement.execute)
-
-      assertResult(Date.valueOf("2011-01-01")) {
-        val resultSet = statement.executeQuery(
-          "SELECT CAST('2011-01-01' as date) FROM test_date LIMIT 1")
-        resultSet.next()
-        resultSet.getDate(1)
-      }
-    }
-  }
-  
   test("SPARK-4309 regression: Date type support") {
     withJdbcStatement { statement =>
       val queries = Seq(
@@ -597,7 +579,7 @@ abstract class HiveThriftJdbcTest extends HiveThriftServer2Test {
 
 abstract class HiveThriftServer2Test extends SparkFunSuite with BeforeAndAfterAll with Logging {
   def mode: ServerMode.Value
-  
+
   private val CLASS_NAME = HiveThriftServer2.getClass.getCanonicalName.stripSuffix("$")
   private val LOG_FILE_MARK = s"starting $CLASS_NAME, logging to "
 
