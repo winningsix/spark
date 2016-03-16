@@ -19,9 +19,12 @@ package org.apache.spark.network.sasl;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Properties;
 import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 
+import com.intel.chimera.cipher.CipherTransformation;
+import com.intel.chimera.conf.ConfigurationKeys;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
@@ -88,8 +91,14 @@ public class SaslClientBootstrap implements TransportClientBootstrap {
           throw new RuntimeException(
             new SaslException("Encryption requests by negotiated non-encrypted connection."));
         }
+
+        if (conf.saslEncryptionAesEnabled()) {
+          negotiateAes(client, saslClient);
+        }
+
         SaslEncryption.addToChannel(channel, saslClient, conf.maxSaslEncryptedBlockSize());
         saslClient = null;
+
         logger.debug("Channel {} configured for SASL encryption.", client);
       }
     } catch (IOException ioe) {
@@ -106,4 +115,31 @@ public class SaslClientBootstrap implements TransportClientBootstrap {
     }
   }
 
+  /**
+   * Negotiates AES cipher based on complete {@link SparkSaslClient}. The keys need to be
+   * decrypted by sasl client.
+   */
+  private void negotiateAes(TransportClient client, SparkSaslClient saslClient) throws IOException {
+    // create option for negotiation
+    CipherOption cipherOption = new CipherOption(conf.saslEncryptionAesCipherTransformation());
+    ByteBuf buf = Unpooled.buffer(cipherOption.encodedLength());
+    cipherOption.encode(buf);
+
+    // send option to server and decode received negotiated option
+    ByteBuffer response = client.sendRpcSync(buf.nioBuffer(), conf.saslRTTimeoutMs());
+    cipherOption = CipherOption.decode(Unpooled.wrappedBuffer(response));
+
+    // decrypt key from option. Server's outKey is client's inKey, and vice versa.
+    byte[] outKey = saslClient.unwrap(cipherOption.inKey, 0, cipherOption.inKey.length);
+    byte[] inKey = saslClient.unwrap(cipherOption.outKey, 0, cipherOption.outKey.length);
+
+    // enable AES on saslClient
+    Properties properties = new Properties();
+    properties.setProperty(ConfigurationKeys.CHIMERA_CRYPTO_SECURE_RANDOM_CLASSES_KEY,
+        conf.saslEncryptionAesCipherClasses());
+    saslClient.enableAes(CipherTransformation.fromName(cipherOption.cipherSuite), properties,
+        inKey, outKey, cipherOption.outIv, cipherOption.inIv);
+
+    logger.debug("AES enabled for SASL encryption.");
+  }
 }

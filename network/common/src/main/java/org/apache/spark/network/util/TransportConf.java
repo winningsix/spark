@@ -18,6 +18,8 @@
 package org.apache.spark.network.util;
 
 import com.google.common.primitives.Ints;
+import com.intel.chimera.cipher.CipherTransformation;
+import com.intel.chimera.cipher.OpensslCipher;
 
 /**
  * A central location that tracks all the settings we expose to users.
@@ -166,4 +168,21 @@ public class TransportConf {
     return conf.getBoolean("spark.network.sasl.serverAlwaysEncrypt", false);
   }
 
+  public boolean saslEncryptionAesEnabled() {
+    return conf.getBoolean("spark.authenticate.sasl.encryption.aes.enabled", false);
+  }
+
+  public String saslEncryptionAesCipherTransformation() {
+    return conf.get("spark.authenticate.sasl.encryption.aes.cipher.transformation",
+        CipherTransformation.AES_CTR_NOPADDING.getName());
+  }
+
+  public int saslEncryptionAesCipherKeySizeBits() {
+    return conf.getInt("spark.authenticate.sasl.encryption.aes.cipher.keySizeBits", 128);
+  }
+
+  public String saslEncryptionAesCipherClasses() {
+    return conf.get("spark.authenticate.sasl.encryption.aes.cipher.classes",
+        OpensslCipher.class.getName());
+  }
 }

@@ -19,6 +19,7 @@ package org.apache.spark.network.sasl;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Properties;
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.NameCallback;
@@ -32,6 +33,7 @@ import javax.security.sasl.SaslException;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
+import com.intel.chimera.cipher.CipherTransformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +51,8 @@ public class SparkSaslClient implements SaslEncryptionBackend {
   private final SecretKeyHolder secretKeyHolder;
   private final String expectedQop;
   private SaslClient saslClient;
+
+  private SparkSaslAES sparkSaslAES;
 
   public SparkSaslClient(String secretKeyId, SecretKeyHolder secretKeyHolder, boolean encrypt) {
     this.secretKeyId = secretKeyId;
@@ -149,14 +153,28 @@ public class SparkSaslClient implements SaslEncryptionBackend {
     }
   }
 
+  public void enableAes(CipherTransformation cipherTransformation, Properties properties,
+      byte[] inKey, byte[] outKey, byte[] inIv, byte[] outIv) throws IOException {
+    sparkSaslAES = new SparkSaslAES(cipherTransformation, properties,
+        inKey, outKey, inIv, outIv);
+  }
+
   @Override
   public byte[] wrap(byte[] data, int offset, int len) throws SaslException {
-    return saslClient.wrap(data, offset, len);
+    if (sparkSaslAES != null) {
+      return sparkSaslAES.wrap(data, offset, len);
+    } else {
+      return saslClient.wrap(data, offset, len);
+    }
   }
 
   @Override
   public byte[] unwrap(byte[] data, int offset, int len) throws SaslException {
-    return saslClient.unwrap(data, offset, len);
+    if (sparkSaslAES != null) {
+      return sparkSaslAES.unwrap(data, offset, len);
+    } else {
+      return saslClient.unwrap(data, offset, len);
+    }
   }
 
 }
