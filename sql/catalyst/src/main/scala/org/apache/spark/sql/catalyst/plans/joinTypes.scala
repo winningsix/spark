@@ -24,6 +24,7 @@ object JoinType {
     case "leftouter" | "left" => LeftOuter
     case "rightouter" | "right" => RightOuter
     case "leftsemi" => LeftSemi
+    case "leftanti" => LeftAnti
     case _ =>
       val supported = Seq(
         "inner",
@@ -48,3 +49,5 @@ case object RightOuter extends JoinType
 case object FullOuter extends JoinType
 
 case object LeftSemi extends JoinType
+
+case object LeftAnti extends JoinType
