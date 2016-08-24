@@ -27,6 +27,9 @@ import org.apache.parquet.io.api.Binary;
 
 import org.apache.spark.sql.execution.vectorized.ColumnVector;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
 /**
  * A values reader for Parquet's run-length encoded data. This is based off of the version in
  * parquet-mr with these changes:
@@ -75,14 +78,13 @@ public final class VectorizedRleValuesReader extends ValuesReader
     fixedWidth = false;
   }
 
-  public VectorizedRleValuesReader(int bitWidth) {
-    fixedWidth = true;
-    init(bitWidth);
-  }
-
   @Override
-  public void initFromPage(int valueCount, byte[] page, int start) {
+  public void initFromPage(
+    int valueCount,
+    ByteBuffer byteBuffer,
+    int start) throws IOException {
     this.offset = start;
+    byte[] page = byteBuffer.array();
     this.in = page;
     if (fixedWidth) {
       if (bitWidth != 0) {
@@ -101,6 +103,11 @@ public final class VectorizedRleValuesReader extends ValuesReader
     } else {
       this.currentCount = 0;
     }
+  }
+
+  public VectorizedRleValuesReader(int bitWidth) {
+    fixedWidth = true;
+    init(bitWidth);
   }
 
   // Initialize the reader from a buffer. This is used for the V2 page encoding where the

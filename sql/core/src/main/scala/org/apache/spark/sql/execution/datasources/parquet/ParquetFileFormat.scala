@@ -473,6 +473,8 @@ private[parquet] class ParquetOutputWriterFactory(
 
     // Sets compression scheme
     conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodec)
+
+    conf.set(ParquetOutputFormat.ENABLE_BLOOM_FILTER, true.toString)
     new SerializableConfiguration(conf)
   }
 

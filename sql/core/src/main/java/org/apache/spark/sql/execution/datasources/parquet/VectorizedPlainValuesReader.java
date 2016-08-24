@@ -42,11 +42,14 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
   }
 
   @Override
-  public void initFromPage(int valueCount, byte[] bytes, int offset) throws IOException {
-    this.buffer = bytes;
+  public void initFromPage(
+    int valueCount,
+    ByteBuffer byteBuffer,
+    int offset) throws IOException {
+    this.buffer = byteBuffer.array();
     this.offset = offset + Platform.BYTE_ARRAY_OFFSET;
     if (bigEndianPlatform) {
-      byteBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+      this.byteBuffer = byteBuffer;
     }
   }
 
