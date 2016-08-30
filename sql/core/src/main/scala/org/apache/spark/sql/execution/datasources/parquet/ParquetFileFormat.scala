@@ -125,6 +125,15 @@ class ParquetFileFormat
     // Sets compression scheme
     conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodec)
 
+    conf.set(ParquetOutputFormat.ENABLE_BLOOM_FILTER,
+      sparkSession.sessionState.conf.enableParquetBloomFilter.toString)
+
+    conf.set(ParquetOutputFormat.BLOOM_FILTER_COL_NAME,
+      sparkSession.sessionState.conf.parquetBloomFilterColNames.toString)
+
+    conf.set(ParquetOutputFormat.EXPECTED_ENTRIES,
+      sparkSession.sessionState.conf.parquetBloomFilterExpectedEntries.toString)
+
     // SPARK-15719: Disables writing Parquet summary files by default.
     if (conf.get(ParquetOutputFormat.ENABLE_JOB_SUMMARY) == null) {
       conf.setBoolean(ParquetOutputFormat.ENABLE_JOB_SUMMARY, false)
@@ -474,7 +483,13 @@ private[parquet] class ParquetOutputWriterFactory(
     // Sets compression scheme
     conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodec)
 
-    conf.set(ParquetOutputFormat.ENABLE_BLOOM_FILTER, true.toString)
+    conf.set(ParquetOutputFormat.ENABLE_BLOOM_FILTER, sqlConf.enableParquetBloomFilter.toString)
+
+    conf.set(ParquetOutputFormat.BLOOM_FILTER_COL_NAME, sqlConf.parquetBloomFilterColNames.toString)
+
+    conf.set(ParquetOutputFormat.EXPECTED_ENTRIES, sqlConf.parquetBloomFilterExpectedEntries
+        .toString)
+
     new SerializableConfiguration(conf)
   }
 

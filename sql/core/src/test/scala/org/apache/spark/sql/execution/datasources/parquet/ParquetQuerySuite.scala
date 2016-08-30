@@ -45,6 +45,16 @@ class ParquetQuerySuite extends QueryTest with ParquetTest with SharedSQLContext
     }
   }
 
+  test("test Bloom filter queries") {
+    withSQLConf(SQLConf.PARQUET_ENABLE_BLOOM_FILTER.key -> true.toString,
+      SQLConf.PARQUET_BLOOM_FILTER_COL_NAME.key -> "_1",
+      SQLConf.PARQUET_BLOOM_FILTER_EXPECTED_ENTRIES.key -> "10") {
+      withParquetTable((0 until 10).map(i => (i, i.toString)), "t") {
+        checkAnswer(sql("SELECT _1 FROM t where t._1 = 5"), Row.apply(5))
+      }
+    }
+  }
+
   test("appending") {
     val data = (0 until 10).map(i => (i, i.toString))
     spark.createDataFrame(data).toDF("c1", "c2").createOrReplaceTempView("tmp")

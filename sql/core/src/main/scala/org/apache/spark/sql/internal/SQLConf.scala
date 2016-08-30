@@ -243,6 +243,22 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val PARQUET_ENABLE_BLOOM_FILTER = SQLConfigBuilder("spark.sql.parquet.enable.bloom.filter")
+      .doc("to be added")
+      .booleanConf
+      .createWithDefault(false)
+
+  val PARQUET_BLOOM_FILTER_EXPECTED_ENTRIES = SQLConfigBuilder("spark.sql.parquet.bloom.filter" +
+      ".expected.entries")
+      .doc("to be added")
+      .stringConf
+      .createWithDefaultString("")
+
+  val PARQUET_BLOOM_FILTER_COL_NAME = SQLConfigBuilder("spark.sql.parquet.bloom.filter.col.name")
+      .doc("to be added")
+      .stringConf
+      .createWithDefaultString("")
+
   val ORC_FILTER_PUSHDOWN_ENABLED = SQLConfigBuilder("spark.sql.orc.filterPushdown")
     .doc("When true, enable filter pushdown for ORC files.")
     .booleanConf
@@ -642,6 +658,12 @@ private[sql] class SQLConf extends Serializable with CatalystConf with Logging {
   def writeLegacyParquetFormat: Boolean = getConf(PARQUET_WRITE_LEGACY_FORMAT)
 
   def inMemoryPartitionPruning: Boolean = getConf(IN_MEMORY_PARTITION_PRUNING)
+
+  def enableParquetBloomFilter: Boolean = getConf(PARQUET_ENABLE_BLOOM_FILTER)
+
+  def parquetBloomFilterExpectedEntries: String = getConf(PARQUET_BLOOM_FILTER_EXPECTED_ENTRIES)
+
+  def parquetBloomFilterColNames: String = getConf(PARQUET_BLOOM_FILTER_COL_NAME)
 
   def columnNameOfCorruptRecord: String = getConf(COLUMN_NAME_OF_CORRUPT_RECORD)
 
