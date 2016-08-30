@@ -52,7 +52,7 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
     assert (file.length() > 0);
     final BufferedInputStream bs = new BufferedInputStream(new FileInputStream(file));
     try {
-      this.in = serializerManager.wrapForCompression(blockId, bs);
+      this.in = serializerManager.wrapStream(blockId, bs);
       this.din = new DataInputStream(this.in);
       numRecords = numRecordsRemaining = din.readInt();
     } catch (IOException e) {

@@ -37,7 +37,7 @@ private[spark] class DiskBlockObjectWriter(
     val file: File,
     serializerInstance: SerializerInstance,
     bufferSize: Int,
-    compressStream: OutputStream => OutputStream,
+    wrapStream: OutputStream => OutputStream,
     syncWrites: Boolean,
     // These write metrics concurrently shared with other active DiskBlockObjectWriters who
     // are themselves performing writes. All updates must be relative.
@@ -88,7 +88,8 @@ private[spark] class DiskBlockObjectWriter(
     fos = new FileOutputStream(file, true)
     ts = new TimeTrackingOutputStream(writeMetrics, fos)
     channel = fos.getChannel()
-    bs = compressStream(new BufferedOutputStream(ts, bufferSize))
+    bs = wrapStream(new BufferedOutputStream(ts, bufferSize))
+
     objOut = serializerInstance.serializeStream(bs)
     initialized = true
     this
