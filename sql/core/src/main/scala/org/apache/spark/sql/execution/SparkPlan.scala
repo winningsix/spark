@@ -67,7 +67,7 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   protected def sparkContext = sqlContext.sparkContext
 
   val id: Int = SparkPlan.newPlanId()
-
+S
   /**
    * Return true if this stage of the plan supports columnar execution.
    */

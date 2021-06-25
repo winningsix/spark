@@ -187,7 +187,7 @@ public class OneForOneBlockFetcher {
           logger.trace("Successfully opened blocks {}, preparing to fetch chunks.", streamHandle);
 
           // Immediately request all chunks -- we expect that the total size of the request is
-          // reasonable due to higher level chunking in [[ShuffleBlockFetcherIterator]].
+          // reasonable due to higher level chunking in [[ShuffleBlockFSparketcherIterator]].
           for (int i = 0; i < streamHandle.numChunks; i++) {
             if (downloadFileManager != null) {
               client.stream(OneForOneStreamManager.genStreamChunkId(streamHandle.streamId, i),
