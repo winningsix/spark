@@ -945,6 +945,27 @@ private[spark] class DAGScheduler(
     missing.toList
   }
 
+  /**
+   * Whether the RDD graph rooted at `finalRDD` contains a [[PipelinedShuffleDependency]] anywhere.
+   * Walks the RDD dependency graph directly (not the stage graph), so it can be checked before any
+   * stages are created -- letting a job be rejected up front without leaving partial scheduler
+   * state behind.
+   */
+  private def rddGraphHasPipelinedDependency(finalRDD: RDD[_]): Boolean = {
+    // traverseRDDGraphUntil stops and returns false as soon as the visitor returns false; we use
+    // that to short-circuit on the first pipelined dependency found. It returns true if the whole
+    // graph was visited without stopping (i.e. none found), so negate the result.
+    !traverseRDDGraphUntil(finalRDD) { (rdd, enqueue) =>
+      val hasPipelined = rdd.dependencies.exists {
+        case _: PipelinedShuffleDependency[_, _, _] => true
+        case dep =>
+          enqueue(dep.rdd)
+          false
+      }
+      !hasPipelined // keep traversing while none found; stop (return false) when one is found
+    }
+  }
+
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
   private def eagerlyComputePartitionsForRddAndAncestors(rdd: RDD[_]): Unit = {
     val startTime = System.nanoTime
@@ -1346,6 +1367,40 @@ private[spark] class DAGScheduler(
     }
   }
 
+  /**
+   * Reconsider waiting stages that read `runningParent` through a pipelined edge, now that it has
+   * started running. A pipelined edge is non-sequencing, so such a consumer can be co-scheduled as
+   * soon as its producer is running -- it need not wait for the producer to finish. This is the
+   * "producer started" analog of `submitWaitingChildStages` (which fires on producer *completion*):
+   * without it, a pipelined consumer parked because its producer was not yet runnable (e.g. the
+   * producer sat behind a regular shuffle) would not be co-scheduled until the producer finished,
+   * losing the pipelining. Inert unless `runningParent` is the pipelined producer of a waiting
+   * stage.
+   */
+  private def submitWaitingPipelinedChildStages(runningParent: Stage): Unit = {
+    val pipelinedChildren = waitingStages.filter { child =>
+      child.parents.contains(runningParent) && isPipelinedProducer(runningParent)
+    }.toArray
+    // Remove them from waitingStages before resubmitting, or submitStage's `!waitingStages(stage)`
+    // guard would treat them as already-scheduled and no-op (mirrors submitWaitingChildStages).
+    waitingStages --= pipelinedChildren
+    for (child <- pipelinedChildren.sortBy(_.firstJobId)) {
+      logInfo(log"Reconsidering ${MDC(STAGE, child)} now that its pipelined producer " +
+        log"${MDC(STAGE, runningParent)} is running")
+      submitStage(child)
+    }
+  }
+
+  /**
+   * Whether `stage` produces its output through a [[PipelinedShuffleDependency]] -- i.e. it is a
+   * pipelined producer, whose consumers may run concurrently with it. Callers that need the
+   * producer/consumer relationship check `child.parents.contains(stage)` separately.
+   */
+  private def isPipelinedProducer(stage: Stage): Boolean = stage match {
+    case m: ShuffleMapStage => m.shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]
+    case _ => false
+  }
+
   /** Finds the earliest-created active job that needs the stage */
   // TODO: Probably should actually find among the active jobs that need this
   // stage the one with the highest priority (highest-priority pool, earliest created).
@@ -1486,6 +1541,20 @@ private[spark] class DAGScheduler(
       listener.jobFailed(
         SparkCoreErrors.sparkJobCancelledAsPartOfJobGroupError(jobId, jobGroupIdOpt.get))
       logInfo(log"Skip running a job that belongs to the cancelled job group ${MDC(GROUP_ID, jobGroupIdOpt.get)}")
+      return
+    }
+
+    // A job that uses a pipelined shuffle runs its producer and consumer stages concurrently, so a
+    // speculative copy of a producer would race a consumer already reading the producer's partial
+    // output, with no commit barrier protecting the read. Reject such a job up front -- before any
+    // stages are created, so no partial scheduler state is left behind. (Inert for jobs without
+    // any pipelined dependency.)
+    if (sc.conf.get(config.SPECULATION_ENABLED) && rddGraphHasPipelinedDependency(finalRDD)) {
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: speculation is incompatible with " +
+        log"pipelined shuffle dependencies")
+      listener.jobFailed(new SparkException(
+        "Speculative execution is not supported for a job that uses a pipelined shuffle " +
+          s"dependency. Disable ${config.SPECULATION_ENABLED.key} for such jobs."))
       return
     }
 
@@ -1630,11 +1699,40 @@ private[spark] class DAGScheduler(
             logInfo(log"Submitting ${MDC(STAGE, stage)} (${MDC(RDD_ID, stage.rdd)}), " +
                     log"which has no missing parents")
             submitMissingTasks(stage, jobId.get)
+            // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
+            submitWaitingPipelinedChildStages(stage)
           } else {
             for (parent <- missing) {
               submitStage(parent)
             }
-            waitingStages += stage
+
+            // A missing parent reached through a PipelinedShuffleDependency ("pipelined parent")
+            // is incrementally readable: this stage may run before that parent materializes, so
+            // the two are co-scheduled. `missing` already holds the direct parent shuffle-map
+            // stages (from getMissingParentStages), so classify them by their shuffle dependency
+            // type -- no extra graph walk. For a job with no pipelined dependency, pipelinedMissing
+            // is empty and this stage simply parks in waitingStages, exactly as before.
+            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
+            // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
+            // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
+            // has its own regular missing parent); running this stage against a not-yet-running
+            // producer would strand it. If any parent is regular or not yet runnable, park this
+            // stage. It is then resubmitted and co-scheduled once its parents become runnable --
+            // via submitWaitingChildStages when a regular parent completes, or via
+            // submitWaitingPipelinedChildStages when a pipelined parent starts running.
+            val allPipelinedParentsRunning =
+              pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
+
+            if (regularMissing.isEmpty && allPipelinedParentsRunning) {
+              logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its running pipelined " +
+                log"producer(s) ${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
+              submitMissingTasks(stage, jobId.get)
+              // This stage is now running; if it is itself the pipelined producer of a waiting
+              // consumer, co-schedule that consumer too.
+              submitWaitingPipelinedChildStages(stage)
+            } else {
+              waitingStages += stage
+            }
           }
         }
       }
