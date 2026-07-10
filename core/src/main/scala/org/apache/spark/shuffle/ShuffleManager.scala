@@ -104,8 +104,15 @@ private[spark] trait ShuffleManager {
  */
 private[spark] object ShuffleManager {
   def create(conf: SparkConf, isDriver: Boolean): ShuffleManager = {
-    Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
-      getShuffleManagerClassName(conf), conf, isDriver)
+    if (conf.get(config.SHUFFLE_MANAGER_INCREMENTAL).isDefined) {
+      // An incremental manager is configured: install the router, which serves pipelined shuffle
+      // dependencies with the incremental manager and everything else with the default manager.
+      new PipelinedShuffleManagerRouter(conf, isDriver)
+    } else {
+      // No incremental manager configured: instantiate the single default manager, unchanged.
+      Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
+        getShuffleManagerClassName(conf), conf, isDriver)
+    }
   }
 
   def getShuffleManagerClassName(conf: SparkConf): String = {

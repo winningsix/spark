@@ -27,7 +27,7 @@ import org.apache.spark._
 import org.apache.spark.internal.config
 import org.apache.spark.rdd.{RDD, RDDOperationScope}
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{ShuffleWriteMetricsReporter, ShuffleWriteProcessor}
+import org.apache.spark.shuffle.{PipelinedShuffleManagerRouter, ShuffleWriteMetricsReporter, ShuffleWriteProcessor}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{
@@ -300,7 +300,14 @@ object ShuffleExchangeExec {
     // corner-cases where a partitioner constructed with `numPartitions` partitions may output
     // fewer partitions (like RangePartitioner, for example).
     val conf = SparkEnv.get.conf
-    val shuffleManager = SparkEnv.get.shuffleManager
+    // When the PipelinedShuffleManagerRouter is installed, the top-level manager is the router;
+    // regular (non-pipelined) shuffles are served by its underlying default manager, so inspect
+    // that manager's type here rather than the router's (otherwise a sort-based default would be
+    // misdetected and every regular-shuffle record would be conservatively copied).
+    val shuffleManager = SparkEnv.get.shuffleManager match {
+      case router: PipelinedShuffleManagerRouter => router.regularShuffleManager
+      case other => other
+    }
     val sortBasedShuffleOn = shuffleManager.isInstanceOf[SortShuffleManager]
     val bypassMergeThreshold = conf.get(config.SHUFFLE_SORT_BYPASS_MERGE_THRESHOLD)
     val numParts = partitioner.numPartitions

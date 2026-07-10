@@ -323,9 +323,14 @@ class SparkEnv (
       return
     }
 
+    // The tracker is needed when a StreamingShuffleManager is in use, whether it is the sole
+    // configured manager, wrapped by MultiShuffleManager, or installed as the incremental manager
+    // (spark.shuffle.manager.incremental) behind the PipelinedShuffleManagerRouter.
     val shuffleManagerName = ShuffleManager.getShuffleManagerClassName(conf)
+    val incrementalManagerName = conf.get(config.SHUFFLE_MANAGER_INCREMENTAL)
     if (shuffleManagerName == classOf[StreamingShuffleManager].getName
-        || shuffleManagerName == classOf[MultiShuffleManager].getName) {
+        || shuffleManagerName == classOf[MultiShuffleManager].getName
+        || incrementalManagerName.contains(classOf[StreamingShuffleManager].getName)) {
       val tracker = if (SparkContext.isDriver(executorId)) {
         new StreamingShuffleOutputTrackerMaster(conf)
       } else {
