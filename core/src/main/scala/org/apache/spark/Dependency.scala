@@ -308,7 +308,16 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     aggregator,
     mapSideCombine,
     shuffleWriterProcessor,
-    rowBasedChecksums)
+    rowBasedChecksums) {
+
+  // Push-based shuffle merge is incompatible with a pipelined (incrementally-readable) shuffle: it
+  // exposes output only after a post-completion "finalize" step, the opposite of incremental reads,
+  // and would register merge results in the MapOutputTracker for a transient shuffle that must not
+  // outlive its group (spec S4, S9). ShuffleDependency enables merge by default whenever push-based
+  // shuffle is on cluster-wide; disable it here so a pipelined producer never acquires merger
+  // locations and its completion never routes through the merge-finalize path.
+  setShuffleMergeAllowed(false)
+}
 
 
 /**
