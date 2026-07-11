@@ -6622,6 +6622,39 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
+
+  test("pipelined shuffle: both producer and consumer task sets are marked isPipelined") {
+    // The TaskSet.isPipelined flag drives group-atomic failure in the task scheduler; verify the
+    // DAGScheduler sets it for both members of a pipelined group (producer and consumer).
+    val producerRdd = new MyRDD(sc, 2, Nil)
+    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    submit(consumerRdd, Array(0, 1))
+    assert(taskSets.size === 2)
+    val producerTs = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq producerRdd).get
+    val consumerTs = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq consumerRdd).get
+    assert(producerTs.isPipelined, "the pipelined producer's task set must be marked isPipelined")
+    assert(consumerTs.isPipelined, "the pipelined consumer's task set must be marked isPipelined")
+
+    completeShuffleMapStageSuccessfully(producerTs.stageId, 0, 2)
+    complete(consumerTs, Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
+
+  test("regular shuffle: task sets are NOT marked isPipelined (inertness)") {
+    // A regular producer/consumer must not be marked isPipelined.
+    val producerRdd = new MyRDD(sc, 2, Nil)
+    val regularDep = new ShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+    submit(consumerRdd, Array(0, 1))
+    assert(taskSets.head.isPipelined === false, "a regular producer must not be marked isPipelined")
+    completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+    assert(taskSets(1).isPipelined === false, "a regular consumer must not be marked isPipelined")
+    complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
 }
 
 class DAGSchedulerAbortStageOffSuite extends DAGSchedulerSuite {

@@ -1424,6 +1424,34 @@ private[spark] class DAGScheduler(
     case _ => false
   }
 
+  /**
+   * Whether `stage` is a member of a pipelined group -- i.e. it is connected to another stage by a
+   * [[PipelinedShuffleDependency]], either as the producer (it writes such a shuffle) or as a
+   * consumer (one of its direct parent shuffle dependencies is pipelined). Members run
+   * concurrently over a transient shuffle that cannot be re-read in isolation, so a member's task
+   * failure must fail the whole group rather than resubmit one stage; the task scheduler keys its
+   * fail-fast behavior off this (via TaskSet.isPipelined). False for any stage in a job with no
+   * pipelined dependency.
+   */
+  private def isPipelinedGroupMember(stage: Stage): Boolean = {
+    if (isPipelinedProducer(stage)) {
+      return true
+    }
+    // Consumer check: does this stage read through a PipelinedShuffleDependency at one of its
+    // shuffle boundaries? Walk the stage's own RDD graph (descending narrow deps, stopping at every
+    // shuffle boundary) -- the same edges that define the stage -- and look for a pipelined one.
+    !traverseRDDGraphUntil(stage.rdd) { (rdd, enqueue) =>
+      val hasPipelinedBoundary = rdd.dependencies.exists {
+        case _: PipelinedShuffleDependency[_, _, _] => true
+        case _: ShuffleDependency[_, _, _] => false // regular shuffle boundary: do not descend
+        case narrowDep =>
+          enqueue(narrowDep.rdd)
+          false
+      }
+      !hasPipelinedBoundary // keep walking until a pipelined boundary is found
+    }
+  }
+
   /** Finds the earliest-created active job that needs the stage */
   // TODO: Probably should actually find among the active jobs that need this
   // stage the one with the highest priority (highest-priority pool, earliest created).
@@ -2145,7 +2173,7 @@ private[spark] class DAGScheduler(
 
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
-        stage.resourceProfileId, shuffleId))
+        stage.resourceProfileId, shuffleId, isPipelined = isPipelinedGroupMember(stage)))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run
