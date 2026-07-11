@@ -2891,6 +2891,23 @@ private[spark] class DAGScheduler(
             log"${MDC(STAGE_ATTEMPT_ID, task.stageAttemptId)} and there is a more recent attempt for " +
             log"that stage (attempt " +
             log"${MDC(NUM_ATTEMPT, failedStage.latestInfo.attemptNumber())}) running")
+        } else if (isPipelinedGroupMember(failedStage) || isPipelinedGroupMember(mapStage)) {
+          // Failure is group-atomic for a pipelined group (spec S6). The base scheduler handles a
+          // FetchFailed by resubmitting just the map stage in isolation and recomputing serially,
+          // but a transient pipelined shuffle cannot be re-read and its members are co-scheduled, so
+          // a lone-stage resubmit is never valid and would deadlock the group (SC-233883). Abort the
+          // whole group instead: aborting the failed stage tears down its running co-scheduled
+          // members and fails the job, and the caller (e.g. the streaming batch loop) reruns the
+          // batch from scratch. This is distinct from the maxTaskFailures=1 lever (which handles
+          // task failures the TaskSetManager counts): a FetchFailed is NOT counted there (the base
+          // TaskSetManager marks the task successful and zombies the set), so the routing to group
+          // failure must be enforced here.
+          logInfo(log"Failing pipelined group containing ${MDC(FAILED_STAGE, failedStage)} " +
+            log"(${MDC(FAILED_STAGE_NAME, failedStage.name)}) atomically due to a fetch failure " +
+            log"from ${MDC(STAGE, mapStage)} (${MDC(STAGE_NAME, mapStage.name)})")
+          failedStage.failedAttemptIds.add(task.stageAttemptId)
+          abortStage(failedStage,
+            s"A pipelined group member failed with a fetch failure: $failureMessage", None)
         } else {
           val ignoreStageFailure = ignoreDecommissionFetchFailure &&
             isExecutorDecommissioningOrDecommissioned(taskScheduler, bmAddress)
