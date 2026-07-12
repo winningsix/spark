@@ -1782,7 +1782,7 @@ package object config {
         "this is set, both managers coexist in the same JVM and each shuffle is routed by its " +
         "dependency type, so a cluster can run both regular and pipelined (e.g. real-time mode) " +
         "queries. When unset, no incremental manager is created and behavior is unchanged.")
-      .version("4.1.0")
+      .version("4.3.0")
       .stringConf
       .createOptional
 

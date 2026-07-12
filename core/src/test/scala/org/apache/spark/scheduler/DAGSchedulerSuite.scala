@@ -387,6 +387,15 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     @volatile var maxConcurrentTasksForTest: Int = 1000
     override protected def maxConcurrentTasksForStage(stage: Stage): Int = maxConcurrentTasksForTest
 
+    // Occupancy (tasks running for OTHER work in the stage's resource profile, excluding the group's
+    // own members) reported to the pipelined-group FREE-slot check. Defaults to 0 (nothing else
+    // running) so existing tests see free == total; a test can supply a function to simulate a busy
+    // cluster and exercise the free-slot fail-fast. The mock TaskScheduler is not a
+    // TaskSchedulerImpl, so the production seam would return 0 anyway; this makes it controllable.
+    @volatile var runningTasksForOtherWorkForTest: (Stage, Set[Stage]) => Int = (_, _) => 0
+    override protected def runningTasksForOtherWork(stage: Stage, group: Set[Stage]): Int =
+      runningTasksForOtherWorkForTest(stage, group)
+
     /**
      * Schedules shuffle merge finalize.
      */
@@ -6562,6 +6571,75 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("pipelined shuffle: buffered consumer TaskEnd events are still emitted when the job aborts") {
+    // A consumer's successful task completions are buffered (deferred) with their TaskEnd NOT yet
+    // posted while the producer runs. If the job is then torn down (here: the consumer's own task
+    // hits a FetchFailed, which aborts the group), those buffered successes must still emit their
+    // TaskEnd -- otherwise a listener that tracks active tasks (e.g. AppStatusListener, which only
+    // removes a stage once activeTasks hits 0) would leak the consumer stage as perpetually running.
+    // Mechanism: aborting the job tears down the still-running producer via
+    // cancelRunningIndependentStages, whose markStageAsFinished releases the consumer's deferral and
+    // drops its buffered events, posting their TaskEnd. This test guards that end-to-end invariant.
+    val endedTaskIds = new java.util.concurrent.ConcurrentHashMap[Long, Boolean]()
+    val recordingListener = new SparkListener {
+      override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit =
+        endedTaskIds.put(taskEnd.taskInfo.taskId, true)
+    }
+    sc.addSparkListener(recordingListener)
+    try {
+      val producerRdd = new MyRDD(sc, 2, Nil)
+      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+      val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+      val failListener = new JobListener {
+        override def taskSucceeded(index: Int, result: Any): Unit = results.put(index, result)
+        override def jobFailed(exception: Exception): Unit = failure.set(exception)
+      }
+      submit(consumerRdd, Array(0, 1), listener = failListener)
+      // Identify the co-scheduled consumer (ResultStage over consumerRdd) and its still-running
+      // pipelined producer by RDD identity rather than task-set order.
+      val consumerTaskSet = taskSets.find { ts =>
+        scheduler.stageIdToStage(ts.stageId).rdd eq consumerRdd
+      }.get
+      assert(scheduler.pipelinedConsumerDeferrals.size === 1,
+        "the consumer must be co-scheduled with a running producer (a deferral must exist)")
+
+      // Consumer partition 0 succeeds -> buffered (deferred), so no TaskEnd is posted yet. Give it a
+      // known taskId so we can assert its TaskEnd fires on teardown.
+      val bufferedTaskId = 7007L
+      runEvent(makeCompletionEvent(consumerTaskSet.tasks(0), Success, 42,
+        taskInfo = createFakeTaskInfoWithId(bufferedTaskId)))
+      sc.listenerBus.waitUntilEmpty()
+      assert(!endedTaskIds.containsKey(bufferedTaskId),
+        "the buffered consumer completion must not post its TaskEnd while deferred")
+      assert(scheduler.pipelinedConsumerDeferrals.get(
+        scheduler.stageIdToStage(consumerTaskSet.stageId)).exists(_.bufferedEvents.nonEmpty),
+        "the consumer's successful completion must be buffered while its producer runs")
+
+      // The consumer's OTHER task now hits a FetchFailed. For a pipelined group member this aborts
+      // the whole group (PR8 group-atomic failure) -- WITHOUT the producer ever finishing, so
+      // teardown goes through abortStage -> failJobAndIndependentStages ->
+      // cleanupStateForJobAndIndependentStages (NOT the producer-completion release path, which
+      // already posts TaskEnd correctly). The buffered success for partition 0 must still emit its
+      // TaskEnd on that cleanup path.
+      runEvent(makeCompletionEvent(
+        consumerTaskSet.tasks(1),
+        FetchFailed(makeBlockManagerId("hostA"), pipelinedDep.shuffleId, 0L, 0, 0, "ignored"),
+        null))
+      scheduler.resubmitFailedStages()
+      assert(failure.get() != null, "the job must fail")
+
+      // The buffered consumer success must still have produced a TaskEnd on teardown.
+      sc.listenerBus.waitUntilEmpty()
+      assert(endedTaskIds.containsKey(bufferedTaskId),
+        "a buffered consumer TaskEnd must still be emitted when the job aborts, to avoid leaking " +
+          "the stage as perpetually running in active-task listeners")
+      assertDataStructuresEmpty()
+    } finally {
+      sc.removeSparkListener(recordingListener)
+    }
+  }
+
   test("pipelined shuffle: a deferred consumer task fires its TaskEnd exactly once (at replay)") {
     // A deferred CompletionEvent must have its side effects (task-end listener event, accumulator
     // update) applied exactly once -- at replay -- not once when buffered and again when replayed.
@@ -6685,6 +6763,66 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     complete(taskSets(1), Seq((Success, 42), (Success, 43)))
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
+  }
+
+  test("pipelined shuffle: a group that fits total capacity but not FREE slots fails fast (S4.1)") {
+    // Spec S4.1: admission is decided against currently-FREE slots, not total capacity. A group of
+    // producer(2) + consumer(2) = 4 tasks fits a 10-slot cluster in principle, but if 8 slots are
+    // already occupied by OTHER work only 2 are free -- the group cannot co-fit right now and must
+    // fail fast rather than queue forever. Under the old total-capacity check this would wrongly be
+    // admitted (4 <= 10) and then hang. runningTasksForOtherWork already excludes the group's own
+    // members, so we report 8 directly.
+    val producerRdd = new MyRDD(sc, 2, Nil) // touch sc first so `scheduler` is initialized
+    val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
+    myScheduler.maxConcurrentTasksForTest = 10
+    myScheduler.runningTasksForOtherWorkForTest = (_, _) => 8 // 8 of 10 slots busy elsewhere -> 2 free
+    try {
+      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+      val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+      val failListener = new JobListener {
+        override def taskSucceeded(index: Int, result: Any): Unit = {}
+        override def jobFailed(exception: Exception): Unit = failure.set(exception)
+      }
+      submit(consumerRdd, Array(0, 1), listener = failListener)
+
+      assert(failure.get() != null,
+        "a group that fits total but not free slots must fail the job (S4.1 free-slot check)")
+      assert(failure.get().getMessage.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT") ||
+        failure.get().getMessage.contains("currently free"),
+        s"expected a free-slot insufficient-slot error, got: ${failure.get().getMessage}")
+      assertDataStructuresEmpty()
+    } finally {
+      myScheduler.maxConcurrentTasksForTest = 1000
+      myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0
+    }
+  }
+
+  test("pipelined shuffle: the group's own running members are not charged against its admission") {
+    // Occupancy for the free-slot check counts only OTHER work: the group's own already-running
+    // producer must not be charged, or a group that exactly fills free capacity would be wrongly
+    // rejected. Model a full cluster where the ONLY running tasks are this group's own: 4 total
+    // slots, other-work occupancy = 0 (the seam excludes the group) -> free = 4 >= demand 4 ->
+    // admitted. The exclusion itself is unit-tested against TaskSchedulerImpl separately; here we
+    // assert the DAGScheduler admits a demand==capacity group when nothing else is running.
+    val producerRdd = new MyRDD(sc, 2, Nil)
+    val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
+    myScheduler.maxConcurrentTasksForTest = 4
+    myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0 // only the group's own work runs
+    try {
+      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+      val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      submit(consumerRdd, Array(0, 1))
+      assert(taskSets.size === 2,
+        "a group whose demand equals free capacity must be co-scheduled, not rejected")
+      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+      complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
+      assertDataStructuresEmpty()
+    } finally {
+      myScheduler.maxConcurrentTasksForTest = 1000
+      myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0
+    }
   }
 
   test("regular shuffle: task sets are NOT marked isPipelined (inertness)") {
