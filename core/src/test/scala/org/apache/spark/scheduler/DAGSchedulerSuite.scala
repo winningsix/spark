@@ -7268,6 +7268,72 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
+
+  // ==========================================================================================
+  // Group-atomic rerun resets per-partition commit authorization (M1.8, spec S5)
+  // ==========================================================================================
+
+  test("pipelined shuffle: a group rerun resets per-partition commit authorization") {
+    // Spec S5: a PG is atomic, so a failure reruns the WHOLE group -- including a result stage whose
+    // tasks already succeeded and committed. Those committed partitions are rerun and must be
+    // allowed to commit again. OutputCommitCoordinator permanently denies re-commit for a committed
+    // partition (a Success clears nothing; keyed by stage id). M1 satisfies S5 two ways, both
+    // asserted here: (b) the group teardown runs the committed result stage through
+    // markStageAsFinished -> stageEnd, clearing its committer state (so no stale authorization
+    // survives); and (a) the caller's rerun is a NEW job whose stages get FRESH stage ids, so the
+    // coordinator has no prior committer for them regardless.
+    val producerRdd = new MyRDD(sc, 2, Nil)
+    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+    val failListener = new JobListener {
+      override def taskSucceeded(index: Int, result: Any): Unit = {}
+      override def jobFailed(exception: Exception): Unit = failure.set(exception)
+    }
+    submit(consumerRdd, Array(0, 1), listener = failListener)
+    val producerTaskSet = taskSets.head
+    val consumerTaskSet = taskSets(1)
+    val firstConsumerStageId = consumerTaskSet.stageId
+
+    // The consumer (result stage) commits partition 0: handleTaskCompletion calls
+    // outputCommitCoordinator.taskCompleted(Success) at its top (before the deferral buffering), so
+    // this registers committer state for the consumer stage even though the completion is deferred.
+    runEvent(makeCompletionEvent(consumerTaskSet.tasks(0), Success, 42))
+    assert(!scheduler.outputCommitCoordinator.isEmpty,
+      "committing a result task must register committer state in the coordinator")
+
+    // The producer now fails -> group-atomic failure -> the whole group is torn down and the job
+    // fails; the caller will rerun the batch as a new job.
+    failed(producerTaskSet, "producer blew up")
+    assert(failure.get() != null, "the group must fail atomically when the producer fails")
+    // Teardown cleared the committed result stage's authorization (via stageEnd): no stale state.
+    assert(scheduler.outputCommitCoordinator.isEmpty,
+      "group teardown must reset per-partition commit authorization (S5); none may survive")
+    assertDataStructuresEmpty()
+
+    // The caller reruns the batch as a NEW job on the same dependency. Its stages get fresh ids, so
+    // the coordinator has no prior committer, and the rerun's partition 0 can commit again. Only the
+    // task sets submitted from here on belong to the rerun (earlier ones' stages were cleaned up, so
+    // look them up defensively).
+    val taskSetsBeforeRerun = taskSets.size
+    val rerunConsumer = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    submit(rerunConsumer, Array(0, 1))
+    val rerunTaskSets = taskSets.drop(taskSetsBeforeRerun)
+    val rerunConsumerTaskSet = rerunTaskSets.find { ts =>
+      scheduler.stageIdToStage.get(ts.stageId).exists(_.rdd eq rerunConsumer)
+    }.get
+    val rerunProducerTaskSet = rerunTaskSets.find { ts =>
+      scheduler.stageIdToStage.get(ts.stageId).exists(_.rdd eq producerRdd)
+    }.get
+    assert(rerunConsumerTaskSet.stageId != firstConsumerStageId,
+      "the rerun's result stage must get a fresh stage id (fresh coordinator state)")
+    complete(rerunProducerTaskSet, Seq(
+      (Success, makeMapStatus("hostA", 2)),
+      (Success, makeMapStatus("hostB", 2))))
+    complete(rerunConsumerTaskSet, Seq((Success, 7), (Success, 8)))
+    assert(results === Map(0 -> 7, 1 -> 8), "the rerun must complete, re-committing its partitions")
+    assertDataStructuresEmpty()
+  }
 }
 
 class DAGSchedulerAbortStageOffSuite extends DAGSchedulerSuite {
