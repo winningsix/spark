@@ -7220,7 +7220,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a reliable RDD checkpoint in a member's chain is rejected") {
+  test("pipelined shuffle: a reliable RDD checkpoint in a PRODUCER's chain is rejected") {
     // A reliable checkpoint writes a durable, lineage-truncated snapshot -> reintroduces cross-time
     // reuse of a transient edge and needs a post-success recompute of the vanished input. Rejected
     // by walking the producer's within-stage chain for a ReliableRDDCheckpointData. Keyed on
@@ -7234,6 +7234,28 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
       assertPipelinedUnsupported(
         submitAndCaptureFailure(consumerRdd, Array(0, 1)), "reliable RDD checkpoint")
+      assertDataStructuresEmpty()
+    }
+  }
+
+  test("pipelined shuffle: a reliable RDD checkpoint in a CONSUMER's chain is rejected") {
+    // The rejection must cover a consumer member's chain too, not just the producer's: a consumer's
+    // transient input IS the pipelined shuffle, so a reliable checkpoint there would re-read the
+    // vanished stream on recompute. Shape: producer --pipelined--> consumer(checkpointed) --regular
+    // --> result, so the consumer is a distinct shuffle-map stage whose within-stage chain carries
+    // the checkpoint.
+    withTempDir { dir =>
+      sc.setCheckpointDir(dir.getCanonicalPath)
+      val producerRdd = new MyRDD(sc, 2, Nil)
+      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+      // The consumer RDD reads the pipelined shuffle AND is reliably checkpointed.
+      val consumerRdd = new MyCheckpointRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      consumerRdd.checkpoint()
+      assert(consumerRdd.checkpointData.exists(_.isInstanceOf[ReliableRDDCheckpointData[_]]))
+      val regularDep = new ShuffleDependency(consumerRdd, new HashPartitioner(2))
+      val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+      assertPipelinedUnsupported(
+        submitAndCaptureFailure(resultRdd, Array(0, 1)), "reliable RDD checkpoint")
       assertDataStructuresEmpty()
     }
   }
