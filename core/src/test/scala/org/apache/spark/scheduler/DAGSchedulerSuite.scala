@@ -41,7 +41,7 @@ import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.{LEGACY_ABORT_STAGE_AFTER_KILL_TASKS, Tests}
 import org.apache.spark.network.shuffle.ExternalBlockStoreClient
-import org.apache.spark.rdd.{DeterministicLevel, RDD}
+import org.apache.spark.rdd.{DeterministicLevel, RDD, ReliableRDDCheckpointData}
 import org.apache.spark.resource.{ExecutorResourceRequests, ResourceProfile, ResourceProfileBuilder, TaskResourceProfile, TaskResourceRequests}
 import org.apache.spark.resource.ResourceUtils.{FPGA, GPU}
 import org.apache.spark.rpc.RpcTimeoutException
@@ -7175,6 +7175,97 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(!scheduler.runningStages.exists(s => s.rdd.eq(producerRdd) || s.rdd.eq(consumerRdd)),
       "neither producer nor consumer may be left running after the group fails")
     sc.listenerBus.waitUntilEmpty()
+    assertDataStructuresEmpty()
+  }
+
+  // ==========================================================================================
+  // Fail-fast on unsupported idioms in a pipelined group (M1.7, spec S9)
+  // ==========================================================================================
+
+  /** Submit `finalRdd` and return the job failure exception, or null if the job did not fail. */
+  private def submitAndCaptureFailure(finalRdd: RDD[_], partitions: Array[Int]): Exception = {
+    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+    val failListener = new JobListener {
+      override def taskSucceeded(index: Int, result: Any): Unit = {}
+      override def jobFailed(exception: Exception): Unit = failure.set(exception)
+    }
+    submit(finalRdd, partitions, listener = failListener)
+    failure.get()
+  }
+
+  private def assertPipelinedUnsupported(failure: Exception, reasonSubstring: String): Unit = {
+    assert(failure != null, "the job must fail fast on the unsupported pipelined idiom")
+    val msg = failure.getMessage
+    assert(msg.contains("PIPELINED_SHUFFLE_UNSUPPORTED") || msg.contains("unsupported feature"),
+      s"expected a PIPELINED_SHUFFLE_UNSUPPORTED error, got: $msg")
+    assert(msg.contains(reasonSubstring), s"expected reason to mention '$reasonSubstring', got: $msg")
+  }
+
+  test("pipelined shuffle: a barrier producer stage is rejected") {
+    // A barrier stage exposes output only after a global sync, incompatible with incremental reads.
+    val producerRdd = new MyRDD(sc, 2, Nil).barrier().mapPartitions(iter => iter)
+    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    assertPipelinedUnsupported(submitAndCaptureFailure(consumerRdd, Array(0, 1)), "barrier")
+    assertDataStructuresEmpty()
+  }
+
+  test("pipelined shuffle: a statically-indeterminate producer is rejected") {
+    // Indeterminate output's recovery is stage rollback-and-recompute, which a group never performs
+    // (moot under S6); reject rather than carry dead machinery.
+    val producerRdd = new MyRDD(sc, 2, Nil, indeterminate = true)
+    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    assertPipelinedUnsupported(submitAndCaptureFailure(consumerRdd, Array(0, 1)), "indeterminate")
+    assertDataStructuresEmpty()
+  }
+
+  test("pipelined shuffle: a reliable RDD checkpoint in a member's chain is rejected") {
+    // A reliable checkpoint writes a durable, lineage-truncated snapshot -> reintroduces cross-time
+    // reuse of a transient edge and needs a post-success recompute of the vanished input. Rejected
+    // by walking the producer's within-stage chain for a ReliableRDDCheckpointData. Keyed on
+    // checkpointData (not isCheckpointed): the write has not happened yet at group-creation time.
+    withTempDir { dir =>
+      sc.setCheckpointDir(dir.getCanonicalPath)
+      val checkpointableRdd = new MyCheckpointRDD(sc, 2, Nil)
+      checkpointableRdd.checkpoint() // sets checkpointData to a ReliableRDDCheckpointData
+      assert(checkpointableRdd.checkpointData.exists(_.isInstanceOf[ReliableRDDCheckpointData[_]]))
+      val pipelinedDep = new PipelinedShuffleDependency(checkpointableRdd, new HashPartitioner(2))
+      val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      assertPipelinedUnsupported(
+        submitAndCaptureFailure(consumerRdd, Array(0, 1)), "reliable RDD checkpoint")
+      assertDataStructuresEmpty()
+    }
+  }
+
+  test("pipelined shuffle: a producer feeding more than one consumer (fan-out) is rejected") {
+    // 1:N fan-out is a supported model deferred to a later version; v1 rejects it. To make the
+    // producer feed two distinct consumer STAGES (narrow deps would collapse into one stage), each
+    // consumer writes its own regular shuffle; a final stage reads both. Both consumer stages read
+    // the same pipelined producer -> fan-out.
+    val producerRdd = new MyRDD(sc, 2, Nil)
+    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerA = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    val consumerB = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+    val regularDepA = new ShuffleDependency(consumerA, new HashPartitioner(2))
+    val regularDepB = new ShuffleDependency(consumerB, new HashPartitioner(2))
+    val join = new MyRDD(sc, 2, List(regularDepA, regularDepB), tracker = mapOutputTracker)
+    assertPipelinedUnsupported(submitAndCaptureFailure(join, Array(0, 1)), "more than one consumer")
+    assertDataStructuresEmpty()
+  }
+
+  test("regular shuffle idioms are NOT rejected (inertness of the pipelined fail-fast)") {
+    // None of the pipelined fail-fast checks may fire for a job with no pipelined dependency: a
+    // barrier + indeterminate + reliable-checkpointed regular shuffle must run exactly as before.
+    val producerRdd = new MyRDD(sc, 2, Nil, indeterminate = true)
+    val regularDep = new ShuffleDependency(producerRdd, new HashPartitioner(2))
+    val consumerRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+    submit(consumerRdd, Array(0, 1))
+    // The job proceeds normally (producer stage submitted), i.e. NOT failed by a pipelined check.
+    assert(failure === null, "a regular shuffle must not be rejected by the pipelined fail-fast")
+    completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+    complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
 }
