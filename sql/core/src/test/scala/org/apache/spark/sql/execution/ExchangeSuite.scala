@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution
 
 import scala.util.Random
 
+import org.apache.spark.PipelinedShuffleDependency
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.sql.{Dataset, Row}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -57,6 +58,15 @@ class ExchangeSuite extends SharedSparkSession {
       plan => ShuffleExchangeExec(SinglePartition, plan),
       input.map(Row.fromTuple)
     )
+  }
+
+  test("batch SQL shuffle can opt in to a pipelined dependency") {
+    withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true") {
+      val input = spark.range(16).queryExecution.executedPlan
+      val exchange = ShuffleExchangeExec(HashPartitioning(input.output, 2), input)
+
+      assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+    }
   }
 
   test("null-aware hash shuffle spreads identical NULL keys from one mapper") {

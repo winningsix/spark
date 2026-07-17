@@ -49,7 +49,7 @@ import org.apache.spark.sql.internal.SQLConf
  */
 // TODO: all commands should look up table from the current catalog. The `SessionCatalog` doesn't
 //       need to track current database at all.
-private[sql] trait CatalogManager extends SQLConfHelper with Logging {
+private[sql] abstract class CatalogManager extends SQLConfHelper with Logging {
 
   // ---- Underlying state exposed by implementations ----
   def defaultSessionCatalog: CatalogPlugin

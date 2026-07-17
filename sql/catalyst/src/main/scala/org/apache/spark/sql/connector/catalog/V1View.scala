@@ -39,12 +39,29 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
  * them.
  */
 private[sql] class V1View(val v1Table: CatalogTable)
-    extends View(V1View.builderFrom(v1Table))
+    extends View {
+  private val delegate = V1View.builderFrom(v1Table).build()
+
+  override def name(): String = v1Table.identifier.unquotedString
+  override def query(): String = delegate.query()
+  override def queryText(): String = delegate.queryText()
+  override def currentCatalog(): String = delegate.currentCatalog()
+  override def currentNamespace(): Array[String] = delegate.currentNamespace()
+  override def schema(): org.apache.spark.sql.types.StructType = delegate.schema()
+  override def columns(): Array[Column] = delegate.columns()
+  override def queryColumnNames(): Array[String] = delegate.queryColumnNames()
+  override def columnAliases(): Array[String] = delegate.columnAliases()
+  override def columnComments(): Array[String] = delegate.columnComments()
+  override def properties(): java.util.Map[String, String] = delegate.properties()
+  override def sqlConfigs(): java.util.Map[String, String] = delegate.sqlConfigs()
+  override def schemaMode(): String = delegate.schemaMode()
+  override def viewDependencies(): DependencyList = delegate.viewDependencies()
+}
 
 private[sql] object V1View {
   /**
    * Convert a v1 [[CatalogTable]] view into a [[View.Builder]] with the same fields.
-   * Used as the {@code super(builder)} argument when constructing a [[V1View]].
+   * Used to create the delegate when constructing a [[V1View]].
    */
   private def builderFrom(v1Table: CatalogTable): View.Builder = {
     val builder = new View.Builder()

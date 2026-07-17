@@ -540,16 +540,26 @@ object ShuffleExchangeExec {
         0
       }
     }
-    val dependency =
+    val shuffleWriteProcessor = createShuffleWriteProcessor(writeMetrics)
+    val rowBasedChecksums = UnsafeRowChecksum.createUnsafeRowChecksums(checksumSize)
+    val dependency = if (SQLConf.get.pipelinedShuffleEnabled) {
+      new PipelinedShuffleDependency[Int, InternalRow, InternalRow](
+        rddWithPartitionIds,
+        new PartitionIdPassthrough(part.numPartitions),
+        serializer,
+        shuffleWriterProcessor = shuffleWriteProcessor,
+        rowBasedChecksums = rowBasedChecksums)
+    } else {
       new ShuffleDependency[Int, InternalRow, InternalRow](
         rddWithPartitionIds,
         new PartitionIdPassthrough(part.numPartitions),
         serializer,
-        shuffleWriterProcessor = createShuffleWriteProcessor(writeMetrics),
-        rowBasedChecksums = UnsafeRowChecksum.createUnsafeRowChecksums(checksumSize),
+        shuffleWriterProcessor = shuffleWriteProcessor,
+        rowBasedChecksums = rowBasedChecksums,
         _checksumMismatchFullRetryEnabled = SQLConf.get.shuffleChecksumMismatchFullRetryEnabled,
         checksumMismatchQueryLevelRollbackEnabled =
           SQLConf.get.shuffleChecksumMismatchQueryLevelRollbackEnabled)
+    }
 
     dependency
   }
