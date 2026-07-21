@@ -20,7 +20,7 @@ package org.apache.spark.scheduler
 import java.nio.ByteBuffer
 import java.util.Properties
 import java.util.concurrent.{CountDownLatch, ExecutorService, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap}
@@ -43,9 +43,13 @@ import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
 class FakeSchedulerBackend extends SchedulerBackend {
+  val reviveOffersCount = new AtomicInteger()
+
   def start(): Unit = {}
   def stop(): Unit = {}
-  def reviveOffers(): Unit = {}
+  def reviveOffers(): Unit = {
+    reviveOffersCount.incrementAndGet()
+  }
   def defaultParallelism(): Int = 1
   def maxNumConcurrentTasks(rp: ResourceProfile): Int = 0
 
@@ -100,6 +104,18 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     confs.foreach { case (k, v) => conf.set(k, v) }
     sc = new SparkContext(conf)
     taskScheduler = new TaskSchedulerImpl(sc, sc.conf.get(config.TASK_MAX_FAILURES))
+    setupHelper()
+  }
+
+  def setupSchedulerWithDeterministicOffers(
+      master: String,
+      confs: (String, String)*): TaskSchedulerImpl = {
+    val conf = new SparkConf().setMaster(master).setAppName("TaskSchedulerImplSuite")
+    confs.foreach { case (k, v) => conf.set(k, v) }
+    sc = new SparkContext(conf)
+    taskScheduler = new TaskSchedulerImpl(sc, sc.conf.get(config.TASK_MAX_FAILURES)) {
+      override def shuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = offers
+    }
     setupHelper()
   }
 
@@ -294,6 +310,710 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       rpId, Array(rpId, rpId), Array(fourCores, fourCores),
       Array(Map.empty[String, Int], Map.empty[String, Int]))
     assert(slots === Int.MaxValue)
+  }
+
+  test("pipelined task sets are offered resources round-robin when enabled") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.LOCALITY_WAIT.key -> "0")
+    val taskSet0 = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
+    val taskSet1 = FakeTask.createTaskSet(16, stageId = 1, stageAttemptId = 0)
+    val taskSet2 = FakeTask.createTaskSet(16, stageId = 2, stageAttemptId = 0)
+    Seq(taskSet0, taskSet1, taskSet2).foreach { taskSet =>
+      taskScheduler.submitTasks(new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true))
+    }
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))).flatten
+
+    assert(tasks.length === 16)
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(byStage.keySet === Set(0, 1, 2))
+    assert(byStage(0) < 16, "the first pipelined task set must not drain every slot")
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined task set round-robin gives downstream consumers a slot") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true)
+    }
+
+    // Four wide producers plus a single-task downstream result stage reproduce the failure mode
+    // seen with native backpressure: each producer can otherwise take one task per executor and
+    // fill all 16 slots before the result-stage reader starts.
+    Seq(
+      pipelinedTaskSet(16, stageId = 0),
+      pipelinedTaskSet(16, stageId = 1),
+      pipelinedTaskSet(16, stageId = 2),
+      pipelinedTaskSet(16, stageId = 3),
+      pipelinedTaskSet(1, stageId = 4)).foreach(taskScheduler.submitTasks)
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))).flatten
+
+    assert(tasks.length === 16)
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(byStage.keySet === Set(0, 1, 2, 3, 4))
+    assert(byStage(4) === 1, "the downstream result stage must receive a slot")
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined task set per-stage cap limits running upstream tasks") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "2",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true)
+    }
+
+    Seq(
+      pipelinedTaskSet(16, stageId = 0),
+      pipelinedTaskSet(16, stageId = 1),
+      pipelinedTaskSet(16, stageId = 2),
+      pipelinedTaskSet(16, stageId = 3),
+      pipelinedTaskSet(1, stageId = 4)).foreach(taskScheduler.submitTasks)
+
+    val offers = IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))
+    val tasks = taskScheduler.resourceOffers(offers).flatten
+
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(tasks.length === 9)
+    assert(byStage(0) === 2)
+    assert(byStage(1) === 2)
+    assert(byStage(2) === 2)
+    assert(byStage(3) === 2)
+    assert(byStage(4) === 1)
+
+    val secondOffer = taskScheduler.resourceOffers(offers).flatten
+    assert(secondOffer.isEmpty, "stages at their running cap must not launch more tasks")
+    assert(!failedTaskSet)
+  }
+
+  test("simple pipelined group uses simple per-stage cap override") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "2",
+      config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 2)
+    }
+
+    Seq(
+      pipelinedTaskSet(16, stageId = 0),
+      pipelinedTaskSet(1, stageId = 1)).foreach(taskScheduler.submitTasks)
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))).flatten
+
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(tasks.length === 5)
+    assert(byStage(0) === 4)
+    assert(byStage(1) === 1)
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined producer cap override can relax pure producers without relaxing readers") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 3,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(16, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(16, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))).flatten
+
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(tasks.length === 16)
+    assert(byStage(0) > 4)
+    assert(byStage(1) > 4)
+    assert(byStage(2) === 4, "reader stages must retain the regular reader-residency cap")
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined round robin spreads a task set across executor offers") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[64]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.LOCALITY_WAIT.key -> "0")
+    val taskSet = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
+    taskScheduler.submitTasks(new TaskSet(
+      taskSet.tasks,
+      taskSet.stageId,
+      taskSet.stageAttemptId,
+      taskSet.priority,
+      taskSet.properties,
+      taskSet.resourceProfileId,
+      taskSet.shuffleId,
+      isPipelined = true,
+      pipelinedGroupStageCount = 1,
+      pipelinedGroupId = Some("group-0"),
+      isPipelinedShuffleProducer = true))
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 16),
+      WorkerOffer("executor1", "host1", 16),
+      WorkerOffer("executor2", "host2", 16),
+      WorkerOffer("executor3", "host3", 16))).flatten
+
+    val byExecutor = tasks.groupBy(_.executorId).view.mapValues(_.size).toMap
+    assert(tasks.length === 16)
+    assert(byExecutor === Map(
+      "executor0" -> 4,
+      "executor1" -> 4,
+      "executor2" -> 4,
+      "executor3" -> 4))
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined per-executor cap limits one stage on each executor") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[64]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "2",
+      config.LOCALITY_WAIT.key -> "0")
+    val taskSet = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
+    taskScheduler.submitTasks(new TaskSet(
+      taskSet.tasks,
+      taskSet.stageId,
+      taskSet.stageAttemptId,
+      taskSet.priority,
+      taskSet.properties,
+      taskSet.resourceProfileId,
+      taskSet.shuffleId,
+      isPipelined = true,
+      pipelinedGroupStageCount = 1,
+      pipelinedGroupId = Some("group-0"),
+      isPipelinedShuffleProducer = true))
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 16),
+      WorkerOffer("executor1", "host1", 16),
+      WorkerOffer("executor2", "host2", 16),
+      WorkerOffer("executor3", "host3", 16))).flatten
+
+    val byExecutor = tasks.groupBy(_.executorId).view.mapValues(_.size).toMap
+    assert(tasks.length === 8)
+    assert(byExecutor === Map(
+      "executor0" -> 2,
+      "executor1" -> 2,
+      "executor2" -> 2,
+      "executor3" -> 2))
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined reader residency blocks pure producers until readers are resident") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 5,
+        pipelinedGroupId = Some("group-0"),
+        requiresAllPipelinedShuffleReadersResident = true,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(16, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(16, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = true),
+      pipelinedTaskSet(4, stageId = 3, isReader = true, isProducer = true),
+      pipelinedTaskSet(1, stageId = 4, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4),
+      WorkerOffer("executor1", "host1", 4),
+      WorkerOffer("executor2", "host2", 4),
+      WorkerOffer("executor3", "host3", 4))).flatten
+
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+    assert(tasks.length === 16)
+    assert(byStage(2) === 4)
+    assert(byStage(3) === 4)
+    assert(byStage(4) === 1)
+    assert(byStage.getOrElse(0, 0) + byStage.getOrElse(1, 0) === 7)
+
+    val launchOrder = tasks
+      .sortBy(_.taskId)
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+    assert(launchOrder.take(9).forall(Set(2, 3, 4).contains),
+      "all reader tasks must launch before pure producers consume remaining slots")
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined reader residency refills pure producers after first wave completes") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.LOCALITY_WAIT.key -> "0")
+    val backend = taskScheduler.backend.asInstanceOf[FakeSchedulerBackend]
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 4,
+        pipelinedGroupId = Some("group-0"),
+        requiresAllPipelinedShuffleReadersResident = true,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(60, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(60, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = true),
+      pipelinedTaskSet(1, stageId = 3, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+    backend.reviveOffersCount.set(0)
+
+    val hostsByExecutor = Map(
+      "executor0" -> "host0",
+      "executor1" -> "host1",
+      "executor2" -> "host2",
+      "executor3" -> "host3")
+    val fullOffers = hostsByExecutor.toIndexedSeq.sortBy(_._1).map {
+      case (executorId, host) => WorkerOffer(executorId, host, 4)
+    }
+    val firstWave = taskScheduler.resourceOffers(fullOffers).flatten
+    val firstWaveStages = firstWave
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+    val firstWaveByStage = firstWaveStages.groupBy(identity).view.mapValues(_.size).toMap
+    assert(firstWave.length === 16)
+    assert(firstWaveByStage(2) === 4)
+    assert(firstWaveByStage(3) === 1)
+    assert(firstWaveByStage.getOrElse(0, 0) + firstWaveByStage.getOrElse(1, 0) === 11)
+
+    val producerTasks = firstWave.filter { task =>
+      val stageId = taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+      stageId == 0 || stageId == 1
+    }
+    val producerTaskSetManagers = producerTasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId))
+      .distinct
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val resultSer = SparkEnv.get.closureSerializer.newInstance()
+    producerTasks.foreach { task =>
+      val result = new DirectTaskResult[Int](valueSer.serialize(task.taskId.toInt), Seq(),
+        Array[Long]())
+      taskScheduler.statusUpdate(task.taskId, TaskState.FINISHED, resultSer.serialize(result))
+    }
+
+    eventually(timeout(10.seconds)) {
+      assert(producerTaskSetManagers.map(_.tasksSuccessful).sum === producerTasks.length)
+      assert(producerTaskSetManagers.forall(_.runningTasks === 0))
+      assert(backend.reviveOffersCount.get() > 0)
+    }
+
+    val refillOffers = producerTasks
+      .groupBy(_.executorId)
+      .toIndexedSeq
+      .sortBy(_._1)
+      .map { case (executorId, tasks) =>
+        WorkerOffer(executorId, hostsByExecutor(executorId), tasks.length)
+      }
+    val refillTasks = taskScheduler.resourceOffers(refillOffers).flatten
+    val refillStages = refillTasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+    assert(refillTasks.length === producerTasks.length)
+    assert(refillStages.forall(stageId => stageId == 0 || stageId == 1))
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined pure producer refill prioritizes a starved sibling producer") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 4,
+        pipelinedGroupId = Some("group-0"),
+        requiresAllPipelinedShuffleReadersResident = true,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(60, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(60, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = true),
+      pipelinedTaskSet(4, stageId = 3, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val hostsByExecutor = Map(
+      "executor0" -> "host0",
+      "executor1" -> "host1",
+      "executor2" -> "host2",
+      "executor3" -> "host3")
+    val fullOffers = hostsByExecutor.toIndexedSeq.sortBy(_._1).map {
+      case (executorId, host) => WorkerOffer(executorId, host, 4)
+    }
+    val firstWave = taskScheduler.resourceOffers(fullOffers).flatten
+    def stageIdFor(task: TaskDescription): Int = {
+      taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    }
+    val firstWaveByStage = firstWave.map(stageIdFor).groupBy(identity).view.mapValues(_.size).toMap
+    assert(firstWave.length === 16)
+    assert(firstWaveByStage === Map(0 -> 4, 1 -> 4, 2 -> 4, 3 -> 4))
+
+    val stage0Manager = firstWave
+      .find(stageIdFor(_) == 0)
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId))
+      .get
+    val stage1Tasks = firstWave.filter(stageIdFor(_) == 1).sortBy(_.taskId)
+    val stage1Manager = taskScheduler.taskIdToTaskSetManager.get(stage1Tasks.head.taskId)
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val resultSer = SparkEnv.get.closureSerializer.newInstance()
+
+    stage1Tasks.foreach { task =>
+      val result = new DirectTaskResult[Int](valueSer.serialize(task.taskId.toInt), Seq(),
+        Array[Long]())
+      taskScheduler.statusUpdate(task.taskId, TaskState.FINISHED, resultSer.serialize(result))
+
+      val refillTasks = taskScheduler.resourceOffers(IndexedSeq(
+        WorkerOffer(task.executorId, hostsByExecutor(task.executorId), 1))).flatten
+      assert(refillTasks.length === 1)
+      assert(stageIdFor(refillTasks.head) === 1,
+        "a producer with fewer resident tasks must be refilled before its sibling advances")
+      assert(stage0Manager.runningTasks >= stage1Manager.runningTasks)
+    }
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined pure producer batch refill prioritizes a drained sibling producer") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 4,
+        pipelinedGroupId = Some("group-0"),
+        requiresAllPipelinedShuffleReadersResident = true,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(60, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(60, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = true),
+      pipelinedTaskSet(4, stageId = 3, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val hostsByExecutor = Map(
+      "executor0" -> "host0",
+      "executor1" -> "host1",
+      "executor2" -> "host2",
+      "executor3" -> "host3")
+    val fullOffers = hostsByExecutor.toIndexedSeq.sortBy(_._1).map {
+      case (executorId, host) => WorkerOffer(executorId, host, 4)
+    }
+    val firstWave = taskScheduler.resourceOffers(fullOffers).flatten
+    def stageIdFor(task: TaskDescription): Int = {
+      taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    }
+    val firstWaveByStage = firstWave.map(stageIdFor).groupBy(identity).view.mapValues(_.size).toMap
+    assert(firstWave.length === 16)
+    assert(firstWaveByStage === Map(0 -> 4, 1 -> 4, 2 -> 4, 3 -> 4))
+
+    val stage0Manager = firstWave
+      .find(stageIdFor(_) == 0)
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId))
+      .get
+    val stage1Tasks = firstWave.filter(stageIdFor(_) == 1).sortBy(_.taskId)
+    val stage1Manager = taskScheduler.taskIdToTaskSetManager.get(stage1Tasks.head.taskId)
+    val readerTaskSetManagers = firstWave
+      .filter(task => Set(2, 3).contains(stageIdFor(task)))
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId))
+      .distinct
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val resultSer = SparkEnv.get.closureSerializer.newInstance()
+
+    stage1Tasks.foreach { task =>
+      val result = new DirectTaskResult[Int](valueSer.serialize(task.taskId.toInt), Seq(),
+        Array[Long]())
+      taskScheduler.statusUpdate(task.taskId, TaskState.FINISHED, resultSer.serialize(result))
+    }
+    eventually(timeout(10.seconds)) {
+      assert(stage1Manager.tasksSuccessful === stage1Tasks.length)
+      assert(stage1Manager.runningTasks === 0)
+    }
+    readerTaskSetManagers.foreach { manager =>
+      manager.pendingTasks.all.clear()
+      manager.pendingSpeculatableTasks.all.clear()
+    }
+    val schedulableStagesBeforeRefill = taskScheduler.rootPool.getSortedTaskSetQueue
+      .map(_.stageId)
+      .toSet
+    assert(!schedulableStagesBeforeRefill.contains(2))
+    assert(!schedulableStagesBeforeRefill.contains(3))
+
+    val refillOffers = stage1Tasks
+      .groupBy(_.executorId)
+      .toIndexedSeq
+      .sortBy(_._1)
+      .map { case (executorId, tasks) =>
+        WorkerOffer(executorId, hostsByExecutor(executorId), tasks.length)
+      }
+    val refillTasks = taskScheduler.resourceOffers(refillOffers).flatten
+    assert(refillTasks.length === stage1Tasks.length)
+    assert(refillTasks.map(stageIdFor).forall(_ == 1),
+      "a drained producer sibling must receive the next batch of free slots")
+    assert(stage0Manager.runningTasks >= stage1Manager.runningTasks)
+    assert(!failedTaskSet)
+  }
+
+  test("pipelined reader residency is rechecked after a resident reader exits") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[16]",
+      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
+      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
+      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 4,
+        pipelinedGroupId = Some("group-0"),
+        requiresAllPipelinedShuffleReadersResident = true,
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(60, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(60, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(4, stageId = 2, isReader = true, isProducer = true),
+      pipelinedTaskSet(4, stageId = 3, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val hostsByExecutor = Map(
+      "executor0" -> "host0",
+      "executor1" -> "host1",
+      "executor2" -> "host2",
+      "executor3" -> "host3")
+    val fullOffers = hostsByExecutor.toIndexedSeq.sortBy(_._1).map {
+      case (executorId, host) => WorkerOffer(executorId, host, 4)
+    }
+    val firstWave = taskScheduler.resourceOffers(fullOffers).flatten
+    def stageIdFor(task: TaskDescription): Int = {
+      taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    }
+    val firstWaveByStage = firstWave.map(stageIdFor).groupBy(identity).view.mapValues(_.size).toMap
+    assert(firstWave.length === 16)
+    assert(firstWaveByStage === Map(0 -> 4, 1 -> 4, 2 -> 4, 3 -> 4))
+
+    val exitedReader = firstWave.find(stageIdFor(_) == 3).get
+    val readerManager = taskScheduler.taskIdToTaskSetManager.get(exitedReader.taskId)
+    readerManager.removeRunningTask(exitedReader.taskId)
+
+    val refillTasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor4", "host4", 1))).flatten
+    assert(refillTasks.isEmpty,
+      "pure producers must not consume newly free slots after reader residency is lost")
+    assert(!failedTaskSet)
   }
 
   private def setupTaskSchedulerForLocalityTests(
