@@ -227,10 +227,11 @@ The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/
 - Runtime bloom enabled
 - `mpp.maxDriversPerFragment=1`
 - `cudf.concurrentGpuTasks=2`
-- Power test time: `23.000s`
+- Power test time: about `25s`
+- Raw `time.csv` in the cited run reports `23.000s`
 - Total time including table setup: `33.725s`
 
-The user-facing shorthand for this baseline has been "about 23-25 sec". The raw `time.csv` reports `23.000s` Power Test Time.
+The user-facing shorthand for this baseline should be "about 25 sec". The raw cited run is slightly faster at `23.000s`, but the architecture/performance comparison should not imply that `23.000s` is the stable baseline for every run.
 
 This baseline is not apples-to-apples with the streaming UCX POC. It used old Gluten MPP execution, which fused native query fragments and bypassed much of Spark's normal stage-by-stage execution overhead. It remains the target performance bar, but it is not an incremental Spark shuffle manager.
 
@@ -238,16 +239,16 @@ This baseline is not apples-to-apples with the streaming UCX POC. It used old Gl
 
 ```mermaid
 flowchart LR
-  A[Old MPP 23s] --> B[Target bar]
+  A[Old MPP about 25s] --> B[Target bar]
   C[Streaming UCX 251s] --> D[Current POC]
-  C --> E[10.9x slower]
+  C --> E[About 10x slower]
 ```
 
 At 22-query level:
 
 | Metric | Streaming UCX POC | Old Gluten MPP baseline | Gap |
 | --- | ---: | ---: | ---: |
-| Power test time | `251.000s` | `23.000s` | `10.9x` slower |
+| Power test time | `251.000s` | about `25s`, raw cited run `23.000s` | about `10x` slower |
 | Sum of query times | `250.436s` | `4.685s` query-only sum | `53.5x` slower query-only |
 | Total wall time | `263.295s` | `33.725s` | `7.8x` slower |
 | cuDF fallback | `0` in strict 22/22 run | `0` observed by guard | comparable |
