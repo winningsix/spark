@@ -1,10 +1,10 @@
-# Spark 5 Pipelined UCX Shuffle POC Status - 2026-07-21
+# Spark 4.2 Pipelined UCX Shuffle POC Status - 2026-07-21
 
 ## Scope
 
-This document summarizes the current Spark 5 / Gluten / Velox POC for fully streaming UCX shuffle on TPC-H 1TB with 4 GPUs.
+This document summarizes the current Spark 4.2 / Gluten / Velox POC for fully streaming UCX shuffle on TPC-H 1TB with 4 GPUs.
 
-The public upstream material currently describes this direction as Spark 4.x Real-Time Mode (RTM). This POC is on a Spark 5.x / Spark 5.2 branch, but it follows the same core direction: Spark-level concurrent stages plus streaming shuffle. The batch SQL POC adds a Gluten/Velox GPU-native UCX data plane and a driver-side control plane.
+The public upstream material describes this direction as Spark 4.2 Real-Time Mode (RTM) and related Spark 4.x work. Some local branch and path names still include `spark5` because of the original POC naming, but the design motivation and upstream reference point should be read as Spark 4.2 / Spark 4.x RTM.
 
 The diagrams are intentionally simple so they render cleanly in GitHub Wiki.
 
@@ -55,7 +55,7 @@ The important upstream points for this POC are:
 - Concurrent stage scheduling is required: dependent stages must be allowed to run at the same time.
 - Upstream RTM starts from Structured Streaming. It does not directly provide a batch SQL MPP query coordinator.
 
-## Spark 5.2 POC Changes
+## Spark 4.2 POC Changes
 
 The Spark-side POC changes turn the RTM direction into a batch SQL incremental shuffle path:
 
