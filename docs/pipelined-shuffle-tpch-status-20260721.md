@@ -226,7 +226,13 @@ The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/
 - Runtime bloom enabled
 - `mpp.maxDriversPerFragment=1`
 - `cudf.concurrentGpuTasks=2`
-- User-facing aggregate target: about `25s` Power Test Time on 4 GPUs
+- Current reference baseline: `4GPU Gluten MPP min-hot`
+- Sum of query times: `27.182s`
+- User-facing aggregate target: about `25s` on 4 GPUs
+
+This is the current usable per-query reference for comparison against the streaming shuffle POC. There may be a faster min-hot run, but this table is internally consistent and should be used instead of the invalid `0.xs` failed-run data.
+
+The source note for this baseline also compared against 4GPU PrestoDB: MPP sum `27.182s`, PrestoDB sum `29.376s`, and Presto/MPP `1.08x`. The rest of this document uses only the Gluten MPP min-hot column to compare against the streaming shuffle POC.
 
 Important correction: the previously cited local run root must not be used for old-MPP per-query comparison:
 
@@ -235,7 +241,7 @@ Important correction: the previously cited local run root must not be used for o
 - All 22 JSON summaries in that run report `queryStatus=["Failed","Failed","Failed"]`.
 - The failure reason is executor placement for `MppNativeQueryRDD`, for example `partition 0 expected executor 0, but Spark scheduled it on 4`.
 
-Therefore, the old MPP baseline should be treated as an aggregate historical target of about `25s`. Do not use the `0.xs` per-query numbers from the invalid run. A valid old-MPP per-query artifact still needs to be located before publishing per-query MPP comparisons.
+Therefore, do not use the `0.xs` per-query numbers from the invalid run. Use the `4GPU Gluten MPP min-hot` values above unless a faster valid min-hot artifact is located.
 
 This baseline is not apples-to-apples with the streaming UCX POC. It used old Gluten MPP execution, which fused native query fragments and bypassed much of Spark's normal stage-by-stage execution overhead. It remains the target performance bar, but it is not an incremental Spark shuffle manager.
 
@@ -243,49 +249,50 @@ This baseline is not apples-to-apples with the streaming UCX POC. It used old Gl
 
 ```mermaid
 flowchart LR
-  A[Old MPP about 25s] --> B[Target bar]
+  A[Old MPP min-hot 27.2s] --> B[Target bar]
   C[Streaming UCX 251s] --> D[Current POC]
-  C --> E[About 10x slower]
+  C --> E[9.2x slower]
 ```
 
 At 22-query level:
 
 | Metric | Streaming UCX POC | Old Gluten MPP baseline | Gap |
 | --- | ---: | ---: | ---: |
-| Power test time | `251.000s` | about `25s` historical target | about `10x` slower |
-| Sum of query times | `250.436s` | valid per-query source not yet located | not computed |
+| Power test time | `251.000s` | about `25s` target | about `10x` slower |
+| Sum of query times | `250.436s` | `27.182s` min-hot | `9.2x` slower |
 | Total wall time | `263.295s` | valid comparable source not yet located | not computed |
-| cuDF fallback | `0` in strict 22/22 run | not recomputed from valid baseline artifact | unknown |
+| cuDF fallback | `0` in strict 22/22 run | not recomputed from min-hot table | unknown |
 | MPP plan-collapse evidence | `0` | MPP enabled / collapsed path | intentionally different |
 
-Current streaming UCX per-query times:
+Per-query comparison against the `4GPU Gluten MPP min-hot` reference:
 
-| Query | Streaming UCX POC s |
-| --- | ---: |
-| Q1 | 5.512 |
-| Q2 | 6.583 |
-| Q3 | 14.404 |
-| Q4 | 2.852 |
-| Q5 | 31.957 |
-| Q6 | 0.852 |
-| Q7 | 19.572 |
-| Q8 | 13.300 |
-| Q9 | 12.540 |
-| Q10 | 19.502 |
-| Q11 | 4.763 |
-| Q12 | 15.425 |
-| Q13 | 4.625 |
-| Q14 | 2.892 |
-| Q15 | 6.210 |
-| Q16 | 5.310 |
-| Q17 | 18.440 |
-| Q18 | 28.332 |
-| Q19 | 2.819 |
-| Q20 | 6.067 |
-| Q21 | 25.667 |
-| Q22 | 2.812 |
+| Query | Streaming UCX POC s | Gluten MPP min-hot s | Gap |
+| --- | ---: | ---: | ---: |
+| Q1 | 5.512 | 1.782 | 3.1x |
+| Q2 | 6.583 | 0.757 | 8.7x |
+| Q3 | 14.404 | 1.236 | 11.7x |
+| Q4 | 2.852 | 0.712 | 4.0x |
+| Q5 | 31.957 | 1.278 | 25.0x |
+| Q6 | 0.852 | 0.798 | 1.1x |
+| Q7 | 19.572 | 1.521 | 12.9x |
+| Q8 | 13.300 | 1.541 | 8.6x |
+| Q9 | 12.540 | 1.657 | 7.6x |
+| Q10 | 19.502 | 1.333 | 14.6x |
+| Q11 | 4.763 | 0.436 | 10.9x |
+| Q12 | 15.425 | 0.891 | 17.3x |
+| Q13 | 4.625 | 1.181 | 3.9x |
+| Q14 | 2.892 | 1.098 | 2.6x |
+| Q15 | 6.210 | 1.832 | 3.4x |
+| Q16 | 5.310 | 0.447 | 11.9x |
+| Q17 | 18.440 | 1.607 | 11.5x |
+| Q18 | 28.332 | 1.532 | 18.5x |
+| Q19 | 2.819 | 1.193 | 2.4x |
+| Q20 | 6.067 | 1.486 | 4.1x |
+| Q21 | 25.667 | 2.267 | 11.3x |
+| Q22 | 2.812 | 0.597 | 4.7x |
+| SUM | 250.436 | 27.182 | 9.2x |
 
-Do not publish per-query MPP gaps until a valid old-MPP per-query artifact is found. The previous `0.xs` MPP numbers came from a failed run and were removed.
+The previous `0.xs` MPP numbers came from a failed run and were removed.
 
 ## Performance Interpretation
 
