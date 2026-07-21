@@ -58,7 +58,9 @@ private[spark] class IncrementalShuffleHandle(val delegate: ShuffleHandle)
  * clusters that do not opt in.
  */
 private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Boolean)
-  extends ShuffleManager with Logging {
+  extends ShuffleManager
+  with PipelinedShuffleControlPlane
+  with Logging {
 
   private val defaultManager: ShuffleManager =
     Utils.instantiateSerializerOrShuffleManager[ShuffleManager](
@@ -82,6 +84,12 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
 
   /** The manager that serves pipelined (incrementally-readable) shuffles. Exposed for testing. */
   private[spark] def incrementalShuffleManager: ShuffleManager = incrementalManager
+
+  private def incrementalControlPlane: Option[PipelinedShuffleControlPlane] =
+    incrementalManager match {
+      case controlPlane: PipelinedShuffleControlPlane => Some(controlPlane)
+      case _ => None
+    }
 
   logInfo(s"Using PipelinedShuffleManagerRouter: regular shuffles -> " +
     s"${defaultManager.getClass.getName}, pipelined shuffles -> " +
@@ -139,6 +147,28 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
     val incrementalResult = incrementalManager.unregisterShuffle(shuffleId)
     val defaultResult = defaultManager.unregisterShuffle(shuffleId)
     incrementalResult || defaultResult
+  }
+
+  override def registerPipelinedShuffleGroup(
+      group: PipelinedShuffleGroupMetadata): Unit = {
+    incrementalControlPlane.foreach(_.registerPipelinedShuffleGroup(group))
+  }
+
+  override def requiresAllPipelinedShuffleReadersResident(
+      group: PipelinedShuffleGroupMetadata): Boolean = {
+    incrementalControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(group))
+  }
+
+  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
+    incrementalControlPlane.foreach(_.admitPipelinedShuffleGroup(groupId))
+  }
+
+  override def completePipelinedShuffleGroup(groupId: String): Unit = {
+    incrementalControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
+  }
+
+  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
+    incrementalControlPlane.foreach(_.abortPipelinedShuffleGroup(groupId, reason))
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = {

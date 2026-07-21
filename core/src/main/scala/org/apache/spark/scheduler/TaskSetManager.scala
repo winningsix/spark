@@ -171,6 +171,19 @@ private[spark] class TaskSetManager(
 
   override def runningTasks: Int = runningTasksSet.size
 
+  def runningTasksOnExecutor(execId: String): Int = {
+    var count = 0
+    val taskIds = executorIdToTaskIds.getOrElse(execId, TaskSetManager.EMPTY_LONG_SET)
+    val iter = taskIds.iterator
+    while (iter.hasNext) {
+      val tid = iter.next()
+      if (taskInfos.get(tid).exists(_.running)) {
+        count += 1
+      }
+    }
+    count
+  }
+
   def someAttemptSucceeded(tid: Long): Boolean = {
     successful(taskInfos(tid).index)
   }

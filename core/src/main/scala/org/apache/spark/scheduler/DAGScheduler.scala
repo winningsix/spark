@@ -50,6 +50,8 @@ import org.apache.spark.resource.{ResourceProfile, TaskResourceProfile}
 import org.apache.spark.resource.ResourceProfile.{DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.rpc.RpcTimeoutException
+import org.apache.spark.shuffle.{PipelinedShuffleControlPlane, PipelinedShuffleGroupMetadata,
+  PipelinedShuffleStageMetadata}
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
 import org.apache.spark.util._
@@ -186,6 +188,14 @@ private[spark] class DAGScheduler(
       pendingProducers: HashSet[Stage] = new HashSet[Stage],
       bufferedEvents: ListBuffer[CompletionEvent] = new ListBuffer[CompletionEvent])
   private[scheduler] val pipelinedConsumerDeferrals = new HashMap[Stage, DeferredCompletion]
+
+  private[scheduler] val pipelinedShuffleGroupStageIds = new HashMap[String, Set[Int]]
+  private[scheduler] val stageIdToPipelinedShuffleGroupId = new HashMap[Int, String]
+  private[scheduler] val registeredPipelinedShuffleGroups = new HashSet[String]
+  private[scheduler] val admittedPipelinedShuffleGroups = new HashSet[String]
+
+  private var pipelinedSubmitScopeDepth = 0
+  private var pipelinedSubmitReviveNeeded = false
 
   private[scheduler] val activeJobs = new HashSet[ActiveJob]
 
@@ -723,10 +733,9 @@ private[spark] class DAGScheduler(
     stage
   }
 
-  private def pipelinedUnsupportedError(reason: String): SparkException = new SparkException(
-    errorClass = "PIPELINED_SHUFFLE_UNSUPPORTED",
-    messageParameters = scala.collection.immutable.Map("reason" -> reason),
-    cause = null)
+  private def pipelinedUnsupportedError(reason: String): SparkException = {
+    new SparkException(s"PIPELINED_SHUFFLE_UNSUPPORTED: unsupported feature: $reason")
+  }
 
   /**
    * Fail-fast on producer-side idioms a pipelined shuffle cannot support in v1 (spec S9), checked
@@ -1209,6 +1218,7 @@ private[spark] class DAGScheduler(
                 // deferral outlives its job (e.g. on job abort before the producers finished).
                 pipelinedConsumerDeferrals -= stage
                 pipelinedConsumerDeferrals.values.foreach(_.pendingProducers -= stage)
+                removeStageFromPipelinedShuffleGroup(stageId)
               }
               // data structures based on StageId
               stageIdToStage -= stageId
@@ -1573,6 +1583,10 @@ private[spark] class DAGScheduler(
     case _ => false
   }
 
+  private def isPipelinedShuffleReaderStage(stage: Stage): Boolean = {
+    stage.parents.exists(isPipelinedProducer)
+  }
+
   /**
    * The full pipelined group `stage` belongs to: the connected component of the stage graph over
    * pipelined edges (both the producers `stage` reads through a [[PipelinedShuffleDependency]] and,
@@ -1607,10 +1621,11 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * Best-effort admission check for a pipelined group: all its member stages must run concurrently,
-   * so the cluster must have enough task slots for the whole group at once. If the group's demand
-   * exceeds what is currently available it can never be co-resident and, lacking an out-of-band slot
-   * reservation, would deadlock -- so we fail fast with a clear error.
+   * Best-effort admission check for a pipelined group. Pull-style managers use every task in every
+   * group member as their concurrent demand. Push-style managers that require reader residency use
+   * the minimum live set needed to keep the stream moving: all reader partitions plus one producer
+   * slot for each pure producer stage. If that demand exceeds what is currently available, the group
+   * cannot be co-resident and would deadlock without a slot reservation, so we fail fast.
    *
    * Demand is compared against FREE slots, not total capacity (spec S4.1): free = total capacity
    * minus the tasks already running for OTHER work (other groups and regular jobs) in the SAME
@@ -1634,13 +1649,136 @@ private[spark] class DAGScheduler(
    *
    * Returns Some((demand, freeSlots)) when the group does not fit, else None.
    */
-  private def pipelinedGroupExceedsCapacity(stage: Stage): Option[(Int, Int)] = {
+  private def pipelinedGroupExceedsCapacity(stage: Stage, jobId: Int): Option[(Int, Int)] = {
+    if (!sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED)) {
+      logWarning(log"Skipping pipelined stage-group slot check for ${MDC(STAGE, stage)} because " +
+        log"${MDC(CONFIG, config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key)} is disabled. " +
+        log"External query-level admission control must prevent deadlocks.")
+      return None
+    }
     val group = pipelinedGroupOf(stage)
-    val demand = group.toSeq.map(_.numTasks).sum
+    val demand =
+      if (pipelinedShuffleRequiresReaderResidency(group, jobId)) {
+        pipelinedResidentReaderSlots(group) + pipelinedMinProducerSlots(group)
+      } else {
+        group.toSeq.map(_.numTasks).sum
+      }
     val totalSlots = maxConcurrentTasksForStage(stage)
     val occupiedByOthers = runningTasksForOtherWork(stage, group)
     val freeSlots = math.max(0, totalSlots - occupiedByOthers)
     if (demand > freeSlots) Some((demand, freeSlots)) else None
+  }
+
+  private def pipelinedShuffleRequiresReaderResidency(group: Set[Stage], jobId: Int): Boolean = {
+    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
+    pipelinedShuffleControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(metadata))
+  }
+
+  private def pipelinedResidentReaderSlots(group: Set[Stage]): Int = {
+    group.toSeq.filter(isPipelinedShuffleReaderStage).map(_.numTasks).sum
+  }
+
+  private def pipelinedMinProducerSlots(group: Set[Stage]): Int = {
+    group.count { stage =>
+      isPipelinedProducer(stage) && !isPipelinedShuffleReaderStage(stage) && stage.numTasks > 0
+    }
+  }
+
+  private sealed trait PipelinedReaderResidencyBlock {
+    def reason: String
+  }
+  private case class FatalPipelinedReaderResidencyBlock(reason: String)
+    extends PipelinedReaderResidencyBlock
+  private case class WaitingForPipelinedReaderResidencySlots(reason: String)
+    extends PipelinedReaderResidencyBlock
+
+  private def pipelinedReaderResidencyBlocked(
+      stage: Stage,
+      jobId: Int): Option[PipelinedReaderResidencyBlock] = {
+    val group = pipelinedGroupOf(stage)
+    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
+    if (!pipelinedShuffleRequiresReaderResidency(group, jobId)) {
+      return None
+    }
+
+    val readerSlots = pipelinedResidentReaderSlots(group)
+    val minProducerSlots = pipelinedMinProducerSlots(group)
+    val minRequiredSlots = readerSlots + minProducerSlots
+    val totalSlots = maxConcurrentTasksForStage(stage)
+    val occupiedByOthers = runningTasksForOtherWork(stage, group)
+    val freeSlots = math.max(0, totalSlots - occupiedByOthers)
+    if (minRequiredSlots > totalSlots) {
+      return Some(FatalPipelinedReaderResidencyBlock(
+        s"Cannot admit pipelined shuffle group ${metadata.groupId}: incremental shuffle manager " +
+          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) to " +
+          s"be resident and at least $minProducerSlots producer task slot(s) to remain available, " +
+          s"but this resource profile has only $totalSlots task slot(s). Increase Spark task-slot " +
+          s"capacity for this resource profile, reduce resident reader stages, or lower the " +
+          s"pipelined shuffle partition count; otherwise push-based shuffle readers can occupy " +
+          s"every slot while producers never launch."))
+    }
+    if (minRequiredSlots > freeSlots) {
+      return Some(WaitingForPipelinedReaderResidencySlots(
+        s"Deferring pipelined shuffle group ${metadata.groupId}: incremental shuffle manager " +
+          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) to " +
+          s"be resident and at least $minProducerSlots producer task slot(s) to remain available; " +
+          s"this resource profile has $totalSlots task slot(s), but only $freeSlots are currently " +
+          s"free because $occupiedByOthers task(s) are running for other work. The group will be " +
+          s"reconsidered when running stages finish."))
+    }
+
+    val (maxRunningTasksPerStage, configKey) =
+      pipelinedGroupMaxRunningTasksPerStageFor(group)
+    if (maxRunningTasksPerStage <= 0) {
+      return None
+    }
+
+    group.toSeq
+      .filter(isPipelinedShuffleReaderStage)
+      .sortBy(_.id)
+      .find(_.numTasks > maxRunningTasksPerStage)
+      .map { readerStage =>
+        FatalPipelinedReaderResidencyBlock(
+          s"Cannot admit pipelined shuffle group ${metadata.groupId}: " +
+          s"incremental shuffle manager ${env.shuffleManager.getClass.getName} requires all " +
+          s"${readerStage.numTasks} reader task(s) for stage ${readerStage.id} to be resident, " +
+          s"but $configKey=$maxRunningTasksPerStage caps the stage below its partition count. " +
+          s"Increase $configKey to at least ${readerStage.numTasks} or reduce the pipelined " +
+          s"shuffle partition count; otherwise push-based shuffle writers can deadlock waiting " +
+          s"for reduce partitions whose reader tasks were not launched.")
+      }
+  }
+
+  private def pipelinedGroupMaxRunningTasksPerStageFor(group: Set[Stage]): (Int, String) = {
+    val simpleCap = sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE)
+    if (group.size <= 2 && simpleCap > 0) {
+      (simpleCap, config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE.key)
+    } else {
+      (
+        sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE),
+        config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key)
+    }
+  }
+
+  private def shouldSubmitPipelinedTaskSetWithoutRevive(isPipelinedMember: Boolean): Boolean = {
+    sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED) &&
+      pipelinedSubmitScopeDepth > 0 &&
+      isPipelinedMember
+  }
+
+  private def pipelinedShuffleGroupAdmissionBlocked(stage: Stage): Option[(String, Int)] = {
+    val maxConcurrentGroups =
+      sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_MAX_CONCURRENT_GROUPS)
+    if (maxConcurrentGroups <= 0) {
+      return None
+    }
+    val groupId = pipelinedShuffleGroupId(pipelinedGroupOf(stage))
+    if (admittedPipelinedShuffleGroups.contains(groupId) ||
+        admittedPipelinedShuffleGroups.size < maxConcurrentGroups) {
+      None
+    } else {
+      Some((groupId, maxConcurrentGroups))
+    }
   }
 
   /**
@@ -1691,6 +1829,150 @@ private[spark] class DAGScheduler(
           false
       }
       !hasPipelinedBoundary // keep walking until a pipelined boundary is found
+    }
+  }
+
+  private def pipelinedShuffleControlPlane: Option[PipelinedShuffleControlPlane] = {
+    env.shuffleManager match {
+      case controlPlane: PipelinedShuffleControlPlane => Some(controlPlane)
+      case _ => None
+    }
+  }
+
+  private def pipelinedShuffleGroupId(group: Set[Stage]): String = {
+    group.toSeq.map(_.id).sorted.mkString("stages-", "-", "")
+  }
+
+  private def pipelinedShuffleGroupMetadata(
+      group: Set[Stage],
+      jobId: Int): PipelinedShuffleGroupMetadata = {
+    val groupId = pipelinedShuffleGroupId(group)
+    val queryExecutionId = Option(jobIdToQueryExecutionId.get(jobId)).map(_.longValue())
+    PipelinedShuffleGroupMetadata(
+      groupId = groupId,
+      jobId = jobId,
+      queryExecutionId = queryExecutionId,
+      stages = group.toSeq.sortBy(_.id).map(pipelinedShuffleStageMetadata))
+  }
+
+  private def pipelinedShuffleStageMetadata(stage: Stage): PipelinedShuffleStageMetadata = {
+    val shuffleId = stage match {
+      case m: ShuffleMapStage if isPipelinedProducer(m) => Some(m.shuffleDep.shuffleId)
+      case _ => None
+    }
+    PipelinedShuffleStageMetadata(
+      stageId = stage.id,
+      attemptId = stage.latestInfo.attemptNumber(),
+      numTasks = stage.numTasks,
+      shuffleId = shuffleId)
+  }
+
+  private def registerPipelinedShuffleGroup(stage: Stage, jobId: Int): Option[String] = {
+    if (!isPipelinedGroupMember(stage)) {
+      return None
+    }
+    val group = pipelinedGroupOf(stage)
+    val groupId = pipelinedShuffleGroupId(group)
+    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
+    val firstRegistration = registeredPipelinedShuffleGroups.add(groupId)
+    pipelinedShuffleGroupStageIds(groupId) = group.map(_.id).toSet
+    group.foreach { groupStage =>
+      stageIdToPipelinedShuffleGroupId(groupStage.id) = groupId
+    }
+    pipelinedShuffleControlPlane.foreach(_.registerPipelinedShuffleGroup(metadata))
+    if (firstRegistration) {
+      logInfo(log"Registered pipelined shuffle group ${MDC(GROUP_ID, groupId)} with stages " +
+        log"${MDC(STAGE_ID, metadata.stages.map(_.stageId))} and shuffles " +
+        log"${MDC(SHUFFLE_IDS, metadata.stages.flatMap(_.shuffleId))}")
+    }
+    Some(groupId)
+  }
+
+  private def admitPipelinedShuffleGroup(stage: Stage, jobId: Int): Unit = {
+    registerPipelinedShuffleGroup(stage, jobId).foreach { groupId =>
+      if (admittedPipelinedShuffleGroups.add(groupId)) {
+        pipelinedShuffleControlPlane.foreach(_.admitPipelinedShuffleGroup(groupId))
+        logInfo(log"Admitted pipelined shuffle group ${MDC(GROUP_ID, groupId)}")
+      }
+    }
+  }
+
+  private def completePipelinedShuffleGroupIfReady(stage: Stage): Unit = {
+    stageIdToPipelinedShuffleGroupId.get(stage.id).foreach { groupId =>
+      val stageIds = pipelinedShuffleGroupStageIds.getOrElse(groupId, Set.empty[Int])
+      val stillActive = stageIds.exists { stageId =>
+        stageIdToStage.get(stageId).exists { groupStage =>
+          runningStages.contains(groupStage) ||
+            waitingStages.contains(groupStage) ||
+            failedStages.contains(groupStage)
+        }
+      }
+      if (!stillActive && registeredPipelinedShuffleGroups.contains(groupId)) {
+        pipelinedShuffleControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
+        logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)}")
+        removePipelinedShuffleGroup(groupId)
+        reconsiderWaitingPipelinedStages()
+      }
+    }
+  }
+
+  private def abortPipelinedShuffleGroup(stage: Stage, reason: String): Unit = {
+    val groupId = stageIdToPipelinedShuffleGroupId.get(stage.id).orElse {
+      if (isPipelinedGroupMember(stage)) {
+        Some(pipelinedShuffleGroupId(pipelinedGroupOf(stage)))
+      } else {
+        None
+      }
+    }
+    groupId.foreach { id =>
+      if (registeredPipelinedShuffleGroups.contains(id) ||
+          admittedPipelinedShuffleGroups.contains(id) ||
+          pipelinedShuffleGroupStageIds.contains(id)) {
+        pipelinedShuffleControlPlane.foreach(_.abortPipelinedShuffleGroup(id, reason))
+        logWarning(log"Aborted pipelined shuffle group ${MDC(GROUP_ID, id)}: " +
+          log"${MDC(REASON, reason)}")
+        removePipelinedShuffleGroup(id)
+        reconsiderWaitingPipelinedStages()
+      }
+    }
+  }
+
+  private def removePipelinedShuffleGroup(groupId: String): Unit = {
+    val stageIds = pipelinedShuffleGroupStageIds.remove(groupId).getOrElse(Set.empty[Int])
+    stageIds.foreach { stageId =>
+      if (stageIdToPipelinedShuffleGroupId.get(stageId).contains(groupId)) {
+        stageIdToPipelinedShuffleGroupId -= stageId
+      }
+    }
+    registeredPipelinedShuffleGroups -= groupId
+    admittedPipelinedShuffleGroups -= groupId
+  }
+
+  private def removeStageFromPipelinedShuffleGroup(stageId: Int): Unit = {
+    stageIdToPipelinedShuffleGroupId.get(stageId).foreach { groupId =>
+      stageIdToPipelinedShuffleGroupId -= stageId
+      val remaining = pipelinedShuffleGroupStageIds.getOrElse(groupId, Set.empty[Int]) - stageId
+      if (remaining.isEmpty) {
+        if (registeredPipelinedShuffleGroups.contains(groupId)) {
+          pipelinedShuffleControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
+          logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)} during cleanup")
+        }
+        removePipelinedShuffleGroup(groupId)
+      } else {
+        pipelinedShuffleGroupStageIds(groupId) = remaining
+      }
+    }
+  }
+
+  private def reconsiderWaitingPipelinedStages(): Unit = {
+    val candidates = waitingStages.filter(isPipelinedGroupMember).toArray
+    if (candidates.nonEmpty) {
+      waitingStages --= candidates
+      for (stage <- candidates.sortBy(_.firstJobId)) {
+        logInfo(log"Reconsidering waiting pipelined ${MDC(STAGE, stage)} after " +
+          log"pipelined group admission state changed")
+        submitStage(stage)
+      }
     }
   }
 
@@ -1979,85 +2261,116 @@ private[spark] class DAGScheduler(
 
   /** Submits stage, but first recursively submits any missing parents. */
   private def submitStage(stage: Stage): Unit = {
-    val jobId = activeJobForStage(stage)
-    if (jobId.isDefined) {
-      logDebug(s"submitStage($stage (name=${stage.name};" +
-        s"jobs=${stage.jobIds.toSeq.sorted.mkString(",")}))")
-      if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
-        if (stage.getNextAttemptId >= maxStageAttempts) {
-          val reason = s"$stage (name=${stage.name}) has been resubmitted for the maximum " +
-            s"allowable number of times: ${maxStageAttempts}, which is the max value of " +
-            s"config `${config.STAGE_MAX_ATTEMPTS.key}` and " +
-            s"`${config.STAGE_MAX_CONSECUTIVE_ATTEMPTS.key}`."
-          abortStage(stage, reason, None)
-        } else {
-          val missing = getMissingParentStages(stage).sortBy(_.id)
-          logInfo(log"Missing parents found for ${MDC(STAGE, stage)}: ${MDC(MISSING_PARENT_STAGES, missing)}")
-          if (missing.isEmpty) {
-            logInfo(log"Submitting ${MDC(STAGE, stage)} (${MDC(RDD_ID, stage.rdd)}), " +
-                    log"which has no missing parents")
-            submitMissingTasks(stage, jobId.get)
-            // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
-            submitWaitingPipelinedChildStages(stage)
+    val outermostPipelinedSubmitScope = pipelinedSubmitScopeDepth == 0
+    pipelinedSubmitScopeDepth += 1
+    try {
+      val jobId = activeJobForStage(stage)
+      if (jobId.isDefined) {
+        logDebug(s"submitStage($stage (name=${stage.name};" +
+          s"jobs=${stage.jobIds.toSeq.sorted.mkString(",")}))")
+        if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
+          if (stage.getNextAttemptId >= maxStageAttempts) {
+            val reason = s"$stage (name=${stage.name}) has been resubmitted for the maximum " +
+              s"allowable number of times: ${maxStageAttempts}, which is the max value of " +
+              s"config `${config.STAGE_MAX_ATTEMPTS.key}` and " +
+              s"`${config.STAGE_MAX_CONSECUTIVE_ATTEMPTS.key}`."
+            abortStage(stage, reason, None)
           } else {
-            for (parent <- missing) {
-              submitStage(parent)
-            }
-
-            // A missing parent reached through a PipelinedShuffleDependency ("pipelined parent")
-            // is incrementally readable: this stage may run before that parent materializes, so
-            // the two are co-scheduled. `missing` already holds the direct parent shuffle-map
-            // stages (from getMissingParentStages), so classify them by their shuffle dependency
-            // type -- no extra graph walk. For a job with no pipelined dependency, pipelinedMissing
-            // is empty and this stage simply parks in waitingStages, exactly as before.
-            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
-            // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
-            // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
-            // has its own regular missing parent); running this stage against a not-yet-running
-            // producer would strand it. If any parent is regular or not yet runnable, park this
-            // stage. It is then resubmitted and co-scheduled once its parents become runnable --
-            // via submitWaitingChildStages when a regular parent completes, or via
-            // submitWaitingPipelinedChildStages when a pipelined parent starts running.
-            val allPipelinedParentsRunning =
-              pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
-
-            if (regularMissing.isEmpty && allPipelinedParentsRunning) {
-              // Best-effort slot check: the whole pipelined group must run at once, so its demand
-              // must fit in the currently-FREE slots (total capacity minus what other work is
-              // already running; spec S4.1). If it cannot, fail fast with a clear error rather than
-              // deadlock (there is no out-of-band slot reservation in v1). Group-level idiom
-              // rejection (fan-out, mixed profile, internal regular shuffle) already happened at job
-              // submission (checkAllPipelinedGroupsSupported), so by here the group is supported.
-              pipelinedGroupExceedsCapacity(stage) match {
-                case Some((demand, freeSlots)) =>
-                  abortStage(stage, s"Cannot co-schedule pipelined stage group: needs $demand " +
-                    s"concurrent task slots but only $freeSlots are currently free.",
-                    Some(new SparkException(
-                      errorClass = "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT",
-                      messageParameters = scala.collection.immutable.Map(
-                        "numTasks" -> demand.toString, "numSlots" -> freeSlots.toString),
-                      cause = null)))
-                case None =>
-                  logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its running " +
-                    log"pipelined producer(s) ${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
-                  // Record that this stage is co-scheduled with still-running pipelined producers,
-                  // so its successful completions are deferred until those producers finish (S5).
-                  val deferral =
-                    pipelinedConsumerDeferrals.getOrElseUpdate(stage, DeferredCompletion())
-                  deferral.pendingProducers ++= pipelinedMissing
-                  submitMissingTasks(stage, jobId.get)
-                  // This stage is now running; if it is itself the pipelined producer of a waiting
-                  // consumer, co-schedule that consumer too.
-                  submitWaitingPipelinedChildStages(stage)
-              }
+            val missing = getMissingParentStages(stage).sortBy(_.id)
+            logInfo(log"Missing parents found for ${MDC(STAGE, stage)}: " +
+              log"${MDC(MISSING_PARENT_STAGES, missing)}")
+            if (missing.isEmpty) {
+              logInfo(log"Submitting ${MDC(STAGE, stage)} (${MDC(RDD_ID, stage.rdd)}), " +
+                      log"which has no missing parents")
+              submitMissingTasks(stage, jobId.get)
+              // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
+              submitWaitingPipelinedChildStages(stage)
             } else {
-              waitingStages += stage
+              for (parent <- missing) {
+                submitStage(parent)
+              }
+
+              // A missing parent reached through a PipelinedShuffleDependency ("pipelined parent")
+              // is incrementally readable: this stage may run before that parent materializes, so
+              // the two are co-scheduled. `missing` already holds the direct parent shuffle-map
+              // stages (from getMissingParentStages), so classify them by their shuffle dependency
+              // type -- no extra graph walk. For a job with no pipelined dependency,
+              // pipelinedMissing is empty and this stage simply parks in waitingStages, exactly as
+              // before.
+              val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
+              // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
+              // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
+              // has its own regular missing parent); running this stage against a not-yet-running
+              // producer would strand it. If any parent is regular or not yet runnable, park this
+              // stage. It is then resubmitted and co-scheduled once its parents become runnable --
+              // via submitWaitingChildStages when a regular parent completes, or via
+              // submitWaitingPipelinedChildStages when a pipelined parent starts running.
+              val allPipelinedParentsRunning =
+                pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
+
+              if (regularMissing.isEmpty && allPipelinedParentsRunning) {
+                // Best-effort slot check: the whole pipelined group must run at once, so its demand
+                // must fit in the currently-FREE slots (total capacity minus what other work is
+                // already running; spec S4.1). If it cannot, fail fast with a clear error rather
+                // than deadlock (there is no out-of-band slot reservation in v1). Group-level idiom
+                // rejection (fan-out, mixed profile, internal regular shuffle) already happened at
+                // job submission (checkAllPipelinedGroupsSupported), so by here the group is
+                // supported.
+                pipelinedShuffleGroupAdmissionBlocked(stage) match {
+                  case Some((groupId, maxConcurrentGroups)) =>
+                    logInfo(log"Deferring ${MDC(STAGE, stage)} for pipelined shuffle group " +
+                      log"${MDC(GROUP_ID, groupId)} because " +
+                      log"${MDC(CONFIG,
+                        config.SCHEDULER_PIPELINED_GROUP_MAX_CONCURRENT_GROUPS.key)}=" +
+                      log"${MDC(NUM_TASKS, maxConcurrentGroups)} and another group is active")
+                    waitingStages += stage
+                  case None =>
+                    pipelinedReaderResidencyBlocked(stage, jobId.get) match {
+                      case Some(FatalPipelinedReaderResidencyBlock(reason)) =>
+                        abortStage(stage, reason, Some(new SparkException(reason)))
+                      case Some(WaitingForPipelinedReaderResidencySlots(reason)) =>
+                        logInfo(log"${MDC(MESSAGE, reason)}")
+                        waitingStages += stage
+                      case None =>
+                        pipelinedGroupExceedsCapacity(stage, jobId.get) match {
+                          case Some((demand, freeSlots)) =>
+                            val reason =
+                              s"Cannot co-schedule pipelined stage group: needs $demand concurrent " +
+                                s"task slots but only $freeSlots are currently free."
+                            abortStage(stage, reason, Some(new SparkException(reason)))
+                          case None =>
+                            admitPipelinedShuffleGroup(stage, jobId.get)
+                            logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its " +
+                              log"running pipelined producer(s) " +
+                              log"${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
+                            // Record that this stage is co-scheduled with still-running pipelined
+                            // producers, so its successful completions are deferred until those
+                            // producers finish (S5).
+                            val deferral =
+                              pipelinedConsumerDeferrals.getOrElseUpdate(stage, DeferredCompletion())
+                            deferral.pendingProducers ++= pipelinedMissing
+                            submitMissingTasks(stage, jobId.get)
+                            // This stage is now running; if it is itself the pipelined producer of a
+                            // waiting consumer, co-schedule that consumer too.
+                            submitWaitingPipelinedChildStages(stage)
+                        }
+                    }
+                }
+              } else {
+                waitingStages += stage
+              }
             }
           }
         }
+      } else {
+        abortStage(stage, "No active job for stage " + stage.id, None)
       }
-    } else {
-      abortStage(stage, "No active job for stage " + stage.id, None)
+    } finally {
+      pipelinedSubmitScopeDepth -= 1
+      if (outermostPipelinedSubmitScope && pipelinedSubmitReviveNeeded) {
+        pipelinedSubmitReviveNeeded = false
+        taskScheduler.reviveOffers()
+      }
     }
   }
 
@@ -2343,6 +2656,7 @@ private[spark] class DAGScheduler(
     }
     listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo,
       Utils.cloneProperties(properties)))
+    registerPipelinedShuffleGroup(stage, jobId)
 
     // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
     // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
@@ -2436,9 +2750,28 @@ private[spark] class DAGScheduler(
         case _: ResultStage => None
       }
 
-      taskScheduler.submitTasks(new TaskSet(
+      val isPipelinedMember = isPipelinedGroupMember(stage)
+      val pipelinedGroup = if (isPipelinedMember) pipelinedGroupOf(stage) else Set.empty[Stage]
+      val pipelinedGroupIdOpt =
+        if (isPipelinedMember) Some(pipelinedShuffleGroupId(pipelinedGroup)) else None
+      val requiresReaderResidency = isPipelinedMember &&
+        pipelinedShuffleControlPlane.exists(
+          _.requiresAllPipelinedShuffleReadersResident(
+            pipelinedShuffleGroupMetadata(pipelinedGroup, jobId)))
+      val taskSet = new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
-        stage.resourceProfileId, shuffleId, isPipelined = isPipelinedGroupMember(stage)))
+        stage.resourceProfileId, shuffleId, isPipelined = isPipelinedMember,
+        pipelinedGroupStageCount = pipelinedGroup.size,
+        pipelinedGroupId = pipelinedGroupIdOpt,
+        requiresAllPipelinedShuffleReadersResident = requiresReaderResidency,
+        isPipelinedShuffleReader = isPipelinedMember && isPipelinedShuffleReaderStage(stage),
+        isPipelinedShuffleProducer = isPipelinedMember && isPipelinedProducer(stage))
+      if (shouldSubmitPipelinedTaskSetWithoutRevive(isPipelinedMember)) {
+        pipelinedSubmitReviveNeeded = true
+        taskScheduler.submitTasksWithoutRevive(taskSet)
+      } else {
+        taskScheduler.submitTasks(taskSet)
+      }
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run
@@ -3959,6 +4292,14 @@ private[spark] class DAGScheduler(
     listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
     runningStages -= stage
 
+    if (!willRetry && isPipelinedGroupMember(stage)) {
+      if (errorMessage.isDefined) {
+        abortPipelinedShuffleGroup(stage, errorMessage.get)
+      } else {
+        completePipelinedShuffleGroupIfReady(stage)
+      }
+    }
+
     // Release any pipelined consumers whose completion was deferred while this stage (a pipelined
     // producer) was running. Only act when the producer's outcome is final:
     //  - willRetry: the stage is being retried, not finished -- leave consumers deferred.
@@ -3978,6 +4319,9 @@ private[spark] class DAGScheduler(
       if (!producerAboutToResubmit) {
         releaseDeferredPipelinedConsumers(stage, producerFailed = producerFailed)
       }
+    }
+    if (!willRetry && errorMessage.isEmpty) {
+      reconsiderWaitingPipelinedStages()
     }
   }
 
@@ -4039,6 +4383,9 @@ private[spark] class DAGScheduler(
     if (!stageIdToStage.contains(failedStage.id)) {
       // Skip all the actions if the stage has been removed.
       return
+    }
+    if (isPipelinedGroupMember(failedStage)) {
+      abortPipelinedShuffleGroup(failedStage, reason)
     }
     val dependentJobs: Seq[ActiveJob] =
       activeJobs.filter(job => stageDependsOn(job.finalStage, failedStage)).toSeq
