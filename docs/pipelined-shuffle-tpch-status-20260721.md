@@ -219,7 +219,6 @@ Important caveat: this 22-query run was before the latest Spark live task-set re
 
 The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/native execution path:
 
-- Run root: `/raid/ferdinandx/q2/runs/perf-4gpu-20260603/single-session-agent2-q17fix-full22-20260612-093223`
 - Spark: `spark-3.5.5-bin-hadoop3`
 - `spark.gluten.mpp.enabled=true`
 - 4 executors, 1 GPU per task, `spark.task.resource.gpu.amount=1`
@@ -227,11 +226,16 @@ The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/
 - Runtime bloom enabled
 - `mpp.maxDriversPerFragment=1`
 - `cudf.concurrentGpuTasks=2`
-- Power test time: about `25s`
-- Raw `time.csv` in the cited run reports `23.000s`
-- Total time including table setup: `33.725s`
+- User-facing aggregate target: about `25s` Power Test Time on 4 GPUs
 
-The user-facing shorthand for this baseline should be "about 25 sec". The raw cited run is slightly faster at `23.000s`, but the architecture/performance comparison should not imply that `23.000s` is the stable baseline for every run.
+Important correction: the previously cited local run root must not be used for old-MPP per-query comparison:
+
+- Invalid per-query source: `/raid/ferdinandx/q2/runs/perf-4gpu-20260603/single-session-agent2-q17fix-full22-20260612-093223`
+- Its `time.csv` reports `Power Test Time=23.000s`, but the 22 `queryN` rows sum to only `4.685s`.
+- All 22 JSON summaries in that run report `queryStatus=["Failed","Failed","Failed"]`.
+- The failure reason is executor placement for `MppNativeQueryRDD`, for example `partition 0 expected executor 0, but Spark scheduled it on 4`.
+
+Therefore, the old MPP baseline should be treated as an aggregate historical target of about `25s`. Do not use the `0.xs` per-query numbers from the invalid run. A valid old-MPP per-query artifact still needs to be located before publishing per-query MPP comparisons.
 
 This baseline is not apples-to-apples with the streaming UCX POC. It used old Gluten MPP execution, which fused native query fragments and bypassed much of Spark's normal stage-by-stage execution overhead. It remains the target performance bar, but it is not an incremental Spark shuffle manager.
 
@@ -248,40 +252,40 @@ At 22-query level:
 
 | Metric | Streaming UCX POC | Old Gluten MPP baseline | Gap |
 | --- | ---: | ---: | ---: |
-| Power test time | `251.000s` | about `25s`, raw cited run `23.000s` | about `10x` slower |
-| Sum of query times | `250.436s` | `4.685s` query-only sum | `53.5x` slower query-only |
-| Total wall time | `263.295s` | `33.725s` | `7.8x` slower |
-| cuDF fallback | `0` in strict 22/22 run | `0` observed by guard | comparable |
+| Power test time | `251.000s` | about `25s` historical target | about `10x` slower |
+| Sum of query times | `250.436s` | valid per-query source not yet located | not computed |
+| Total wall time | `263.295s` | valid comparable source not yet located | not computed |
+| cuDF fallback | `0` in strict 22/22 run | not recomputed from valid baseline artifact | unknown |
 | MPP plan-collapse evidence | `0` | MPP enabled / collapsed path | intentionally different |
 
-Per-query comparison:
+Current streaming UCX per-query times:
 
-| Query | Streaming UCX POC s | Old Gluten MPP s | Gap |
-| --- | ---: | ---: | ---: |
-| Q1 | 5.512 | 0.450 | 12.2x |
-| Q2 | 6.583 | 1.236 | 5.3x |
-| Q3 | 14.404 | 0.165 | 87.3x |
-| Q4 | 2.852 | 0.152 | 18.8x |
-| Q5 | 31.957 | 0.197 | 162.2x |
-| Q6 | 0.852 | 0.121 | 7.0x |
-| Q7 | 19.572 | 0.185 | 105.8x |
-| Q8 | 13.300 | 0.236 | 56.4x |
-| Q9 | 12.540 | 0.182 | 68.9x |
-| Q10 | 19.502 | 0.157 | 124.2x |
-| Q11 | 4.763 | 0.167 | 28.5x |
-| Q12 | 15.425 | 0.115 | 134.1x |
-| Q13 | 4.625 | 0.093 | 49.7x |
-| Q14 | 2.892 | 0.112 | 25.8x |
-| Q15 | 6.210 | 0.158 | 39.3x |
-| Q16 | 5.310 | 0.100 | 53.1x |
-| Q17 | 18.440 | 0.137 | 134.6x |
-| Q18 | 28.332 | 0.145 | 195.4x |
-| Q19 | 2.819 | 0.105 | 26.8x |
-| Q20 | 6.067 | 0.167 | 36.3x |
-| Q21 | 25.667 | 0.176 | 145.8x |
-| Q22 | 2.812 | 0.129 | 21.8x |
+| Query | Streaming UCX POC s |
+| --- | ---: |
+| Q1 | 5.512 |
+| Q2 | 6.583 |
+| Q3 | 14.404 |
+| Q4 | 2.852 |
+| Q5 | 31.957 |
+| Q6 | 0.852 |
+| Q7 | 19.572 |
+| Q8 | 13.300 |
+| Q9 | 12.540 |
+| Q10 | 19.502 |
+| Q11 | 4.763 |
+| Q12 | 15.425 |
+| Q13 | 4.625 |
+| Q14 | 2.892 |
+| Q15 | 6.210 |
+| Q16 | 5.310 |
+| Q17 | 18.440 |
+| Q18 | 28.332 |
+| Q19 | 2.819 |
+| Q20 | 6.067 |
+| Q21 | 25.667 |
+| Q22 | 2.812 |
 
-The per-query MPP numbers are extremely small because that run used the old collapsed/native MPP profile and different execution semantics. The comparison should be used as a performance bar, not as proof that the Spark-level streaming path should already have identical overhead.
+Do not publish per-query MPP gaps until a valid old-MPP per-query artifact is found. The previous `0.xs` MPP numbers came from a failed run and were removed.
 
 ## Performance Interpretation
 
