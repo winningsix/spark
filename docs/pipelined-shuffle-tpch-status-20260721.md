@@ -4,50 +4,45 @@
 
 This document summarizes the current Spark 5 / Gluten / Velox POC for fully streaming UCX shuffle on TPC-H 1TB with 4 GPUs.
 
-The public upstream material currently describes this work as Spark 4.x Real-Time Mode (RTM). In this POC we are working on a Spark 5.x / Spark 5.2 branch that follows the same design direction: Spark-level concurrent stages plus a streaming shuffle path, with Gluten and Velox providing a GPU-native UCX data plane for batch SQL.
+The public upstream material currently describes this direction as Spark 4.x Real-Time Mode (RTM). This POC is on a Spark 5.x / Spark 5.2 branch, but it follows the same core direction: Spark-level concurrent stages plus streaming shuffle. The batch SQL POC adds a Gluten/Velox GPU-native UCX data plane and a driver-side control plane.
 
-Wiki note: the diagrams below use Mermaid code blocks, which render directly in GitHub Markdown and GitHub Wiki. If the final wiki target does not support Mermaid, these blocks can be exported to images without changing the surrounding text.
+The diagrams are intentionally simple so they render cleanly in GitHub Wiki.
 
 ## Code Branches
 
-- Spark: `poc/tpch4gpu-spark5-20260717`
-- Gluten: `poc/tpch4gpu-gluten-20260717`
-- Velox: `poc/tpch4gpu-velox-20260717`
+| Component | Branch |
+| --- | --- |
+| Spark | `poc/tpch4gpu-spark5-20260717` |
+| Gluten | `poc/tpch4gpu-gluten-20260717` |
+| Velox | `poc/tpch4gpu-velox-20260717` |
 
 ## Motivation
 
-The old Gluten MPP path is very fast, but it achieves that by collapsing Spark query fragments into native MPP execution. That makes the query mostly controlled by Gluten/Velox native coordination instead of Spark's normal shuffle, stage, task, retry, and resource model. It is a good performance baseline, but it is not an incremental Spark shuffle manager.
+The old Gluten MPP path is very fast, but it relies on collapsing Spark query fragments into native MPP execution. That gives most query control to the native MPP layer instead of Spark's normal shuffle, stage, task, retry, and resource model. It is the current performance target, but it is not an incremental Spark shuffle manager.
 
-The target here is different:
+The target of this POC is different:
 
 - Keep Spark stages and shuffle dependencies visible to Spark.
-- Let upstream tasks push shuffle data to downstream tasks as data becomes available instead of waiting for the full upstream stage to finish.
-- Schedule multiple dependent stages concurrently so the pipeline can stay resident.
+- Push shuffle data to downstream tasks as soon as batches are ready.
+- Run producer and consumer stages concurrently.
 - Use Velox UCX exchange as the native GPU data plane.
-- Avoid MPP plan collapse and avoid CPU fallback.
-- Build enough query/group-level control to prevent deadlock, memory blow-up, and unnecessary spill.
-
-This is motivated by the same upstream Spark RTM direction. Spark 4.1 introduced the first official RTM support for stateless Structured Streaming. Spark 4.2 extended RTM coverage, and the next stateful RTM work is tracked under SPARK-54699 with three key pieces: streaming shuffle, concurrent stage scheduling, and stateful operator support.
+- Avoid MPP plan collapse.
+- Avoid CPU fallback.
+- Add enough query/group-level control to avoid deadlock, memory blow-up, and unnecessary spill.
 
 ```mermaid
-flowchart TD
-  A["Classic Spark shuffle\nProducer stage completes first"] --> B["Materialized shuffle boundary\nDownstream waits"]
-  B --> C["Higher latency\nLess pipeline overlap"]
+flowchart LR
+  A[Classic Spark] --> B[Stage barrier]
+  B --> C[Consumers start late]
 
-  D["Spark RTM direction"] --> E["Streaming shuffle\nPush data when ready"]
-  D --> F["Concurrent stage scheduling\nMultiple dependent stages live"]
-  D --> G["Stateful operator support\nStreaming query state"]
-
-  E --> H["Our batch MPP target\nIncremental UCX shuffle manager"]
-  F --> H
-  G -. "Related but not enough for batch SQL MPP" .-> H
-
-  H --> I["Spark keeps stage/task visibility"]
-  H --> J["Velox UCX moves GPU batches"]
-  H --> K["Driver-side coordinator prevents deadlock"]
+  D[Spark RTM direction] --> E[Streaming shuffle]
+  E --> F[Concurrent stages]
+  F --> G[Batch UCX POC]
 ```
 
-## Upstream References
+## Upstream Spark Changes
+
+Relevant upstream references:
 
 - Databricks Spark 4.2 blog: https://www.databricks.com/blog/introducing-apache-spark-42
 - Apache JIRA SPARK-54699: https://issues.apache.org/jira/browse/SPARK-54699
@@ -56,167 +51,51 @@ flowchart TD
 
 The important upstream points for this POC are:
 
-- Streaming shuffle is push-based: upstream tasks can send output directly to downstream-stage tasks in a pipelined fashion.
-- Concurrent stage scheduling is required: downstream stages must be allowed to run before upstream stages complete.
-- RTM's initial upstream target is Structured Streaming, but the scheduler and shuffle mechanics are directly relevant to batch MPP-style pipelining.
+- Streaming shuffle is push-based: upstream tasks can send output directly to downstream tasks.
+- Concurrent stage scheduling is required: dependent stages must be allowed to run at the same time.
+- Upstream RTM starts from Structured Streaming. It does not directly provide a batch SQL MPP query coordinator.
 
 ## Spark 5.2 POC Changes
 
-The Spark-side POC changes are the pieces that turn upstream RTM ideas into a batch SQL incremental shuffle path:
+The Spark-side POC changes turn the RTM direction into a batch SQL incremental shuffle path:
 
-- Pipelined shuffle dependency metadata so supported columnar exchanges can opt into incremental UCX shuffle.
-- `PipelinedShuffleManagerRouter` so normal shuffles still use the regular columnar shuffle manager while pipelined shuffles use `UcxColumnarShuffleManager`.
-- Concurrent pipelined task-set scheduling so producer and consumer stages in the same group can run at the same time.
-- Reader-residency tracking through a live task-set registry, because a consumer task set may have no pending tasks while its already-launched reader tasks are still the important live resources.
-- Group-level admission/refill checks so producers are not refilled before enough downstream readers are resident.
-- Scheduler tests covering the updated `TaskSchedulerImpl` behavior.
+- Add pipelined shuffle dependency metadata for supported columnar exchanges.
+- Route pipelined shuffles through `UcxColumnarShuffleManager`.
+- Keep normal shuffles on the existing columnar shuffle manager.
+- Allow concurrent pipelined task sets in `TaskSchedulerImpl`.
+- Track live task sets so resident readers remain visible even when they have no pending tasks.
+- Gate producer refill on downstream reader residency.
+- Add scheduler tests for the updated `TaskSchedulerImpl` behavior.
 
-These changes are Spark changes because they affect stage admission, task-set liveness, resource fairness, and shuffle manager routing. Gluten and Velox cannot fully solve those from below Spark because they do not own the Spark driver scheduler state.
-
-```mermaid
-flowchart LR
-  subgraph "Upstream Spark RTM"
-    RTM1["SPARK-56664\nStreaming shuffle"]
-    RTM2["SPARK-57000\nConcurrent stage scheduling"]
-    RTM3["SPARK-57228\nStateful operators"]
-  end
-
-  subgraph "This POC"
-    P1["Spark pipelined shuffle dependency"]
-    P2["Concurrent pipelined task sets"]
-    P3["Gluten UCX group coordinator"]
-    P4["Velox UCX Exchange / PartitionedOutput"]
-  end
-
-  RTM1 --> P1
-  RTM1 --> P4
-  RTM2 --> P2
-  RTM3 -. "Streaming lifecycle only\nnot batch MPP coordinator" .-> P3
-```
-
-## Fit With Streaming MPP
-
-The current POC aligns with the streaming MPP design in these areas:
-
-- Push-based shuffle data plane: Velox `UcxPartitionedOutput` pushes produced batches to downstream UCX endpoints, and Velox `UcxExchange` reads them as a native exchange source.
-- Concurrent stage scheduling: Spark scheduler changes allow task sets from multiple pipelined stages to be live at the same time.
-- All-stage-up style admission: downstream readers must be resident before producer refill proceeds, otherwise a push-based pipeline can deadlock or over-buffer.
-- Spark-visible shuffle dependency: the shuffle remains a Spark dependency instead of being hidden behind MPP plan collapse.
-- Driver-side control: Spark/Gluten coordinate shuffle groups, writer endpoint registration, reader readiness, completion, and abort.
-- Velox-native operator path: the physical data movement is implemented by Velox native UCX exchange and partitioned output operators, not by the old `MppNativeQueryExec` workaround.
-
-The main remaining gaps are:
-
-- Upstream Spark RTM does not provide a batch SQL MPP query coordinator for this use case. Structured Streaming RTM has its own query lifecycle; our TPC-H batch path still needs a Spark/Gluten driver-side `PipelinedQueryCoordinator` or equivalent.
-- Velox operator state alone is not enough to control the whole query. Velox sees task-local operator state, but it does not own Spark stage admission, task-set liveness, retry, executor placement, or cross-stage reader residency.
-- Backpressure must cross layers. Velox UCX queues can block the native data path, but Spark still needs scheduler-level admission/refill control so it does not launch producers without enough live consumers or let one stage monopolize GPU residency.
-- Failure semantics are still POC-level. Group abort, retry, endpoint cleanup, duplicate writer registration, and partial reader failure need production-grade handling.
-- Full GPU coverage still has a runtime bloom gap. Runtime bloom improves Q7 latency but currently causes Velox cuDF fallback around `velox_might_contain` / `velox_bloom_filter_agg`.
-- Performance is not yet close to the old Gluten MPP baseline. The current path proves the architectural direction, but not the final performance envelope.
-
-```mermaid
-flowchart TD
-  subgraph "Aligned now"
-    A1["Push-based UCX data movement"]
-    A2["Concurrent Spark stages"]
-    A3["Spark-visible shuffle"]
-    A4["No MPP plan collapse in native UCX template"]
-    A5["Velox native UCX operators"]
-  end
-
-  subgraph "Open gaps"
-    G1["Production query/group coordinator"]
-    G2["Cross-layer backpressure credits"]
-    G3["Failure/retry cleanup semantics"]
-    G4["Runtime bloom fully-GPU path"]
-    G5["Operator-level timing for Velox native plan"]
-    G6["Performance parity with old MPP"]
-  end
-
-  A1 --> G2
-  A2 --> G1
-  A3 --> G3
-  A5 --> G5
-  A5 --> G4
-  G1 --> G6
-  G2 --> G6
-  G4 --> G6
-```
+These changes need to live in Spark because they affect stage admission, task-set liveness, resource fairness, and shuffle manager routing. Gluten and Velox cannot fully solve those from below Spark.
 
 ## Current Architecture
 
-The shuffle path is no longer the old Gluten MPP plan-collapse workaround when running the native UCX template. The current path is:
+The native UCX template no longer uses the old Gluten MPP plan-collapse workaround. Spark keeps the stage graph visible, Gluten owns UCX metadata/control, and Velox owns native GPU data movement.
 
 ```mermaid
 flowchart LR
-  subgraph Spark["Spark driver / scheduler"]
-    S1["Physical planning\nmark pipelined shuffle deps"]
-    S2["PipelinedShuffleManagerRouter"]
-    S3["TaskSchedulerImpl\nconcurrent pipelined task sets"]
-    S4["Live task-set registry\nreader residency visibility"]
-  end
-
-  subgraph Gluten["Gluten integration"]
-    G1["UcxColumnarShuffleManager"]
-    G2["UCX shuffle handle registry"]
-    G3["NativeUcxShuffleReadMetadataIterator"]
-    G4["VeloxIteratorApi\nreader specs + writer context"]
-  end
-
-  subgraph Velox["Velox native plan"]
-    V1["ExchangeNode"]
-    V2["PartitionedOutput"]
-    V3["cuDF adapter rewrite"]
-    V4["UcxExchange"]
-    V5["UcxPartitionedOutput"]
-  end
-
-  S1 --> S2
-  S2 --> G1
-  S3 --> S4
-  G1 --> G2
-  G2 --> G3
-  G3 --> G4
-  G4 --> V1
-  G4 --> V2
-  V1 --> V3
-  V2 --> V3
-  V3 --> V4
-  V3 --> V5
+  SQL[Spark SQL plan] --> SCHED[Spark scheduler]
+  SCHED --> SHUF[Incremental shuffle manager]
+  SHUF --> COORD[Gluten UCX coordinator]
+  COORD --> META[Reader and writer metadata]
+  META --> PLAN[Velox native plan]
+  PLAN --> OUT[UcxPartitionedOutput]
+  OUT --> UCX[UCX GPU transport]
+  UCX --> IN[UcxExchange]
+  IN --> TASK[Downstream GPU task]
 ```
 
-Compared with the old MPP path:
-
-```mermaid
-flowchart TB
-  subgraph Old["Old Gluten MPP collapsed path"]
-    O1["Spark SQL plan"]
-    O2["MPP strategy / native query"]
-    O3["Native MPP coordinator"]
-    O4["Velox fragments"]
-    O1 --> O2 --> O3 --> O4
-  end
-
-  subgraph New["Incremental streaming shuffle path"]
-    N1["Spark SQL plan"]
-    N2["Spark stages remain visible"]
-    N3["Pipelined shuffle dependencies"]
-    N4["Gluten UCX coordinator"]
-    N5["Velox UCX exchange operators"]
-    N1 --> N2 --> N3 --> N4 --> N5
-  end
-
-  O3 -. "Fast baseline,\nbut not Spark shuffle manager" .-> N4
-  N2 -. "More Spark control,\nmore scheduler overhead today" .-> O3
-```
+Current path:
 
 1. Spark physical planning marks supported columnar shuffle dependencies as pipelined.
-2. `PipelinedShuffleManagerRouter` delegates regular shuffles to the standard columnar shuffle manager and pipelined shuffles to `UcxColumnarShuffleManager`.
-3. Gluten creates UCX shuffle handles, registers writer endpoints, and exposes reader metadata through `NativeUcxShuffleReadMetadataIterator`.
-4. `VeloxIteratorApi` captures native UCX reader specs and writer context while building Velox tasks.
-5. `SubstraitToVeloxPlan` creates Velox UCX `ExchangeNode`s for native shuffle inputs.
-6. `VeloxRuntime` wraps shuffle writer tasks with native UCX `PartitionedOutput`.
-7. Velox cuDF operator adapters replace those nodes with `UcxExchange` and `UcxPartitionedOutput`.
+2. `PipelinedShuffleManagerRouter` sends pipelined shuffles to `UcxColumnarShuffleManager`.
+3. Gluten creates UCX shuffle handles and registers writer/reader endpoints.
+4. `NativeUcxShuffleReadMetadataIterator` exposes reader metadata.
+5. `VeloxIteratorApi` passes UCX reader specs and writer context into Velox task construction.
+6. `SubstraitToVeloxPlan` creates Velox UCX `ExchangeNode`s.
+7. `VeloxRuntime` wraps writer tasks with native UCX `PartitionedOutput`.
+8. Velox cuDF adapters replace these with `UcxExchange` and `UcxPartitionedOutput`.
 
 Representative evidence from the latest Q7 validation:
 
@@ -229,99 +108,88 @@ Representative evidence from the latest Q7 validation:
 - `Wrapped Velox plan with native UCX PartitionedOutput`
 - `replacing PartitionedOutput with UcxPartitionedOutput`
 
+## Difference From Old Gluten MPP
+
+```mermaid
+flowchart LR
+  A[Old Gluten MPP] --> B[Plan collapse]
+  B --> C[Native MPP coordinator]
+  C --> D[Fast baseline]
+
+  E[Streaming UCX POC] --> F[Spark-visible stages]
+  F --> G[Incremental UCX shuffle]
+  G --> H[Velox UCX exchange]
+```
+
+| Area | Old Gluten MPP | Streaming UCX POC |
+| --- | --- | --- |
+| Spark stage visibility | Mostly hidden behind native MPP | Preserved |
+| Shuffle model | Native MPP exchange | Spark incremental shuffle manager |
+| Data plane | Native Velox/MPP | Velox UCX exchange |
+| Query coordinator | Native MPP coordinator | Spark/Gluten driver-side coordinator needed |
+| Performance today | Fast baseline | Functional but slow |
+| Main value | Maximum fused native execution | Spark-compatible streaming shuffle design |
+
+## Fit With Streaming MPP
+
+What already matches the streaming MPP design:
+
+- Push-based UCX shuffle data path.
+- Concurrent producer and consumer stages.
+- All-stage-up style reader residency checks.
+- Spark-visible shuffle dependency.
+- Driver-side group control in Spark/Gluten.
+- Velox-native `UcxExchange` and `UcxPartitionedOutput`.
+- No `MppNativeQueryExec` path in the native UCX template.
+
+Main gaps:
+
+- Production query/group coordinator is still missing.
+- Backpressure needs a stronger cross-layer credit model.
+- Failure, retry, endpoint cleanup, and abort semantics are still POC-level.
+- Runtime bloom currently has a fully-GPU gap.
+- Velox native operator timing is still insufficient for deep performance attribution.
+- Performance is not close to the old 4GPU Gluten MPP baseline yet.
+
 ## Control Plane And Backpressure
 
 There are three layers of control:
 
-- Spark driver scheduler control: pipelined shuffle groups, concurrent stage scheduling, group admission, deferred consumer completion, reader residency checks, per-stage/per-executor caps, and producer fairness.
-- Gluten UCX coordinator: shuffle/group state, writer endpoint registration, reader coverage, reader readiness gates, reader endpoint polling, and group completion/abort messages.
-- Velox UCX exchange: native UCX exchange and partitioned output operators with UCX output queues and backpressure on the device-buffer data path.
-
-The most recent Spark scheduler fix keeps live task sets in a pipelined group registry instead of relying only on `Pool.getSortedTaskSetQueue`. That matters because a downstream reader task set can have zero pending tasks while its tasks are still running and resident. Without the live registry, Spark could lose visibility of resident readers and block producer refill indefinitely with `waiting-for-reader-residency`.
-
-The design implication is that query-level control still belongs above Velox. Velox should enforce local operator and buffer backpressure, while Spark/Gluten must own global group state: which stages are admitted, which readers are resident, whether producers may refill, whether a group should abort, and how retry/cleanup is handled.
+| Layer | Responsibility |
+| --- | --- |
+| Spark driver scheduler | Pipelined groups, concurrent stages, task-set liveness, reader residency, producer refill |
+| Gluten UCX coordinator | Shuffle/group state, endpoint registration, readiness, completion, abort |
+| Velox UCX exchange | Native queues, GPU buffers, local operator blocking and data movement |
 
 ```mermaid
-sequenceDiagram
-  participant Driver as Spark Driver
-  participant Scheduler as TaskScheduler
-  participant Coord as Gluten UCX Coordinator
-  participant Reader as Downstream Reader Task
-  participant Writer as Upstream Writer Task
-  participant Velox as Velox UCX Operators
-
-  Driver->>Coord: Create pipelined shuffle group
-  Driver->>Scheduler: Admit dependent stages concurrently
-  Scheduler->>Reader: Launch reader tasks first/enough
-  Reader->>Coord: Register reader endpoint
-  Coord-->>Driver: Reader coverage/residency ready
-  Driver->>Scheduler: Allow producer refill
-  Scheduler->>Writer: Launch/refill writer tasks
-  Writer->>Coord: Register writer endpoint
-  Writer->>Velox: Produce GPU batches
-  Velox->>Reader: Push/read through UCX exchange
-  Velox-->>Writer: Queue full / credit unavailable
-  Writer-->>Scheduler: Backpressure or blocked progress
-  Scheduler-->>Driver: Keep readers resident, throttle producers
-  Reader->>Coord: Drain/complete
-  Writer->>Coord: Complete writers
-  Coord-->>Driver: Group complete or abort
+flowchart LR
+  R[Readers resident] --> A[Admit producers]
+  A --> P[Push GPU batches]
+  P --> Q[UCX queues]
+  Q --> D[Consumers drain]
+  D --> R
+  Q --> X[Queue full]
+  X --> T[Throttle producer refill]
+  T --> R
 ```
 
-```mermaid
-stateDiagram-v2
-  [*] --> Planned
-  Planned --> Admitting: build group from shuffle deps
-  Admitting --> WaitingForReaders: launch downstream task sets
-  WaitingForReaders --> Running: enough readers resident
-  WaitingForReaders --> Aborting: timeout / task failure
-  Running --> Backpressured: UCX queue full or credits exhausted
-  Backpressured --> Running: readers drain / credits restored
-  Running --> Draining: all writers complete
-  Draining --> Succeeded: readers consumed all endpoints
-  Running --> Aborting: writer / reader / executor failure
-  Backpressured --> Aborting: failure while blocked
-  Aborting --> Failed: cleanup endpoints and task sets
-  Succeeded --> [*]
-  Failed --> [*]
-```
+Velox can block local operators when UCX queues are full. That is necessary but not sufficient. Spark/Gluten still need global state: which stages are admitted, which readers are resident, whether producers may refill, whether a group should abort, and how retry/cleanup should happen.
 
-```mermaid
-flowchart RL
-  P["Producer Velox operator\nUcxPartitionedOutput"] --> Q["UCX output queues\nGPU buffers"]
-  Q --> C["Consumer Velox operator\nUcxExchange"]
-  C --> D["Downstream GPU compute"]
-
-  Q -- "queue full / no credits" --> BP1["Native operator blocks"]
-  BP1 --> BP2["Writer task reports blocked progress"]
-  BP2 --> BP3["Spark/Gluten throttles producer refill"]
-  BP3 --> BP4["Keep reader tasks resident"]
-  BP4 --> C
-
-  BP3 -. "Missing or weak signal today" .-> Gap["Potential underfill,\ndeadlock risk,\nor unnecessary spill"]
-```
+The latest Spark scheduler fix keeps live task sets in a pipelined group registry instead of relying only on `Pool.getSortedTaskSetQueue`. This matters because a downstream reader task set can have zero pending tasks while its already-launched tasks are still resident. Without the live registry, Spark can lose visibility of live readers and block producer refill with `waiting-for-reader-residency`.
 
 ## Current Validation
 
 Latest focused validation after the live task-set registry fix:
 
-- Q7 on GPUs `0,1,6,7`, runtime bloom enabled:
-  - Run root: `/raid/ferdinandx/gtc/poc/spark5-pipelined-tpch4gpu-20260717/tpch-4gpu-gpu03/runs/native-velox-plan-q7-4gpu0167-livegroup-20260721-094942`
-  - Time: `17.227s`
-  - Functional: pass
-  - MPP evidence: `0`
-  - Velox native UCX exchange nodes: `29`
-  - Velox native UCX partitioned outputs: `253`
-  - cuDF fallback: `122`
+| Run | GPUs | Runtime bloom | Time | Functional | Strict GPU | MPP evidence | Velox UCX evidence |
+| --- | --- | --- | ---: | --- | --- | ---: | --- |
+| Q7 | `0,1,6,7` | enabled | `17.227s` | pass | no, `122` cuDF fallbacks | `0` | `29` exchanges, `253` outputs |
+| Q7 | `0,1,3,4` | disabled | `32.801s` | pass | pass, `0` cuDF fallbacks | `0` | `28` exchanges, `252` outputs |
 
-- Q7 on GPUs `0,1,3,4`, runtime bloom disabled:
-  - Run root: `/raid/ferdinandx/gtc/poc/spark5-pipelined-tpch4gpu-20260717/tpch-4gpu-gpu03/runs/native-velox-q7-4gpu0134-querybloomoff-20260721-095737`
-  - Time: `32.801s`
-  - Functional: pass
-  - Strict fully GPU: pass, `cudf_fallbacks=0`
-  - MPP evidence: `0`
-  - Velox native UCX exchange nodes: `28`
-  - Velox native UCX partitioned outputs: `252`
+Run roots:
+
+- Bloom enabled Q7: `/raid/ferdinandx/gtc/poc/spark5-pipelined-tpch4gpu-20260717/tpch-4gpu-gpu03/runs/native-velox-plan-q7-4gpu0167-livegroup-20260721-094942`
+- Bloom disabled Q7: `/raid/ferdinandx/gtc/poc/spark5-pipelined-tpch4gpu-20260717/tpch-4gpu-gpu03/runs/native-velox-q7-4gpu0134-querybloomoff-20260721-095737`
 
 Spark scheduler unit validation:
 
@@ -347,16 +215,6 @@ The best completed 22-query 4GPU strict run from the current streaming UCX POC p
 
 Important caveat: this 22-query run was before the latest Spark live task-set registry fix. The latest code has not yet been rerun for a full 22/22 pass.
 
-```mermaid
-flowchart TD
-  R["22-query strict streaming UCX run"]
-  R --> F["Functional complete\n22/22"]
-  R --> G["Strict cuDF complete\nfallback = 0"]
-  R --> U["UCX evidence\n3156 writer endpoints\n8161 reader endpoints\n3437 shuffle handles"]
-  R --> T["Power test time\n251.000s"]
-  R --> C["Caveat\nbefore live task-set registry fix"]
-```
-
 ## Previous Gluten MPP 4GPU Baseline
 
 The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/native execution path:
@@ -374,18 +232,16 @@ The previous fast 4GPU result was from the old Spark 3.5 + Gluten MPP collapsed/
 
 The user-facing shorthand for this baseline has been "about 23-25 sec". The raw `time.csv` reports `23.000s` Power Test Time.
 
-This baseline is not apples-to-apples with the streaming UCX POC. It used the old Gluten MPP execution model, which fuses native query fragments and bypasses much of Spark's normal stage-by-stage execution overhead. It remains the target performance bar, but it is not an incremental Spark shuffle manager.
+This baseline is not apples-to-apples with the streaming UCX POC. It used old Gluten MPP execution, which fused native query fragments and bypassed much of Spark's normal stage-by-stage execution overhead. It remains the target performance bar, but it is not an incremental Spark shuffle manager.
+
+## Performance Comparison
 
 ```mermaid
 flowchart LR
-  B["Old Gluten MPP baseline\nPower: 23.000s\nTotal: 33.725s"]
-  P["Streaming UCX POC\nPower: 251.000s\nTotal: 263.295s"]
-  B --> Target["Performance bar\n23-25s on 4 GPUs"]
-  P --> Gap["Current gap\n10.9x slower power\n7.8x slower wall"]
-  Gap --> Work["Requires coordinator,\nbackpressure,\noperator timing,\nGPU bloom work"]
+  A[Old MPP 23s] --> B[Target bar]
+  C[Streaming UCX 251s] --> D[Current POC]
+  C --> E[10.9x slower]
 ```
-
-## Performance Comparison
 
 At 22-query level:
 
@@ -424,28 +280,7 @@ Per-query comparison:
 | Q21 | 25.667 | 0.176 | 145.8x |
 | Q22 | 2.812 | 0.129 | 21.8x |
 
-The per-query MPP numbers are extremely small because that run is the old collapsed/native MPP profile and includes different execution semantics. The comparison should be used as a performance bar, not as proof that the current Spark-level streaming path should have identical per-query overheads without further scheduler/control-plane optimization.
-
-The chart below compresses the 22-query comparison into four buckets. The old MPP path is almost flat at this scale because each query reported sub-second latency except Q2.
-
-```mermaid
-flowchart LR
-  subgraph OldMPP["Old Gluten MPP query-only sum 4.685s"]
-    OB1["Small queries\nQ1,Q4,Q6,Q11,Q13,Q14,Q16,Q19,Q22\n1.429s"]
-    OB2["Join-heavy middle\nQ2,Q3,Q8,Q9,Q10,Q15,Q20\n2.301s"]
-    OB3["Hard joins\nQ5,Q7,Q12,Q17,Q18,Q21\n0.955s"]
-  end
-
-  subgraph StreamingUCX["Streaming UCX query-only sum 250.436s"]
-    NB1["Small queries\n32.437s"]
-    NB2["Join-heavy middle\n78.606s"]
-    NB3["Hard joins\n139.393s"]
-  end
-
-  OB1 -. "22.7x" .-> NB1
-  OB2 -. "34.2x" .-> NB2
-  OB3 -. "146.0x" .-> NB3
-```
+The per-query MPP numbers are extremely small because that run used the old collapsed/native MPP profile and different execution semantics. The comparison should be used as a performance bar, not as proof that the Spark-level streaming path should already have identical overhead.
 
 ## Performance Interpretation
 
@@ -453,45 +288,28 @@ The current POC has passed the important functional checks: 22/22 queries comple
 
 The performance is still far from acceptable. The largest likely contributors are:
 
-- Spark-level task/stage overhead is now visible again because we are no longer using query-level MPP collapse.
-- The current control plane is conservative. Reader residency waits and group admission avoid deadlock, but can underfill GPUs or serialize producer refill.
-- Endpoint/control metadata is high: the 22-query run registered thousands of writer/reader endpoints and shuffle handles.
+- Spark task/stage overhead is visible again because the query is no longer hidden by MPP plan collapse.
+- The current control plane is conservative and can underfill GPUs.
+- Endpoint/control metadata overhead is high: thousands of writer endpoints, reader endpoints, and shuffle handles.
 - Runtime bloom has a speed/correctness trade-off today: bloom enabled is faster on Q7 but not strict fully GPU; bloom disabled is strict fully GPU but slower.
-- We need Velox native plan operator timing, not `MppNativeQuery` timing, to separate shuffle wait, operator compute, output queue blocking, endpoint setup, and scheduler gaps.
-
-```mermaid
-flowchart TD
-  Perf["Current performance gap"]
-  Perf --> Sched["Spark scheduler overhead\nstage/task boundaries visible again"]
-  Perf --> Control["Conservative control plane\nreader waits and producer throttling"]
-  Perf --> Endpoint["Endpoint setup and polling\nthousands of UCX handles/endpoints"]
-  Perf --> Bloom["Runtime bloom trade-off\nfast with fallback, strict GPU slower"]
-  Perf --> Unknown["Insufficient Velox native operator timing"]
-
-  Sched --> Fix1["Measure idle GPU time and task gaps"]
-  Control --> Fix2["Credit-based group coordinator"]
-  Endpoint --> Fix3["Batch/reuse metadata and endpoints"]
-  Bloom --> Fix4["GPU bloom expression/agg path"]
-  Unknown --> Fix5["Per-operator blocked/compute/queue metrics"]
-```
+- We need Velox native plan operator timing, not `MppNativeQuery` timing, to split shuffle wait, compute time, queue blocking, endpoint setup, and scheduler gaps.
 
 ## Next Work
 
-The next engineering targets are:
-
-1. Finish the driver-side pipelined query/group coordinator state machine: group admission, all-stage-up gating, reader residency, producer refill credits, completion, abort, and retry cleanup.
-2. Tighten backpressure across Spark and Velox: expose enough native queue/readiness state to Spark/Gluten so scheduler decisions are based on actual consumer capacity.
-3. Add operator-level timing for Velox native plans: `UcxExchange`, `UcxPartitionedOutput`, GPU operators, blocked time, queue wait, endpoint wait, and spill/fallback counters.
-4. Fix the runtime bloom GPU path or replace it with a GPU-compatible pruning path.
-5. Reduce endpoint setup/control-plane overhead through batching, reuse, and less polling.
-6. Rerun full 22/22 after the live task-set registry fix and after the next coordinator/backpressure iteration.
-
 ```mermaid
 flowchart LR
-  N1["1. Coordinator state machine"] --> N2["2. Cross-layer backpressure"]
-  N2 --> N3["3. Velox native operator timing"]
-  N3 --> N4["4. Runtime bloom GPU path"]
-  N4 --> N5["5. Endpoint/control overhead"]
-  N5 --> N6["6. Full 22/22 rerun"]
-  N6 --> N7["Compare against 23-25s MPP bar"]
+  A[Coordinator] --> B[Backpressure]
+  B --> C[Velox timing]
+  C --> D[GPU bloom]
+  D --> E[Endpoint overhead]
+  E --> F[Full 22-query rerun]
 ```
+
+Next engineering targets:
+
+1. Finish the driver-side pipelined query/group coordinator state machine.
+2. Tighten Spark/Gluten/Velox backpressure with a real credit signal.
+3. Add Velox native operator timing for `UcxExchange`, `UcxPartitionedOutput`, GPU compute, blocked time, queue wait, endpoint wait, and spill/fallback counters.
+4. Fix or replace the runtime bloom path so it remains fully GPU.
+5. Reduce endpoint setup and polling overhead.
+6. Rerun full 22/22 after the next coordinator/backpressure iteration.
