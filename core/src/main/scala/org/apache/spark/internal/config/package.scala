@@ -1920,6 +1920,19 @@ package object config {
       .checkValue(_ >= 0, "must be non-negative")
       .createOptional
 
+  private[spark] val SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE =
+    ConfigBuilder("spark.scheduler.pipelined.group.producer.minRunningTasksPerStage")
+      .internal()
+      .doc("Minimum number of launched-or-finished tasks to reserve for one ready pure producer " +
+        "stage in a reader-resident pipelined shuffle group before other producer or reader " +
+        "stages consume the remaining offers. This is a driver-side frontier control for " +
+        "incremental shuffle managers whose native readers need enough upstream writer endpoints " +
+        "to make progress. The default preserves the existing one-producer-slot residency rule.")
+      .version("4.3.0")
+      .intConf
+      .checkValue(_ >= 1, "must be positive")
+      .createWithDefault(1)
+
   private[spark] val SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.scheduler.pipelined.group.maxRunningTasksPerExecutor")
       .internal()
@@ -1932,6 +1945,17 @@ package object config {
       .intConf
       .checkValue(_ >= 0, "must be non-negative")
       .createWithDefault(0)
+
+  private[spark] val SCHEDULER_PIPELINED_GROUP_KILL_INTERRUPT_THREAD_ENABLED =
+    ConfigBuilder("spark.scheduler.pipelined.group.killInterruptThread.enabled")
+      .internal()
+      .doc("When true, DAGScheduler interrupts running task threads while cancelling stages in a " +
+        "pipelined shuffle group. This helps incremental-shuffle readers and writers leave native " +
+        "wait states quickly after group failure without changing cancellation semantics for " +
+        "non-pipelined jobs.")
+      .version("4.3.0")
+      .booleanConf
+      .createWithDefault(true)
 
   private[spark] val SHUFFLE_REDUCE_LOCALITY_ENABLE =
     ConfigBuilder("spark.shuffle.reduceLocality.enabled")
