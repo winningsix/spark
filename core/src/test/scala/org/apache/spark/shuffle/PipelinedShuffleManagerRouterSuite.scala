@@ -104,9 +104,14 @@ private class IncrementalRecordingManager(conf: SparkConf, isDriver: Boolean)
   val completedGroups = mutable.ArrayBuffer[String]()
   val abortedGroups = mutable.ArrayBuffer[(String, String)]()
   @volatile var requireAllReadersResident = false
+  @volatile var maxConcurrentProducers: Option[Int] = None
 
   override def requiresAllPipelinedShuffleReadersResident(
       group: PipelinedShuffleGroupMetadata): Boolean = requireAllReadersResident
+
+  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
+    maxConcurrentProducers
+  }
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
     registeredGroups += group
@@ -294,6 +299,9 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     assert(!router.requiresAllPipelinedShuffleReadersResident(group))
     incMgr.requireAllReadersResident = true
     assert(router.requiresAllPipelinedShuffleReadersResident(group))
+    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).isEmpty)
+    incMgr.maxConcurrentProducers = Some(7)
+    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).contains(7))
     router.admitPipelinedShuffleGroup(group.groupId)
     router.completePipelinedShuffleGroup(group.groupId)
     router.abortPipelinedShuffleGroup(group.groupId, "failed")

@@ -55,7 +55,12 @@ private[spark] class TaskSet(
     val isPipelinedShuffleReader: Boolean = false,
     // True if this stage writes a PipelinedShuffleDependency. A stage can be both producer and
     // reader in a multi-hop pipelined chain.
-    val isPipelinedShuffleProducer: Boolean = false) {
+    val isPipelinedShuffleProducer: Boolean = false,
+    // Pipelined shuffle ids produced by this stage. Used by UCX-style push shuffles to gate a
+    // producer only on the reader task sets that directly consume its output.
+    val pipelinedProducerShuffleIds: Seq[Int] = Seq.empty,
+    // Pipelined shuffle ids consumed by this stage.
+    val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty) {
 
   def this(
       tasks: Array[Task[_]],

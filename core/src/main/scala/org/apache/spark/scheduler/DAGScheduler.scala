@@ -493,6 +493,10 @@ private[spark] class DAGScheduler(
   /** Whether to abort a stage after canceling all of its tasks. */
   private val legacyAbortStageAfterKillTasks = sc.conf.get(LEGACY_ABORT_STAGE_AFTER_KILL_TASKS)
 
+  /** Whether pipelined shuffle group cancellation should interrupt task threads. */
+  private val pipelinedGroupKillInterruptThread =
+    sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_KILL_INTERRUPT_THREAD_ENABLED)
+
   /**
    * Called by the TaskSetManager to report task's starting.
    */
@@ -1587,6 +1591,45 @@ private[spark] class DAGScheduler(
     stage.parents.exists(isPipelinedProducer)
   }
 
+  private def pipelinedProducerShuffleIds(stage: Stage): Seq[Int] = stage match {
+    case m: ShuffleMapStage if isPipelinedProducer(m) => Seq(m.shuffleDep.shuffleId)
+    case _ => Seq.empty
+  }
+
+  private def pipelinedParentShuffleIds(stage: Stage): Seq[Int] = {
+    stage.parents.collect {
+      case m: ShuffleMapStage if isPipelinedProducer(m) => m.shuffleDep.shuffleId
+    }.toSeq
+  }
+
+  private def pipelinedDirectReaderStagesForProducer(
+      producer: Stage,
+      group: Set[Stage]): Set[Stage] = {
+    val producerShuffleIds = pipelinedProducerShuffleIds(producer).toSet
+    if (producerShuffleIds.isEmpty) {
+      Set.empty
+    } else {
+      group.filter { candidate =>
+        pipelinedParentShuffleIds(candidate).exists(producerShuffleIds.contains)
+      }
+    }
+  }
+
+  private def pipelinedTransitiveReaderStagesForProducer(
+      producer: Stage,
+      group: Set[Stage]): Set[Stage] = {
+    val readers = new HashSet[Stage]
+    val toVisit = new ListBuffer[Stage]
+    toVisit ++= pipelinedDirectReaderStagesForProducer(producer, group)
+    while (toVisit.nonEmpty) {
+      val reader = toVisit.remove(0)
+      if (readers.add(reader) && isPipelinedProducer(reader)) {
+        toVisit ++= pipelinedDirectReaderStagesForProducer(reader, group)
+      }
+    }
+    readers.toSet
+  }
+
   /**
    * The full pipelined group `stage` belongs to: the connected component of the stage graph over
    * pipelined edges (both the producers `stage` reads through a [[PipelinedShuffleDependency]] and,
@@ -1659,7 +1702,7 @@ private[spark] class DAGScheduler(
     val group = pipelinedGroupOf(stage)
     val demand =
       if (pipelinedShuffleRequiresReaderResidency(group, jobId)) {
-        pipelinedResidentReaderSlots(group) + pipelinedMinProducerSlots(group)
+        pipelinedReaderResidencyDemand(group).totalSlots
       } else {
         group.toSeq.map(_.numTasks).sum
       }
@@ -1674,14 +1717,58 @@ private[spark] class DAGScheduler(
     pipelinedShuffleControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(metadata))
   }
 
-  private def pipelinedResidentReaderSlots(group: Set[Stage]): Int = {
-    group.toSeq.filter(isPipelinedShuffleReaderStage).map(_.numTasks).sum
+  private case class PipelinedReaderResidencyDemand(readerSlots: Int, producerSlots: Int) {
+    def totalSlots: Int = readerSlots + producerSlots
   }
 
-  private def pipelinedMinProducerSlots(group: Set[Stage]): Int = {
-    group.count { stage =>
-      isPipelinedProducer(stage) && !isPipelinedShuffleReaderStage(stage) && stage.numTasks > 0
+  private def pipelinedReaderResidencyFrontiers(
+      group: Set[Stage]): Seq[(Set[Stage], Seq[Stage])] = {
+    val producers = group.toSeq.filter(stage => isPipelinedProducer(stage) && stage.numTasks > 0)
+    producers
+      .groupBy { producer =>
+        pipelinedTransitiveReaderStagesForProducer(producer, group).map(_.id).toSeq.sorted
+      }
+      .collect {
+        case (readerIds, frontierProducers) if readerIds.nonEmpty =>
+          val readerIdSet = readerIds.toSet
+          val readers = group.filter(stage => readerIdSet.contains(stage.id))
+          (readers, frontierProducers)
+      }
+      .toSeq
+  }
+
+  private def pipelinedReaderResidencyDemand(group: Set[Stage]): PipelinedReaderResidencyDemand = {
+    val demands = pipelinedReaderResidencyFrontiers(group).map {
+      case (readers, producers) =>
+        PipelinedReaderResidencyDemand(
+          readerSlots = readers.toSeq.map(_.numTasks).sum,
+          producerSlots = pipelinedReaderResidencyProducerSlots(producers))
     }
+    if (demands.isEmpty) {
+      PipelinedReaderResidencyDemand(0, 0)
+    } else {
+      demands.maxBy(_.totalSlots)
+    }
+  }
+
+  private def pipelinedReaderResidencyProducerSlots(producers: Seq[Stage]): Int = {
+    val frontierTarget =
+      sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE)
+    if (frontierTarget <= 1) {
+      producers.size
+    } else if (producers.isEmpty) {
+      0
+    } else {
+      producers.map(producer => math.min(producer.numTasks, frontierTarget)).max
+    }
+  }
+
+  private def pipelinedReaderStagesRequiringResidency(group: Set[Stage]): Seq[Stage] = {
+    group.toSeq
+      .filter(isPipelinedProducer)
+      .flatMap(producer => pipelinedTransitiveReaderStagesForProducer(producer, group))
+      .distinct
+      .sortBy(_.id)
   }
 
   private sealed trait PipelinedReaderResidencyBlock {
@@ -1701,17 +1788,19 @@ private[spark] class DAGScheduler(
       return None
     }
 
-    val readerSlots = pipelinedResidentReaderSlots(group)
-    val minProducerSlots = pipelinedMinProducerSlots(group)
-    val minRequiredSlots = readerSlots + minProducerSlots
+    val demand = pipelinedReaderResidencyDemand(group)
+    val readerSlots = demand.readerSlots
+    val minProducerSlots = demand.producerSlots
+    val minRequiredSlots = demand.totalSlots
     val totalSlots = maxConcurrentTasksForStage(stage)
     val occupiedByOthers = runningTasksForOtherWork(stage, group)
     val freeSlots = math.max(0, totalSlots - occupiedByOthers)
     if (minRequiredSlots > totalSlots) {
       return Some(FatalPipelinedReaderResidencyBlock(
         s"Cannot admit pipelined shuffle group ${metadata.groupId}: incremental shuffle manager " +
-          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) to " +
-          s"be resident and at least $minProducerSlots producer task slot(s) to remain available, " +
+          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) in " +
+          s"the largest transitive reader frontier to be resident and at least $minProducerSlots " +
+          s"producer task slot(s) to remain available, " +
           s"but this resource profile has only $totalSlots task slot(s). Increase Spark task-slot " +
           s"capacity for this resource profile, reduce resident reader stages, or lower the " +
           s"pipelined shuffle partition count; otherwise push-based shuffle readers can occupy " +
@@ -1720,8 +1809,9 @@ private[spark] class DAGScheduler(
     if (minRequiredSlots > freeSlots) {
       return Some(WaitingForPipelinedReaderResidencySlots(
         s"Deferring pipelined shuffle group ${metadata.groupId}: incremental shuffle manager " +
-          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) to " +
-          s"be resident and at least $minProducerSlots producer task slot(s) to remain available; " +
+          s"${env.shuffleManager.getClass.getName} requires all $readerSlots reader task(s) in " +
+          s"the largest transitive reader frontier to be resident and at least $minProducerSlots " +
+          s"producer task slot(s) to remain available; " +
           s"this resource profile has $totalSlots task slot(s), but only $freeSlots are currently " +
           s"free because $occupiedByOthers task(s) are running for other work. The group will be " +
           s"reconsidered when running stages finish."))
@@ -1733,8 +1823,7 @@ private[spark] class DAGScheduler(
       return None
     }
 
-    group.toSeq
-      .filter(isPipelinedShuffleReaderStage)
+    pipelinedReaderStagesRequiringResidency(group)
       .sortBy(_.id)
       .find(_.numTasks > maxRunningTasksPerStage)
       .map { readerStage =>
@@ -1864,7 +1953,8 @@ private[spark] class DAGScheduler(
       stageId = stage.id,
       attemptId = stage.latestInfo.attemptNumber(),
       numTasks = stage.numTasks,
-      shuffleId = shuffleId)
+      shuffleId = shuffleId,
+      pipelinedParentShuffleIds = pipelinedParentShuffleIds(stage))
   }
 
   private def registerPipelinedShuffleGroup(stage: Stage, jobId: Int): Option[String] = {
@@ -2288,6 +2378,12 @@ private[spark] class DAGScheduler(
             } else {
               for (parent <- missing) {
                 submitStage(parent)
+              }
+              // Recursive parent submission can fail-fast and abort the job, which removes this
+              // stage from the scheduler state. Do not park an already-aborted consumer back into
+              // waitingStages after unwinding the recursion.
+              if (!stageIdToStage.contains(stage.id) || activeJobForStage(stage).isEmpty) {
+                return
               }
 
               // A missing parent reached through a PipelinedShuffleDependency ("pipelined parent")
@@ -2765,7 +2861,11 @@ private[spark] class DAGScheduler(
         pipelinedGroupId = pipelinedGroupIdOpt,
         requiresAllPipelinedShuffleReadersResident = requiresReaderResidency,
         isPipelinedShuffleReader = isPipelinedMember && isPipelinedShuffleReaderStage(stage),
-        isPipelinedShuffleProducer = isPipelinedMember && isPipelinedProducer(stage))
+        isPipelinedShuffleProducer = isPipelinedMember && isPipelinedProducer(stage),
+        pipelinedProducerShuffleIds =
+          if (isPipelinedMember) pipelinedProducerShuffleIds(stage) else Seq.empty,
+        pipelinedReaderShuffleIds =
+          if (isPipelinedMember) pipelinedParentShuffleIds(stage) else Seq.empty)
       if (shouldSubmitPipelinedTaskSetWithoutRevive(isPipelinedMember)) {
         pipelinedSubmitReviveNeeded = true
         taskScheduler.submitTasksWithoutRevive(taskSet)
@@ -2887,6 +2987,22 @@ private[spark] class DAGScheduler(
             log"Using 'false' instead", e)
           false
       }
+    }
+  }
+
+  private def shouldInterruptTaskThreadForStage(stage: Stage, job: ActiveJob): Boolean = {
+    if (pipelinedGroupKillInterruptThread && isPipelinedGroupMember(stage)) {
+      true
+    } else {
+      shouldInterruptTaskThread(job)
+    }
+  }
+
+  private def shouldInterruptTaskThreadForStage(stage: Stage, job: Option[ActiveJob]): Boolean = {
+    if (pipelinedGroupKillInterruptThread && isPipelinedGroupMember(stage)) {
+      true
+    } else {
+      job.exists(shouldInterruptTaskThread)
     }
   }
 
@@ -3114,7 +3230,7 @@ private[spark] class DAGScheduler(
     try {
       // killAllTaskAttempts will fail if a SchedulerBackend does not implement killTask.
       val job = jobIdToActiveJob.get(stage.firstJobId)
-      val shouldInterrupt = job.exists(j => shouldInterruptTaskThread(j))
+      val shouldInterrupt = shouldInterruptTaskThreadForStage(stage, job)
       taskScheduler.killAllTaskAttempts(stage.id, shouldInterrupt, reason)
     } catch {
       case e: UnsupportedOperationException =>
@@ -3280,7 +3396,7 @@ private[spark] class DAGScheduler(
                       // zombie tasks in this stage.
                       taskScheduler.killAllTaskAttempts(
                         stageId,
-                        shouldInterruptTaskThread(job),
+                        shouldInterruptTaskThreadForStage(resultStage, job),
                         reason = "Stage finished")
                     } catch {
                       case e: UnsupportedOperationException =>
@@ -3589,7 +3705,7 @@ private[spark] class DAGScheduler(
             val reason = s"Task $task from barrier stage $failedStage (${failedStage.name}) " +
               "failed."
             val job = jobIdToActiveJob.get(failedStage.firstJobId)
-            val shouldInterrupt = job.exists(j => shouldInterruptTaskThread(j))
+            val shouldInterrupt = shouldInterruptTaskThreadForStage(failedStage, job)
             taskScheduler.killAllTaskAttempts(stageId, shouldInterrupt, reason)
           } catch {
             case e: UnsupportedOperationException =>
@@ -4443,7 +4559,8 @@ private[spark] class DAGScheduler(
           // Stages with failedAttemptIds may have tasks that are running
           if (runningStages.contains(stage) || stage.failedAttemptIds.nonEmpty) {
             try { // killAllTaskAttempts will fail if a SchedulerBackend does not implement killTask
-              taskScheduler.killAllTaskAttempts(stageId, shouldInterruptTaskThread(job), reason)
+              taskScheduler.killAllTaskAttempts(
+                stageId, shouldInterruptTaskThreadForStage(stage, job), reason)
               if (legacyAbortStageAfterKillTasks) {
                 stageFailed(stageId, reason)
               }

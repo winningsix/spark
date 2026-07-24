@@ -159,6 +159,10 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
     incrementalControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(group))
   }
 
+  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
+    incrementalControlPlane.flatMap(_.maxConcurrentPipelinedShuffleProducers(groupId))
+  }
+
   override def admitPipelinedShuffleGroup(groupId: String): Unit = {
     incrementalControlPlane.foreach(_.admitPipelinedShuffleGroup(groupId))
   }
@@ -169,6 +173,14 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
 
   override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
     incrementalControlPlane.foreach(_.abortPipelinedShuffleGroup(groupId, reason))
+  }
+
+  override def completePipelinedQuery(queryExecutionId: Long): Unit = {
+    incrementalControlPlane.foreach(_.completePipelinedQuery(queryExecutionId))
+  }
+
+  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {
+    incrementalControlPlane.foreach(_.abortPipelinedQuery(queryExecutionId, reason))
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = {

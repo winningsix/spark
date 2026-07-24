@@ -42,6 +42,13 @@ case object ReuseExchangeAndSubquery extends Rule[SparkPlan] {
 
       def reuse(plan: SparkPlan): SparkPlan = {
         plan.transformUpWithPruning(_.containsAnyPattern(EXCHANGE, PLAN_EXPRESSION)) {
+          // Exchange reuse runs before Gluten can rewrite broadcast exchanges into pipelined
+          // shuffles. Preserve every exchange edge while pipelining is enabled: the eventual
+          // stream has destructive reads and cannot replay one destination queue to a second
+          // consumer.
+          case exchange: Exchange if conf.pipelinedShuffleEnabled =>
+            exchange
+
           case exchange: Exchange if conf.exchangeReuseEnabled =>
             val cachedExchange = exchanges.getOrElseUpdate(exchange.canonicalized, exchange)
             if (cachedExchange.ne(exchange)) {
