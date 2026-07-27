@@ -38,6 +38,7 @@ private class RecordingShuffleManager(conf: SparkConf, isDriver: Boolean) extend
   RecordingShuffleManager.register(this)
   val registered = mutable.ArrayBuffer[Int]()
   val writerCalls = mutable.ArrayBuffer[Int]()
+  val mapInputCalls = mutable.ArrayBuffer[Int]()
   val readerCalls = mutable.ArrayBuffer[Int]()
   val unregistered = mutable.ArrayBuffer[Int]()
   @volatile var stopped = false
@@ -57,6 +58,16 @@ private class RecordingShuffleManager(conf: SparkConf, isDriver: Boolean) extend
       s"expected an unwrapped RecordingHandle, got $handle")
     writerCalls += handle.shuffleId
     null
+  }
+  override def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = {
+    require(handle.isInstanceOf[RecordingShuffleManager.RecordingHandle],
+      s"expected an unwrapped RecordingHandle, got $handle")
+    mapInputCalls += handle.shuffleId
+    createInput
   }
   override def getReader[K, C](
       handle: ShuffleHandle, startMapIndex: Int, endMapIndex: Int, startPartition: Int,
@@ -212,6 +223,30 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     assert(defaultMgr.writerCalls.isEmpty)
     assert(defaultMgr.readerCalls === Seq(21))
     assert(incrementalMgr.readerCalls.isEmpty)
+  }
+
+  test("map task input wrapping routes by handle and remains lazy") {
+    val router = startWithRouter()
+    val incrementalHandle = router.registerShuffle(22, pipelinedDep(sc))
+    val regularHandle = router.registerShuffle(23, regularDep(sc))
+    val context = mock(classOf[TaskContext])
+    var inputCreations = 0
+
+    val incrementalInput = router.wrapShuffleMapTaskInput(
+      incrementalHandle, 0L, context) {
+      inputCreations += 1
+      Iterator(1)
+    }
+    val regularInput = router.wrapShuffleMapTaskInput(regularHandle, 0L, context) {
+      inputCreations += 1
+      Iterator(2)
+    }
+
+    assert(inputCreations === 2)
+    assert(incrementalInput.toSeq === Seq(1))
+    assert(regularInput.toSeq === Seq(2))
+    assert(incrementalMgr.mapInputCalls === Seq(22))
+    assert(defaultMgr.mapInputCalls === Seq(23))
   }
 
   test("IncrementalShuffleHandle survives Java serialization (the driver->executor path)") {

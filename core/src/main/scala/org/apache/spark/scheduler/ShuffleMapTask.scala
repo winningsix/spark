@@ -18,7 +18,6 @@
 package org.apache.spark.scheduler
 
 import java.lang.management.ManagementFactory
-import java.lang.reflect.InvocationTargetException
 import java.nio.ByteBuffer
 import java.util.Properties
 
@@ -26,9 +25,6 @@ import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.util.Utils
-
-import scala.util.control.NonFatal
 
 /**
  * A ShuffleMapTask divides the elements of an RDD into multiple buckets (based on a partitioner
@@ -107,7 +103,10 @@ private[spark] class ShuffleMapTask(
     } else {
       context.taskAttemptId()
     }
-    val inputs = withNativeUcxShuffleWriterContext(dep, mapId, context) {
+    val inputs = SparkEnv.get.shuffleManager.wrapShuffleMapTaskInput(
+      dep.shuffleHandle,
+      mapId,
+      context) {
       rdd.iterator(partition, context)
     }
     dep.shuffleWriterProcessor.write(
@@ -116,40 +115,6 @@ private[spark] class ShuffleMapTask(
       mapId,
       partitionId,
       context)
-  }
-
-  private def withNativeUcxShuffleWriterContext(
-      dep: ShuffleDependency[_, _, _],
-      mapId: Long,
-      context: TaskContext)(
-      f: => Iterator[_]): Iterator[_] = {
-    val conf = SparkEnv.get.conf
-    if (!conf.getBoolean("spark.gluten.ucx.shuffle.nativeExchange.enabled", false)) {
-      return f
-    }
-    try {
-      val cls = Utils.classForName("org.apache.spark.shuffle.NativeUcxShuffleExecution$")
-      val module = cls.getField("MODULE$").get(null)
-      val method = cls.getMethod(
-        "withShuffleMapTaskWriterContext",
-        classOf[ShuffleDependency[_, _, _]],
-        java.lang.Long.TYPE,
-        classOf[TaskContext],
-        classOf[Function0[_]])
-      method.invoke(
-        module,
-        dep,
-        Long.box(mapId),
-        context,
-        (() => f): Function0[Iterator[_]]).asInstanceOf[Iterator[_]]
-    } catch {
-      case e: InvocationTargetException if e.getCause != null =>
-        throw e.getCause
-      case NonFatal(e) =>
-        throw new SparkException(
-          "Failed to install native UCX shuffle writer context before creating map output iterator",
-          e)
-    }
   }
 
   override def preferredLocations: Seq[TaskLocation] = preferredLocs

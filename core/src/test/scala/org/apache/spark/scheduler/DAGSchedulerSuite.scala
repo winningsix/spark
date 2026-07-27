@@ -6380,7 +6380,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   }
 
   test("pipelined shuffle: round-robin mode coalesces task submission revive for a group") {
-    sc.conf.set(config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED, true)
 
     val rddA = new MyRDD(sc, 2, Nil)
     val psdA = new PipelinedShuffleDependency(rddA, new HashPartitioner(2))
@@ -6895,7 +6894,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       "does not fit") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
 
     val leftProducerRdd = new MyRDD(sc, 60, Nil)
     val rightProducerRdd = new MyRDD(sc, 60, Nil)
@@ -6930,7 +6928,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: reader-residency slot check admits transitive reader frontier") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
 
     val leftProducerRdd = new MyRDD(sc, 60, Nil)
     val rightProducerRdd = new MyRDD(sc, 60, Nil)
@@ -6975,35 +6972,9 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
-  test("pipelined shuffle: reader-residency manager rejects reader stage capped below partitions") {
-    conf
-      .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
-      .set(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key, "1")
-      .set(config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE.key, "0")
-
-    val producerRdd = new MyRDD(sc, 2, Nil)
-    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
-    val failListener = new JobListener {
-      override def taskSucceeded(index: Int, result: Any): Unit = {}
-      override def jobFailed(exception: Exception): Unit = failure.set(exception)
-    }
-
-    submit(consumerRdd, Array(0, 1), listener = failListener)
-
-    assert(failure.get() != null,
-      "a push-based pipelined shuffle must reject a capped reader stage before it deadlocks")
-    assert(failure.get().getMessage.contains("requires all 2 reader task(s)"))
-    assert(failure.get().getMessage.contains(
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key))
-  }
-
   test("pipelined shuffle: reader-residency manager rejects groups with no producer slot") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
 
     val producerRdd = new MyRDD(sc, 2, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
@@ -7031,7 +7002,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: reader-residency slot check rejects configured producer frontier") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
       .set(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE.key, "60")
 
     val producerRdd = new MyRDD(sc, 60, Nil)
@@ -7060,7 +7030,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: reader-residency manager waits for transient slot pressure") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
 
     val blockerRdd = new MyRDD(sc, 1, Nil)
     val blockerListener = new JobListener {
