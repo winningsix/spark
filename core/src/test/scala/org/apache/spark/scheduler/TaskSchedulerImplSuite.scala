@@ -39,6 +39,8 @@ import org.apache.spark.resource.{ExecutorResourceRequests, ResourceAmountUtils,
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
+import org.apache.spark.shuffle.{FullGroupResidency, PipelinedGroupSchedulingRequirements,
+  ReaderResidencyWithElasticProducers}
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
@@ -58,6 +60,30 @@ class FakeSchedulerBackend extends SchedulerBackend {
 
 class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   with MockitoSugar with Eventually {
+
+  private def pipelinedGroupRequirements(
+      taskScheduler: TaskSchedulerImpl,
+      residencyPolicy: org.apache.spark.shuffle.PipelinedGroupResidencyPolicy) = {
+    val conf = taskScheduler.conf
+    PipelinedGroupSchedulingRequirements(
+      residencyPolicy = residencyPolicy,
+      maxRunningTasksPerExecutor =
+        Option(conf.get(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR))
+          .filter(_ > 0))
+  }
+
+  private def elasticPipelinedGroupRequirements(
+      taskScheduler: TaskSchedulerImpl): PipelinedGroupSchedulingRequirements = {
+    val conf = taskScheduler.conf
+    pipelinedGroupRequirements(
+      taskScheduler,
+      ReaderResidencyWithElasticProducers(
+        minProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
+        maxProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
+            .filter(_ > 0)))
+  }
 
   var failedTaskSetException: Option[Throwable] = None
   var failedTaskSetReason: String = null
@@ -293,6 +319,41 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(!failedTaskSet)
   }
 
+  test("atomic pipelined group publication registers every member before the first offer") {
+    val taskScheduler = setupSchedulerWithMaster(
+      "local[6]",
+      config.LOCALITY_WAIT.key -> "0")
+    val requirements = PipelinedGroupSchedulingRequirements(FullGroupResidency)
+    val taskSets = (0 until 3).map { stageId =>
+      val original = FakeTask.createTaskSet(2, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        original.tasks,
+        original.stageId,
+        original.stageAttemptId,
+        original.priority,
+        original.properties,
+        original.resourceProfileId,
+        original.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 3,
+        pipelinedGroupId = Some("group-0"),
+        pipelinedGroupSchedulingRequirements = requirements,
+        isPipelinedShuffleReader = stageId > 0,
+        isPipelinedShuffleProducer = stageId < 2)
+    }
+
+    taskScheduler.submitPipelinedGroup(taskSets, requirements)
+    val launched = taskScheduler.resourceOffers(
+      IndexedSeq(WorkerOffer("executor0", "host0", 6))).flatten
+    val launchedStageIds = launched.map { task =>
+      taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    }.toSet
+
+    assert(launched.size === 6)
+    assert(launchedStageIds === Set(0, 1, 2))
+    assert(!failedTaskSet)
+  }
+
   test("pipelined task set round-robin gives downstream consumers a slot") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
@@ -406,6 +467,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 1,
       pipelinedGroupId = Some("group-0"),
+      pipelinedGroupSchedulingRequirements =
+        pipelinedGroupRequirements(taskScheduler, FullGroupResidency),
       isPipelinedShuffleProducer = true))
 
     val tasks = taskScheduler.resourceOffers(IndexedSeq(
@@ -441,6 +504,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 1,
       pipelinedGroupId = Some("group-0"),
+      pipelinedGroupSchedulingRequirements =
+        pipelinedGroupRequirements(taskScheduler, FullGroupResidency),
       isPipelinedShuffleProducer = true))
 
     val tasks = taskScheduler.resourceOffers(IndexedSeq(
@@ -482,7 +547,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 5,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -544,7 +609,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 2,
       pipelinedGroupId = Some("group-0"),
-      requiresAllPipelinedShuffleReadersResident = true,
+      pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
       isPipelinedShuffleReader = true,
       isPipelinedShuffleProducer = true))
 
@@ -591,7 +656,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 2,
       pipelinedGroupId = Some("group-0"),
-      requiresAllPipelinedShuffleReadersResident = true,
+      pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
       isPipelinedShuffleReader = true,
       isPipelinedShuffleProducer = true))
 
@@ -633,7 +698,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 2,
       pipelinedGroupId = Some("group-0"),
-      requiresAllPipelinedShuffleReadersResident = true,
+      pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
       isPipelinedShuffleReader = true,
       isPipelinedShuffleProducer = true))
 
@@ -671,7 +736,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       pipelinedGroupStageCount = 2,
       pipelinedGroupId = Some("group-0"),
-      requiresAllPipelinedShuffleReadersResident = true,
+      pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
       isPipelinedShuffleReader = true,
       isPipelinedShuffleProducer = true))
 
@@ -712,7 +777,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 2,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -758,7 +823,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 5,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer,
         pipelinedProducerShuffleIds = producerShuffleIds,
@@ -825,7 +890,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 3,
         pipelinedGroupId = Some(groupId),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer,
         pipelinedProducerShuffleIds = producerShuffleIds,
@@ -894,7 +959,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 2,
         pipelinedGroupId = Some(groupId),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer,
         pipelinedProducerShuffleIds = producerShuffleIds,
@@ -957,7 +1022,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -1047,7 +1112,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -1123,7 +1188,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -1223,7 +1288,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -1273,7 +1338,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        requiresAllPipelinedShuffleReadersResident = true,
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }

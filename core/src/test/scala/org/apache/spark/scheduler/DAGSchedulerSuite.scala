@@ -48,7 +48,8 @@ import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.shuffle.{FetchFailedException, MetadataFetchFailedException,
-  PipelinedShuffleControlPlane, PipelinedShuffleGroupMetadata}
+  PipelinedGroupSchedulingRequirements, PipelinedShuffleControlPlane,
+  PipelinedShuffleGroupMetadata}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId, BlockManagerMaster}
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, CallSite, Clock, LongAccumulator, SystemClock, ThreadUtils, Utils}
@@ -208,7 +209,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   private var firstInit: Boolean = _
   /** Set of TaskSets the DAGScheduler has requested executed. */
   val taskSets = scala.collection.mutable.Buffer[TaskSet]()
-  val taskSetsSubmittedWithoutRevive = scala.collection.mutable.Buffer[TaskSet]()
+  val submittedPipelinedTaskSetGroups = scala.collection.mutable.Buffer[Seq[TaskSet]]()
   var reviveOffersCount = 0
 
   def taskSet(stageId: Int, attemptId: Int): TaskSet = {
@@ -244,11 +245,12 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     override def submitTasks(taskSet: TaskSet): Unit = {
       recordSubmittedTaskSet(taskSet)
     }
-    override def submitTasksWithoutRevive(taskSet: TaskSet): Unit = {
-      taskSetsSubmittedWithoutRevive += taskSet
-      recordSubmittedTaskSet(taskSet)
-    }
-    override def reviveOffers(): Unit = {
+    override def submitPipelinedGroup(
+        taskSets: Seq[TaskSet],
+        requirements: PipelinedGroupSchedulingRequirements): Unit = {
+      assert(taskSets.forall(_.pipelinedGroupSchedulingRequirements === requirements))
+      submittedPipelinedTaskSetGroups += taskSets
+      taskSets.foreach(recordSubmittedTaskSet)
       reviveOffersCount += 1
     }
     override def killTaskAttempt(
@@ -485,7 +487,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     failure = null
     sc.addSparkListener(sparkListener)
     taskSets.clear()
-    taskSetsSubmittedWithoutRevive.clear()
+    submittedPipelinedTaskSetGroups.clear()
     reviveOffersCount = 0
     tasksMarkedAsCompleted.clear()
     cancelledStages.clear()
@@ -6175,6 +6177,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(scheduler.pipelinedShuffleGroupAttemptIds.isEmpty)
     assert(scheduler.registeredPipelinedShuffleGroups.isEmpty)
     assert(scheduler.admittedPipelinedShuffleGroups.isEmpty)
+    assert(scheduler.pendingPipelinedTaskSetsByGroup.isEmpty)
   }
 
   // Nothing in this test should break if the task info's fields are null, but
@@ -6269,8 +6272,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       new MyRDD(sc, 2, List(pipelinedDep, regularDep), tracker = mapOutputTracker)
     submit(consumerRdd, Array(0, 1))
 
-    // Both producers are submitted, but the consumer waits (it has a regular missing parent).
-    assert(taskSets.size === 2, s"expected both producers submitted, got ${taskSets.size}")
+    // The regular producer is submitted immediately. The pipelined producer remains buffered with
+    // its group until the consumer becomes runnable, so TaskScheduler cannot see a partial group.
+    assert(taskSets.size === 1, s"expected only the regular producer submitted, got ${taskSets.size}")
+    assert(scheduler.stageIdToStage(taskSets.head.stageId).rdd eq regularProducerRdd)
+    assert(submittedPipelinedTaskSetGroups.isEmpty)
     assert(scheduler.waitingStages.exists(_.rdd eq consumerRdd),
       "consumer should be waiting on its regular parent")
 
@@ -6281,6 +6287,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }.get.stageId
     completeShuffleMapStageSuccessfully(regularStageId, 0, 2)
     assert(taskSets.size === 3, "consumer should be co-scheduled once the regular parent finishes")
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.size === 2)
 
     // Finish the pipelined producer and the consumer.
     val pipelinedStageId = taskSets.find { ts =>
@@ -6379,7 +6387,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: round-robin mode coalesces task submission revive for a group") {
+  test("pipelined shuffle: publishes a complete group atomically") {
 
     val rddA = new MyRDD(sc, 2, Nil)
     val psdA = new PipelinedShuffleDependency(rddA, new HashPartitioner(2))
@@ -6390,7 +6398,9 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     submit(consumerRdd, Array(0, 1))
 
     assert(taskSets.size === 3)
-    assert(taskSetsSubmittedWithoutRevive.map(_.stageId).toSet === taskSets.map(_.stageId).toSet)
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.map(_.stageId).toSet ===
+      taskSets.map(_.stageId).toSet)
     assert(reviveOffersCount === 1)
   }
 
@@ -6419,6 +6429,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     completeShuffleMapStageSuccessfully(idR1, 0, 2)
     assert(scheduler.runningStages.exists(_.rdd eq rddP1), "P1 should be running")
     assert(!scheduler.runningStages.exists(_.rdd eq rddP2), "P2 should not be running yet")
+    assert(submittedPipelinedTaskSetGroups.isEmpty,
+      "a partial group must not be visible to TaskScheduler")
     assert(scheduler.waitingStages.exists(_.rdd eq rddC),
       "C must re-park while its second pipelined parent P2 is not yet running")
 
@@ -6426,6 +6438,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val idR2 = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rddR2).get.stageId
     completeShuffleMapStageSuccessfully(idR2, 0, 2)
     assert(scheduler.runningStages.exists(_.rdd eq rddC), "C should now be co-scheduled")
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.size === 3)
 
     val idP1 = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rddP1).get.stageId
     completeShuffleMapStageSuccessfully(idP1, 0, 2)
@@ -7059,19 +7073,28 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
       assert(failure.get() === null,
         "temporary occupancy by other work should defer the group instead of aborting it")
-      assert(taskSets.size === 2, "only the blocker and pipelined producer should be running")
+      assert(taskSets.size === 1,
+        "only the blocker should be visible while the pipelined group is incomplete")
+      assert(submittedPipelinedTaskSetGroups.isEmpty)
       assert(scheduler.waitingStages.exists(_.rdd eq consumerRdd))
 
       blockerOccupiesSlots.set(false)
       complete(blockerTaskSet, Seq((Success, 0)))
 
       assert(taskSets.size === 3,
-        "the waiting pipelined consumer should be reconsidered when other work frees slots")
+        "the complete pipelined group should publish when other work frees slots")
+      assert(submittedPipelinedTaskSetGroups.size === 1)
+      assert(submittedPipelinedTaskSetGroups.head.size === 2)
       assert(!scheduler.waitingStages.exists(_.rdd eq consumerRdd))
 
-      val producerStageId = taskSets(1).stageId
+      val producerStageId = taskSets.find { taskSet =>
+        scheduler.stageIdToStage.get(taskSet.stageId).exists(_.rdd eq producerRdd)
+      }.get.stageId
       completeShuffleMapStageSuccessfully(producerStageId, 0, 2)
-      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+      val consumerTaskSet = taskSets.find { taskSet =>
+        scheduler.stageIdToStage.get(taskSet.stageId).exists(_.rdd eq consumerRdd)
+      }.get
+      complete(consumerTaskSet, Seq((Success, 42), (Success, 43)))
       assert(results === Map(0 -> 42, 1 -> 43))
       assertDataStructuresEmpty()
     } finally {
