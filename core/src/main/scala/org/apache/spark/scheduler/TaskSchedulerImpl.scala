@@ -206,12 +206,6 @@ private[spark] class TaskSchedulerImpl(
   private var schedulableBuilder: SchedulableBuilder = null
   // default scheduler is FIFO
   val schedulingMode: SchedulingMode = conf.get(SCHEDULER_MODE)
-  private val pipelinedGroupRoundRobinEnabled =
-    conf.get(SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED)
-  private val pipelinedGroupMaxRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE)
-  private val pipelinedGroupSimpleMaxRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE)
   private val pipelinedGroupProducerMaxRunningTasksPerStage =
     conf.get(SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
   private val pipelinedGroupProducerMinRunningTasksPerStage =
@@ -682,7 +676,7 @@ private[spark] class TaskSchedulerImpl(
   }
 
   private def usePipelinedGroupRoundRobin(taskSet: TaskSetManager): Boolean = {
-    pipelinedGroupRoundRobinEnabled && taskSet.taskSet.isPipelined && !taskSet.isBarrier
+    taskSet.taskSet.isPipelined && !taskSet.isBarrier
   }
 
   private def registerPipelinedTaskSet(taskSet: TaskSetManager): Unit = {
@@ -743,7 +737,7 @@ private[spark] class TaskSchedulerImpl(
     } else if (pipelinedProducerFairnessBlocksProducer(taskSet, activeTaskSets)) {
       TaskLaunchLimit(0, "producer-sibling-fairness")
     } else {
-      val runningTasksCap = pipelinedGroupMaxRunningTasksPerStageFor(taskSet.taskSet)
+      val runningTasksCap = pipelinedProducerMaxRunningTasksFor(taskSet.taskSet)
       if (runningTasksCap <= 0) {
         TaskLaunchLimit(1, "allowed-no-stage-cap")
       } else {
@@ -760,10 +754,6 @@ private[spark] class TaskSchedulerImpl(
   private def pipelinedActiveReaderResidencyGroupBlockReason(
       taskSet: TaskSetManager,
       activeTaskSets: Iterable[TaskSetManager]): Option[String] = {
-    if (!pipelinedGroupRoundRobinEnabled) {
-      return None
-    }
-
     pipelinedActiveReaderResidencyGroup(activeTaskSets).flatMap { case (activeGroupId, taskSets) =>
       if (taskSet.taskSet.pipelinedGroupId.contains(activeGroupId)) {
         None
@@ -1087,27 +1077,16 @@ private[spark] class TaskSchedulerImpl(
     }
   }
 
-  private def pipelinedGroupMaxRunningTasksPerStageFor(taskSet: TaskSet): Int = {
-    val baseCap = if (taskSet.pipelinedGroupStageCount > 0 &&
-        taskSet.pipelinedGroupStageCount <= 2 &&
-        pipelinedGroupSimpleMaxRunningTasksPerStage > 0) {
-      pipelinedGroupSimpleMaxRunningTasksPerStage
-    } else {
-      pipelinedGroupMaxRunningTasksPerStage
-    }
+  private def pipelinedProducerMaxRunningTasksFor(taskSet: TaskSet): Int = {
     if (taskSet.isPipelinedShuffleProducer && !taskSet.isPipelinedShuffleReader) {
-      pipelinedGroupProducerMaxRunningTasksPerStage.getOrElse(baseCap)
+      pipelinedGroupProducerMaxRunningTasksPerStage.getOrElse(0)
     } else {
-      baseCap
+      0
     }
   }
 
   private def pipelinedGroupRoundRobinOfferOrder(
       sortedTaskSets: Iterable[TaskSetManager]): Iterable[TaskSetManager] = {
-    if (!pipelinedGroupRoundRobinEnabled) {
-      return sortedTaskSets
-    }
-
     val offerOrder = new ArrayBuffer[TaskSetManager]
     val pipelinedBlock = new ArrayBuffer[TaskSetManager]
 

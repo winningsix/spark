@@ -256,10 +256,9 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(!failedTaskSet)
   }
 
-  test("pipelined task sets are offered resources round-robin when enabled") {
+  test("pipelined task sets are offered resources round-robin") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
       config.LOCALITY_WAIT.key -> "0")
     val taskSet0 = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
     val taskSet1 = FakeTask.createTaskSet(16, stageId = 1, stageAttemptId = 0)
@@ -297,7 +296,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined task set round-robin gives downstream consumers a slot") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
@@ -341,107 +339,9 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(!failedTaskSet)
   }
 
-  test("pipelined task set per-stage cap limits running upstream tasks") {
+  test("pipelined producer cap can be disabled without limiting resident readers") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "2",
-      config.LOCALITY_WAIT.key -> "0")
-
-    def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
-      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
-      new TaskSet(
-        taskSet.tasks,
-        taskSet.stageId,
-        taskSet.stageAttemptId,
-        taskSet.priority,
-        taskSet.properties,
-        taskSet.resourceProfileId,
-        taskSet.shuffleId,
-        isPipelined = true)
-    }
-
-    Seq(
-      pipelinedTaskSet(16, stageId = 0),
-      pipelinedTaskSet(16, stageId = 1),
-      pipelinedTaskSet(16, stageId = 2),
-      pipelinedTaskSet(16, stageId = 3),
-      pipelinedTaskSet(1, stageId = 4)).foreach(taskScheduler.submitTasks)
-
-    val offers = IndexedSeq(
-      WorkerOffer("executor0", "host0", 4),
-      WorkerOffer("executor1", "host1", 4),
-      WorkerOffer("executor2", "host2", 4),
-      WorkerOffer("executor3", "host3", 4))
-    val tasks = taskScheduler.resourceOffers(offers).flatten
-
-    val byStage = tasks
-      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
-      .groupBy(identity)
-      .view
-      .mapValues(_.size)
-      .toMap
-    assert(tasks.length === 9)
-    assert(byStage(0) === 2)
-    assert(byStage(1) === 2)
-    assert(byStage(2) === 2)
-    assert(byStage(3) === 2)
-    assert(byStage(4) === 1)
-
-    val secondOffer = taskScheduler.resourceOffers(offers).flatten
-    assert(secondOffer.isEmpty, "stages at their running cap must not launch more tasks")
-    assert(!failedTaskSet)
-  }
-
-  test("simple pipelined group uses simple per-stage cap override") {
-    val taskScheduler = setupSchedulerWithMaster(
-      "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "2",
-      config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
-      config.LOCALITY_WAIT.key -> "0")
-
-    def pipelinedTaskSet(numTasks: Int, stageId: Int): TaskSet = {
-      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
-      new TaskSet(
-        taskSet.tasks,
-        taskSet.stageId,
-        taskSet.stageAttemptId,
-        taskSet.priority,
-        taskSet.properties,
-        taskSet.resourceProfileId,
-        taskSet.shuffleId,
-        isPipelined = true,
-        pipelinedGroupStageCount = 2)
-    }
-
-    Seq(
-      pipelinedTaskSet(16, stageId = 0),
-      pipelinedTaskSet(1, stageId = 1)).foreach(taskScheduler.submitTasks)
-
-    val tasks = taskScheduler.resourceOffers(IndexedSeq(
-      WorkerOffer("executor0", "host0", 4),
-      WorkerOffer("executor1", "host1", 4),
-      WorkerOffer("executor2", "host2", 4),
-      WorkerOffer("executor3", "host3", 4))).flatten
-
-    val byStage = tasks
-      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
-      .groupBy(identity)
-      .view
-      .mapValues(_.size)
-      .toMap
-    assert(tasks.length === 5)
-    assert(byStage(0) === 4)
-    assert(byStage(1) === 1)
-    assert(!failedTaskSet)
-  }
-
-  test("pipelined producer cap override can relax pure producers without relaxing readers") {
-    val taskScheduler = setupSchedulerWithMaster(
-      "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -486,14 +386,13 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(tasks.length === 16)
     assert(byStage(0) > 4)
     assert(byStage(1) > 4)
-    assert(byStage(2) === 4, "reader stages must retain the regular reader-residency cap")
+    assert(byStage(2) === 4, "every reader task must remain resident")
     assert(!failedTaskSet)
   }
 
   test("pipelined round robin spreads a task set across executor offers") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[64]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
       config.LOCALITY_WAIT.key -> "0")
     val taskSet = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
     taskScheduler.submitTasks(new TaskSet(
@@ -528,7 +427,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined per-executor cap limits one stage on each executor") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[64]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "2",
       config.LOCALITY_WAIT.key -> "0")
     val taskSet = FakeTask.createTaskSet(16, stageId = 0, stageAttemptId = 0)
@@ -564,8 +462,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency reserves and balances source producer lanes") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -633,8 +529,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined producer-reader residency balances partial executor offers") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[24]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -682,8 +576,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined producer-reader residency distributes remainder across full offers") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[24]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -725,8 +617,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("partial offers trigger global producer-reader residency rebalance") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[24]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
     val backend = taskScheduler.backend.asInstanceOf[FakeSchedulerBackend]
@@ -766,8 +656,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined producer-reader residency can exceed a static executor cap") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[64]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -809,8 +697,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency reserves a single-task producer in the same offer") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[2]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(stageId: Int, isReader: Boolean, isProducer: Boolean): TaskSet = {
@@ -849,8 +735,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader frontier includes downstream producer-reader stages") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[19]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
@@ -918,8 +802,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency serializes active groups at task launch") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "1",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "1",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -982,8 +864,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency waits for a suspended group to drain") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[4]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
     taskScheduler.initialize(new FakeSchedulerBackend {
@@ -1056,8 +936,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency refills pure producers after first wave completes") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
     val backend = taskScheduler.backend.asInstanceOf[FakeSchedulerBackend]
@@ -1148,8 +1026,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined pure producer refill prioritizes a starved sibling producer") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
       config.LOCALITY_WAIT.key -> "0")
@@ -1226,8 +1102,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined pure producer batch refill prioritizes a drained sibling producer") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
       config.LOCALITY_WAIT.key -> "0")
@@ -1327,8 +1201,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency fills configured pure producer frontier") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE.key -> "8",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "0",
@@ -1381,8 +1253,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency is rechecked after a resident reader exits") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED.key -> "true",
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key -> "4",
       config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 

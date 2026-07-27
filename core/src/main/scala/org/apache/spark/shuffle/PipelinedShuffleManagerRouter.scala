@@ -119,6 +119,20 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
     }
   }
 
+  override def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = {
+    handle match {
+      case incremental: IncrementalShuffleHandle =>
+        incrementalManager.wrapShuffleMapTaskInput(
+          incremental.delegate, mapId, context)(createInput)
+      case _ =>
+        defaultManager.wrapShuffleMapTaskInput(handle, mapId, context)(createInput)
+    }
+  }
+
   override def getReader[K, C](
       handle: ShuffleHandle,
       startMapIndex: Int,
