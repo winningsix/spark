@@ -1791,7 +1791,7 @@ package object config {
       .internal()
       .doc("When true, fail fast if a pipelined stage group requires more concurrently free task " +
         "slots than the scheduler currently has. Disabling this is intended for experimental " +
-        "incremental-shuffle deployments that provide their own query-level admission control.")
+        "incremental-shuffle deployments that guarantee sufficient task-slot capacity.")
       .version("4.3.0")
       .booleanConf
       .createWithDefault(true)

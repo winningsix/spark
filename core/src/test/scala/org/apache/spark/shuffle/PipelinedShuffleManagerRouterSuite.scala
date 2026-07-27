@@ -104,29 +104,24 @@ private class IncrementalRecordingManager(conf: SparkConf, isDriver: Boolean)
   val completedGroups = mutable.ArrayBuffer[String]()
   val abortedGroups = mutable.ArrayBuffer[(String, String)]()
   @volatile var requireAllReadersResident = false
-  @volatile var maxConcurrentProducers: Option[Int] = None
 
   override def requiresAllPipelinedShuffleReadersResident(
       group: PipelinedShuffleGroupMetadata): Boolean = requireAllReadersResident
-
-  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
-    maxConcurrentProducers
-  }
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
     registeredGroups += group
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
-    admittedGroups += groupId
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    admittedGroups += groupAttemptId
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Unit = {
-    completedGroups += groupId
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    completedGroups += groupAttemptId
   }
 
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
-    abortedGroups += groupId -> reason
+  override def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {
+    abortedGroups += groupAttemptId -> reason
   }
 }
 
@@ -280,8 +275,7 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     val router = startWithRouter()
     val group = PipelinedShuffleGroupMetadata(
       groupId = "stages-1-2",
-      jobId = 4,
-      queryExecutionId = Some(9L),
+      groupAttemptId = "stages-1.0-2.0",
       stages = Seq(
         PipelinedShuffleStageMetadata(
           stageId = 1,
@@ -299,17 +293,14 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     assert(!router.requiresAllPipelinedShuffleReadersResident(group))
     incMgr.requireAllReadersResident = true
     assert(router.requiresAllPipelinedShuffleReadersResident(group))
-    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).isEmpty)
-    incMgr.maxConcurrentProducers = Some(7)
-    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).contains(7))
-    router.admitPipelinedShuffleGroup(group.groupId)
-    router.completePipelinedShuffleGroup(group.groupId)
-    router.abortPipelinedShuffleGroup(group.groupId, "failed")
+    router.admitPipelinedShuffleGroup(group.groupAttemptId)
+    router.completePipelinedShuffleGroup(group.groupAttemptId)
+    router.abortPipelinedShuffleGroup(group.groupAttemptId, "failed")
 
     assert(incMgr.registeredGroups === Seq(group))
-    assert(incMgr.admittedGroups === Seq(group.groupId))
-    assert(incMgr.completedGroups === Seq(group.groupId))
-    assert(incMgr.abortedGroups === Seq(group.groupId -> "failed"))
+    assert(incMgr.admittedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.completedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.abortedGroups === Seq(group.groupAttemptId -> "failed"))
   }
 
   test("unregisterShuffle ORs the two managers: succeeds when only the owning manager returns true") {

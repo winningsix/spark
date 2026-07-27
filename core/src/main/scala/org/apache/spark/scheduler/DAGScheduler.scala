@@ -191,6 +191,7 @@ private[spark] class DAGScheduler(
 
   private[scheduler] val pipelinedShuffleGroupStageIds = new HashMap[String, Set[Int]]
   private[scheduler] val stageIdToPipelinedShuffleGroupId = new HashMap[Int, String]
+  private[scheduler] val pipelinedShuffleGroupAttemptIds = new HashMap[String, String]
   private[scheduler] val registeredPipelinedShuffleGroups = new HashSet[String]
   private[scheduler] val admittedPipelinedShuffleGroups = new HashSet[String]
 
@@ -1692,16 +1693,16 @@ private[spark] class DAGScheduler(
    *
    * Returns Some((demand, freeSlots)) when the group does not fit, else None.
    */
-  private def pipelinedGroupExceedsCapacity(stage: Stage, jobId: Int): Option[(Int, Int)] = {
+  private def pipelinedGroupExceedsCapacity(stage: Stage): Option[(Int, Int)] = {
     if (!sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED)) {
       logWarning(log"Skipping pipelined stage-group slot check for ${MDC(STAGE, stage)} because " +
         log"${MDC(CONFIG, config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key)} is disabled. " +
-        log"External query-level admission control must prevent deadlocks.")
+        log"The deployment must guarantee enough task slots to prevent deadlocks.")
       return None
     }
     val group = pipelinedGroupOf(stage)
     val demand =
-      if (pipelinedShuffleRequiresReaderResidency(group, jobId)) {
+      if (pipelinedShuffleRequiresReaderResidency(group)) {
         pipelinedReaderResidencyDemand(group).totalSlots
       } else {
         group.toSeq.map(_.numTasks).sum
@@ -1712,8 +1713,8 @@ private[spark] class DAGScheduler(
     if (demand > freeSlots) Some((demand, freeSlots)) else None
   }
 
-  private def pipelinedShuffleRequiresReaderResidency(group: Set[Stage], jobId: Int): Boolean = {
-    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
+  private def pipelinedShuffleRequiresReaderResidency(group: Set[Stage]): Boolean = {
+    val metadata = pipelinedShuffleGroupMetadata(group)
     pipelinedShuffleControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(metadata))
   }
 
@@ -1780,11 +1781,10 @@ private[spark] class DAGScheduler(
     extends PipelinedReaderResidencyBlock
 
   private def pipelinedReaderResidencyBlocked(
-      stage: Stage,
-      jobId: Int): Option[PipelinedReaderResidencyBlock] = {
+      stage: Stage): Option[PipelinedReaderResidencyBlock] = {
     val group = pipelinedGroupOf(stage)
-    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
-    if (!pipelinedShuffleRequiresReaderResidency(group, jobId)) {
+    val metadata = pipelinedShuffleGroupMetadata(group)
+    if (!pipelinedShuffleRequiresReaderResidency(group)) {
       return None
     }
 
@@ -1932,15 +1932,22 @@ private[spark] class DAGScheduler(
     group.toSeq.map(_.id).sorted.mkString("stages-", "-", "")
   }
 
-  private def pipelinedShuffleGroupMetadata(
-      group: Set[Stage],
-      jobId: Int): PipelinedShuffleGroupMetadata = {
+  private def pipelinedShuffleGroupAttemptId(group: Set[Stage]): String = {
     val groupId = pipelinedShuffleGroupId(group)
-    val queryExecutionId = Option(jobIdToQueryExecutionId.get(jobId)).map(_.longValue())
+    pipelinedShuffleGroupAttemptIds.getOrElseUpdate(groupId, {
+      group.toSeq
+        .sortBy(_.id)
+        .map(stage => s"${stage.id}.${stage.latestInfo.attemptNumber()}")
+        .mkString("stages-", "-", "")
+    })
+  }
+
+  private def pipelinedShuffleGroupMetadata(
+      group: Set[Stage]): PipelinedShuffleGroupMetadata = {
+    val groupId = pipelinedShuffleGroupId(group)
     PipelinedShuffleGroupMetadata(
       groupId = groupId,
-      jobId = jobId,
-      queryExecutionId = queryExecutionId,
+      groupAttemptId = pipelinedShuffleGroupAttemptId(group),
       stages = group.toSeq.sortBy(_.id).map(pipelinedShuffleStageMetadata))
   }
 
@@ -1957,32 +1964,36 @@ private[spark] class DAGScheduler(
       pipelinedParentShuffleIds = pipelinedParentShuffleIds(stage))
   }
 
-  private def registerPipelinedShuffleGroup(stage: Stage, jobId: Int): Option[String] = {
+  private def registerPipelinedShuffleGroup(stage: Stage): Option[String] = {
     if (!isPipelinedGroupMember(stage)) {
       return None
     }
     val group = pipelinedGroupOf(stage)
     val groupId = pipelinedShuffleGroupId(group)
-    val metadata = pipelinedShuffleGroupMetadata(group, jobId)
+    val metadata = pipelinedShuffleGroupMetadata(group)
     val firstRegistration = registeredPipelinedShuffleGroups.add(groupId)
     pipelinedShuffleGroupStageIds(groupId) = group.map(_.id).toSet
+    pipelinedShuffleGroupAttemptIds(groupId) = metadata.groupAttemptId
     group.foreach { groupStage =>
       stageIdToPipelinedShuffleGroupId(groupStage.id) = groupId
     }
     pipelinedShuffleControlPlane.foreach(_.registerPipelinedShuffleGroup(metadata))
     if (firstRegistration) {
-      logInfo(log"Registered pipelined shuffle group ${MDC(GROUP_ID, groupId)} with stages " +
+      logInfo(log"Registered pipelined shuffle group ${MDC(GROUP_ID, groupId)} attempt " +
+        log"${MDC(STAGE_ATTEMPT_ID, metadata.groupAttemptId)} with stages " +
         log"${MDC(STAGE_ID, metadata.stages.map(_.stageId))} and shuffles " +
         log"${MDC(SHUFFLE_IDS, metadata.stages.flatMap(_.shuffleId))}")
     }
     Some(groupId)
   }
 
-  private def admitPipelinedShuffleGroup(stage: Stage, jobId: Int): Unit = {
-    registerPipelinedShuffleGroup(stage, jobId).foreach { groupId =>
+  private def admitPipelinedShuffleGroup(stage: Stage): Unit = {
+    registerPipelinedShuffleGroup(stage).foreach { groupId =>
       if (admittedPipelinedShuffleGroups.add(groupId)) {
-        pipelinedShuffleControlPlane.foreach(_.admitPipelinedShuffleGroup(groupId))
-        logInfo(log"Admitted pipelined shuffle group ${MDC(GROUP_ID, groupId)}")
+        val groupAttemptId = pipelinedShuffleGroupAttemptIds(groupId)
+        pipelinedShuffleControlPlane.foreach(_.admitPipelinedShuffleGroup(groupAttemptId))
+        logInfo(log"Admitted pipelined shuffle group ${MDC(GROUP_ID, groupId)} attempt " +
+          log"${MDC(STAGE_ATTEMPT_ID, groupAttemptId)}")
       }
     }
   }
@@ -1998,8 +2009,10 @@ private[spark] class DAGScheduler(
         }
       }
       if (!stillActive && registeredPipelinedShuffleGroups.contains(groupId)) {
-        pipelinedShuffleControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
-        logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)}")
+        val groupAttemptId = pipelinedShuffleGroupAttemptIds(groupId)
+        pipelinedShuffleControlPlane.foreach(_.completePipelinedShuffleGroup(groupAttemptId))
+        logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)} attempt " +
+          log"${MDC(STAGE_ATTEMPT_ID, groupAttemptId)}")
         removePipelinedShuffleGroup(groupId)
         reconsiderWaitingPipelinedStages()
       }
@@ -2018,8 +2031,11 @@ private[spark] class DAGScheduler(
       if (registeredPipelinedShuffleGroups.contains(id) ||
           admittedPipelinedShuffleGroups.contains(id) ||
           pipelinedShuffleGroupStageIds.contains(id)) {
-        pipelinedShuffleControlPlane.foreach(_.abortPipelinedShuffleGroup(id, reason))
-        logWarning(log"Aborted pipelined shuffle group ${MDC(GROUP_ID, id)}: " +
+        val groupAttemptId = pipelinedShuffleGroupAttemptIds.getOrElse(id, id)
+        pipelinedShuffleControlPlane.foreach(
+          _.abortPipelinedShuffleGroup(groupAttemptId, reason))
+        logWarning(log"Aborted pipelined shuffle group ${MDC(GROUP_ID, id)} attempt " +
+          log"${MDC(STAGE_ATTEMPT_ID, groupAttemptId)}: " +
           log"${MDC(REASON, reason)}")
         removePipelinedShuffleGroup(id)
         reconsiderWaitingPipelinedStages()
@@ -2036,6 +2052,7 @@ private[spark] class DAGScheduler(
     }
     registeredPipelinedShuffleGroups -= groupId
     admittedPipelinedShuffleGroups -= groupId
+    pipelinedShuffleGroupAttemptIds -= groupId
   }
 
   private def removeStageFromPipelinedShuffleGroup(stageId: Int): Unit = {
@@ -2044,8 +2061,11 @@ private[spark] class DAGScheduler(
       val remaining = pipelinedShuffleGroupStageIds.getOrElse(groupId, Set.empty[Int]) - stageId
       if (remaining.isEmpty) {
         if (registeredPipelinedShuffleGroups.contains(groupId)) {
-          pipelinedShuffleControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
-          logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)} during cleanup")
+          val groupAttemptId = pipelinedShuffleGroupAttemptIds.getOrElse(groupId, groupId)
+          pipelinedShuffleControlPlane.foreach(
+            _.completePipelinedShuffleGroup(groupAttemptId))
+          logInfo(log"Completed pipelined shuffle group ${MDC(GROUP_ID, groupId)} attempt " +
+            log"${MDC(STAGE_ATTEMPT_ID, groupAttemptId)} during cleanup")
         }
         removePipelinedShuffleGroup(groupId)
       } else {
@@ -2421,21 +2441,21 @@ private[spark] class DAGScheduler(
                       log"${MDC(NUM_TASKS, maxConcurrentGroups)} and another group is active")
                     waitingStages += stage
                   case None =>
-                    pipelinedReaderResidencyBlocked(stage, jobId.get) match {
+                    pipelinedReaderResidencyBlocked(stage) match {
                       case Some(FatalPipelinedReaderResidencyBlock(reason)) =>
                         abortStage(stage, reason, Some(new SparkException(reason)))
                       case Some(WaitingForPipelinedReaderResidencySlots(reason)) =>
                         logInfo(log"${MDC(MESSAGE, reason)}")
                         waitingStages += stage
                       case None =>
-                        pipelinedGroupExceedsCapacity(stage, jobId.get) match {
+                        pipelinedGroupExceedsCapacity(stage) match {
                           case Some((demand, freeSlots)) =>
                             val reason =
                               s"Cannot co-schedule pipelined stage group: needs $demand concurrent " +
                                 s"task slots but only $freeSlots are currently free."
                             abortStage(stage, reason, Some(new SparkException(reason)))
                           case None =>
-                            admitPipelinedShuffleGroup(stage, jobId.get)
+                            admitPipelinedShuffleGroup(stage)
                             logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its " +
                               log"running pipelined producer(s) " +
                               log"${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
@@ -2752,7 +2772,7 @@ private[spark] class DAGScheduler(
     }
     listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo,
       Utils.cloneProperties(properties)))
-    registerPipelinedShuffleGroup(stage, jobId)
+    registerPipelinedShuffleGroup(stage)
 
     // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
     // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
@@ -2849,11 +2869,15 @@ private[spark] class DAGScheduler(
       val isPipelinedMember = isPipelinedGroupMember(stage)
       val pipelinedGroup = if (isPipelinedMember) pipelinedGroupOf(stage) else Set.empty[Stage]
       val pipelinedGroupIdOpt =
-        if (isPipelinedMember) Some(pipelinedShuffleGroupId(pipelinedGroup)) else None
+        if (isPipelinedMember) {
+          Some(pipelinedShuffleGroupAttemptId(pipelinedGroup))
+        } else {
+          None
+        }
       val requiresReaderResidency = isPipelinedMember &&
         pipelinedShuffleControlPlane.exists(
           _.requiresAllPipelinedShuffleReadersResident(
-            pipelinedShuffleGroupMetadata(pipelinedGroup, jobId)))
+            pipelinedShuffleGroupMetadata(pipelinedGroup)))
       val taskSet = new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
         stage.resourceProfileId, shuffleId, isPipelined = isPipelinedMember,

@@ -32,16 +32,16 @@ private[spark] case class PipelinedShuffleStageMetadata(
  */
 private[spark] case class PipelinedShuffleGroupMetadata(
     groupId: String,
-    jobId: Int,
-    queryExecutionId: Option[Long],
+    groupAttemptId: String,
     stages: Seq[PipelinedShuffleStageMetadata])
 
 /**
- * Optional lifecycle hook for incremental shuffle managers that need query/stage-group state.
+ * Optional scheduling-requirement and runtime-lifecycle hook for incremental shuffle managers.
  *
- * DAGScheduler owns the Spark stage graph and therefore announces group registration, admission,
- * completion, and abort. The concrete incremental shuffle manager owns the shuffle implementation
- * and can use these callbacks to maintain a query-level control plane.
+ * DAGScheduler owns the Spark stage graph and is the authority for group registration, admission,
+ * completion, and abort. An incremental shuffle manager reports data-plane requirements and treats
+ * lifecycle callbacks as commands or notifications. It must not maintain an independent scheduler
+ * outcome that can override Spark's group outcome.
  */
 private[spark] trait PipelinedShuffleControlPlane {
 
@@ -57,40 +57,17 @@ private[spark] trait PipelinedShuffleControlPlane {
   def requiresAllPipelinedShuffleReadersResident(group: PipelinedShuffleGroupMetadata): Boolean =
     false
 
-  /**
-   * Maximum number of pure producer tasks that Spark may keep running for this group.
-   *
-   * This admission happens before a Spark task is launched. It lets a query-level control plane
-   * bound native producers without occupying executor task slots with writers that are only
-   * waiting for credit. Reader-producer tasks are excluded because they form the resident drain
-   * path for push-oriented shuffle data.
-   *
-   * None means unlimited. Zero temporarily pauses producer expansion; already-running tasks are
-   * never preempted. Spark may exceed this cap by the configured per-stage minimum when a pending
-   * pure producer stage has no running task. This liveness lane prevents a query-level pause from
-   * fencing a sibling producer stage that is needed to drain the current frontier.
-   */
-  def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = None
+  def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {}
 
-  def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit
+  def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {}
 
-  def admitPipelinedShuffleGroup(groupId: String): Unit
+  def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {}
 
-  def completePipelinedShuffleGroup(groupId: String): Unit
+  def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {}
+}
 
-  def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit
-
-  /**
-   * Mark the SQL execution that owns one or more pipelined shuffle groups as successful.
-   *
-   * Group completion only means that the currently known Spark stage component has stopped. A
-   * query-level control plane must retain exchange state until this callback so later jobs in the
-   * same SQL execution join the same coordinator instance.
-   */
-  def completePipelinedQuery(queryExecutionId: Long): Unit = {}
-
-  /**
-   * Abort every pipelined shuffle group owned by the failed SQL execution.
-   */
-  def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {}
+private[spark] trait RequiresAllPipelinedShuffleReadersResident
+  extends PipelinedShuffleControlPlane {
+  final override def requiresAllPipelinedShuffleReadersResident(
+      group: PipelinedShuffleGroupMetadata): Boolean = true
 }

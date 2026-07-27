@@ -36,7 +36,6 @@ import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.execution.ui.{SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.SQL_EVENT_TRUNCATE_LENGTH
-import org.apache.spark.shuffle.PipelinedShuffleControlPlane
 import org.apache.spark.util.{Utils, UUIDv7Generator}
 
 /**
@@ -87,29 +86,6 @@ object SQLExecution extends Logging {
   private def nextExecutionId: Long = _nextExecutionId.getAndIncrement
 
   private[sql] val executionIdToQueryExecution = new ConcurrentHashMap[Long, QueryExecution]()
-
-  private def completePipelinedQuery(
-      executionId: Long,
-      failure: Option[Throwable]): Unit = {
-    Option(SparkEnv.get).map(_.shuffleManager).collect {
-      case controlPlane: PipelinedShuffleControlPlane => controlPlane
-    }.foreach { controlPlane =>
-      try {
-        failure match {
-          case Some(error) =>
-            controlPlane.abortPipelinedQuery(executionId, Utils.exceptionString(error))
-          case None =>
-            controlPlane.completePipelinedQuery(executionId)
-        }
-      } catch {
-        case NonFatal(error) =>
-          logWarning(
-            s"Failed to finalize the pipelined shuffle control plane for SQL execution " +
-              s"$executionId",
-            error)
-      }
-    }
-  }
 
   def getQueryExecution(executionId: Long): QueryExecution = {
     executionIdToQueryExecution.get(executionId)
@@ -311,7 +287,6 @@ object SQLExecution extends Logging {
 
               // Clean up jobs tracked by DAGScheduler for this query execution.
               sc.dagScheduler.cleanupQueryJobs(executionId)
-              completePipelinedQuery(executionId, ex)
 
               sc.listenerBus.post(event)
 

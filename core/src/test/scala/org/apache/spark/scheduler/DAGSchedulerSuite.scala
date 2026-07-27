@@ -6172,6 +6172,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(scheduler.pipelinedConsumerDeferrals.isEmpty)
     assert(scheduler.pipelinedShuffleGroupStageIds.isEmpty)
     assert(scheduler.stageIdToPipelinedShuffleGroupId.isEmpty)
+    assert(scheduler.pipelinedShuffleGroupAttemptIds.isEmpty)
     assert(scheduler.registeredPipelinedShuffleGroups.isEmpty)
     assert(scheduler.admittedPipelinedShuffleGroups.isEmpty)
   }
@@ -6564,6 +6565,13 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
     submit(consumerRdd, Array(0, 1))
     assert(taskSets.size === 2)
+    val groupAttemptIds = taskSets.flatMap(_.pipelinedGroupId).distinct
+    val expectedGroupAttemptId = taskSets
+      .sortBy(_.stageId)
+      .map(taskSet => s"${taskSet.stageId}.${taskSet.stageAttemptId}")
+      .mkString("stages-", "-", "")
+    assert(groupAttemptIds.size === 1)
+    assert(groupAttemptIds.head === expectedGroupAttemptId)
     val producerStageId = taskSets.head.stageId
     val consumerTaskSet = taskSets(1)
 

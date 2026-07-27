@@ -40,7 +40,6 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.shuffle.PipelinedShuffleControlPlane
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
@@ -220,13 +219,6 @@ private[spark] class TaskSchedulerImpl(
   private val pipelinedGroupMaxRunningTasksPerExecutor =
     conf.get(SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR)
   private val pipelinedTaskSetsByGroup = new HashMap[String, HashSet[TaskSetManager]]
-  private lazy val pipelinedShuffleControlPlane = Option(SparkEnv.get).flatMap { env =>
-    env.shuffleManager match {
-      case controlPlane: PipelinedShuffleControlPlane => Some(controlPlane)
-      case _ => None
-    }
-  }
-
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
 
   // This is a var so that we can reset it for testing purposes.
@@ -751,55 +743,18 @@ private[spark] class TaskSchedulerImpl(
     } else if (pipelinedProducerFairnessBlocksProducer(taskSet, activeTaskSets)) {
       TaskLaunchLimit(0, "producer-sibling-fairness")
     } else {
-      pipelinedControlPlaneProducerBlockCap(taskSet, activeTaskSets) match {
-        case Some(cap) =>
-          TaskLaunchLimit(0, s"control-plane-group-producer-cap($cap)")
-        case None =>
-          val runningTasksCap = pipelinedGroupMaxRunningTasksPerStageFor(taskSet.taskSet)
-          if (runningTasksCap <= 0) {
-            TaskLaunchLimit(1, "allowed-no-stage-cap")
-          } else {
-            val remaining = runningTasksCap - taskSet.runningTasks
-            if (remaining <= 0) {
-              TaskLaunchLimit(0, s"stage-running-cap($runningTasksCap)")
-            } else {
-              TaskLaunchLimit(math.min(1, remaining), s"allowed-stage-cap($runningTasksCap)")
-            }
-          }
+      val runningTasksCap = pipelinedGroupMaxRunningTasksPerStageFor(taskSet.taskSet)
+      if (runningTasksCap <= 0) {
+        TaskLaunchLimit(1, "allowed-no-stage-cap")
+      } else {
+        val remaining = runningTasksCap - taskSet.runningTasks
+        if (remaining <= 0) {
+          TaskLaunchLimit(0, s"stage-running-cap($runningTasksCap)")
+        } else {
+          TaskLaunchLimit(math.min(1, remaining), s"allowed-stage-cap($runningTasksCap)")
+        }
       }
     }
-  }
-
-  private def pipelinedControlPlaneProducerBlockCap(
-      taskSet: TaskSetManager,
-      activeTaskSets: Iterable[TaskSetManager]): Option[Int] = {
-    val taskSetInfo = taskSet.taskSet
-    if (!taskSetInfo.isPipelinedShuffleProducer || taskSetInfo.isPipelinedShuffleReader) {
-      return None
-    }
-
-    taskSetInfo.pipelinedGroupId.flatMap { groupId =>
-      maxConcurrentPipelinedShuffleProducers(groupId).flatMap { cap =>
-        val runningPureProducers = pipelinedGroupTaskSets(taskSet, activeTaskSets).iterator
-          .filter { candidate =>
-            val candidateInfo = candidate.taskSet
-            candidateInfo.isPipelinedShuffleProducer && !candidateInfo.isPipelinedShuffleReader
-          }
-          .map(_.runningTasks)
-          .sum
-        val needsLivenessSlot =
-          pipelinedTaskSetHasPendingWork(taskSet) &&
-            taskSet.runningTasks < pipelinedGroupProducerMinRunningTasksPerStage
-        Option.when(runningPureProducers >= cap && !needsLivenessSlot)(cap)
-      }
-    }
-  }
-
-  private[scheduler] def maxConcurrentPipelinedShuffleProducers(
-      groupId: String): Option[Int] = {
-    pipelinedShuffleControlPlane
-      .flatMap(_.maxConcurrentPipelinedShuffleProducers(groupId))
-      .map(math.max(0, _))
   }
 
   private def pipelinedActiveReaderResidencyGroupBlockReason(
