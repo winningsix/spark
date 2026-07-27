@@ -97,6 +97,33 @@ private class DefaultRecordingManager(conf: SparkConf, isDriver: Boolean)
   extends RecordingShuffleManager(conf, isDriver)
 private class IncrementalRecordingManager(conf: SparkConf, isDriver: Boolean)
   extends RecordingShuffleManager(conf, isDriver)
+  with PipelinedShuffleControlPlane {
+
+  val registeredGroups = mutable.ArrayBuffer[PipelinedShuffleGroupMetadata]()
+  val admittedGroups = mutable.ArrayBuffer[String]()
+  val completedGroups = mutable.ArrayBuffer[String]()
+  val abortedGroups = mutable.ArrayBuffer[(String, String)]()
+  @volatile var requireAllReadersResident = false
+
+  override def requiresAllPipelinedShuffleReadersResident(
+      group: PipelinedShuffleGroupMetadata): Boolean = requireAllReadersResident
+
+  override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
+    registeredGroups += group
+  }
+
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    admittedGroups += groupAttemptId
+  }
+
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    completedGroups += groupAttemptId
+  }
+
+  override def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {
+    abortedGroups += groupAttemptId -> reason
+  }
+}
 
 class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkContext {
 
@@ -242,6 +269,38 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     assert(sortRouter.regularShuffleManager
       .isInstanceOf[org.apache.spark.shuffle.sort.SortShuffleManager])
     sortRouter.stop()
+  }
+
+  test("pipelined shuffle control-plane methods delegate to the incremental manager") {
+    val router = startWithRouter()
+    val group = PipelinedShuffleGroupMetadata(
+      groupId = "stages-1-2",
+      groupAttemptId = "stages-1.0-2.0",
+      stages = Seq(
+        PipelinedShuffleStageMetadata(
+          stageId = 1,
+          attemptId = 0,
+          numTasks = 2,
+          shuffleId = Some(10)),
+        PipelinedShuffleStageMetadata(
+          stageId = 2,
+          attemptId = 0,
+          numTasks = 2,
+          shuffleId = None)))
+    val incMgr = incrementalMgr.asInstanceOf[IncrementalRecordingManager]
+
+    router.registerPipelinedShuffleGroup(group)
+    assert(!router.requiresAllPipelinedShuffleReadersResident(group))
+    incMgr.requireAllReadersResident = true
+    assert(router.requiresAllPipelinedShuffleReadersResident(group))
+    router.admitPipelinedShuffleGroup(group.groupAttemptId)
+    router.completePipelinedShuffleGroup(group.groupAttemptId)
+    router.abortPipelinedShuffleGroup(group.groupAttemptId, "failed")
+
+    assert(incMgr.registeredGroups === Seq(group))
+    assert(incMgr.admittedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.completedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.abortedGroups === Seq(group.groupAttemptId -> "failed"))
   }
 
   test("unregisterShuffle ORs the two managers: succeeds when only the owning manager returns true") {

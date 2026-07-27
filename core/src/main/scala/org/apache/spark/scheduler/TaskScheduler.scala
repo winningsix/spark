@@ -54,6 +54,13 @@ private[spark] trait TaskScheduler {
   // Submit a sequence of tasks to run.
   def submitTasks(taskSet: TaskSet): Unit
 
+  // Submit a sequence of tasks without immediately asking the backend for offers. The default
+  // preserves the original behavior for TaskScheduler implementations that do not override it.
+  def submitTasksWithoutRevive(taskSet: TaskSet): Unit = submitTasks(taskSet)
+
+  // Ask the backend for offers after one or more task sets have been submitted without revive.
+  def reviveOffers(): Unit = {}
+
   /**
    * Kills a task attempt.
    * Throw UnsupportedOperationException if the backend doesn't support kill a task.

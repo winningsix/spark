@@ -39,7 +39,43 @@ private[spark] class TaskSet(
     // isolation, so any task failure must fail the whole group rather than be retried per-task;
     // the TaskSetManager uses this to fail fast (maxTaskFailures = 1) and to count every failure,
     // including otherwise-uncounted ones like executor loss. Defaults to false.
-    val isPipelined: Boolean = false) {
+    val isPipelined: Boolean = false,
+    // Number of scheduler stages in the connected pipelined group. Zero for non-pipelined task
+    // sets or when the creator does not provide group metadata.
+    val pipelinedGroupStageCount: Int = 0,
+    // Attempt-scoped identifier for the connected pipelined group this task set belongs to.
+    // DAGScheduler allocates a new generation after group teardown, so stale TaskSets cannot share
+    // admission state with the current attempt.
+    val pipelinedGroupId: Option[String] = None,
+    // True when the selected incremental shuffle manager needs every pipelined shuffle reader
+    // partition in the group to be launched before pure producer stages can freely consume slots.
+    val requiresAllPipelinedShuffleReadersResident: Boolean = false,
+    // True if this pipelined stage consumes an upstream PipelinedShuffleDependency. UCX-style
+    // push shuffles need every reader partition to stay resident, so the task scheduler can cap
+    // readers differently from source-side pure producers.
+    val isPipelinedShuffleReader: Boolean = false,
+    // True if this stage writes a PipelinedShuffleDependency. A stage can be both producer and
+    // reader in a multi-hop pipelined chain.
+    val isPipelinedShuffleProducer: Boolean = false,
+    // Pipelined shuffle ids produced by this stage. Used by UCX-style push shuffles to gate a
+    // producer only on the reader task sets that directly consume its output.
+    val pipelinedProducerShuffleIds: Seq[Int] = Seq.empty,
+    // Pipelined shuffle ids consumed by this stage.
+    val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty) {
+
+  def this(
+      tasks: Array[Task[_]],
+      stageId: Int,
+      stageAttemptId: Int,
+      priority: Int,
+      properties: Properties,
+      resourceProfileId: Int,
+      shuffleId: Option[Int],
+      isPipelined: Boolean) = {
+    this(tasks, stageId, stageAttemptId, priority, properties, resourceProfileId, shuffleId,
+      isPipelined, 0)
+  }
+
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id
