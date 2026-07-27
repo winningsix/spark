@@ -64,10 +64,6 @@ private[spark] case class ReaderResidencyWithElasticProducers(
 
 /**
  * Spark-internal scheduling requirements resolved before a pipelined group is published.
- *
- * The shuffle-manager extension point remains the existing reader-residency capability in this
- * phase. A later, separately validated change may expose this closed requirements type through a
- * narrow declarative provider.
  */
 private[spark] case class PipelinedGroupSchedulingRequirements(
     residencyPolicy: PipelinedGroupResidencyPolicy = FullGroupResidency,
@@ -77,26 +73,29 @@ private[spark] case class PipelinedGroupSchedulingRequirements(
 }
 
 /**
- * Optional scheduling-requirement and runtime-lifecycle hook for incremental shuffle managers.
+ * Optional, declarative scheduling hook for incremental shuffle managers.
+ *
+ * A provider selects only from the residency policies defined and implemented by Spark. The
+ * returned requirements are resolved once per group attempt and remain immutable until that
+ * attempt completes or aborts. Providers must not perform admission, choose tasks, or refill
+ * producer stages; those decisions remain entirely in Spark's schedulers.
+ */
+private[spark] trait PipelinedShuffleSchedulingProvider {
+
+  def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements =
+    PipelinedGroupSchedulingRequirements()
+}
+
+/**
+ * Optional runtime-lifecycle listener for incremental shuffle managers.
  *
  * DAGScheduler owns the Spark stage graph and is the authority for group registration, admission,
- * completion, and abort. An incremental shuffle manager reports data-plane requirements and treats
- * lifecycle callbacks as commands or notifications. It must not maintain an independent scheduler
- * outcome that can override Spark's group outcome.
+ * completion, and abort. An incremental shuffle manager treats these callbacks as commands or
+ * notifications. It must not maintain an independent scheduler outcome that can override Spark's
+ * group outcome.
  */
 private[spark] trait PipelinedShuffleControlPlane {
-
-  /**
-   * Whether every reduce partition reader for each pipelined shuffle in this group must be resident
-   * before the group can make progress safely.
-   *
-   * Pull-oriented implementations can leave this at false. Push-oriented implementations with
-   * bounded native output queues should return true so the scheduler rejects configurations that
-   * cap a reader stage below its partition count; otherwise producers can block forever on output
-   * partitions whose reader tasks were never launched.
-   */
-  def requiresAllPipelinedShuffleReadersResident(group: PipelinedShuffleGroupMetadata): Boolean =
-    false
 
   def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {}
 
@@ -105,10 +104,4 @@ private[spark] trait PipelinedShuffleControlPlane {
   def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {}
 
   def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {}
-}
-
-private[spark] trait RequiresAllPipelinedShuffleReadersResident
-  extends PipelinedShuffleControlPlane {
-  final override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = true
 }

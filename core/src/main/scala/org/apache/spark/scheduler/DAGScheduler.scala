@@ -51,8 +51,8 @@ import org.apache.spark.resource.ResourceProfile.{DEFAULT_RESOURCE_PROFILE_ID, E
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.shuffle.{FullGroupResidency, PipelinedGroupSchedulingRequirements,
-  PipelinedShuffleControlPlane, PipelinedShuffleGroupMetadata, PipelinedShuffleStageMetadata,
-  ReaderResidencyWithElasticProducers}
+  PipelinedShuffleControlPlane, PipelinedShuffleGroupMetadata, PipelinedShuffleSchedulingProvider,
+  PipelinedShuffleStageMetadata, ReaderResidencyWithElasticProducers}
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
 import org.apache.spark.util._
@@ -195,6 +195,8 @@ private[spark] class DAGScheduler(
   private[scheduler] val pipelinedShuffleGroupAttemptIds = new HashMap[String, String]
   private[scheduler] val registeredPipelinedShuffleGroups = new HashSet[String]
   private[scheduler] val admittedPipelinedShuffleGroups = new HashSet[String]
+  private[scheduler] val pipelinedSchedulingRequirementsByGroupAttempt =
+    new HashMap[String, PipelinedGroupSchedulingRequirements]
 
   private var pipelinedSubmitScopeDepth = 0
   private[scheduler] val pendingPipelinedTaskSetsByGroup =
@@ -1708,25 +1710,18 @@ private[spark] class DAGScheduler(
   private def pipelinedShuffleSchedulingRequirements(
       group: Set[Stage]): PipelinedGroupSchedulingRequirements = {
     val metadata = pipelinedShuffleGroupMetadata(group)
-    val policy =
-      if (pipelinedShuffleControlPlane.exists(
-          _.requiresAllPipelinedShuffleReadersResident(metadata))) {
-        ReaderResidencyWithElasticProducers(
-          minProducerTasksPerStage =
-            sc.conf.get(
-              config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
-          maxProducerTasksPerStage =
-            sc.conf
-              .get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
-              .filter(_ > 0))
-      } else {
-        FullGroupResidency
-      }
-    PipelinedGroupSchedulingRequirements(
-      residencyPolicy = policy,
-      maxRunningTasksPerExecutor =
-        Option(sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR))
-          .filter(_ > 0))
+    pipelinedSchedulingRequirementsByGroupAttempt.getOrElseUpdate(
+      metadata.groupAttemptId, {
+        val configuredPerExecutorLimit =
+          Option(sc.conf.get(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR))
+            .filter(_ > 0)
+        val declaredRequirements = pipelinedShuffleSchedulingProvider
+          .map(_.schedulingRequirements(metadata))
+          .getOrElse(PipelinedGroupSchedulingRequirements())
+        declaredRequirements.copy(
+          maxRunningTasksPerExecutor =
+            declaredRequirements.maxRunningTasksPerExecutor.orElse(configuredPerExecutorLimit))
+      })
   }
 
   private case class PipelinedReaderResidencyDemand(readerSlots: Int, producerSlots: Int) {
@@ -1939,6 +1934,13 @@ private[spark] class DAGScheduler(
     }
   }
 
+  private def pipelinedShuffleSchedulingProvider: Option[PipelinedShuffleSchedulingProvider] = {
+    env.shuffleManager match {
+      case provider: PipelinedShuffleSchedulingProvider => Some(provider)
+      case _ => None
+    }
+  }
+
   private def pipelinedShuffleGroupId(group: Set[Stage]): String = {
     group.toSeq.map(_.id).sorted.mkString("stages-", "-", "")
   }
@@ -2056,8 +2058,9 @@ private[spark] class DAGScheduler(
   }
 
   private def removePipelinedShuffleGroup(groupId: String): Unit = {
-    pipelinedShuffleGroupAttemptIds.get(groupId).foreach {
-      pendingPipelinedTaskSetsByGroup -= _
+    pipelinedShuffleGroupAttemptIds.get(groupId).foreach { groupAttemptId =>
+      pendingPipelinedTaskSetsByGroup -= groupAttemptId
+      pipelinedSchedulingRequirementsByGroupAttempt -= groupAttemptId
     }
     val stageIds = pipelinedShuffleGroupStageIds.remove(groupId).getOrElse(Set.empty[Int])
     stageIds.foreach { stageId =>
