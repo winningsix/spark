@@ -21,6 +21,7 @@ import java.util.Properties
 
 import org.apache.spark.internal.LogKeys.{STAGE_ATTEMPT_ID, STAGE_ID}
 import org.apache.spark.internal.MessageWithContext
+import org.apache.spark.shuffle.{FullGroupResidency, PipelinedGroupSchedulingRequirements}
 
 /**
  * A set of tasks submitted together to the low-level TaskScheduler, usually representing
@@ -47,9 +48,9 @@ private[spark] class TaskSet(
     // DAGScheduler allocates a new generation after group teardown, so stale TaskSets cannot share
     // admission state with the current attempt.
     val pipelinedGroupId: Option[String] = None,
-    // True when the selected incremental shuffle manager needs every pipelined shuffle reader
-    // partition in the group to be launched before pure producer stages can freely consume slots.
-    val requiresAllPipelinedShuffleReadersResident: Boolean = false,
+    // Static scheduling requirements declared by the selected incremental shuffle manager.
+    val pipelinedGroupSchedulingRequirements: PipelinedGroupSchedulingRequirements =
+      PipelinedGroupSchedulingRequirements(FullGroupResidency),
     // True if this pipelined stage consumes an upstream PipelinedShuffleDependency. UCX-style
     // push shuffles need every reader partition to stay resident, so the task scheduler can cap
     // readers differently from source-side pure producers.

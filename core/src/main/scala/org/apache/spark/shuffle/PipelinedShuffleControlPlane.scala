@@ -36,6 +36,47 @@ private[spark] case class PipelinedShuffleGroupMetadata(
     stages: Seq[PipelinedShuffleStageMetadata])
 
 /**
+ * Minimum task residency required before a pipelined shuffle group can make progress safely.
+ */
+private[spark] sealed trait PipelinedGroupResidencyPolicy
+
+/**
+ * Conservatively require every task in every member stage to fit concurrently.
+ *
+ * This is the default for incremental shuffle managers that do not declare a more specific
+ * requirement, and for long-running CPU real-time tasks that cannot rotate source partitions.
+ */
+private[spark] case object FullGroupResidency extends PipelinedGroupResidencyPolicy
+
+/**
+ * Keep all pipelined readers resident while allowing finite pure-producer tasks to rotate.
+ *
+ * The producer limits are data-plane policy, interpreted and enforced only by Spark.
+ */
+private[spark] case class ReaderResidencyWithElasticProducers(
+    minProducerTasksPerStage: Int = 1,
+    maxProducerTasksPerStage: Option[Int] = None)
+  extends PipelinedGroupResidencyPolicy {
+  require(minProducerTasksPerStage >= 1, "minimum producer residency must be positive")
+  require(maxProducerTasksPerStage.forall(_ >= minProducerTasksPerStage),
+    "maximum producer residency must not be lower than its minimum")
+}
+
+/**
+ * Spark-internal scheduling requirements resolved before a pipelined group is published.
+ *
+ * The shuffle-manager extension point remains the existing reader-residency capability in this
+ * phase. A later, separately validated change may expose this closed requirements type through a
+ * narrow declarative provider.
+ */
+private[spark] case class PipelinedGroupSchedulingRequirements(
+    residencyPolicy: PipelinedGroupResidencyPolicy = FullGroupResidency,
+    maxRunningTasksPerExecutor: Option[Int] = None) {
+  require(maxRunningTasksPerExecutor.forall(_ >= 1),
+    "per-executor task limit must be positive when set")
+}
+
+/**
  * Optional scheduling-requirement and runtime-lifecycle hook for incremental shuffle managers.
  *
  * DAGScheduler owns the Spark stage graph and is the authority for group registration, admission,
