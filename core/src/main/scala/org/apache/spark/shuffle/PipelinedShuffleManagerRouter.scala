@@ -59,6 +59,7 @@ private[spark] class IncrementalShuffleHandle(val delegate: ShuffleHandle)
  */
 private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Boolean)
   extends ShuffleManager
+  with PipelinedShuffleSchedulingProvider
   with PipelinedShuffleControlPlane
   with Logging {
 
@@ -88,6 +89,12 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
   private def incrementalControlPlane: Option[PipelinedShuffleControlPlane] =
     incrementalManager match {
       case controlPlane: PipelinedShuffleControlPlane => Some(controlPlane)
+      case _ => None
+    }
+
+  private def incrementalSchedulingProvider: Option[PipelinedShuffleSchedulingProvider] =
+    incrementalManager match {
+      case provider: PipelinedShuffleSchedulingProvider => Some(provider)
       case _ => None
     }
 
@@ -168,9 +175,11 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
     incrementalControlPlane.foreach(_.registerPipelinedShuffleGroup(group))
   }
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = {
-    incrementalControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(group))
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    incrementalSchedulingProvider
+      .map(_.schedulingRequirements(group))
+      .getOrElse(PipelinedGroupSchedulingRequirements())
   }
 
   override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {

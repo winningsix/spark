@@ -22,9 +22,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 import org.apache.spark.{ShuffleDependency, SparkConf, SparkContext, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
-import org.apache.spark.shuffle.{RequiresAllPipelinedShuffleReadersResident, ShuffleBlockResolver,
-  ShuffleHandle, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter,
-  ShuffleWriteMetricsReporter, ShuffleWriter}
+import org.apache.spark.shuffle.{ShuffleBlockResolver, ShuffleHandle, ShuffleManager, ShuffleReader,
+  ShuffleReadMetricsReporter, ShuffleWriteMetricsReporter, ShuffleWriter}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.shuffle.streaming.MultiShuffleManager.isStreamingShuffleEnabled
 
@@ -52,7 +51,6 @@ manager if you want to run batch and real time queries at the same time.
  */
 class MultiShuffleManager(conf: SparkConf)
   extends ShuffleManager
-  with RequiresAllPipelinedShuffleReadersResident
   with Logging {
   // To make sure the type of shuffle manager used for a shuffle is the same during its lifetime
   private val shuffleIdToManager = new ConcurrentHashMap[Int, ShuffleManager]()

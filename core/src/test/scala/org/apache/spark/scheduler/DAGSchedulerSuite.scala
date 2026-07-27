@@ -49,7 +49,8 @@ import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.shuffle.{FetchFailedException, MetadataFetchFailedException,
   PipelinedGroupSchedulingRequirements, PipelinedShuffleControlPlane,
-  PipelinedShuffleGroupMetadata}
+  PipelinedShuffleGroupMetadata, PipelinedShuffleSchedulingProvider,
+  ReaderResidencyWithElasticProducers}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId, BlockManagerMaster}
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, CallSite, Clock, LongAccumulator, SystemClock, ThreadUtils, Utils}
@@ -183,12 +184,26 @@ class DummyScheduledFuture(
 
 class DAGSchedulerSuiteDummyException extends Exception
 
+object ReaderResidencyRequiredShuffleManager {
+  val schedulingRequirementCalls = new AtomicInteger()
+}
+
 class ReaderResidencyRequiredShuffleManager(conf: SparkConf, isDriver: Boolean)
   extends SortShuffleManager(conf)
+  with PipelinedShuffleSchedulingProvider
   with PipelinedShuffleControlPlane {
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = true
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.incrementAndGet()
+    PipelinedGroupSchedulingRequirements(
+      residencyPolicy = ReaderResidencyWithElasticProducers(
+        minProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
+        maxProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
+            .filter(_ > 0)))
+  }
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {}
 
@@ -6177,6 +6192,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(scheduler.pipelinedShuffleGroupAttemptIds.isEmpty)
     assert(scheduler.registeredPipelinedShuffleGroups.isEmpty)
     assert(scheduler.admittedPipelinedShuffleGroups.isEmpty)
+    assert(scheduler.pipelinedSchedulingRequirementsByGroupAttempt.isEmpty)
     assert(scheduler.pendingPipelinedTaskSetsByGroup.isEmpty)
   }
 
@@ -6947,6 +6963,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val rightProducerRdd = new MyRDD(sc, 60, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 10
+    val providerCallsBefore =
+      ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.get()
     try {
       val leftDep = new PipelinedShuffleDependency(leftProducerRdd, new HashPartitioner(4))
       val rightDep = new PipelinedShuffleDependency(rightProducerRdd, new HashPartitioner(4))
@@ -6960,6 +6978,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assert(listener.failure === null,
         "streaming admission should charge each transitive reader-producer frontier once")
       assert(taskSets.size === 4, "the full pipelined group should be co-scheduled")
+      assert(
+        ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.get() ===
+          providerCallsBefore + 1,
+        "scheduling requirements must be resolved once and frozen for one group attempt")
 
       val leftTaskSet =
         taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq leftProducerRdd).get

@@ -78,7 +78,6 @@ object StreamingShuffleManager extends Logging {
 
 private[spark] class StreamingShuffleManager
   extends ShuffleManager
-  with RequiresAllPipelinedShuffleReadersResident
   with Logging {
 
   logInfo(log"Using StreamingShuffleManager")

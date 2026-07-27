@@ -26,7 +26,7 @@ import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.SHUFFLE_MANAGER
 import org.apache.spark.network.shuffle.streaming.{DataMessage, TerminationAckMessage, TerminationControlMessage}
-import org.apache.spark.shuffle.{PipelinedShuffleGroupMetadata, PipelinedShuffleStageMetadata}
+import org.apache.spark.shuffle.PipelinedShuffleSchedulingProvider
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 
@@ -37,15 +37,6 @@ class StreamingShuffleManagerSuite
   with MockitoSugar {
 
   private val SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
-
-  private def pipelinedGroup: PipelinedShuffleGroupMetadata = {
-    PipelinedShuffleGroupMetadata(
-      groupId = "stages-1-2",
-      groupAttemptId = "stages-1.0-2.0",
-      stages = Seq(
-        PipelinedShuffleStageMetadata(1, 0, 2, Some(9)),
-        PipelinedShuffleStageMetadata(2, 0, 2, None)))
-  }
 
   // ---- getWriterId ----
 
@@ -105,12 +96,11 @@ class StreamingShuffleManagerSuite
     }
   }
 
-  test("streaming shuffle managers require resident pipelined readers") {
-    val group = pipelinedGroup
-    assert(new StreamingShuffleManager().requiresAllPipelinedShuffleReadersResident(group))
+  test("streaming shuffle managers keep conservative full-group scheduling requirements") {
+    assert(!new StreamingShuffleManager().isInstanceOf[PipelinedShuffleSchedulingProvider])
     val multiManager = new MultiShuffleManager(new SparkConf(loadDefaults = false))
     try {
-      assert(multiManager.requiresAllPipelinedShuffleReadersResident(group))
+      assert(!multiManager.isInstanceOf[PipelinedShuffleSchedulingProvider])
     } finally {
       multiManager.stop()
     }
