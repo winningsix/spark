@@ -26,6 +26,7 @@ import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.SHUFFLE_MANAGER
 import org.apache.spark.network.shuffle.streaming.{DataMessage, TerminationAckMessage, TerminationControlMessage}
+import org.apache.spark.shuffle.PipelinedShuffleSchedulingProvider
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 
@@ -92,6 +93,16 @@ class StreamingShuffleManagerSuite
       val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(2))
       val handle = new StreamingShuffleManager().registerShuffle(0, dep)
       assert(handle.isInstanceOf[StreamingShuffleHandle[_, _, _]])
+    }
+  }
+
+  test("streaming shuffle managers keep conservative full-group scheduling requirements") {
+    assert(!new StreamingShuffleManager().isInstanceOf[PipelinedShuffleSchedulingProvider])
+    val multiManager = new MultiShuffleManager(new SparkConf(loadDefaults = false))
+    try {
+      assert(!multiManager.isInstanceOf[PipelinedShuffleSchedulingProvider])
+    } finally {
+      multiManager.stop()
     }
   }
 

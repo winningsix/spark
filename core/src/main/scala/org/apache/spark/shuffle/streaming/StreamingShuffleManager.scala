@@ -76,7 +76,9 @@ object StreamingShuffleManager extends Logging {
   }
 }
 
-private[spark] class StreamingShuffleManager extends ShuffleManager with Logging {
+private[spark] class StreamingShuffleManager
+  extends ShuffleManager
+  with Logging {
 
   logInfo(log"Using StreamingShuffleManager")
 

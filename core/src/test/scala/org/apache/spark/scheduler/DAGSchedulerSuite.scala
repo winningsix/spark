@@ -48,7 +48,9 @@ import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.shuffle.{FetchFailedException, MetadataFetchFailedException,
-  PipelinedShuffleControlPlane, PipelinedShuffleGroupMetadata}
+  PipelinedGroupSchedulingRequirements, PipelinedShuffleControlPlane,
+  PipelinedShuffleGroupMetadata, PipelinedShuffleSchedulingProvider,
+  ReaderResidencyWithElasticProducers}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId, BlockManagerMaster}
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, CallSite, Clock, LongAccumulator, SystemClock, ThreadUtils, Utils}
@@ -182,12 +184,26 @@ class DummyScheduledFuture(
 
 class DAGSchedulerSuiteDummyException extends Exception
 
+object ReaderResidencyRequiredShuffleManager {
+  val schedulingRequirementCalls = new AtomicInteger()
+}
+
 class ReaderResidencyRequiredShuffleManager(conf: SparkConf, isDriver: Boolean)
   extends SortShuffleManager(conf)
+  with PipelinedShuffleSchedulingProvider
   with PipelinedShuffleControlPlane {
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = true
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.incrementAndGet()
+    PipelinedGroupSchedulingRequirements(
+      residencyPolicy = ReaderResidencyWithElasticProducers(
+        minProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
+        maxProducerTasksPerStage =
+          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
+            .filter(_ > 0)))
+  }
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {}
 
@@ -208,7 +224,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   private var firstInit: Boolean = _
   /** Set of TaskSets the DAGScheduler has requested executed. */
   val taskSets = scala.collection.mutable.Buffer[TaskSet]()
-  val taskSetsSubmittedWithoutRevive = scala.collection.mutable.Buffer[TaskSet]()
+  val submittedPipelinedTaskSetGroups = scala.collection.mutable.Buffer[Seq[TaskSet]]()
   var reviveOffersCount = 0
 
   def taskSet(stageId: Int, attemptId: Int): TaskSet = {
@@ -244,11 +260,12 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     override def submitTasks(taskSet: TaskSet): Unit = {
       recordSubmittedTaskSet(taskSet)
     }
-    override def submitTasksWithoutRevive(taskSet: TaskSet): Unit = {
-      taskSetsSubmittedWithoutRevive += taskSet
-      recordSubmittedTaskSet(taskSet)
-    }
-    override def reviveOffers(): Unit = {
+    override def submitPipelinedGroup(
+        taskSets: Seq[TaskSet],
+        requirements: PipelinedGroupSchedulingRequirements): Unit = {
+      assert(taskSets.forall(_.pipelinedGroupSchedulingRequirements === requirements))
+      submittedPipelinedTaskSetGroups += taskSets
+      taskSets.foreach(recordSubmittedTaskSet)
       reviveOffersCount += 1
     }
     override def killTaskAttempt(
@@ -485,7 +502,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     failure = null
     sc.addSparkListener(sparkListener)
     taskSets.clear()
-    taskSetsSubmittedWithoutRevive.clear()
+    submittedPipelinedTaskSetGroups.clear()
     reviveOffersCount = 0
     tasksMarkedAsCompleted.clear()
     cancelledStages.clear()
@@ -6172,8 +6189,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(scheduler.pipelinedConsumerDeferrals.isEmpty)
     assert(scheduler.pipelinedShuffleGroupStageIds.isEmpty)
     assert(scheduler.stageIdToPipelinedShuffleGroupId.isEmpty)
+    assert(scheduler.pipelinedShuffleGroupAttemptIds.isEmpty)
     assert(scheduler.registeredPipelinedShuffleGroups.isEmpty)
     assert(scheduler.admittedPipelinedShuffleGroups.isEmpty)
+    assert(scheduler.pipelinedSchedulingRequirementsByGroupAttempt.isEmpty)
+    assert(scheduler.pendingPipelinedTaskSetsByGroup.isEmpty)
   }
 
   // Nothing in this test should break if the task info's fields are null, but
@@ -6268,8 +6288,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       new MyRDD(sc, 2, List(pipelinedDep, regularDep), tracker = mapOutputTracker)
     submit(consumerRdd, Array(0, 1))
 
-    // Both producers are submitted, but the consumer waits (it has a regular missing parent).
-    assert(taskSets.size === 2, s"expected both producers submitted, got ${taskSets.size}")
+    // The regular producer is submitted immediately. The pipelined producer remains buffered with
+    // its group until the consumer becomes runnable, so TaskScheduler cannot see a partial group.
+    assert(taskSets.size === 1, s"expected only the regular producer submitted, got ${taskSets.size}")
+    assert(scheduler.stageIdToStage(taskSets.head.stageId).rdd eq regularProducerRdd)
+    assert(submittedPipelinedTaskSetGroups.isEmpty)
     assert(scheduler.waitingStages.exists(_.rdd eq consumerRdd),
       "consumer should be waiting on its regular parent")
 
@@ -6280,6 +6303,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }.get.stageId
     completeShuffleMapStageSuccessfully(regularStageId, 0, 2)
     assert(taskSets.size === 3, "consumer should be co-scheduled once the regular parent finishes")
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.size === 2)
 
     // Finish the pipelined producer and the consumer.
     val pipelinedStageId = taskSets.find { ts =>
@@ -6378,8 +6403,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: round-robin mode coalesces task submission revive for a group") {
-    sc.conf.set(config.SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED, true)
+  test("pipelined shuffle: publishes a complete group atomically") {
 
     val rddA = new MyRDD(sc, 2, Nil)
     val psdA = new PipelinedShuffleDependency(rddA, new HashPartitioner(2))
@@ -6390,7 +6414,9 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     submit(consumerRdd, Array(0, 1))
 
     assert(taskSets.size === 3)
-    assert(taskSetsSubmittedWithoutRevive.map(_.stageId).toSet === taskSets.map(_.stageId).toSet)
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.map(_.stageId).toSet ===
+      taskSets.map(_.stageId).toSet)
     assert(reviveOffersCount === 1)
   }
 
@@ -6419,6 +6445,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     completeShuffleMapStageSuccessfully(idR1, 0, 2)
     assert(scheduler.runningStages.exists(_.rdd eq rddP1), "P1 should be running")
     assert(!scheduler.runningStages.exists(_.rdd eq rddP2), "P2 should not be running yet")
+    assert(submittedPipelinedTaskSetGroups.isEmpty,
+      "a partial group must not be visible to TaskScheduler")
     assert(scheduler.waitingStages.exists(_.rdd eq rddC),
       "C must re-park while its second pipelined parent P2 is not yet running")
 
@@ -6426,6 +6454,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val idR2 = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rddR2).get.stageId
     completeShuffleMapStageSuccessfully(idR2, 0, 2)
     assert(scheduler.runningStages.exists(_.rdd eq rddC), "C should now be co-scheduled")
+    assert(submittedPipelinedTaskSetGroups.size === 1)
+    assert(submittedPipelinedTaskSetGroups.head.size === 3)
 
     val idP1 = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rddP1).get.stageId
     completeShuffleMapStageSuccessfully(idP1, 0, 2)
@@ -6564,6 +6594,13 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
     submit(consumerRdd, Array(0, 1))
     assert(taskSets.size === 2)
+    val groupAttemptIds = taskSets.flatMap(_.pipelinedGroupId).distinct
+    val expectedGroupAttemptId = taskSets
+      .sortBy(_.stageId)
+      .map(taskSet => s"${taskSet.stageId}.${taskSet.stageAttemptId}")
+      .mkString("stages-", "-", "")
+    assert(groupAttemptIds.size === 1)
+    assert(groupAttemptIds.head === expectedGroupAttemptId)
     val producerStageId = taskSets.head.stageId
     val consumerTaskSet = taskSets(1)
 
@@ -6887,7 +6924,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       "does not fit") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
 
     val leftProducerRdd = new MyRDD(sc, 60, Nil)
     val rightProducerRdd = new MyRDD(sc, 60, Nil)
@@ -6919,15 +6955,87 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
+  test("pipelined shuffle: full-group admission requires all 124 tasks in CPU reference DAG") {
+    val leftProducerRdd = new MyRDD(sc, 60, Nil)
+    val rightProducerRdd = new MyRDD(sc, 60, Nil)
+    val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
+    myScheduler.maxConcurrentTasksForTest = 6
+    try {
+      val leftDep = new PipelinedShuffleDependency(leftProducerRdd, new HashPartitioner(4))
+      val rightDep = new PipelinedShuffleDependency(rightProducerRdd, new HashPartitioner(4))
+      val readerRdd =
+        new MyRDD(sc, 4, List(leftDep, rightDep), tracker = mapOutputTracker)
+      val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+      val failListener = new JobListener {
+        override def taskSucceeded(index: Int, result: Any): Unit = {}
+        override def jobFailed(exception: Exception): Unit = failure.set(exception)
+      }
+
+      submit(readerRdd, Array(0, 1, 2, 3), listener = failListener)
+
+      assert(failure.get() != null,
+        "full-group residency must reject a 124-task group on a 6-slot cluster")
+      assert(failure.get().getMessage.contains("needs 124 concurrent task slots"))
+      assert(failure.get().getMessage.contains("only 6 are currently free"))
+      assertDataStructuresEmpty()
+    } finally {
+      myScheduler.maxConcurrentTasksForTest = 1000
+    }
+  }
+
+  test("pipelined shuffle: bounded CPU reference admits the 124-task DAG with 6 slots") {
+    conf.set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
+
+    val leftProducerRdd = new MyRDD(sc, 60, Nil)
+    val rightProducerRdd = new MyRDD(sc, 60, Nil)
+    val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
+    myScheduler.maxConcurrentTasksForTest = 6
+    try {
+      val leftDep = new PipelinedShuffleDependency(leftProducerRdd, new HashPartitioner(4))
+      val rightDep = new PipelinedShuffleDependency(rightProducerRdd, new HashPartitioner(4))
+      val readerRdd =
+        new MyRDD(sc, 4, List(leftDep, rightDep), tracker = mapOutputTracker)
+      val listener = new SimpleListener
+
+      submit(readerRdd, Array(0, 1, 2, 3), listener = listener)
+
+      assert(listener.failure === null,
+        "four resident readers plus one task from each producer fit exactly in six slots")
+      assert(taskSets.size === 3,
+        "both finite producer stages and the resident reader stage must be co-scheduled")
+
+      val leftTaskSet =
+        taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq leftProducerRdd).get
+      val rightTaskSet =
+        taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rightProducerRdd).get
+      val readerTaskSet =
+        taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq readerRdd).get
+
+      completeShuffleMapStageSuccessfully(leftTaskSet.stageId, 0, 4)
+      completeShuffleMapStageSuccessfully(rightTaskSet.stageId, 0, 4)
+      complete(readerTaskSet, Seq(
+        (Success, 40),
+        (Success, 41),
+        (Success, 42),
+        (Success, 43)))
+
+      assert(listener.results === Map(0 -> 40, 1 -> 41, 2 -> 42, 3 -> 43))
+      assertDataStructuresEmpty()
+    } finally {
+      myScheduler.maxConcurrentTasksForTest = 1000
+    }
+  }
+
   test("pipelined shuffle: reader-residency slot check admits transitive reader frontier") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
 
     val leftProducerRdd = new MyRDD(sc, 60, Nil)
     val rightProducerRdd = new MyRDD(sc, 60, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 10
+    val providerCallsBefore =
+      ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.get()
     try {
       val leftDep = new PipelinedShuffleDependency(leftProducerRdd, new HashPartitioner(4))
       val rightDep = new PipelinedShuffleDependency(rightProducerRdd, new HashPartitioner(4))
@@ -6941,6 +7049,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assert(listener.failure === null,
         "streaming admission should charge each transitive reader-producer frontier once")
       assert(taskSets.size === 4, "the full pipelined group should be co-scheduled")
+      assert(
+        ReaderResidencyRequiredShuffleManager.schedulingRequirementCalls.get() ===
+          providerCallsBefore + 1,
+        "scheduling requirements must be resolved once and frozen for one group attempt")
 
       val leftTaskSet =
         taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq leftProducerRdd).get
@@ -6967,35 +7079,9 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
-  test("pipelined shuffle: reader-residency manager rejects reader stage capped below partitions") {
-    conf
-      .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
-      .set(config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key, "1")
-      .set(config.SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE.key, "0")
-
-    val producerRdd = new MyRDD(sc, 2, Nil)
-    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
-    val failListener = new JobListener {
-      override def taskSucceeded(index: Int, result: Any): Unit = {}
-      override def jobFailed(exception: Exception): Unit = failure.set(exception)
-    }
-
-    submit(consumerRdd, Array(0, 1), listener = failListener)
-
-    assert(failure.get() != null,
-      "a push-based pipelined shuffle must reject a capped reader stage before it deadlocks")
-    assert(failure.get().getMessage.contains("requires all 2 reader task(s)"))
-    assert(failure.get().getMessage.contains(
-      config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE.key))
-  }
-
   test("pipelined shuffle: reader-residency manager rejects groups with no producer slot") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
 
     val producerRdd = new MyRDD(sc, 2, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
@@ -7023,7 +7109,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: reader-residency slot check rejects configured producer frontier") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "true")
       .set(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE.key, "60")
 
     val producerRdd = new MyRDD(sc, 60, Nil)
@@ -7052,7 +7137,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: reader-residency manager waits for transient slot pressure") {
     conf
       .set(config.SHUFFLE_MANAGER.key, classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED.key, "false")
 
     val blockerRdd = new MyRDD(sc, 1, Nil)
     val blockerListener = new JobListener {
@@ -7082,19 +7166,28 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
       assert(failure.get() === null,
         "temporary occupancy by other work should defer the group instead of aborting it")
-      assert(taskSets.size === 2, "only the blocker and pipelined producer should be running")
+      assert(taskSets.size === 1,
+        "only the blocker should be visible while the pipelined group is incomplete")
+      assert(submittedPipelinedTaskSetGroups.isEmpty)
       assert(scheduler.waitingStages.exists(_.rdd eq consumerRdd))
 
       blockerOccupiesSlots.set(false)
       complete(blockerTaskSet, Seq((Success, 0)))
 
       assert(taskSets.size === 3,
-        "the waiting pipelined consumer should be reconsidered when other work frees slots")
+        "the complete pipelined group should publish when other work frees slots")
+      assert(submittedPipelinedTaskSetGroups.size === 1)
+      assert(submittedPipelinedTaskSetGroups.head.size === 2)
       assert(!scheduler.waitingStages.exists(_.rdd eq consumerRdd))
 
-      val producerStageId = taskSets(1).stageId
+      val producerStageId = taskSets.find { taskSet =>
+        scheduler.stageIdToStage.get(taskSet.stageId).exists(_.rdd eq producerRdd)
+      }.get.stageId
       completeShuffleMapStageSuccessfully(producerStageId, 0, 2)
-      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+      val consumerTaskSet = taskSets.find { taskSet =>
+        scheduler.stageIdToStage.get(taskSet.stageId).exists(_.rdd eq consumerRdd)
+      }.get
+      complete(consumerTaskSet, Seq((Success, 42), (Success, 43)))
       assert(results === Map(0 -> 42, 1 -> 43))
       assertDataStructuresEmpty()
     } finally {

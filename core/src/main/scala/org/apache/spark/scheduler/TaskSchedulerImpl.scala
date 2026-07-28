@@ -40,7 +40,8 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.shuffle.PipelinedShuffleControlPlane
+import org.apache.spark.shuffle.{PipelinedGroupSchedulingRequirements,
+  ReaderResidencyWithElasticProducers}
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
@@ -207,26 +208,7 @@ private[spark] class TaskSchedulerImpl(
   private var schedulableBuilder: SchedulableBuilder = null
   // default scheduler is FIFO
   val schedulingMode: SchedulingMode = conf.get(SCHEDULER_MODE)
-  private val pipelinedGroupRoundRobinEnabled =
-    conf.get(SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED)
-  private val pipelinedGroupMaxRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE)
-  private val pipelinedGroupSimpleMaxRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE)
-  private val pipelinedGroupProducerMaxRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
-  private val pipelinedGroupProducerMinRunningTasksPerStage =
-    conf.get(SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE)
-  private val pipelinedGroupMaxRunningTasksPerExecutor =
-    conf.get(SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR)
   private val pipelinedTaskSetsByGroup = new HashMap[String, HashSet[TaskSetManager]]
-  private lazy val pipelinedShuffleControlPlane = Option(SparkEnv.get).flatMap { env =>
-    env.shuffleManager match {
-      case controlPlane: PipelinedShuffleControlPlane => Some(controlPlane)
-      case _ => None
-    }
-  }
-
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
 
   // This is a var so that we can reset it for testing purposes.
@@ -285,62 +267,75 @@ private[spark] class TaskSchedulerImpl(
   }
 
   override def submitTasks(taskSet: TaskSet): Unit = {
-    submitTasks(taskSet, reviveOffers = true)
-  }
-
-  override def submitTasksWithoutRevive(taskSet: TaskSet): Unit = {
-    submitTasks(taskSet, reviveOffers = false)
-  }
-
-  override def reviveOffers(): Unit = {
+    this.synchronized {
+      registerTaskSet(taskSet)
+    }
     backend.reviveOffers()
   }
 
-  private def submitTasks(taskSet: TaskSet, reviveOffers: Boolean): Unit = {
+  override def submitPipelinedGroup(
+      taskSets: Seq[TaskSet],
+      requirements: PipelinedGroupSchedulingRequirements): Unit = {
+    require(taskSets.nonEmpty, "cannot publish an empty pipelined group")
+    val groupIds = taskSets.flatMap(_.pipelinedGroupId).distinct
+    require(groupIds.size == 1 && taskSets.forall(_.pipelinedGroupId.isDefined),
+      s"pipelined TaskSets must have one group id, found ${groupIds.mkString("[", ",", "]")}")
+    require(taskSets.forall(_.isPipelined),
+      s"all TaskSets in pipelined group ${groupIds.head} must be marked pipelined")
+    require(taskSets.forall(_.pipelinedGroupSchedulingRequirements == requirements),
+      s"all TaskSets in pipelined group ${groupIds.head} must have identical requirements")
+    val expectedTaskSetCounts = taskSets.map(_.pipelinedGroupStageCount).distinct
+    require(expectedTaskSetCounts.size == 1 && expectedTaskSetCounts.head == taskSets.size,
+      s"pipelined group ${groupIds.head} expected " +
+        s"${expectedTaskSetCounts.mkString("[", ",", "]")} TaskSets but received ${taskSets.size}")
+
+    this.synchronized {
+      taskSets.sortBy(taskSet => (taskSet.priority, taskSet.stageId)).foreach(registerTaskSet)
+    }
+    backend.reviveOffers()
+  }
+
+  /** Register one TaskSet. The caller must hold this TaskSchedulerImpl's monitor. */
+  private def registerTaskSet(taskSet: TaskSet): Unit = {
     val tasks = taskSet.tasks
     logInfo(log"Adding task set " + taskSet.logId +
       log" with ${MDC(LogKeys.NUM_TASKS, tasks.length)} tasks resource profile " +
       log"${MDC(LogKeys.RESOURCE_PROFILE_ID, taskSet.resourceProfileId)}")
-    this.synchronized {
-      val manager = createTaskSetManager(taskSet, maxTaskFailures)
-      val stage = taskSet.stageId
-      val stageTaskSets =
-        taskSetsByStageIdAndAttempt.getOrElseUpdate(stage, new HashMap[Int, TaskSetManager])
+    val manager = createTaskSetManager(taskSet, maxTaskFailures)
+    val stage = taskSet.stageId
+    val stageTaskSets =
+      taskSetsByStageIdAndAttempt.getOrElseUpdate(stage, new HashMap[Int, TaskSetManager])
 
-      // Mark all the existing TaskSetManagers of this stage as zombie, as we are adding a new one.
-      // This is necessary to handle a corner case. Let's say a stage has 10 partitions and has 2
-      // TaskSetManagers: TSM1(zombie) and TSM2(active). TSM1 has a running task for partition 10
-      // and it completes. TSM2 finishes tasks for partition 1-9, and thinks he is still active
-      // because partition 10 is not completed yet. However, DAGScheduler gets task completion
-      // events for all the 10 partitions and thinks the stage is finished. If it's a shuffle stage
-      // and somehow it has missing map outputs, then DAGScheduler will resubmit it and create a
-      // TSM3 for it. As a stage can't have more than one active task set managers, we must mark
-      // TSM2 as zombie (it actually is).
-      stageTaskSets.foreach { case (_, ts) =>
-        ts.isZombie = true
-      }
-      stageTaskSets(taskSet.stageAttemptId) = manager
-      registerPipelinedTaskSet(manager)
-      schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
+    // Mark all the existing TaskSetManagers of this stage as zombie, as we are adding a new one.
+    // This is necessary to handle a corner case. Let's say a stage has 10 partitions and has 2
+    // TaskSetManagers: TSM1(zombie) and TSM2(active). TSM1 has a running task for partition 10
+    // and it completes. TSM2 finishes tasks for partition 1-9, and thinks he is still active
+    // because partition 10 is not completed yet. However, DAGScheduler gets task completion
+    // events for all the 10 partitions and thinks the stage is finished. If it's a shuffle stage
+    // and somehow it has missing map outputs, then DAGScheduler will resubmit it and create a
+    // TSM3 for it. As a stage can't have more than one active task set managers, we must mark
+    // TSM2 as zombie (it actually is).
+    stageTaskSets.foreach { case (_, ts) =>
+      ts.isZombie = true
+    }
+    stageTaskSets(taskSet.stageAttemptId) = manager
+    registerPipelinedTaskSet(manager)
+    schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
 
-      if (!isLocal && !hasReceivedTask) {
-        starvationTimer.scheduleAtFixedRate(new TimerTask() {
-          override def run(): Unit = {
-            if (!hasLaunchedTask) {
-              logWarning("Initial job has not accepted any resources; " +
-                "check your cluster UI to ensure that workers are registered " +
-                "and have sufficient resources")
-            } else {
-              this.cancel()
-            }
+    if (!isLocal && !hasReceivedTask) {
+      starvationTimer.scheduleAtFixedRate(new TimerTask() {
+        override def run(): Unit = {
+          if (!hasLaunchedTask) {
+            logWarning("Initial job has not accepted any resources; " +
+              "check your cluster UI to ensure that workers are registered " +
+              "and have sufficient resources")
+          } else {
+            this.cancel()
           }
-        }, STARVATION_TIMEOUT_MS, STARVATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-      }
-      hasReceivedTask = true
+        }
+      }, STARVATION_TIMEOUT_MS, STARVATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
     }
-    if (reviveOffers) {
-      backend.reviveOffers()
-    }
+    hasReceivedTask = true
   }
 
   // Label as private[scheduler] to allow tests to swap in different task set managers if necessary
@@ -572,11 +567,14 @@ private[spark] class TaskSchedulerImpl(
       execId: String,
       eligibleExecutors: Set[String]): Boolean = {
     val readerResidencyTarget = pipelinedReaderResidencyTargetPerExecutor(taskSet)
+    val maxRunningTasksPerExecutor =
+      taskSet.taskSet.pipelinedGroupSchedulingRequirements.maxRunningTasksPerExecutor
+        .getOrElse(0)
     val effectiveTaskSetCap =
-      if (pipelinedGroupMaxRunningTasksPerExecutor > 0 && readerResidencyTarget > 0) {
-        math.max(pipelinedGroupMaxRunningTasksPerExecutor, readerResidencyTarget)
+      if (maxRunningTasksPerExecutor > 0 && readerResidencyTarget > 0) {
+        math.max(maxRunningTasksPerExecutor, readerResidencyTarget)
       } else {
-        pipelinedGroupMaxRunningTasksPerExecutor
+        maxRunningTasksPerExecutor
       }
     val belowTaskSetCap =
       !usePipelinedGroupRoundRobin(taskSet) ||
@@ -590,7 +588,7 @@ private[spark] class TaskSchedulerImpl(
     val taskSetInfo = taskSet.taskSet
     val executorCount = executorIdToRunningTaskIds.size
     if (executorCount > 0 &&
-        taskSetInfo.requiresAllPipelinedShuffleReadersResident &&
+        pipelinedShuffleUsesElasticProducers(taskSetInfo) &&
         taskSetInfo.isPipelinedShuffleReader &&
         taskSetInfo.isPipelinedShuffleProducer) {
       ((taskSet.numTasks.toLong + executorCount - 1) / executorCount).toInt
@@ -610,7 +608,7 @@ private[spark] class TaskSchedulerImpl(
       eligibleExecutors: Set[String]): Boolean = {
     val taskSetInfo = taskSet.taskSet
     if (!usePipelinedGroupRoundRobin(taskSet) ||
-        !taskSetInfo.requiresAllPipelinedShuffleReadersResident ||
+        !pipelinedShuffleUsesElasticProducers(taskSetInfo) ||
         !taskSetInfo.isPipelinedShuffleProducer) {
       return true
     }
@@ -690,7 +688,23 @@ private[spark] class TaskSchedulerImpl(
   }
 
   private def usePipelinedGroupRoundRobin(taskSet: TaskSetManager): Boolean = {
-    pipelinedGroupRoundRobinEnabled && taskSet.taskSet.isPipelined && !taskSet.isBarrier
+    taskSet.taskSet.isPipelined && !taskSet.isBarrier
+  }
+
+  private def pipelinedShuffleUsesElasticProducers(taskSet: TaskSet): Boolean = {
+    pipelinedElasticProducerPolicy(taskSet).isDefined
+  }
+
+  private def pipelinedElasticProducerPolicy(
+      taskSet: TaskSet): Option[ReaderResidencyWithElasticProducers] = {
+    taskSet.pipelinedGroupSchedulingRequirements.residencyPolicy match {
+      case policy: ReaderResidencyWithElasticProducers => Some(policy)
+      case _ => None
+    }
+  }
+
+  private def pipelinedProducerMinRunningTasksPerStage(taskSet: TaskSet): Int = {
+    pipelinedElasticProducerPolicy(taskSet).map(_.minProducerTasksPerStage).getOrElse(1)
   }
 
   private def registerPipelinedTaskSet(taskSet: TaskSetManager): Unit = {
@@ -751,64 +765,23 @@ private[spark] class TaskSchedulerImpl(
     } else if (pipelinedProducerFairnessBlocksProducer(taskSet, activeTaskSets)) {
       TaskLaunchLimit(0, "producer-sibling-fairness")
     } else {
-      pipelinedControlPlaneProducerBlockCap(taskSet, activeTaskSets) match {
-        case Some(cap) =>
-          TaskLaunchLimit(0, s"control-plane-group-producer-cap($cap)")
-        case None =>
-          val runningTasksCap = pipelinedGroupMaxRunningTasksPerStageFor(taskSet.taskSet)
-          if (runningTasksCap <= 0) {
-            TaskLaunchLimit(1, "allowed-no-stage-cap")
-          } else {
-            val remaining = runningTasksCap - taskSet.runningTasks
-            if (remaining <= 0) {
-              TaskLaunchLimit(0, s"stage-running-cap($runningTasksCap)")
-            } else {
-              TaskLaunchLimit(math.min(1, remaining), s"allowed-stage-cap($runningTasksCap)")
-            }
-          }
+      val runningTasksCap = pipelinedProducerMaxRunningTasksFor(taskSet.taskSet)
+      if (runningTasksCap <= 0) {
+        TaskLaunchLimit(1, "allowed-no-stage-cap")
+      } else {
+        val remaining = runningTasksCap - taskSet.runningTasks
+        if (remaining <= 0) {
+          TaskLaunchLimit(0, s"stage-running-cap($runningTasksCap)")
+        } else {
+          TaskLaunchLimit(math.min(1, remaining), s"allowed-stage-cap($runningTasksCap)")
+        }
       }
     }
-  }
-
-  private def pipelinedControlPlaneProducerBlockCap(
-      taskSet: TaskSetManager,
-      activeTaskSets: Iterable[TaskSetManager]): Option[Int] = {
-    val taskSetInfo = taskSet.taskSet
-    if (!taskSetInfo.isPipelinedShuffleProducer || taskSetInfo.isPipelinedShuffleReader) {
-      return None
-    }
-
-    taskSetInfo.pipelinedGroupId.flatMap { groupId =>
-      maxConcurrentPipelinedShuffleProducers(groupId).flatMap { cap =>
-        val runningPureProducers = pipelinedGroupTaskSets(taskSet, activeTaskSets).iterator
-          .filter { candidate =>
-            val candidateInfo = candidate.taskSet
-            candidateInfo.isPipelinedShuffleProducer && !candidateInfo.isPipelinedShuffleReader
-          }
-          .map(_.runningTasks)
-          .sum
-        val needsLivenessSlot =
-          pipelinedTaskSetHasPendingWork(taskSet) &&
-            taskSet.runningTasks < pipelinedGroupProducerMinRunningTasksPerStage
-        Option.when(runningPureProducers >= cap && !needsLivenessSlot)(cap)
-      }
-    }
-  }
-
-  private[scheduler] def maxConcurrentPipelinedShuffleProducers(
-      groupId: String): Option[Int] = {
-    pipelinedShuffleControlPlane
-      .flatMap(_.maxConcurrentPipelinedShuffleProducers(groupId))
-      .map(math.max(0, _))
   }
 
   private def pipelinedActiveReaderResidencyGroupBlockReason(
       taskSet: TaskSetManager,
       activeTaskSets: Iterable[TaskSetManager]): Option[String] = {
-    if (!pipelinedGroupRoundRobinEnabled) {
-      return None
-    }
-
     pipelinedActiveReaderResidencyGroup(activeTaskSets).flatMap { case (activeGroupId, taskSets) =>
       if (taskSet.taskSet.pipelinedGroupId.contains(activeGroupId)) {
         None
@@ -840,7 +813,7 @@ private[spark] class TaskSchedulerImpl(
     pipelinedRegisteredAndActiveTaskSets(activeTaskSets).foreach { taskSet =>
       val taskSetInfo = taskSet.taskSet
       taskSetInfo.pipelinedGroupId.foreach { groupId =>
-        if (taskSetInfo.requiresAllPipelinedShuffleReadersResident &&
+        if (pipelinedShuffleUsesElasticProducers(taskSetInfo) &&
             (taskSetInfo.isPipelinedShuffleReader || taskSetInfo.isPipelinedShuffleProducer) &&
             pipelinedTaskSetHasActiveWork(taskSet)) {
           grouped.getOrElseUpdate(groupId, new ArrayBuffer[TaskSetManager]) += taskSet
@@ -863,7 +836,7 @@ private[spark] class TaskSchedulerImpl(
       taskSet: TaskSetManager,
       activeTaskSets: Iterable[TaskSetManager]): Boolean = {
     val taskSetInfo = taskSet.taskSet
-    if (!taskSetInfo.requiresAllPipelinedShuffleReadersResident) {
+    if (!pipelinedShuffleUsesElasticProducers(taskSetInfo)) {
       return false
     }
 
@@ -872,7 +845,7 @@ private[spark] class TaskSchedulerImpl(
       val pendingPureProducers = groupTaskSets.iterator.filter { producer =>
         val producerInfo = producer.taskSet
         !producer.isZombie &&
-          producerInfo.requiresAllPipelinedShuffleReadersResident &&
+          pipelinedShuffleUsesElasticProducers(producerInfo) &&
           producerInfo.isPipelinedShuffleProducer &&
           !producerInfo.isPipelinedShuffleReader &&
           pipelinedTaskSetHasPendingWork(producer)
@@ -892,7 +865,7 @@ private[spark] class TaskSchedulerImpl(
           }
         }.toSet
         !missingDirectReaders.contains(taskSet) && !producersMissingReaders.contains(taskSet)
-      } else if (pipelinedGroupProducerMinRunningTasksPerStage > 1) {
+      } else if (pipelinedProducerMinRunningTasksPerStage(taskSetInfo) > 1) {
         pipelinedPureProducerFrontierTargetTaskSet(groupTaskSets).exists(_ != taskSet)
       } else {
         val readyStarvedProducers = pendingPureProducers.filter { producer =>
@@ -918,7 +891,7 @@ private[spark] class TaskSchedulerImpl(
       taskSet: TaskSetManager,
       activeTaskSets: Iterable[TaskSetManager]): Boolean = {
     val taskSetInfo = taskSet.taskSet
-    if (!taskSetInfo.requiresAllPipelinedShuffleReadersResident ||
+    if (!pipelinedShuffleUsesElasticProducers(taskSetInfo) ||
         !taskSetInfo.isPipelinedShuffleProducer ||
         taskSetInfo.isPipelinedShuffleReader ||
         taskSet.runningTasks <= 0) {
@@ -927,14 +900,14 @@ private[spark] class TaskSchedulerImpl(
 
     taskSetInfo.pipelinedGroupId.exists { _ =>
       val groupTaskSets = pipelinedGroupTaskSets(taskSet, activeTaskSets)
-      if (pipelinedGroupProducerMinRunningTasksPerStage > 1 &&
+      if (pipelinedProducerMinRunningTasksPerStage(taskSetInfo) > 1 &&
           pipelinedPureProducerFrontierTargetTaskSet(groupTaskSets).contains(taskSet)) {
         false
       } else {
         val pendingPureProducers = groupTaskSets.iterator.filter { candidate =>
           val candidateInfo = candidate.taskSet
           !candidate.isZombie &&
-            candidateInfo.requiresAllPipelinedShuffleReadersResident &&
+            pipelinedShuffleUsesElasticProducers(candidateInfo) &&
             candidateInfo.isPipelinedShuffleProducer &&
             !candidateInfo.isPipelinedShuffleReader &&
             pipelinedTaskSetHasPendingWork(candidate)
@@ -953,7 +926,7 @@ private[spark] class TaskSchedulerImpl(
     val underTargetProducers = groupTaskSets.iterator.filter { producer =>
       val producerInfo = producer.taskSet
       !producer.isZombie &&
-        producerInfo.requiresAllPipelinedShuffleReadersResident &&
+        pipelinedShuffleUsesElasticProducers(producerInfo) &&
         producerInfo.isPipelinedShuffleProducer &&
         !producerInfo.isPipelinedShuffleReader &&
         pipelinedTaskSetHasPendingWork(producer) &&
@@ -983,10 +956,10 @@ private[spark] class TaskSchedulerImpl(
 
   private def pipelinedPureProducerFrontierTarget(taskSet: TaskSetManager): Int = {
     val taskSetInfo = taskSet.taskSet
-    if (taskSetInfo.requiresAllPipelinedShuffleReadersResident &&
+    if (pipelinedShuffleUsesElasticProducers(taskSetInfo) &&
         taskSetInfo.isPipelinedShuffleProducer &&
         !taskSetInfo.isPipelinedShuffleReader) {
-      math.min(taskSet.numTasks, pipelinedGroupProducerMinRunningTasksPerStage)
+      math.min(taskSet.numTasks, pipelinedProducerMinRunningTasksPerStage(taskSetInfo))
     } else {
       0
     }
@@ -1027,7 +1000,7 @@ private[spark] class TaskSchedulerImpl(
     val readers = pipelinedGroupTaskSets(taskSet, activeTaskSets).iterator.filter { candidate =>
       val candidateInfo = candidate.taskSet
       !candidate.isZombie &&
-        candidateInfo.requiresAllPipelinedShuffleReadersResident &&
+        pipelinedShuffleUsesElasticProducers(candidateInfo) &&
         candidateInfo.isPipelinedShuffleReader
     }.toSeq
     val producerShuffleIds = taskSetInfo.pipelinedProducerShuffleIds.toSet
@@ -1047,7 +1020,7 @@ private[spark] class TaskSchedulerImpl(
       s" group=${taskSetInfo.pipelinedGroupId.getOrElse("-")}" +
       s" reader=${taskSetInfo.isPipelinedShuffleReader}" +
       s" producer=${taskSetInfo.isPipelinedShuffleProducer}" +
-      s" requireReaders=${taskSetInfo.requiresAllPipelinedShuffleReadersResident}" +
+      s" residencyPolicy=${taskSetInfo.pipelinedGroupSchedulingRequirements.residencyPolicy}" +
       s" producerShuffleIds=${taskSetInfo.pipelinedProducerShuffleIds.mkString("[", ",", "]")}" +
       s" readerShuffleIds=${taskSetInfo.pipelinedReaderShuffleIds.mkString("[", ",", "]")}" +
       s" running=${taskSet.runningTasks}" +
@@ -1085,7 +1058,7 @@ private[spark] class TaskSchedulerImpl(
       taskSet: TaskSetManager,
       activeTaskSets: Iterable[TaskSetManager]): Boolean = {
     val taskSetInfo = taskSet.taskSet
-    if (!taskSetInfo.requiresAllPipelinedShuffleReadersResident ||
+    if (!pipelinedShuffleUsesElasticProducers(taskSetInfo) ||
         !taskSetInfo.isPipelinedShuffleProducer ||
         taskSetInfo.isPipelinedShuffleReader) {
       return false
@@ -1113,7 +1086,7 @@ private[spark] class TaskSchedulerImpl(
     groupTaskSets.filter { producer =>
       val producerInfo = producer.taskSet
       !producer.isZombie &&
-        producerInfo.requiresAllPipelinedShuffleReadersResident &&
+        pipelinedShuffleUsesElasticProducers(producerInfo) &&
         producerInfo.isPipelinedShuffleProducer &&
         !producerInfo.isPipelinedShuffleReader &&
         pipelinedTaskSetHasPendingWork(producer)
@@ -1127,32 +1100,23 @@ private[spark] class TaskSchedulerImpl(
     } else {
       pureProducers.iterator
         .map(producer => math.min(producer.numTasks,
-          pipelinedGroupProducerMinRunningTasksPerStage))
+          pipelinedProducerMinRunningTasksPerStage(producer.taskSet)))
         .max
     }
   }
 
-  private def pipelinedGroupMaxRunningTasksPerStageFor(taskSet: TaskSet): Int = {
-    val baseCap = if (taskSet.pipelinedGroupStageCount > 0 &&
-        taskSet.pipelinedGroupStageCount <= 2 &&
-        pipelinedGroupSimpleMaxRunningTasksPerStage > 0) {
-      pipelinedGroupSimpleMaxRunningTasksPerStage
-    } else {
-      pipelinedGroupMaxRunningTasksPerStage
-    }
+  private def pipelinedProducerMaxRunningTasksFor(taskSet: TaskSet): Int = {
     if (taskSet.isPipelinedShuffleProducer && !taskSet.isPipelinedShuffleReader) {
-      pipelinedGroupProducerMaxRunningTasksPerStage.getOrElse(baseCap)
+      pipelinedElasticProducerPolicy(taskSet)
+        .flatMap(_.maxProducerTasksPerStage)
+        .getOrElse(0)
     } else {
-      baseCap
+      0
     }
   }
 
   private def pipelinedGroupRoundRobinOfferOrder(
       sortedTaskSets: Iterable[TaskSetManager]): Iterable[TaskSetManager] = {
-    if (!pipelinedGroupRoundRobinEnabled) {
-      return sortedTaskSets
-    }
-
     val offerOrder = new ArrayBuffer[TaskSetManager]
     val pipelinedBlock = new ArrayBuffer[TaskSetManager]
 

@@ -59,6 +59,7 @@ private[spark] class IncrementalShuffleHandle(val delegate: ShuffleHandle)
  */
 private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Boolean)
   extends ShuffleManager
+  with PipelinedShuffleSchedulingProvider
   with PipelinedShuffleControlPlane
   with Logging {
 
@@ -91,6 +92,12 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
       case _ => None
     }
 
+  private def incrementalSchedulingProvider: Option[PipelinedShuffleSchedulingProvider] =
+    incrementalManager match {
+      case provider: PipelinedShuffleSchedulingProvider => Some(provider)
+      case _ => None
+    }
+
   logInfo(s"Using PipelinedShuffleManagerRouter: regular shuffles -> " +
     s"${defaultManager.getClass.getName}, pipelined shuffles -> " +
     s"${incrementalManager.getClass.getName}")
@@ -116,6 +123,20 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
         incrementalManager.getWriter(incremental.delegate, mapId, context, metrics)
       case _ =>
         defaultManager.getWriter(handle, mapId, context, metrics)
+    }
+  }
+
+  override def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = {
+    handle match {
+      case incremental: IncrementalShuffleHandle =>
+        incrementalManager.wrapShuffleMapTaskInput(
+          incremental.delegate, mapId, context)(createInput)
+      case _ =>
+        defaultManager.wrapShuffleMapTaskInput(handle, mapId, context)(createInput)
     }
   }
 
@@ -154,33 +175,24 @@ private[spark] class PipelinedShuffleManagerRouter(conf: SparkConf, isDriver: Bo
     incrementalControlPlane.foreach(_.registerPipelinedShuffleGroup(group))
   }
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = {
-    incrementalControlPlane.exists(_.requiresAllPipelinedShuffleReadersResident(group))
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    incrementalSchedulingProvider
+      .map(_.schedulingRequirements(group))
+      .getOrElse(PipelinedGroupSchedulingRequirements())
   }
 
-  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
-    incrementalControlPlane.flatMap(_.maxConcurrentPipelinedShuffleProducers(groupId))
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    incrementalControlPlane.foreach(_.admitPipelinedShuffleGroup(groupAttemptId))
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
-    incrementalControlPlane.foreach(_.admitPipelinedShuffleGroup(groupId))
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    incrementalControlPlane.foreach(_.completePipelinedShuffleGroup(groupAttemptId))
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Unit = {
-    incrementalControlPlane.foreach(_.completePipelinedShuffleGroup(groupId))
-  }
-
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
-    incrementalControlPlane.foreach(_.abortPipelinedShuffleGroup(groupId, reason))
-  }
-
-  override def completePipelinedQuery(queryExecutionId: Long): Unit = {
-    incrementalControlPlane.foreach(_.completePipelinedQuery(queryExecutionId))
-  }
-
-  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {
-    incrementalControlPlane.foreach(_.abortPipelinedQuery(queryExecutionId, reason))
+  override def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {
+    incrementalControlPlane.foreach(
+      _.abortPipelinedShuffleGroup(groupAttemptId, reason))
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = {

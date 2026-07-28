@@ -38,6 +38,7 @@ private class RecordingShuffleManager(conf: SparkConf, isDriver: Boolean) extend
   RecordingShuffleManager.register(this)
   val registered = mutable.ArrayBuffer[Int]()
   val writerCalls = mutable.ArrayBuffer[Int]()
+  val mapInputCalls = mutable.ArrayBuffer[Int]()
   val readerCalls = mutable.ArrayBuffer[Int]()
   val unregistered = mutable.ArrayBuffer[Int]()
   @volatile var stopped = false
@@ -57,6 +58,16 @@ private class RecordingShuffleManager(conf: SparkConf, isDriver: Boolean) extend
       s"expected an unwrapped RecordingHandle, got $handle")
     writerCalls += handle.shuffleId
     null
+  }
+  override def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = {
+    require(handle.isInstanceOf[RecordingShuffleManager.RecordingHandle],
+      s"expected an unwrapped RecordingHandle, got $handle")
+    mapInputCalls += handle.shuffleId
+    createInput
   }
   override def getReader[K, C](
       handle: ShuffleHandle, startMapIndex: Int, endMapIndex: Int, startPartition: Int,
@@ -95,38 +106,36 @@ private object RecordingShuffleManager {
 // and tests can tell which one handled a shuffle.
 private class DefaultRecordingManager(conf: SparkConf, isDriver: Boolean)
   extends RecordingShuffleManager(conf, isDriver)
+private class PlainIncrementalRecordingManager(conf: SparkConf, isDriver: Boolean)
+  extends RecordingShuffleManager(conf, isDriver)
 private class IncrementalRecordingManager(conf: SparkConf, isDriver: Boolean)
   extends RecordingShuffleManager(conf, isDriver)
+  with PipelinedShuffleSchedulingProvider
   with PipelinedShuffleControlPlane {
 
   val registeredGroups = mutable.ArrayBuffer[PipelinedShuffleGroupMetadata]()
   val admittedGroups = mutable.ArrayBuffer[String]()
   val completedGroups = mutable.ArrayBuffer[String]()
   val abortedGroups = mutable.ArrayBuffer[(String, String)]()
-  @volatile var requireAllReadersResident = false
-  @volatile var maxConcurrentProducers: Option[Int] = None
+  @volatile var requirements = PipelinedGroupSchedulingRequirements()
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = requireAllReadersResident
-
-  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
-    maxConcurrentProducers
-  }
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = requirements
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
     registeredGroups += group
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
-    admittedGroups += groupId
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    admittedGroups += groupAttemptId
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Unit = {
-    completedGroups += groupId
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    completedGroups += groupAttemptId
   }
 
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
-    abortedGroups += groupId -> reason
+  override def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {
+    abortedGroups += groupAttemptId -> reason
   }
 }
 
@@ -183,6 +192,19 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
       .isInstanceOf[PipelinedShuffleManagerRouter])
   }
 
+  test("an incremental manager without a scheduling provider gets full-group requirements") {
+    val conf = new SparkConf(loadDefaults = false)
+      .set(SHUFFLE_MANAGER, classOf[DefaultRecordingManager].getName)
+      .set(SHUFFLE_MANAGER_INCREMENTAL, classOf[PlainIncrementalRecordingManager].getName)
+    val router = startWithRouter(conf)
+    val group = PipelinedShuffleGroupMetadata(
+      groupId = "stages-1-2",
+      groupAttemptId = "stages-1.0-2.0",
+      stages = Seq.empty)
+
+    assert(router.schedulingRequirements(group) === PipelinedGroupSchedulingRequirements())
+  }
+
   test("a PipelinedShuffleDependency registers with the incremental manager, wrapped") {
     val router = startWithRouter()
     val handle = router.registerShuffle(10, pipelinedDep(sc))
@@ -217,6 +239,30 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     assert(defaultMgr.writerCalls.isEmpty)
     assert(defaultMgr.readerCalls === Seq(21))
     assert(incrementalMgr.readerCalls.isEmpty)
+  }
+
+  test("map task input wrapping routes by handle and remains lazy") {
+    val router = startWithRouter()
+    val incrementalHandle = router.registerShuffle(22, pipelinedDep(sc))
+    val regularHandle = router.registerShuffle(23, regularDep(sc))
+    val context = mock(classOf[TaskContext])
+    var inputCreations = 0
+
+    val incrementalInput = router.wrapShuffleMapTaskInput(
+      incrementalHandle, 0L, context) {
+      inputCreations += 1
+      Iterator(1)
+    }
+    val regularInput = router.wrapShuffleMapTaskInput(regularHandle, 0L, context) {
+      inputCreations += 1
+      Iterator(2)
+    }
+
+    assert(inputCreations === 2)
+    assert(incrementalInput.toSeq === Seq(1))
+    assert(regularInput.toSeq === Seq(2))
+    assert(incrementalMgr.mapInputCalls === Seq(22))
+    assert(defaultMgr.mapInputCalls === Seq(23))
   }
 
   test("IncrementalShuffleHandle survives Java serialization (the driver->executor path)") {
@@ -280,8 +326,7 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     val router = startWithRouter()
     val group = PipelinedShuffleGroupMetadata(
       groupId = "stages-1-2",
-      jobId = 4,
-      queryExecutionId = Some(9L),
+      groupAttemptId = "stages-1.0-2.0",
       stages = Seq(
         PipelinedShuffleStageMetadata(
           stageId = 1,
@@ -296,20 +341,21 @@ class PipelinedShuffleManagerRouterSuite extends SparkFunSuite with LocalSparkCo
     val incMgr = incrementalMgr.asInstanceOf[IncrementalRecordingManager]
 
     router.registerPipelinedShuffleGroup(group)
-    assert(!router.requiresAllPipelinedShuffleReadersResident(group))
-    incMgr.requireAllReadersResident = true
-    assert(router.requiresAllPipelinedShuffleReadersResident(group))
-    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).isEmpty)
-    incMgr.maxConcurrentProducers = Some(7)
-    assert(router.maxConcurrentPipelinedShuffleProducers(group.groupId).contains(7))
-    router.admitPipelinedShuffleGroup(group.groupId)
-    router.completePipelinedShuffleGroup(group.groupId)
-    router.abortPipelinedShuffleGroup(group.groupId, "failed")
+    assert(router.schedulingRequirements(group) === PipelinedGroupSchedulingRequirements())
+    incMgr.requirements = PipelinedGroupSchedulingRequirements(
+      residencyPolicy = ReaderResidencyWithElasticProducers(
+        minProducerTasksPerStage = 2,
+        maxProducerTasksPerStage = Some(3)),
+      maxRunningTasksPerExecutor = Some(4))
+    assert(router.schedulingRequirements(group) === incMgr.requirements)
+    router.admitPipelinedShuffleGroup(group.groupAttemptId)
+    router.completePipelinedShuffleGroup(group.groupAttemptId)
+    router.abortPipelinedShuffleGroup(group.groupAttemptId, "failed")
 
     assert(incMgr.registeredGroups === Seq(group))
-    assert(incMgr.admittedGroups === Seq(group.groupId))
-    assert(incMgr.completedGroups === Seq(group.groupId))
-    assert(incMgr.abortedGroups === Seq(group.groupId -> "failed"))
+    assert(incMgr.admittedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.completedGroups === Seq(group.groupAttemptId))
+    assert(incMgr.abortedGroups === Seq(group.groupAttemptId -> "failed"))
   }
 
   test("unregisterShuffle ORs the two managers: succeeds when only the owning manager returns true") {

@@ -21,6 +21,7 @@ import scala.collection.mutable.Map
 
 import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
+import org.apache.spark.shuffle.PipelinedGroupSchedulingRequirements
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.AccumulatorV2
 
@@ -54,12 +55,19 @@ private[spark] trait TaskScheduler {
   // Submit a sequence of tasks to run.
   def submitTasks(taskSet: TaskSet): Unit
 
-  // Submit a sequence of tasks without immediately asking the backend for offers. The default
-  // preserves the original behavior for TaskScheduler implementations that do not override it.
-  def submitTasksWithoutRevive(taskSet: TaskSet): Unit = submitTasks(taskSet)
-
-  // Ask the backend for offers after one or more task sets have been submitted without revive.
-  def reviveOffers(): Unit = {}
+  /**
+   * Atomically publish every TaskSet in one pipelined group before requesting resource offers.
+   *
+   * TaskSchedulerImpl overrides this with a single synchronized registration transaction. The
+   * default is deliberately unsupported so another scheduler cannot accidentally expose a partial
+   * group by falling back to repeated [[submitTasks]] calls.
+   */
+  def submitPipelinedGroup(
+      taskSets: Seq[TaskSet],
+      requirements: PipelinedGroupSchedulingRequirements): Unit = {
+    throw new UnsupportedOperationException(
+      s"${getClass.getName} does not support atomic pipelined group publication")
+  }
 
   /**
    * Kills a task attempt.
