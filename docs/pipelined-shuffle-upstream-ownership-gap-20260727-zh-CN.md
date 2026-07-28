@@ -1105,6 +1105,358 @@ Netty / UnsafeRow transport           UCX / Velox / GPU transport
 credit + termination ack              credit + EOS + native cleanup
 ```
 
+### 基于 Multi-Stage RTM 扩展 Residency Policy
+
+这里需要区分当前已经可用的 stateless RTM 和正在 upstream 的
+multi-stage RTM。
+
+当前 stateless RTM 把 source、窄依赖 operators 和 sink 放在同一个
+Spark stage 中。一个 input partition 对应一个 long-running task，task
+持续运行到 checkpoint interval 结束。因此它只有一个 `TaskSet`，不涉及
+多个 stage 的共同 admission 或 atomic publication。
+
+Multi-stage RTM 通过 `PipelinedShuffleDependency` 连接多个同时运行的
+stage。Upstream 第一版采用保守的 full-gang 模型：
+
+```text
+fullDemand(group) = sum(memberStage.numTasks)
+admit only when fullDemand <= currentlyFreeSlots
+```
+
+这解释了第一版为何可以继续逐个调用普通 `submitTasks`。在严格
+full-gang admission 成功后，第一个 producer 最多只能占用自身的
+`numTasks` 个 slot，剩余容量按算术上仍足以运行其余 member stages。
+`DAGScheduler` 又会在同一个 event-loop submission 中递归提交完整 DAG，
+所以第一版没有单独引入 `submitTasksWithoutRevive` 或 group batch-submit
+API。
+
+但这个结论只对 strict full-gang 成立。不能只把 admission 中的
+`sum(numTasks)` 改小，而继续沿用原来的 TaskScheduler 行为。否则先提交的
+producer 可能占完可用 slots，尚未注册或尚未获得 slot 的 readers 无法
+建立 endpoint，producer 又阻塞在 transport backpressure 上，最终形成
+slot deadlock。
+
+正确扩展方式不是改变 CPU RTM 的默认语义，而是在同一套 multi-stage RTM
+pipelined scheduler 下支持两种 residency policy：
+
+| Policy | Minimum residency | 首个 caller |
+| --- | --- | --- |
+| `FullGroupResidency` | 所有 member stages 的所有 tasks | CPU multi-stage RTM |
+| `ReaderResidencyWithElasticProducers` | 所有 pipelined readers，加每个 pure producer 的最小推进 slots | bounded Spark SQL + Gluten UCX |
+
+CPU RTM 继续默认使用 `FullGroupResidency`。当前 RTM 是 input partition
+与 long-running source task 的固定一对一映射；如果只运行部分 source
+tasks，其余 partitions 可能整个 checkpoint interval 都得不到处理。
+除非未来 source 支持 partition multiplexing、cooperative yield 或
+preemption，否则不应把 CPU RTM 默认放松为 elastic producer。
+
+Gluten bounded batch 的 producer tasks 是有限任务：一个 task 完成后会
+释放 slot，后续 partitions 可以轮转执行。因此可以使用
+`ReaderResidencyWithElasticProducers`。设：
+
+- `readerStages` 是具有 pipelined input 的 stages；intermediate stage
+  同时读上游、写下游，但在集合中只计算一次；
+- `pureProducerStages` 是没有 pipelined input、但具有 pipelined output
+  的 source-side stages；
+- `minProducerTasks(stage)` 是保证该 producer stage 能推进的最小 task
+  数。
+
+则 relaxed admission 的最低需求为：
+
+```text
+minimumDemand(group) =
+    sum(readerStages.numTasks)
+  + sum(minProducerTasks(pureProducerStages))
+```
+
+例如：
+
+```text
+Producer A: 60 tasks, min producer residency = 1
+Producer B: 60 tasks, min producer residency = 1
+Consumer:    4 tasks, all readers resident
+
+FullGroupResidency demand                  = 124 slots
+ReaderResidencyWithElasticProducers demand =   6 slots
+```
+
+#### 建议的通用 Contract
+
+不要把 UCX-specific 配置写进 `DAGScheduler`。应由
+`PipelinedShuffleManager` 或其 control-plane capability 声明静态
+scheduling requirements，Spark 仍然是唯一的 admission 和 launch
+authority。接口形状可以是：
+
+```scala
+sealed trait PipelinedGroupResidencyPolicy
+
+case object FullGroupResidency
+  extends PipelinedGroupResidencyPolicy
+
+case class ReaderResidencyWithElasticProducers(
+    minProducerTasksPerStage: Int,
+    maxProducerTasksPerStage: Option[Int])
+  extends PipelinedGroupResidencyPolicy
+
+case class PipelinedGroupSchedulingRequirements(
+    policy: PipelinedGroupResidencyPolicy,
+    minRunningTasksByStage: Map[Int, Int],
+    maxRunningTasksByStage: Map[Int, Int])
+```
+
+最终类型不必机械照搬以上草案，但必须满足以下 ownership：
+
+- unknown/default pipelined manager 返回保守的 `FullGroupResidency`；
+- CPU `StreamingShuffleManager` 对当前 RTM 返回
+  `FullGroupResidency`；
+- Gluten `UcxShuffleManager` 对 bounded batch 返回
+  `ReaderResidencyWithElasticProducers`；
+- manager 只声明 requirements，不自行 admission，不维护 query-level
+  launch state machine；
+- `DAGScheduler` 计算 group readiness 和 minimum demand；
+- `TaskScheduler` 保证 requirements 对应的实际 residency。
+
+当前本地 `PipelinedShuffleControlPlane` 中的
+`requiresAllPipelinedShuffleReadersResident` 可以演进为上述 requirements
+对象，避免长期保留多个 boolean capability 和 UCX-specific scheduler
+分支。
+
+#### Upstream 重构拆成两个独立接受面
+
+这项重构不应作为一个“让 Spark 接受 Gluten UCX 调度策略”的整体改动
+提交。更容易审查和 upstream 的方式，是把它拆成两个相互依赖、但可以
+独立讨论的接受面：
+
+```text
+第一部分：Spark 接受 relaxed residency 作为通用 scheduler 语义
+                              |
+                              v
+第二部分：Spark 接受一个窄的声明式 extension point 来选择该语义
+```
+
+这里有意把 scheduler capability 放在 extension point 之前。Spark 社区
+首先需要确认 relaxed admission 本身的正确性；extension point 只负责
+让某个 shuffle implementation 选择 Spark 已经定义和验证的 policy，
+不能允许插件注入另一套 admission 算法。
+
+##### 第一部分：接受 relaxed residency
+
+第一部分只讨论 Spark scheduler 能否安全支持：
+
+```text
+ReaderResidencyWithElasticProducers
+```
+
+它不是 GPU 或 UCX feature。它表达的是一种通用的 producer execution
+capability：
+
+- 所有 pipelined reader/intermediate tasks 必须 resident；
+- 每个 pure producer stage 只要求一个 minimum floor；
+- producer task 是 bounded，完成后会释放 slot，剩余 partitions 可以
+  继续轮转；
+- minimum floors 满足后，surplus slots 按公平策略分配，并受到
+  per-stage/per-executor cap 约束。
+
+这部分由 Spark 完整拥有并实现：
+
+```text
+DAGScheduler:
+  group construction
+  -> role classification
+  -> minimum demand
+  -> admission
+
+TaskScheduler:
+  atomic group publication
+  -> minimum-floor-first
+  -> surplus round-robin/cap
+```
+
+第一部分不需要公开稳定的插件 API。测试可以通过 Spark 内部构造的
+requirements 或临时 test shuffle manager 选择 relaxed policy。社区
+评审的重点是：
+
+1. relaxed demand 的计算是否正确；
+2. atomic publication 是否消除了先提交 producer 导致的 slot deadlock；
+3. reader 和 producer minimum floors 是否一定能满足；
+4. producer 是否可以公平轮转且不会超过 cap；
+5. completion、failure 和 attempt fencing 是否仍沿用同一套 group
+   lifecycle。
+
+`FullGroupResidency` 必须继续作为默认行为。没有选择 relaxed policy 的
+CPU RTM、未知 manager 和现有 regular Spark job，其 admission、提交顺序
+和 failure semantics 都不能变化。
+
+##### 第二部分：接受声明式 extension point
+
+只有在 Spark 已经拥有并验证 relaxed scheduler 语义之后，第二部分才
+增加一个窄的 capability provider。建议的接口形状是：
+
+```scala
+trait PipelinedShuffleSchedulingProvider {
+  def schedulingRequirements(
+      group: PipelinedShuffleGroupInfo):
+      PipelinedGroupSchedulingRequirements =
+    PipelinedGroupSchedulingRequirements.fullGroupResidency
+}
+```
+
+初期 extension point 应是 closed policy selection：manager 只能从 Spark
+定义的 `FullGroupResidency` 和
+`ReaderResidencyWithElasticProducers` 中选择，不能提供任意 scheduler
+callback。返回值必须是 group attempt 期间不可变的静态 requirements。
+
+允许的 extension 行为是：
+
+```text
+manager declares requirements once
+Spark validates and resolves requirements
+Spark performs admission/publication/scheduling
+```
+
+不允许的 extension 行为是：
+
+```text
+manager.canAdmit(freeSlots)
+manager.chooseNextStage()
+manager.refillProducers()
+manager.pauseOrResumeSparkTasks()
+```
+
+后面这些回调会把资源状态和 launch authority 再次交给插件，本质上重新
+引入 Gluten query coordinator。
+
+建议把 scheduling provider 与现有 lifecycle listener 分开：
+
+```text
+PipelinedShuffleSchedulingProvider
+  只声明静态 scheduling requirements
+
+PipelinedShuffleLifecycleListener
+  如有需要，只接收 register/complete/abort 事实
+```
+
+第二部分合入后，各实现的选择是：
+
+| Implementation | Declared policy |
+| --- | --- |
+| unknown/default manager | `FullGroupResidency` |
+| CPU `StreamingShuffleManager` | `FullGroupResidency` |
+| Gluten `UcxShuffleManager` bounded batch | `ReaderResidencyWithElasticProducers` |
+
+因此 upstream Spark 不包含任何 UCX class、Velox Driver 逻辑或
+Gluten-specific 配置；Gluten 也不再实现 admission/refill state
+machine。extension point 只连接 policy declaration，scheduler authority
+仍完全属于 Spark。
+
+这两个接受面可以对应两个 follow-up PR，也可以在一个 PR 中拆成两个
+逻辑清晰的 commits。无论采用哪种提交形式，都应分别证明：
+
+- 第一部分关闭 extension point 时，regular Spark 和
+  `FullGroupResidency` 行为完全不变；
+- 第二部分默认 provider 返回 `FullGroupResidency` 时，仍然没有行为
+  变化；
+- 只有 manager 显式选择 relaxed policy 时，才启用 minimum-demand 和
+  elastic-producer scheduling；
+- 本地 Gluten 集成在相同 TPC-H 22-query profile 上功能完整且无性能
+  regression。
+
+#### Relaxed Admission 必须配套 Atomic Group Publication
+
+进入 elastic-producer policy 后，Spark 必须先让 TaskScheduler 看见完整
+group，再开始第一次资源分配。推荐的终态接口是：
+
+```scala
+taskScheduler.submitPipelinedGroup(taskSets, requirements)
+```
+
+其语义是：
+
+```text
+register every TaskSetManager in the group
+    -> publish group metadata and residency floors
+    -> revive resource offers once
+    -> satisfy every stage's minimum floor first
+    -> distribute surplus slots round-robin up to per-stage caps
+```
+
+当前本地的：
+
+```scala
+submitTasksWithoutRevive(taskSet)
+...
+reviveOffers()
+```
+
+可以作为最小实现桥梁，但不是理想的最终 RTM API。它解决了“注册多个
+TaskSet 后统一 revive”，却没有直接表达 group identity、requirements
+和 all-or-nothing publication。主线程可以先保留该桥梁验证行为，再收敛
+为 `submitPipelinedGroup`。
+
+TaskScheduler 的 minimum-floor 调度至少需要满足：
+
+1. 第一次有效 `resourceOffers` 之前，完整 group 的 TaskSetManagers 已
+   注册。
+2. 所有 reader/intermediate stages 先达到要求的 residency floor。
+3. 每个 pure producer stage 至少获得 `minProducerTasks`，避免某个 source
+   frontier 永久饥饿。
+4. minimum floors 满足后，剩余 slots 在 producer stages 间
+   round-robin 分配。
+5. producer 不超过 per-stage/per-executor cap。
+6. transport credit/backpressure 只控制在途数据和 writer readiness，
+   不替代 slot admission。
+
+Deferred completion、group-atomic failure 和 attempt fencing 不因 policy
+变化而分叉。两种 policy 必须共用同一套 group lifecycle；区别只在
+minimum residency 和 surplus-slot distribution。
+
+#### 主线程实施顺序
+
+建议不要扩大 upstream PR #57341 的第一版 scope。先把它作为
+`FullGroupResidency` 基线，再按上述两个接受面推进 follow-up：
+
+第一部分，先让 Spark 接受 relaxed scheduler capability：
+
+1. 引入 Spark-internal `PipelinedGroupSchedulingRequirements`，默认使用
+   `FullGroupResidency`。
+2. 让 `DAGScheduler` 根据 internal policy 计算 full demand 或 minimum
+   demand。
+3. 增加 atomic group publication；短期可复用
+   `submitTasksWithoutRevive`，终态使用 `submitPipelinedGroup`。
+4. `TaskSchedulerImpl` 实现 minimum-floor-first 和 producer
+   round-robin/cap。
+5. 在没有公开 extension point 的条件下，用 Spark internal tests 证明
+   relaxed policy 的 safety、liveness 和公平性。
+
+第二部分，再让 Spark 接受 policy-selection extension point：
+
+6. 引入窄的 `PipelinedShuffleSchedulingProvider`，默认返回
+   `FullGroupResidency`。
+7. 把现有 reader-residency boolean 收敛到 requirements contract，避免
+   在 `TaskSet` 中继续扩散多个 capability flags。
+8. CPU `StreamingShuffleManager` 保持默认或明确选择
+   `FullGroupResidency`。
+9. Gluten `UcxShuffleManager` 在 Gluten 仓库中选择
+   `ReaderResidencyWithElasticProducers`。
+10. 删除 Gluten query coordinator 中 admission/refill 决策，只保留
+    transport execution、credit/backpressure 和必要的 lifecycle facts。
+
+第一轮测试应至少覆盖：
+
+- regular job 和 `FullGroupResidency` 的提交、slot check、offer order
+  与现有行为一致；
+- CPU RTM 在不能容纳全部 long-running tasks 时仍然拒绝 admission；
+- `60 producer + 4 reader` 在 full policy 下需要 64 slots，在 reader
+  policy 下按 `4 + minProducerTasks` admission；
+- 第一次 resource offer 能看到完整 group；
+- readers 达到全部 residency，pure producer 达到 minimum floor；
+- producer surplus round-robin，且 cap 生效；
+- consumer 提前完成仍被 deferred；
+- 任意 member failure 仍然只产生一个 group terminal outcome；
+- old `groupAttemptId` 的 endpoint/readiness/completion 被拒绝；
+- 同一组测试分别使用 CPU Netty manager 和 Gluten UCX manager，证明
+  scheduler contract 与 data plane 解耦。
+
 ### 性能达标基线
 
 开始该 MVP 之前，当前 TPC-H 4-GPU 性能版本固定为同名本地 annotated
@@ -1325,7 +1677,9 @@ branches，没有再保留 coordinator on/off 双路径。
 
 - 在 group metadata 中显式区分 `groupId` 和 `groupAttemptId`；
 - TaskSet/TaskScheduler 使用 attempt-scoped key；
-- CPU manager 声明 reader residency；
+- CPU RTM manager 默认声明 `FullGroupResidency`；
+- Gluten UCX manager 声明
+  `ReaderResidencyWithElasticProducers`；
 - lifecycle callback 明确为 Spark 下发的 command/notification；
 - 增加旧 attempt 不能共享 active-group state 的测试。
 
@@ -1641,7 +1995,137 @@ Spark-visible/transport-only 代码存在稳定回退。
   Structured Streaming execution 决定完整 query/micro-batch 重提；
 - `UcxShuffleCoordinator` 到 `UcxTransportCoordinator` 的类名调整只是
   后续机械重命名，不影响已经完成的 authority 删除；
-- 当前 branch、artifact 和工作树修改仍是本地状态，尚未 push。
+- 本轮 performance gate 通过后，branch 应把 scheduler/provider、测试和本文
+  作为同一个可审查变更集提交并 push；失败的 residency/cap 诊断变体不进入
+  commit。
+
+### 双重 Gate：社区接受与内部性能必须同时满足
+
+后续推进不能只优化一个目标。每一波生产代码改动都必须同时通过两个互相独立的
+gate；任何一个失败，都不进入下一波。
+
+#### 外部 Gate：社区能够独立验证 proposal
+
+对外论证只依赖 Apache Spark 仓库内可复现的 CPU 证据，不引用 Gluten、
+UCX、GPU 或内部 TPC-H 环境。最低要求是：
+
+1. 用确定性 DAG 复现 full-group residency 的容量限制；
+2. 证明 relaxed residency 不是单独修改 admission 公式，而是与 atomic
+   publication、reader/producer floor 和公平 refill 一起工作；
+3. 使用 bounded CPU data plane 验证真实 backpressure、EOS、失败和
+   attempt fencing；
+4. 默认 manager 不实现 extension 时行为完全不变。
+
+当前第一段 scheduler 证据已经落地：
+
+```text
+Producer A: 60 tasks
+Producer B: 60 tasks
+Reader:      4 tasks
+Cluster:     6 slots
+
+Full-group demand: 60 + 60 + 4 = 124 slots
+Relaxed demand:     4 readers + 1 + 1 producer floors = 6 slots
+```
+
+新增的两个 `DAGSchedulerSuite` 用例均通过。当前原分支已机械收敛到
+declarative-provider review tree；Maven 同口径验证结果为：
+
+- `DAGSchedulerSuite`：196/196；
+- `TaskSchedulerImplSuite`：131/131；
+- router 与 streaming shuffle suites：27/27；
+- Scala 合计：354/354，共 8 个 discovered suites；
+- core Java tests：371/371。
+
+这里仅证明 Spark scheduler 的容量、生命周期和既有 core 行为没有功能
+回归，尚不能冒充 queue-depth=1 的真实 CPU backpressure E2E。后者、
+delayed reader、queue byte watermark 和 injected attempt failure 仍是
+社区提案进入 Part II 前的硬门槛。
+
+#### 内部 Gate：Gluten-MPP 或 Flux 保持已达标性能
+
+对内必须证明同一套 Spark extension 和调度语义能够被 Gluten-MPP 或
+Flux 使用，并保持性能 tag 对应的能力与性能。固定验收环境为 4 张 B200
+GPU、TPC-H SF1000、22 条 query、`fully-streaming-4gpu-v1.sh`
+qualified profile，以及相同 SQL bundle、per-query overrides、
+`jvm_collect` result-row gate 和 native runtime。
+
+性能比较不能只看一个 aggregate。每一波生产代码改动至少检查：
+
+1. baseline 和 candidate 都是 22/22 成功；
+2. result-row、strict cuDF、零 fallback、零 Fetch/File error 全部通过；
+3. 逐 query 三样本中位数，标出慢向异常和双位数回退；
+4. 逐 query 中位数之和与同序号 22Q 样本中位数；
+5. endpoint、attempt fence、native drain 和 terminal-state rejection
+   没有异常。
+
+固定参考线是已经复现的 qualified-profile 结果：
+
+| 指标 | Old baseline | Drain v3 candidate | 变化 |
+| --- | ---: | ---: | ---: |
+| 同序号样本最好值 | 27.327 s | 27.396 s | +0.25% |
+| 同序号样本中位数 | 27.914 s | 27.966 s | +0.19% |
+| 逐 query 中位数之和 | 27.571 s | 27.391 s | -0.65% |
+
+本轮已经修改 Spark production code：旧 query-level control-plane 路径
+被收敛为声明式 scheduling provider。当前 10 个受影响 production source
+与 `7d93c154c51` review tree 逐文件一致；本地新编译 jar 中
+`DAGScheduler`、`TaskSchedulerImpl`、provider 和 router 的 class 字节，
+也与冻结的 `pipelined-spark-provider-v3-20260727` candidate artifact
+完全一致。
+
+第一次正式 22Q gate 的确在提交 query 前被环境 preflight 拒绝：固定
+lane 的 GPU 4 和 GPU 5 当时被外部 `presto_server` 分别占用约 140 GiB
+和 112 GiB。没有终止或复用这些外部进程。资源恢复后，先在 GPU
+1/2/3/6 上做诊断，再回到与历史完全相同的物理 GPU 4--7 做正式验证。
+
+这次验证也暴露了一个重要的 benchmark 纪律：不能把跨 GPU、跨资源窗口的
+绝对值直接归因给代码。同一个 old artifact 在 GPU 1/2/3/6 上得到
+`36.567 s`，而回到稳定的 GPU 4--7 窗口后得到 `27.561 s` 和
+`26.709 s`；同一个 provider candidate 也曾在冷窗口得到 `34.021 s`，
+随后在相邻稳定窗口得到 `27.046 s`。因此 `37.353 s`、`43.758 s` 等
+早期跨窗口结果只能用于发现环境或 policy 问题，不能作为最终 code
+regression 结论。
+
+最终采用 O--N--O sandwich：
+
+| 顺序 | Artifact | Run root | hot-min 总和 | 逐 query 中位数总和 |
+| --- | --- | --- | ---: | ---: |
+| O1 | old transport/drain baseline | `ab-old-fast-gpu4567-c11-20260728` | 26.307 s | 27.561 s |
+| N | declarative provider candidate | `ab-new-provider-gpu4567-c12-20260728` | 25.695 s | 27.046 s |
+| O2 | old transport/drain baseline | `ab-old-fast-gpu4567-c13-20260728` | 25.303 s | 26.709 s |
+
+三次均为 GPU 4--7、warmup=1、timed=3、TPC-H SF1000，并且：
+
+- 22/22 query 成功；
+- result rows 全部一致；
+- strict cuDF gate 完整；
+- cuDF fallback、Fetch/File error、MPP launch 和 MPP JNI fragment 均为 0；
+- UCX writer/reader endpoint evidence 分别为 3004/3248。
+
+把 O1 和 O2 的每条 query 共 6 个计时样本合并后，old 的逐-query
+中位数总和为 `27.275 s`；candidate 为 `27.046 s`，变化
+`-0.84%`。Candidate 相对此前 qualified reference `27.391 s` 为
+`-1.26%`。逐 query 检查中最大的两个慢向点是：
+
+- Q9：`+157.5 ms`，`+9.4%`；
+- Q11：`+76.5 ms`，`+10.0%`。
+
+Q11 的百分比被不足 100 ms 的绝对差放大；两者没有形成 aggregate
+回退，且 candidate 的 hot-min 和中位数总和均落在 old sandwich 的正常
+范围内。Q8 在单次 O1 对比中曾显示 `+262 ms`，合并两个 old
+窗口后收敛为 `+50 ms`（`+2.8%`），也说明必须同时看绝对值、重复窗口和
+aggregate，不能按单个短 query 的一次百分比判定。
+
+因此本轮状态更新为：
+
+```text
+Spark functional gate: PASS（Scala 354/354，Java 371/371）
+Internal performance gate: PASS（22/22；27.046 s；vs pooled old -0.84%）
+```
+
+当前 declarative extension/provider 波次可以进入提交和下一波；失败的
+`FullGroupResidency` 与显式 executor-cap 诊断不保留为生产改动。
 
 ### MVP 验收标准
 

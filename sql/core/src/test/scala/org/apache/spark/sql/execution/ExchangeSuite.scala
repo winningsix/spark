@@ -19,15 +19,13 @@ package org.apache.spark.sql.execution
 
 import scala.util.Random
 
-import org.apache.spark.PipelinedShuffleDependency
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.sql.{Dataset, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Literal}
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode, NullAwareHashPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
-import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -59,33 +57,6 @@ class ExchangeSuite extends SharedSparkSession {
       plan => ShuffleExchangeExec(SinglePartition, plan),
       input.map(Row.fromTuple)
     )
-  }
-
-  test("batch SQL shuffle can opt in to a pipelined dependency") {
-    withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true") {
-      val input = spark.range(16).queryExecution.executedPlan
-      val exchange = ShuffleExchangeExec(HashPartitioning(input.output, 2), input)
-
-      assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
-    }
-  }
-
-  test("pipelined query exchanges are not reused across consumers") {
-    withSQLConf(
-      SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true",
-      SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
-      val input = spark.range(16).queryExecution.executedPlan
-      val leftShuffle = ShuffleExchangeExec(HashPartitioning(input.output, 2), input)
-      val rightShuffle = ShuffleExchangeExec(HashPartitioning(input.output, 2), input)
-      val leftBroadcast = BroadcastExchangeExec(IdentityBroadcastMode, input)
-      val rightBroadcast = BroadcastExchangeExec(IdentityBroadcastMode, input)
-      val reused = ReuseExchangeAndSubquery(
-        UnionExec(Seq(leftShuffle, rightShuffle, leftBroadcast, rightBroadcast)))
-
-      assert(reused.collect { case _: ShuffleExchangeLike => true }.size == 2)
-      assert(reused.collect { case _: BroadcastExchangeExec => true }.size == 2)
-      assert(reused.collect { case _: ReusedExchangeExec => true }.isEmpty)
-    }
   }
 
   test("null-aware hash shuffle spreads identical NULL keys from one mapper") {

@@ -56,6 +56,19 @@ private[spark] trait ShuffleManager {
       context: TaskContext,
       metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V]
 
+  /**
+   * Create and wrap the input consumed by a shuffle map task.
+   *
+   * Incremental shuffle managers may need to install task-local state before the input iterator is
+   * created and keep that state active while the iterator is consumed. The default implementation
+   * leaves regular shuffle managers unchanged.
+   */
+  def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = createInput
+
 
   /**
    * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive) to
@@ -158,4 +171,3 @@ private[spark] object ShuffleManager {
     shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
   }
 }
-

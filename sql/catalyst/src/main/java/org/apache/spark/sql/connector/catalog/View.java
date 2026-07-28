@@ -22,168 +22,113 @@ import java.util.Map;
 import java.util.Objects;
 
 import org.apache.spark.annotation.Evolving;
-import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /**
- * A view in a catalog.
- *
- * <p>This remains an interface for binary compatibility with Spark 4.x catalog plugins. The
- * default methods bridge the Spark 4.x view surface to the richer 4.2+ metadata surface, while
- * {@link Builder} retains the typed construction API used by current Spark internals.</p>
+ * A view in a catalog -- the typed payload returned by {@link ViewCatalog#loadView} and accepted
+ * by {@link ViewCatalog#createView} / {@link ViewCatalog#replaceView}. A {@code View} carries the
+ * view-specific fields that cannot be represented as string table properties: the query text,
+ * captured creation-time resolution context, captured SQL configs, schema-binding mode, and
+ * query output column names. Columns and user TBLPROPERTIES are set via the typed builder.
+ * <p>
+ * Unlike a {@link Table}, a {@code View} is itself a {@link Relation} rather than something Spark
+ * realizes into a {@code Table}: Spark expands the view's query text at read time and never builds
+ * a view object. A {@link RelationCatalog} returns a {@code View} directly from
+ * {@link RelationCatalog#loadRelation} for a view identifier, so it never has to smuggle a view
+ * through the {@code Table} surface.
  *
  * @since 4.2.0
  */
 @Evolving
-public interface View extends Relation {
+public class View implements Relation {
 
-  // Spark 4.x catalog-plugin contract. Keeping these methods on an interface lets existing
-  // implementations (notably Iceberg's SparkView) load unchanged on this snapshot runtime.
-  String name();
+  private final Column[] columns;
+  private final Map<String, String> properties;
+  private final String queryText;
+  private final String currentCatalog;
+  private final String[] currentNamespace;
+  private final Map<String, String> sqlConfigs;
+  private final String schemaMode;
+  private final String[] queryColumnNames;
+  private final DependencyList viewDependencies;
 
-  String query();
-
-  String currentCatalog();
-
-  String[] currentNamespace();
-
-  StructType schema();
-
-  String[] queryColumnNames();
-
-  String[] columnAliases();
-
-  String[] columnComments();
+  protected View(Builder builder) {
+    this.columns = builder.columns;
+    this.properties = builder.properties;
+    this.queryText = Objects.requireNonNull(builder.queryText, "queryText should not be null");
+    this.currentCatalog = builder.currentCatalog;
+    this.currentNamespace = builder.currentNamespace;
+    this.sqlConfigs = Collections.unmodifiableMap(builder.sqlConfigs);
+    this.schemaMode = builder.schemaMode;
+    this.queryColumnNames = builder.queryColumnNames;
+    this.viewDependencies = builder.viewDependencies;
+    // Default PROP_TABLE_TYPE = VIEW so `properties()` reflects the typed View classification.
+    // Callers can refine to a more specific view kind (for example, METRIC_VIEW) by calling
+    // RelationBuilder.withTableType(...) on the builder before build().
+    properties.putIfAbsent(TableCatalog.PROP_TABLE_TYPE, TableSummary.VIEW_TABLE_TYPE);
+  }
 
   @Override
-  Map<String, String> properties();
+  public Column[] columns() {
+    return columns;
+  }
 
-  // Current Spark relation/view contract. Defaults adapt a Spark 4.x implementation without
-  // requiring it to be recompiled.
+  public StructType schema() {
+    return CatalogV2Util.v2ColumnsToStructType(columns);
+  }
+
   @Override
-  default Column[] columns() {
-    return CatalogV2Util.structTypeToV2Columns(schema(), true /* keep IDs */);
+  public Map<String, String> properties() {
+    return properties;
   }
 
   /** The SQL text of the view. */
-  default String queryText() {
-    return query();
-  }
+  public String queryText() { return queryText; }
 
-  default Map<String, String> sqlConfigs() {
-    return Collections.emptyMap();
-  }
+  /**
+   * The current catalog at the time the view was created, used to resolve unqualified
+   * identifiers in {@link #queryText()} at read time. May be {@code null} if the view was
+   * created with no captured resolution context.
+   */
+  public String currentCatalog() { return currentCatalog; }
 
-  default String schemaMode() {
-    return null;
-  }
+  /**
+   * The current namespace at the time the view was created, used alongside
+   * {@link #currentCatalog()} to resolve unqualified identifiers in {@link #queryText()} at
+   * read time. Never {@code null}; empty when no namespace was captured.
+   */
+  public String[] currentNamespace() { return currentNamespace; }
 
-  default DependencyList viewDependencies() {
-    return null;
-  }
+  /**
+   * The SQL configs captured at view creation time, applied when parsing and analyzing the
+   * view body. Keys are unprefixed SQL config names (e.g. {@code spark.sql.ansi.enabled}).
+   */
+  public Map<String, String> sqlConfigs() { return sqlConfigs; }
 
-  /** Default implementation produced by {@link Builder}. */
-  final class BuiltView implements View {
-    private final Column[] columns;
-    private final Map<String, String> properties;
-    private final String queryText;
-    private final String currentCatalog;
-    private final String[] currentNamespace;
-    private final Map<String, String> sqlConfigs;
-    private final String schemaMode;
-    private final String[] queryColumnNames;
-    private final DependencyList viewDependencies;
+  /**
+   * The view's schema binding mode. Allowed values match the {@code toString} form of
+   * {@code org.apache.spark.sql.catalyst.analysis.ViewSchemaMode}:
+   * {@code BINDING}, {@code COMPENSATION}, {@code TYPE EVOLUTION}, {@code EVOLUTION}.
+   * May be {@code null} when schema binding is not configured.
+   */
+  public String schemaMode() { return schemaMode; }
 
-    private BuiltView(Builder builder) {
-      this.columns = builder.columns;
-      this.properties = builder.properties;
-      this.queryText = Objects.requireNonNull(builder.queryText, "queryText should not be null");
-      this.currentCatalog = builder.currentCatalog;
-      this.currentNamespace = builder.currentNamespace;
-      this.sqlConfigs = Collections.unmodifiableMap(builder.sqlConfigs);
-      this.schemaMode = builder.schemaMode;
-      this.queryColumnNames = builder.queryColumnNames;
-      this.viewDependencies = builder.viewDependencies;
-      properties.putIfAbsent(TableCatalog.PROP_TABLE_TYPE, TableSummary.VIEW_TABLE_TYPE);
-    }
+  /**
+   * Output column names of the query that created the view, used to map the query output to
+   * the view's declared columns during view resolution. Empty for views in {@code EVOLUTION}
+   * mode, which always use the view's current schema.
+   */
+  public String[] queryColumnNames() { return queryColumnNames; }
 
-    @Override
-    public String name() {
-      return "";
-    }
+  /**
+   * Returns the structured list of objects this view depends on (source tables and functions),
+   * or {@code null} if no dependency list was supplied. Unlike other view metadata which is
+   * encoded into {@link #properties()}, dependency lists are a first-class field because their
+   * nested structure does not round-trip cleanly through flat string properties.
+   */
+  public DependencyList viewDependencies() { return viewDependencies; }
 
-    @Override
-    public String query() {
-      return queryText;
-    }
-
-    @Override
-    public String queryText() {
-      return queryText;
-    }
-
-    @Override
-    public String currentCatalog() {
-      return currentCatalog;
-    }
-
-    @Override
-    public String[] currentNamespace() {
-      return currentNamespace;
-    }
-
-    @Override
-    public StructType schema() {
-      return CatalogV2Util.v2ColumnsToStructType(columns);
-    }
-
-    @Override
-    public Column[] columns() {
-      return columns;
-    }
-
-    @Override
-    public String[] queryColumnNames() {
-      return queryColumnNames;
-    }
-
-    @Override
-    public String[] columnAliases() {
-      return queryColumnNames;
-    }
-
-    @Override
-    public String[] columnComments() {
-      StructField[] fields = schema().fields();
-      String[] comments = new String[fields.length];
-      for (int i = 0; i < fields.length; i++) {
-        comments[i] = fields[i].getComment().isDefined() ? fields[i].getComment().get() : null;
-      }
-      return comments;
-    }
-
-    @Override
-    public Map<String, String> properties() {
-      return properties;
-    }
-
-    @Override
-    public Map<String, String> sqlConfigs() {
-      return sqlConfigs;
-    }
-
-    @Override
-    public String schemaMode() {
-      return schemaMode;
-    }
-
-    @Override
-    public DependencyList viewDependencies() {
-      return viewDependencies;
-    }
-  }
-
-  class Builder extends RelationBuilder<Builder> {
+  public static class Builder extends RelationBuilder<Builder> {
     private String queryText;
     private String currentCatalog;
     private String[] currentNamespace = new String[0];
@@ -193,9 +138,7 @@ public interface View extends Relation {
     private DependencyList viewDependencies = null;
 
     @Override
-    protected Builder self() {
-      return this;
-    }
+    protected Builder self() { return this; }
 
     public Builder withQueryText(String queryText) {
       this.queryText = queryText;
@@ -227,6 +170,11 @@ public interface View extends Relation {
       return this;
     }
 
+    /**
+     * Sets the structured dependency list for this view. Source tables and functions referenced
+     * by the view text should be recorded here so downstream consumers (e.g. catalogs persisting
+     * lineage) can access them without re-analyzing the view body.
+     */
     public Builder withViewDependencies(DependencyList viewDependencies) {
       this.viewDependencies = viewDependencies;
       return this;
@@ -234,7 +182,7 @@ public interface View extends Relation {
 
     public View build() {
       Objects.requireNonNull(columns, "columns should not be null");
-      return new BuiltView(this);
+      return new View(this);
     }
   }
 }

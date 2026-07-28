@@ -1192,16 +1192,6 @@ object SQLConf {
     .checkValue(_ > 0, "The value of spark.sql.shuffle.partitions must be positive")
     .createWithDefault(200)
 
-  val PIPELINED_SHUFFLE_ENABLED =
-    buildConf("spark.sql.shuffle.pipelined.enabled")
-      .internal()
-      .doc("When true, SQL exchanges use PipelinedShuffleDependency so producer and consumer " +
-        "stages may run concurrently with the configured incremental shuffle manager. This is " +
-        "an experimental batch opt-in for validating pipelined stage execution.")
-      .version("5.0.0")
-      .booleanConf
-      .createWithDefault(false)
-
   val SHUFFLE_SPREAD_NULL_JOIN_KEYS_ENABLED =
     buildConf("spark.sql.shuffle.spreadNullJoinKeys.enabled")
       .doc("When true, Spark may spread rows with NULL equi-join keys across shuffle partitions " +
@@ -8627,8 +8617,6 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def cacheVectorizedReaderEnabled: Boolean = getConf(CACHE_VECTORIZED_READER_ENABLED)
 
   def defaultNumShufflePartitions: Int = getConf(SHUFFLE_PARTITIONS)
-
-  def pipelinedShuffleEnabled: Boolean = getConf(PIPELINED_SHUFFLE_ENABLED)
 
   def numShufflePartitions: Int = {
     if (adaptiveExecutionEnabled && coalesceShufflePartitionsEnabled) {
