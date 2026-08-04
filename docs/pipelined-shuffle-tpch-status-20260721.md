@@ -8,10 +8,6 @@ The public upstream material describes this direction as Spark 4.2 Real-Time Mod
 
 The diagrams are intentionally simple so they render cleanly in GitHub Wiki.
 
-The superseded baselines, experiment timeline, rejected A/Bs, and milestone
-evidence are preserved in
-[Spark Fully-Streaming UCX TPC-H 4GPU History](pipelined-shuffle-tpch-history-20260721-27.md).
-
 ## Overall Plan And Success Criteria
 
 The project has two ordered goals.
