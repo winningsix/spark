@@ -20,7 +20,7 @@ package org.apache.spark.scheduler
 import scala.collection.mutable.{HashMap, HashSet, ListBuffer}
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkConf, SparkException}
-import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{CONFIG, GROUP_ID, REASON, SHUFFLE_IDS, STAGE_ATTEMPT_ID, STAGE_ID}
 import org.apache.spark.internal.config
 import org.apache.spark.rdd.RDD

@@ -187,7 +187,7 @@ private[spark] class DAGScheduler(
       delayedTaskCompletionEvents: ListBuffer[CompletionEvent] = new ListBuffer[CompletionEvent])
   private[scheduler] val dependentStageMap = new HashMap[Stage, DependentStageInfo]
 
-  private[scheduler] val pipelinedStageGroups = new PipelinedStageGroupScheduler(
+  private[scheduler] lazy val pipelinedStageGroups = new PipelinedStageGroupScheduler(
     sc.conf,
     () => env.pipelinedShuffleManager,
     () => stageIdToStage.values,
@@ -195,8 +195,8 @@ private[spark] class DAGScheduler(
     stage => runningStages.contains(stage) || waitingStages.contains(stage) ||
       failedStages.contains(stage),
     rddChainReadsPipelinedShuffle,
-    maxConcurrentTasksForProfile,
-    outstandingTasksForOtherWork,
+    rpId => maxConcurrentTasksForProfile(rpId),
+    (rpId, excludeStageIds) => outstandingTasksForOtherWork(rpId, excludeStageIds),
     taskScheduler.submitPipelinedGroup)
 
   private[scheduler] val activeJobs = new HashSet[ActiveJob]

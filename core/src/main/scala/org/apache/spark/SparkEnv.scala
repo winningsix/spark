@@ -47,6 +47,7 @@ import org.apache.spark.security.CryptoStreamUtils
 import org.apache.spark.serializer.{JavaSerializer, Serializer, SerializerManager}
 import org.apache.spark.shuffle.{BlockingShuffleManager, PipelinedShuffleManager}
 import org.apache.spark.shuffle.{ShuffleBlockResolver, ShuffleManager}
+import org.apache.spark.shuffle.streaming.{MultiShuffleManager, StreamingShuffleManager}
 import org.apache.spark.storage._
 import org.apache.spark.udf.worker.UDFWorkerSpecification
 import org.apache.spark.udf.worker.core.{UDFDispatcherFactory, UDFDispatcherManager, WorkerDispatcher}
@@ -431,9 +432,9 @@ class SparkEnv (
     initializeStreamingShuffleOutputTracker()
   }
 
-  // Holds the output tracker used by every pipelined shuffle manager. DAGScheduler routes all
-  // PipelinedShuffleDependency output state through this tracker, including output produced by
-  // custom managers configured through spark.shuffle.manager.incremental.
+  // Holds the streaming shuffle output tracker, which is only present when the configured shuffle
+  // managers require it (i.e., a StreamingShuffleManager as the pipelined manager, or a
+  // MultiShuffleManager as the blocking manager).
   @volatile private var _streamingShuffleOutputTracker: Option[StreamingShuffleOutputTracker] =
     None
 
@@ -441,18 +442,29 @@ class SparkEnv (
     _streamingShuffleOutputTracker
 
   /**
-   * Initialize the StreamingShuffleOutputTracker after both shuffle managers have passed their
-   * type checks. This method is idempotent -- calling it multiple times is safe.
+   * Initialize the StreamingShuffleOutputTracker if the configured shuffle manager requires one
+   * and one does not already exist. This method is idempotent -- calling it multiple times is safe.
    */
   private def initializeStreamingShuffleOutputTracker(): Unit = {
     if (_streamingShuffleOutputTracker.isDefined) {
       return
     }
 
-    // initializeShuffleManager has established that this is a PipelinedShuffleManager. Every such
-    // manager needs the tracker because DAGScheduler registers every PipelinedShuffleDependency
-    // here, independently of the manager's concrete implementation.
-    createStreamingShuffleOutputTracker()
+    // The tracker is needed when the pipelined manager (spark.shuffle.manager.incremental) is a
+    // StreamingShuffleManager -- which is the default. Inspect the already-instantiated manager
+    // rather than re-reading the config; this runs at the end of initializeShuffleManager, so the
+    // manager is non-null here.
+    val incrementalIsStreaming =
+      _pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager]
+    // It is also needed when a MultiShuffleManager is the blocking manager (spark.shuffle.manager):
+    // it internally routes some shuffles to streaming. A bare StreamingShuffleManager cannot be the
+    // blocking manager -- it is pipelined and rejected from that slot in initializeShuffleManager.
+    // TODO: remove this MultiShuffleManager clause once MultiShuffleManager is removed and
+    // streaming shuffles are served only through the incremental (pipelined) manager slot.
+    val blockingIsMulti = _blockingShuffleManager.isInstanceOf[MultiShuffleManager]
+    if (incrementalIsStreaming || blockingIsMulti) {
+      createStreamingShuffleOutputTracker()
+    }
   }
 
   private def createStreamingShuffleOutputTracker(): Unit = {
