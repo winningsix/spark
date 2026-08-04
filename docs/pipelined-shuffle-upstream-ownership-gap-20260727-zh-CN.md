@@ -2037,10 +2037,40 @@ declarative-provider review tree；Maven 同口径验证结果为：
 - Scala 合计：354/354，共 8 个 discovered suites；
 - core Java tests：371/371。
 
-这里仅证明 Spark scheduler 的容量、生命周期和既有 core 行为没有功能
-回归，尚不能冒充 queue-depth=1 的真实 CPU backpressure E2E。后者、
-delayed reader、queue byte watermark 和 injected attempt failure 仍是
-社区提案进入 Part II 前的硬门槛。
+本轮进一步加入了不依赖 Gluten、UCX 或 GPU 的 Spark SQL CPU E2E：
+
+- 使用真实的 `PipelinedShuffleDependency` 和
+  `StreamingShuffleManager`，构造一个 producer、一个 reader、100 万行
+  输入的两阶段流水 DAG；
+- reader 已经 resident，但先停在测试闸门上，不消费网络数据；
+- reader memory quota 设置为 1 byte，network buffer 设置为 64 KiB，
+  writer memory quota 设置为 128 KiB；
+- reader 的 byte watermark 触发 Netty `autoRead=false`，TCP
+  backpressure 继续传导到 writer 的 bounded buffer semaphore；
+- 测试不靠超时猜测 backpressure，而是同时验证 producer 只生成了部分
+  输入、job 尚未结束，并且 producer 线程确实停在
+  `StreamingShuffleWriter.newBuffer`；
+- 打开 reader 闸门后，producer 完成全部 100 万行，reader 得到正确的
+  100 万行结果，整个 Spark job 正常结束，从而覆盖 EOS 和 writer
+  termination acknowledgement。
+
+因此这里不再使用“queue-depth=1”描述 CPU 实现；当前实现的有界单位是
+byte quota，反压链路是 Netty auto-read、TCP 和 writer buffer semaphore。
+相关验证结果为：
+
+- `PipelinedBatchShuffleSuite`：2/2；
+- `SQLExecutionSuite`：11/11；
+- 本轮直接受影响 suites 合计：13/13。
+
+同时删除了 `SQLExecution` 中仍然引用已移除 query-level control-plane
+接口的 terminal callback，共减少 25 行 production code。query completion
+继续由 Spark SQL 正常结束，而 pipelined group 的完成与失败由
+`DAGScheduler` 的 authoritative group lifecycle 管理。
+
+现在 CPU bounded backpressure、delayed reader、byte watermark、EOS 和
+termination acknowledgement 已有端到端证据。尚未补齐的外部硬门槛是
+injected attempt failure 与 attempt fencing E2E；scheduler 级 failure
+语义已有测试，但还需要用真实 CPU data plane 覆盖 late/stale attempt。
 
 #### 内部 Gate：Gluten-MPP 或 Flux 保持已达标性能
 
@@ -2072,7 +2102,10 @@ qualified profile，以及相同 SQL bundle、per-query overrides、
 与 `7d93c154c51` review tree 逐文件一致；本地新编译 jar 中
 `DAGScheduler`、`TaskSchedulerImpl`、provider 和 router 的 class 字节，
 也与冻结的 `pipelined-spark-provider-v3-20260727` candidate artifact
-完全一致。
+完全一致。此后又删除了 `SQLExecution` 中遗留的两个 query terminal
+callback；它们引用的 control-plane API 已经不存在，既无法参与 runtime
+调度，也会导致当前 SQL module 重新编译失败。这个删除不改变 scheduler
+hot path 或 shuffle data path。
 
 第一次正式 22Q gate 的确在提交 query 前被环境 preflight 拒绝：固定
 lane 的 GPU 4 和 GPU 5 当时被外部 `presto_server` 分别占用约 140 GiB
@@ -2120,9 +2153,34 @@ aggregate，不能按单个短 query 的一次百分比判定。
 因此本轮状态更新为：
 
 ```text
-Spark functional gate: PASS（Scala 354/354，Java 371/371）
+Spark functional gate: PASS（原门禁 Scala 354/354、Java 371/371；
+                              新增/直接受影响 SQL suites 13/13）
 Internal performance gate: PASS（22/22；27.046 s；vs pooled old -0.84%）
 ```
+
+补入 CPU backpressure/EOS E2E 并删除遗留 SQL callback 后，又执行了一次
+独立的 22Q follow-up gate。当前 SBT 重新编译得到的 8 个
+`SQLExecution*` class 与上一轮通过门禁的 provider artifact 逐个
+SHA-256 相同；也就是说，这次删除修复了 source tree 的可编译性，但没有
+改变已经验证过的 runtime 字节码。尽管如此，仍然冻结新 artifact 并完成
+一次正式运行：
+
+| Artifact | Run root | hot-min 总和 | 逐 query 中位数总和 |
+| --- | --- | ---: | ---: |
+| CPU E2E follow-up | `spark-cpu-e2e-gpu4567-c14-20260728` | 25.312 s | 27.174 s |
+
+该次运行仍使用 GPU 4--7、warmup=1、timed=3、TPC-H SF1000。结果为：
+
+- 22/22 query 成功，result rows、strict cuDF gate 全部通过；
+- cuDF fallback、Fetch/File error、MPP launch 和 MPP JNI fragment
+  均为 0；
+- UCX writer/reader endpoint evidence 仍为 3004/3248；
+- 相对 pooled old `27.275 s` 为 `-0.37%`；
+- 相对上一 candidate `27.046 s` 为 `+0.47%`；
+- 最大的两个 pooled-old 慢向点是 Q18 `+82 ms`（`+5.9%`）和
+  Q10 `+80 ms`（`+4.7%`），没有双位数逐 query 回退。
+
+因此 CPU 测试波次同样通过内部性能门禁，且没有改变此前的性能结论。
 
 当前 declarative extension/provider 波次可以进入提交和下一波；失败的
 `FullGroupResidency` 与显式 executor-cap 诊断不保留为生产改动。
@@ -2175,7 +2233,7 @@ MVP 的完成定义不是立即删除 `UcxShuffleCoordinator` 这个类，而是
 > micro-batch 的生命周期、checkpoint 和重提；Gluten 只负责 UCX/native
 > transport control plane。
 
-截至 2026-07-27：
+截至 2026-07-28：
 
 - upstream `master` 只有 pipelined shuffle 基础设施，尚未合入五项 group
   调度能力；
@@ -2189,6 +2247,9 @@ MVP 的完成定义不是立即删除 `UcxShuffleCoordinator` 这个类，而是
   production-general 机制；
 - automatic rerun 应继续保留在 Spark SQL 或 Structured Streaming
   execution 层；
+- Spark SQL CPU 路径已有真实 bounded backpressure、delayed reader、
+  EOS 和 termination acknowledgement E2E；真实 data-plane 的
+  attempt failure/fencing 注入测试仍待补齐；
 - Spark-visible 路径最终不需要 Gluten 再实现一套 query-level
   coordinator，但必须保留 UCX/native transport control plane；
 - 本地 shared MVP 已在当前受控范围内完成这项删除：两仓主代码净减
