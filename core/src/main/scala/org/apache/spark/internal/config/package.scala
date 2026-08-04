@@ -1852,87 +1852,6 @@ package object config {
       .stringConf
       .createWithDefault("streaming")
 
-  private[spark] val SCHEDULER_PIPELINED_GROUP_SLOT_CHECK_ENABLED =
-    ConfigBuilder("spark.scheduler.pipelined.group.slotCheck.enabled")
-      .internal()
-      .doc("When true, fail fast if a pipelined stage group requires more concurrently free task " +
-        "slots than the scheduler currently has. Disabling this is intended for experimental " +
-        "incremental-shuffle deployments that provide their own query-level admission control.")
-      .version("4.3.0")
-      .booleanConf
-      .createWithDefault(true)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_ROUND_ROBIN_ENABLED =
-    ConfigBuilder("spark.scheduler.pipelined.group.roundRobin.enabled")
-      .internal()
-      .doc("When true, TaskSchedulerImpl schedules consecutive pipelined task sets in " +
-        "round-robin passes instead of draining one task set before the next. This lets " +
-        "incremental-shuffle producer and consumer stages occupy task slots concurrently " +
-        "without switching the whole scheduler to FAIR mode.")
-      .version("4.3.0")
-      .booleanConf
-      .createWithDefault(false)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_MAX_CONCURRENT_GROUPS =
-    ConfigBuilder("spark.scheduler.pipelined.group.maxConcurrentGroups")
-      .internal()
-      .doc("Maximum number of pipelined shuffle stage groups admitted at the same time. " +
-        "A value of 0 disables this driver-side admission limit. This is a coarse " +
-        "query-level safety valve for incremental shuffle deployments: waiting pipelined " +
-        "stages are reconsidered when an admitted group completes or aborts.")
-      .version("4.3.0")
-      .intConf
-      .checkValue(_ >= 0, "must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_STAGE =
-    ConfigBuilder("spark.scheduler.pipelined.group.maxRunningTasksPerStage")
-      .internal()
-      .doc("Maximum number of concurrently running tasks for each stage in a pipelined " +
-        "shuffle group. A value of 0 disables this per-stage cap. This protects " +
-        "incremental-shuffle pipelines from filling all slots with upstream producers before " +
-        "downstream drain stages can run.")
-      .version("4.3.0")
-      .intConf
-      .checkValue(_ >= 0, "must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_SIMPLE_MAX_RUNNING_TASKS_PER_STAGE =
-    ConfigBuilder("spark.scheduler.pipelined.group.simple.maxRunningTasksPerStage")
-      .internal()
-      .doc("Maximum number of concurrently running tasks for each stage in a simple pipelined " +
-        "shuffle group with at most two scheduler stages. A value of 0 disables the simple-group " +
-        "override and uses spark.scheduler.pipelined.group.maxRunningTasksPerStage instead.")
-      .version("4.3.0")
-      .intConf
-      .checkValue(_ >= 0, "must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE =
-    ConfigBuilder("spark.scheduler.pipelined.group.producer.maxRunningTasksPerStage")
-      .internal()
-      .doc("Optional maximum number of concurrently running tasks for a pure producer stage in a " +
-        "pipelined shuffle group. A pure producer writes a pipelined shuffle but does not read one. " +
-        "When unset, producer stages use the regular pipelined group per-stage cap. A value of 0 " +
-        "disables the per-stage cap for pure producer stages while retaining round-robin scheduling.")
-      .version("4.3.0")
-      .intConf
-      .checkValue(_ >= 0, "must be non-negative")
-      .createOptional
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE =
-    ConfigBuilder("spark.scheduler.pipelined.group.producer.minRunningTasksPerStage")
-      .internal()
-      .doc("Minimum number of launched-or-finished tasks to reserve for one ready pure producer " +
-        "stage in a reader-resident pipelined shuffle group before other producer or reader " +
-        "stages consume the remaining offers. This is a driver-side frontier control for " +
-        "incremental shuffle managers whose native readers need enough upstream writer endpoints " +
-        "to make progress. The default preserves the existing one-producer-slot residency rule.")
-      .version("4.3.0")
-      .intConf
-      .checkValue(_ >= 1, "must be positive")
-      .createWithDefault(1)
-
   private[spark] val SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.scheduler.pipelined.group.maxRunningTasksPerExecutor")
       .internal()
@@ -1945,17 +1864,6 @@ package object config {
       .intConf
       .checkValue(_ >= 0, "must be non-negative")
       .createWithDefault(0)
-
-  private[spark] val SCHEDULER_PIPELINED_GROUP_KILL_INTERRUPT_THREAD_ENABLED =
-    ConfigBuilder("spark.scheduler.pipelined.group.killInterruptThread.enabled")
-      .internal()
-      .doc("When true, DAGScheduler interrupts running task threads while cancelling stages in a " +
-        "pipelined shuffle group. This helps incremental-shuffle readers and writers leave native " +
-        "wait states quickly after group failure without changing cancellation semantics for " +
-        "non-pipelined jobs.")
-      .version("4.3.0")
-      .booleanConf
-      .createWithDefault(true)
 
   private[spark] val SHUFFLE_REDUCE_LOCALITY_ENABLE =
     ConfigBuilder("spark.shuffle.reduceLocality.enabled")

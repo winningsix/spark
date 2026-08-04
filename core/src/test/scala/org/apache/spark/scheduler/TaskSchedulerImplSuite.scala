@@ -73,16 +73,14 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   }
 
   private def elasticPipelinedGroupRequirements(
-      taskScheduler: TaskSchedulerImpl): PipelinedGroupSchedulingRequirements = {
-    val conf = taskScheduler.conf
+      taskScheduler: TaskSchedulerImpl,
+      minProducerTasksPerStage: Int = 1,
+      maxProducerTasksPerStage: Option[Int] = None): PipelinedGroupSchedulingRequirements = {
     pipelinedGroupRequirements(
       taskScheduler,
       ReaderResidencyWithElasticProducers(
-        minProducerTasksPerStage =
-          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
-        maxProducerTasksPerStage =
-          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
-            .filter(_ > 0)))
+        minProducerTasksPerStage = minProducerTasksPerStage,
+        maxProducerTasksPerStage = maxProducerTasksPerStage))
   }
 
   var failedTaskSetException: Option[Throwable] = None
@@ -459,7 +457,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined producer cap can be disabled without limiting resident readers") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(
@@ -583,7 +580,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency reserves and balances source producer lanes") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(
@@ -856,7 +852,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader frontier includes downstream producer-reader stages") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[19]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "6",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -923,7 +918,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency serializes active groups at task launch") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "1",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(
@@ -946,7 +940,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 3,
         pipelinedGroupId = Some(groupId),
-        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(
+          taskScheduler, maxProducerTasksPerStage = Some(1)),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer,
         pipelinedProducerShuffleIds = producerShuffleIds,
@@ -985,7 +980,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency waits for a suspended group to drain") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[4]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
     taskScheduler.initialize(new FakeSchedulerBackend {
       override def killTask(
@@ -1057,7 +1051,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency refills pure producers after first wave completes") {
     val taskScheduler = setupSchedulerWithMaster(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
     val backend = taskScheduler.backend.asInstanceOf[FakeSchedulerBackend]
 
@@ -1147,7 +1140,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined pure producer refill prioritizes a starved sibling producer") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -1223,7 +1215,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined pure producer batch refill prioritizes a drained sibling producer") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "4",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -1322,8 +1313,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency fills configured pure producer frontier") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE.key -> "8",
       config.SCHEDULER_PIPELINED_GROUP_MAX_RUNNING_TASKS_PER_EXECUTOR.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
@@ -1344,7 +1333,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         isPipelined = true,
         pipelinedGroupStageCount = 4,
         pipelinedGroupId = Some("group-0"),
-        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(
+          taskScheduler, minProducerTasksPerStage = 8),
         isPipelinedShuffleReader = isReader,
         isPipelinedShuffleProducer = isProducer)
     }
@@ -1374,7 +1364,6 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
   test("pipelined reader residency is rechecked after a resident reader exits") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[16]",
-      config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE.key -> "0",
       config.LOCALITY_WAIT.key -> "0")
 
     def pipelinedTaskSet(

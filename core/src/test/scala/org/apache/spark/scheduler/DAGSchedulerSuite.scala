@@ -186,6 +186,13 @@ class DAGSchedulerSuiteDummyException extends Exception
 
 object ReaderResidencyRequiredShuffleManager {
   val schedulingRequirementCalls = new AtomicInteger()
+  @volatile var minProducerTasksPerStage = 1
+  @volatile var maxProducerTasksPerStage: Option[Int] = None
+
+  def reset(): Unit = {
+    minProducerTasksPerStage = 1
+    maxProducerTasksPerStage = None
+  }
 }
 
 class ReaderResidencyRequiredShuffleManager(conf: SparkConf, isDriver: Boolean)
@@ -199,10 +206,9 @@ class ReaderResidencyRequiredShuffleManager(conf: SparkConf, isDriver: Boolean)
     PipelinedGroupSchedulingRequirements(
       residencyPolicy = ReaderResidencyWithElasticProducers(
         minProducerTasksPerStage =
-          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE),
+          ReaderResidencyRequiredShuffleManager.minProducerTasksPerStage,
         maxProducerTasksPerStage =
-          conf.get(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MAX_RUNNING_TASKS_PER_STAGE)
-            .filter(_ > 0)))
+          ReaderResidencyRequiredShuffleManager.maxProducerTasksPerStage))
   }
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {}
@@ -482,6 +488,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
   override def beforeEach(): Unit = {
     super.beforeEach()
+    ReaderResidencyRequiredShuffleManager.reset()
     firstInit = true
   }
 
@@ -6377,13 +6384,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(scheduler.waitingStages.isEmpty)
     assert(scheduler.dependentStageMap.isEmpty)
     assert(scheduler.outputCommitCoordinator.isEmpty)
-    assert(scheduler.pipelinedShuffleGroupStageIds.isEmpty)
-    assert(scheduler.stageIdToPipelinedShuffleGroupId.isEmpty)
-    assert(scheduler.pipelinedShuffleGroupAttemptIds.isEmpty)
-    assert(scheduler.registeredPipelinedShuffleGroups.isEmpty)
-    assert(scheduler.admittedPipelinedShuffleGroups.isEmpty)
-    assert(scheduler.pipelinedSchedulingRequirementsByGroupAttempt.isEmpty)
-    assert(scheduler.pendingPipelinedTaskSetsByGroup.isEmpty)
+    assert(scheduler.pipelinedStageGroups.isEmpty)
   }
 
   // Nothing in this test should break if the task info's fields are null, but
@@ -7785,7 +7786,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     conf
       .set(config.SHUFFLE_MANAGER_INCREMENTAL.key,
         classOf[ReaderResidencyRequiredShuffleManager].getName)
-      .set(config.SCHEDULER_PIPELINED_GROUP_PRODUCER_MIN_RUNNING_TASKS_PER_STAGE.key, "60")
+    ReaderResidencyRequiredShuffleManager.minProducerTasksPerStage = 60
 
     val producerRdd = new MyRDD(sc, 60, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
@@ -7807,6 +7808,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assert(failure.get().getMessage.contains("has only 63 task slot(s)"))
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
+      ReaderResidencyRequiredShuffleManager.reset()
     }
   }
 
