@@ -1779,6 +1779,36 @@ private[spark] class DAGScheduler(
   }
 
   /**
+   * The full pipelined group `stage` belongs to: the connected component of the stage graph over
+   * pipelined edges (both the producers `stage` reads through a [[PipelinedShuffleDependency]] and,
+   * transitively, their pipelined producers/consumers). Walks `parents` and the shuffle-map stages
+   * of pipelined dependencies. Returns just `stage` if it has no pipelined edge.
+   */
+  private def pipelinedGroupOf(stage: Stage): Set[Stage] = {
+    val group = new HashSet[Stage]
+    val toVisit = new ListBuffer[Stage]
+    toVisit += stage
+    while (toVisit.nonEmpty) {
+      val current = toVisit.remove(0)
+      if (group.add(current)) {
+        current.parents.foreach {
+          case producer: ShuffleMapStage
+              if producer.shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]] =>
+            toVisit += producer
+          case _ =>
+        }
+        stageIdToStage.valuesIterator.foreach { candidate =>
+          if (!group.contains(candidate) && candidate.parents.contains(current) &&
+              isPipelinedProducer(current)) {
+            toVisit += candidate
+          }
+        }
+      }
+    }
+    group.toSet
+  }
+
+  /**
    * The total concurrent-task demand of an all-pipelined job, computed from the RDD graph BEFORE
    * any stage is created (so a rejection based on it leaves no partial scheduler state, exactly as
    * the barrier slot check and the speculation/DA reject do). Because a job is either all-regular
@@ -1833,9 +1863,23 @@ private[spark] class DAGScheduler(
    * TERMINAL (one check, then fail), delegating transient-shortfall retry to the caller.
    *
    * The check can be turned off with `spark.scheduler.pipelinedGroup.slotCheck.enabled=false` (for
-   * deployments that admit capacity out-of-band, e.g. via a slot reservation).
-   */
+  * deployments that admit capacity out-of-band, e.g. via a slot reservation).
+  */
+  private def pipelinedGroupSlotCheckEnabled: Boolean = {
+    val enabled = sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED)
+    if (!enabled && !warnedPipelinedSlotCheckDisabled) {
+      warnedPipelinedSlotCheckDisabled = true
+      logWarning(log"${MDC(CONFIG, config.PIPELINED_GROUP_SLOT_CHECK_ENABLED.key)}=false: " +
+        log"pipelined-group admission is not checking free slots. This is safe only if capacity " +
+        log"is reserved out-of-band; otherwise a group that cannot co-fit may deadlock.")
+    }
+    enabled
+  }
+
   private def pipelinedGroupExceedsCapacity(stage: Stage): Option[(Int, Int)] = {
+    if (!pipelinedGroupSlotCheckEnabled) {
+      return None
+    }
     val group = pipelinedGroupOf(stage)
     val demand = pipelinedShuffleSchedulingRequirements(group).residencyPolicy match {
       case FullGroupResidency =>
@@ -1843,8 +1887,9 @@ private[spark] class DAGScheduler(
       case policy: ReaderResidencyWithElasticProducers =>
         pipelinedReaderResidencyDemand(group, policy).totalSlots
     }
-    val totalSlots = maxConcurrentTasksForStage(stage)
-    val occupiedByOthers = runningTasksForOtherWork(stage, group)
+    val totalSlots = maxConcurrentTasksForProfile(stage.resourceProfileId)
+    val occupiedByOthers =
+      outstandingTasksForOtherWork(stage.resourceProfileId, group.map(_.id))
     val freeSlots = math.max(0, totalSlots - occupiedByOthers)
     if (demand > freeSlots) Some((demand, freeSlots)) else None
   }
@@ -1934,6 +1979,9 @@ private[spark] class DAGScheduler(
 
   private def pipelinedReaderResidencyBlocked(
       stage: Stage): Option[PipelinedReaderResidencyBlock] = {
+    if (!pipelinedGroupSlotCheckEnabled) {
+      return None
+    }
     val group = pipelinedGroupOf(stage)
     val metadata = pipelinedShuffleGroupMetadata(group)
     val policy = pipelinedShuffleSchedulingRequirements(group).residencyPolicy match {
@@ -1945,8 +1993,9 @@ private[spark] class DAGScheduler(
     val readerSlots = demand.readerSlots
     val minProducerSlots = demand.producerSlots
     val minRequiredSlots = demand.totalSlots
-    val totalSlots = maxConcurrentTasksForStage(stage)
-    val occupiedByOthers = runningTasksForOtherWork(stage, group)
+    val totalSlots = maxConcurrentTasksForProfile(stage.resourceProfileId)
+    val occupiedByOthers =
+      outstandingTasksForOtherWork(stage.resourceProfileId, group.map(_.id))
     val freeSlots = math.max(0, totalSlots - occupiedByOthers)
     if (minRequiredSlots > totalSlots) {
       return Some(FatalPipelinedReaderResidencyBlock(

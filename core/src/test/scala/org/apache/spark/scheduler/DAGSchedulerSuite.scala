@@ -7557,55 +7557,18 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a group too large to co-fit fails fast with INSUFFICIENT_SLOT") {
-    // Constrain reported capacity to 3 slots. A pipelined group of producer(2) + consumer(2) = 4
-    // tasks exceeds it and can never be co-resident, so it must fail fast rather than deadlock.
-    val producerRdd = new MyRDD(sc, 2, Nil) // touch sc first so `scheduler` is initialized
-    scheduler.asInstanceOf[MyDAGScheduler].maxConcurrentTasksForTest = 3
-    try {
-      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-      val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-      val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
-      val failListener = new JobListener {
-        override def taskSucceeded(index: Int, result: Any): Unit = {}
-        override def jobFailed(exception: Exception): Unit = failure.set(exception)
-      }
-      submit(consumerRdd, Array(0, 1), listener = failListener)
-
-      assert(failure.get() != null, "an over-large pipelined group must fail the job")
-      assert(failure.get().getMessage.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT") ||
-        failure.get().getMessage.contains("concurrent task slots"),
-        s"expected an insufficient-slot error, got: ${failure.get().getMessage}")
-      assertDataStructuresEmpty()
-    } finally {
-      scheduler.asInstanceOf[MyDAGScheduler].maxConcurrentTasksForTest = 1000
-    }
-  }
-
-  test("pipelined shuffle: a group that fits is co-scheduled (slot check passes)") {
-    // Producer (2) + consumer (2) = 4 tasks <= 16 slots: co-scheduled normally, no abort.
-    val producerRdd = new MyRDD(sc, 2, Nil)
-    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-    submit(consumerRdd, Array(0, 1))
-    assert(taskSets.size === 2, "group fits, so producer and consumer are co-scheduled")
-    completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
-    complete(taskSets(1), Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
-    assertDataStructuresEmpty()
-  }
-
   test("pipelined shuffle: a group that fits total capacity but not FREE slots fails fast (S4.1)") {
     // Spec S4.1: admission is decided against currently-FREE slots, not total capacity. A group of
     // producer(2) + consumer(2) = 4 tasks fits a 10-slot cluster in principle, but if 8 slots are
     // already occupied by OTHER work only 2 are free -- the group cannot co-fit right now and must
     // fail fast rather than queue forever. Under the old total-capacity check this would wrongly be
-    // admitted (4 <= 10) and then hang. runningTasksForOtherWork already excludes the group's own
+    // admitted (4 <= 10) and then hang. outstandingTasksForOtherWork already excludes the group's
     // members, so we report 8 directly.
     val producerRdd = new MyRDD(sc, 2, Nil) // touch sc first so `scheduler` is initialized
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 10
-    myScheduler.runningTasksForOtherWorkForTest = (_, _) => 8 // 8 of 10 slots busy elsewhere -> 2 free
+    myScheduler.outstandingTasksForOtherWorkForTest =
+      (_, _) => 8 // 8 of 10 slots busy elsewhere -> 2 free
     try {
       val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
       val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
@@ -7624,7 +7587,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assertDataStructuresEmpty()
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
-      myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0
+      myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
     }
   }
 
@@ -7864,7 +7827,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     val blockerOccupiesSlots = new java.util.concurrent.atomic.AtomicBoolean(true)
     myScheduler.maxConcurrentTasksForTest = 10
-    myScheduler.runningTasksForOtherWorkForTest = { (_, _) =>
+    myScheduler.outstandingTasksForOtherWorkForTest = { (_, _) =>
       if (blockerOccupiesSlots.get()) 8 else 0
     }
     try {
@@ -7906,7 +7869,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assertDataStructuresEmpty()
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
-      myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0
+      myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
     }
   }
 
@@ -7920,7 +7883,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val producerRdd = new MyRDD(sc, 2, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 4
-    myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0 // only the group's own work runs
+    myScheduler.outstandingTasksForOtherWorkForTest =
+      (_, _) => 0 // only the group's own work runs
     try {
       val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
       val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
@@ -7933,7 +7897,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       assertDataStructuresEmpty()
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
-      myScheduler.runningTasksForOtherWorkForTest = (_, _) => 0
+      myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
     }
   }
   test("regular shuffle: task sets are NOT marked isPipelined (inertness)") {

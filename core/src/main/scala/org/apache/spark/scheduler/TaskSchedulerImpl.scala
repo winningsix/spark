@@ -488,7 +488,7 @@ private[spark] class TaskSchedulerImpl(
       sc.resourceProfileManager.canBeScheduled(
         taskSet.taskSet.resourceProfileId, shuffledOffers(i).resourceProfileId) &&
         resourcesMeetTaskRequirements(
-          taskSet, availableCpus(i), availableResources(i)).isDefined
+          taskSet, taskCpus, availableCpus(i), availableResources(i)).isDefined
     }.map(i => shuffledOffers(i).executorId).toSet
     val eligiblePipelinedExecutors =
       if (includeAllActivePipelinedExecutors && usePipelinedGroupRoundRobin(taskSet)) {
@@ -1060,7 +1060,7 @@ private[spark] class TaskSchedulerImpl(
 
   private def pipelinedOfferState(
       shuffledOffers: Seq[WorkerOffer],
-      availableCpus: Array[Int]): String = {
+      availableCpus: Array[BigDecimal]): String = {
     shuffledOffers.indices.map { i =>
       val offer = shuffledOffers(i)
       val executorRunning = executorIdToRunningTaskIds.get(offer.executorId).map(_.size).getOrElse(0)
