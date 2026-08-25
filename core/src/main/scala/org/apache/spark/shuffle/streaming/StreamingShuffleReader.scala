@@ -26,7 +26,9 @@ import io.netty.buffer.ByteBufInputStream
 
 import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.config.{EXECUTOR_ID, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY}
+import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID, SHUFFLE_COMPRESS,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY,
+  STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
@@ -81,7 +83,9 @@ class StreamingShuffleReader[K, C](
     handle: ShuffleHandle,
     val context: TaskContext,
     clientHandler: Option[StreamingShuffleClientHandler] = None,
-    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier())
+    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier(),
+    sharedClientFactory: Option[TransportClientFactory] = None,
+    sharedExecutorClient: Option[StreamingShuffleExecutorClient] = None)
     extends ShuffleReader[K, C] with TaskContextAwareLogging {
   assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
   private val conf = SparkEnv.get.conf
@@ -90,8 +94,10 @@ class StreamingShuffleReader[K, C](
   setShuffleIdForLogging(streamingShuffleHandle.shuffleId)
   // a mapping of mapId and client
   private[spark] val clientMap = new ConcurrentHashMap[Long, TransportClient]()
-  // Track factories so we can close them on shutdown.
-  // TODO: refactor to reuse a single client factory across writers.
+  private val logicalClientHandlers =
+    new ConcurrentHashMap[Long, StreamingShuffleClientHandler]()
+  // Standalone readers used by low-level tests own their factories. Readers constructed by the
+  // shuffle manager use its executor-scoped shared factory instead, so this queue stays empty.
   private val clientFactories = new ConcurrentLinkedQueue[TransportClientFactory]()
   private val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
 
@@ -129,6 +135,11 @@ class StreamingShuffleReader[K, C](
   } else {
     null
   }
+  private val compressionCodec = if (conf.get(SHUFFLE_COMPRESS)) {
+    Some(StreamingShuffleCompression.decompressor)
+  } else {
+    None
+  }
 
   // The set of shuffle writers that this reader has successfully received
   // termination ack messages from.  This is used to make sure all term ack messages
@@ -139,7 +150,7 @@ class StreamingShuffleReader[K, C](
 
   // thread pool used to perform client creation in parallel
   private[spark] val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
-    Runtime.getRuntime.availableProcessors,
+    math.max(1, conf.get(EXECUTOR_CORES)),
     s"streaming-shuffle-async-client-creation-${context.partitionId()}")
 
   // Signals to other threads that task discovery should stop. For example, we may receive all
@@ -182,9 +193,22 @@ class StreamingShuffleReader[K, C](
     Utils.tryLogNonFatalError {
       shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
     }
-    Utils.tryLogNonFatalError {
-      clientMap.forEach((_, client) => client.close())
+    sharedExecutorClient match {
+      case Some(executorClient) =>
+        Utils.tryLogNonFatalError {
+          logicalClientHandlers.forEach((writerId, handler) =>
+            executorClient.unregister(
+              streamingShuffleHandle.shuffleId,
+              Math.toIntExact(writerId),
+              context.partitionId(),
+              handler))
+        }
+      case None =>
+        Utils.tryLogNonFatalError {
+          clientMap.forEach((_, client) => client.close())
+        }
     }
+    logicalClientHandlers.clear()
     Utils.tryLogNonFatalError {
       clientFactories.forEach(factory => factory.close())
     }
@@ -357,9 +381,9 @@ class StreamingShuffleReader[K, C](
    * Verifies the checksum of a DataMessage if checksum is enabled.
    * @throws SparkRuntimeException if checksum verification fails
    */
-  private def verifyDataMessageChecksum(dataMessage: DataMessage): Unit = {
+  private def verifyDataMessageChecksum(dataMessage: DataMessage, data: io.netty.buffer.ByteBuf)
+      : Unit = {
     if (shuffleChecksum != null) {
-      val data = dataMessage.data
       shuffleChecksum.reset()
       shuffleChecksum.updateChecksum(data, data.readerIndex(), data.readableBytes())
       val calculatedChecksum = shuffleChecksum.getValue()
@@ -389,12 +413,28 @@ class StreamingShuffleReader[K, C](
       errorNotifier
     ))
     handler.setOnTermAckResponseHandler(onTermAckResponse)
-    val clientContext =
-      new TransportContext(clientConf, handler)
-
-    val factory = clientContext.createClientFactory()
-    clientFactories.add(factory)
-    factory.createClient(remoteHost, remotePort)
+    sharedExecutorClient match {
+      case Some(executorClient) =>
+        val client = executorClient.register(
+          streamingShuffleHandle.shuffleId,
+          mapId,
+          context.partitionId(),
+          remoteHost,
+          remotePort,
+          handler)
+        logicalClientHandlers.put(mapId.toLong, handler)
+        client
+      case None =>
+        sharedClientFactory match {
+          case Some(factory) =>
+            factory.createUnmanagedClient(remoteHost, remotePort, handler)
+          case None =>
+            val clientContext = new TransportContext(clientConf, handler)
+            val factory = clientContext.createClientFactory()
+            clientFactories.add(factory)
+            factory.createClient(remoteHost, remotePort)
+        }
+    }
   }
 
   private def checkTaskFailure(): Unit = {
@@ -410,6 +450,10 @@ class StreamingShuffleReader[K, C](
 
   override def read(): Iterator[Product2[K, C]] = {
     val serializerInstance = streamingShuffleHandle.dependency.serializer.newInstance()
+    val byteBufSerializer = serializerInstance match {
+      case serializer: StreamingShuffleSerializerInstance => Some(serializer)
+      case _ => None
+    }
     // Termination messages are added to a set that contains the shuffle writer ids that have sent
     // termination messages. When the set size reaches the number of shuffle writers, we know
     // that we will not receive any future messages, and the reader can be closed. When a data
@@ -441,9 +485,15 @@ class StreamingShuffleReader[K, C](
             log" shuffle writers ${MDC(LogKeys.SHUFFLE_WRITERS,
               terminationControlMessageSet)}. Shutting down.")
 
-        // make sure all term acks have been sent successfully
-        while (!allTermAcksSentNotice.tryAcquire(100, TimeUnit.MILLISECONDS)) {
-          checkTaskFailure()
+        // The writer-side ACK callbacks are asynchronous. Waiting for every callback here can
+        // deadlock a chained pipelined shuffle: the downstream reader is waiting for upstream
+        // termination while the upstream writer is waiting for this reader's ACK. Keep the
+        // strict behavior as the default for compatibility, but allow the chained path to finish
+        // after all ACKs have been submitted.
+        if (conf.get(STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS)) {
+          while (!allTermAcksSentNotice.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+            checkTaskFailure()
+          }
         }
         true
       } else {
@@ -453,12 +503,45 @@ class StreamingShuffleReader[K, C](
 
     def handleDataMessage(dataMessage: DataMessage): Iterator[(K, C)] = {
       currentDataMessage = dataMessage
-      verifyDataMessageChecksum(dataMessage)
-      val recordData = dataMessage.getRecordData()
-      val deserializedIterator = serializerInstance
-        .deserializeStream(new ByteBufInputStream(recordData))
-        .asKeyValueIterator
-        .asInstanceOf[Iterator[(K, C)]]
+      var decompressedBuffer: io.netty.buffer.ByteBuf = null
+      val recordData = if (dataMessage.uncompressedSize == dataMessage.dataSize) {
+        dataMessage.getRecordData()
+      } else {
+        val decompressor = compressionCodec.getOrElse(throw new IllegalStateException(
+          "Received a compressed streaming shuffle message while spark.shuffle.compress=false"))
+        decompressedBuffer = dataMessage.data.alloc().directBuffer(
+          dataMessage.uncompressedSize, dataMessage.uncompressedSize)
+        try {
+          val compressed = dataMessage.getRecordData()
+          val source = compressed.nioBuffer(compressed.readerIndex(), dataMessage.dataSize)
+          val destination = decompressedBuffer.nioBuffer(0, dataMessage.uncompressedSize)
+          val uncompressedBytes = decompressor.decompress(
+            source, source.position(), dataMessage.dataSize,
+            destination, destination.position(), dataMessage.uncompressedSize)
+          if (uncompressedBytes != dataMessage.uncompressedSize) {
+            throw new IllegalArgumentException(
+              s"Compressed streaming shuffle message produced $uncompressedBytes bytes, " +
+                s"expected ${dataMessage.uncompressedSize}")
+          }
+          decompressedBuffer.writerIndex(dataMessage.uncompressedSize)
+          decompressedBuffer
+        } catch {
+          case t: Throwable =>
+            decompressedBuffer.release()
+            decompressedBuffer = null
+            throw t
+        }
+      }
+      verifyDataMessageChecksum(dataMessage, recordData)
+      val deserializedIterator = byteBufSerializer match {
+        case Some(serializer) =>
+          serializer.keyValueIteratorFromByteBuf(recordData).asInstanceOf[Iterator[(K, C)]]
+        case None =>
+          serializerInstance
+            .deserializeStream(new ByteBufInputStream(recordData))
+            .asKeyValueIterator
+            .asInstanceOf[Iterator[(K, C)]]
+      }
       assert(
         deserializedIterator.hasNext,
         formatMessage(
@@ -477,6 +560,10 @@ class StreamingShuffleReader[K, C](
           }
         }
         override def close(): Unit = {
+          if (decompressedBuffer != null) {
+            decompressedBuffer.release()
+            decompressedBuffer = null
+          }
           dataMessage.release()
           currentDataMessage = null
         }

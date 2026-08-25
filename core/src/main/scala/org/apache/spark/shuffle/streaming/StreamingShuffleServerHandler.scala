@@ -67,22 +67,7 @@ class StreamingShuffleServerHandler(
     try {
       buf = Unpooled.wrappedBuffer(message)
       val shuffleMessage = StreamingShuffleMessage.decode(buf)
-
-      shuffleMessage match {
-        case creditControlMessage: CreditControlMessage =>
-          futureClients(creditControlMessage.shuffleReaderId).complete(client)
-        case terminationAck: TerminationAckMessage =>
-          logInfo(
-            s"Received termination ack message from shuffle reader " +
-              s"${terminationAck.shuffleReaderId}"
-          )
-          onTerminationAckReceived(terminationAck.shuffleReaderId, terminationAck.getSeqNum)
-        case _ =>
-          throw new IllegalArgumentException(
-            s"Unexpected message type in ShuffleServerHandler: " +
-              s"${shuffleMessage.messageType()}"
-          )
-      }
+      handleMessage(client, shuffleMessage)
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle server handler receive failed", ex)
@@ -91,6 +76,26 @@ class StreamingShuffleServerHandler(
       if (buf != null) {
         buf.release()
       }
+    }
+  }
+
+  private[streaming] def handleMessage(
+      client: TransportClient,
+      shuffleMessage: StreamingShuffleMessage): Unit = {
+    shuffleMessage match {
+      case creditControlMessage: CreditControlMessage =>
+        futureClients(creditControlMessage.shuffleReaderId).complete(client)
+      case terminationAck: TerminationAckMessage =>
+        logInfo(
+          s"Received termination ack message from shuffle reader " +
+            s"${terminationAck.shuffleReaderId}"
+        )
+        onTerminationAckReceived(terminationAck.shuffleReaderId, terminationAck.getSeqNum)
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Unexpected message type in ShuffleServerHandler: " +
+            s"${shuffleMessage.messageType()}"
+        )
     }
   }
 

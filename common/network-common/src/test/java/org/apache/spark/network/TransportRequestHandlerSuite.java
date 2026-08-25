@@ -20,6 +20,7 @@ package org.apache.spark.network;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.netty.channel.Channel;
 import org.junit.jupiter.api.Assertions;
@@ -40,6 +41,27 @@ import org.apache.spark.network.server.TransportRequestHandler;
 import org.apache.spark.util.Pair;
 
 public class TransportRequestHandlerSuite {
+
+  @Test
+  public void oneWayHandlerCanRetainManagedBody() throws Exception {
+    AtomicReference<ManagedBuffer> receivedBody = new AtomicReference<>();
+    RpcHandler rpcHandler = new NoOpRpcHandler() {
+      @Override
+      public void receive(TransportClient client, ManagedBuffer message) {
+        receivedBody.set(message);
+      }
+    };
+    Channel channel = mock(Channel.class);
+    TransportClient reverseClient = mock(TransportClient.class);
+    ManagedBuffer body = mock(ManagedBuffer.class);
+    TransportRequestHandler requestHandler = new TransportRequestHandler(
+      channel, reverseClient, rpcHandler, 2L, null);
+
+    requestHandler.handle(new OneWayMessage(body));
+
+    assertSame(body, receivedBody.get());
+    verify(body).release();
+  }
 
   @Test
   public void handleStreamRequest() throws Exception {

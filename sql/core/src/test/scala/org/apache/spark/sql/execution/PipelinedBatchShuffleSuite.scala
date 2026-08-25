@@ -33,26 +33,11 @@ import org.apache.spark.internal.config.{
   STREAMING_SHUFFLE_READER_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
 import org.apache.spark.scheduler.{SparkListener, SparkListenerStageCompleted, SparkListenerStageSubmitted}
-import org.apache.spark.sql.{QueryTest, SparkSessionExtensions}
-import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
-import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.{SharedSparkSession, TestSparkSession}
 import org.apache.spark.util.ThreadUtils
-
-class PipelinedBatchShuffleTestExtensions extends (SparkSessionExtensions => Unit) {
-  override def apply(extensions: SparkSessionExtensions): Unit = {
-    extensions.injectColumnar(_ => new ColumnarRule {
-      override def preColumnarTransitions: Rule[SparkPlan] = plan => plan.transformUp {
-        case exchange: ShuffleExchangeExec
-            if !exchange.pipelined &&
-              !exchange.outputPartitioning.isInstanceOf[RangePartitioning] =>
-          exchange.copy(pipelined = true)
-      }
-    })
-  }
-}
 
 private object PipelinedBatchShuffleBackpressureProbe {
   @volatile var readerStarted = new CountDownLatch(1)
@@ -79,7 +64,7 @@ class PipelinedBatchShuffleSuite extends QueryTest with SharedSparkSession {
       .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 64 << 10)
       .set(STREAMING_SHUFFLE_READER_MAX_MEMORY, 1)
       .set(STREAMING_SHUFFLE_WRITER_MAX_MEMORY, 128 << 10)
-      .set("spark.sql.extensions", classOf[PipelinedBatchShuffleTestExtensions].getName)
+      .set(SQLConf.BATCH_PIPELINED_SHUFFLE_ENABLED.key, "true")
       .set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
       .set(SQLConf.SHUFFLE_PARTITIONS.key, "2")
   }
@@ -125,6 +110,22 @@ class PipelinedBatchShuffleSuite extends QueryTest with SharedSparkSession {
     } finally {
       spark.sparkContext.removeSparkListener(listener)
     }
+  }
+
+  test("shuffles below a range exchange remain materialized") {
+    val result = spark
+      .range(0, 10000, 1, 2)
+      .selectExpr("id % 8 AS k")
+      .groupBy("k")
+      .count()
+      .orderBy("k")
+
+    val exchanges = result.queryExecution.executedPlan.collect {
+      case shuffle: ShuffleExchangeExec => shuffle
+    }
+    assert(exchanges.size >= 2)
+    assert(!exchanges.exists(_.pipelined))
+    assert(result.collect().map(_.getLong(1)).sum == 10000)
   }
 
   test("CPU pipelined shuffle back-pressures its producer and completes after end of stream") {

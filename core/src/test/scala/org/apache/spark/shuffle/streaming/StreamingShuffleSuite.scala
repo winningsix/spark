@@ -26,8 +26,10 @@ import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
 import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.channel.{Channel, ChannelConfig}
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future => NettyFuture}
+import org.mockito.Mockito.when
 import org.scalatest.Assertions.intercept
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually.eventually
@@ -563,6 +565,45 @@ class StreamingShuffleSuite
     // A clean close after termination: the handler must record no error.
     handler.channelInactive(null)
     errorNotifier.getError() should be(None)
+  }
+
+  test("client handler sends credit only once for connection discovery") {
+    val errorNotifier = new ErrorNotifier()
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    var creditMessagesSent = 0
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errorNotifier) {
+      override protected def sendCreditControlMessage(
+          client: TransportClient,
+          shuffleWriterId: Int,
+          credit: Int): Unit = {
+        creditMessagesSent += 1
+      }
+    }
+    val client = mock[TransportClient]
+    val channel = mock[Channel]
+    val channelConfig = mock[ChannelConfig]
+    when(client.getChannel).thenReturn(channel)
+    when(channel.config).thenReturn(channelConfig)
+    when(channelConfig.isAutoRead).thenReturn(true)
+
+    handler.channelActive(client)
+    creditMessagesSent should be(1)
+
+    // Empty DataMessage wire frame: type + seqNum + writer/reader ids + size + checksum.
+    val encoded = ByteBuffer.allocate(32)
+    encoded.putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id())
+    encoded.putLong(0L)
+    encoded.putInt(0)
+    encoded.putInt(0)
+    encoded.putInt(0)
+    encoded.putLong(0L)
+    encoded.flip()
+    handler.receive(client, encoded, null)
+
+    creditMessagesSent should be(1)
+    errorNotifier.getError() should be(None)
+    queue.take().release()
   }
 
   test("reader catches out of order message sequence number from writer - duplicate") {
@@ -1517,7 +1558,7 @@ class StreamingShuffleSuite
             logError("Simulated server handler receive failure", testError)
           }
         }),
-        writerErrorNotifier)
+        errorNotifier = writerErrorNotifier)
 
       // Server should be running initially.
       writer.server.channelFuture() should not be null

@@ -26,11 +26,16 @@ import scala.util.Try
 
 import io.netty.buffer.{ByteBuf, ByteBufOutputStream, CompositeByteBuf, Unpooled}
 import io.netty.channel.{ChannelFuture, ChannelOption}
+import net.jpountz.lz4.LZ4Factory
 
 import org.apache.spark.{SparkContext, SparkEnv, StreamingShuffleTaskLocation, TaskContext}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.config.{EXECUTOR_ID, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
-import org.apache.spark.internal.config.Network.RPC_IO_THREADS
+import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED,
+  STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED,
+  STREAMING_SHUFFLE_WRITER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_SERVER_THREADS,
+  STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.TransportClient
@@ -42,11 +47,23 @@ import org.apache.spark.serializer.{JavaSerializerInstance, SerializationStream}
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriter}
 import org.apache.spark.util.{ErrorNotifier, Utils}
 
+/** Executor-JVM-wide stateless LZ4 primitives for independent streaming-shuffle blocks. */
+private[streaming] object StreamingShuffleCompression {
+  // Cache fastestInstance() once: repeated JNI discovery can serialize on LZ4Factory and retry a
+  // failed native load. The compressor and decompressor implementations are stateless.
+  private lazy val factory = LZ4Factory.fastestInstance()
+  lazy val compressor = factory.fastCompressor()
+  // The factory's fastDecompressor is a Java implementation for ByteBuffer input in lz4-java
+  // 1.11.1, while safeDecompressor is JNI-backed and can validate the compressed input length.
+  lazy val decompressor = factory.safeDecompressor()
+}
+
 class StreamingShuffleWriter[K, V](
     handle: ShuffleHandle,
     mapId: Long,
     val context: TaskContext,
     serverHandler: Option[StreamingShuffleServerHandler] = None,
+    sharedExecutorServer: Option[StreamingShuffleExecutorServer] = None,
     private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier())
     extends ShuffleWriter[K, V] with TaskContextAwareLogging {
   assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
@@ -58,13 +75,25 @@ class StreamingShuffleWriter[K, V](
   private val BUFFER_SIZE: Integer = conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE)
   // The interval at which we flush pending messages.
   private val MAX_BUFFERING_TIME_MS = conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS)
+  private val TIME_BASED_FLUSH_ENABLED = MAX_BUFFERING_TIME_MS > 0
+  private val WAIT_FOR_TERMINATION_ACKS =
+    conf.get(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
+  private val WRITER_BACKPRESSURE_ENABLED =
+    conf.get(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED)
 
   // Shuffle details.
   private val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, V, _]]
   private val serializerInstance = streamingShuffleHandle.dependency.serializer.newInstance()
+  private val byteBufSerializer = serializerInstance match {
+    case serializer: StreamingShuffleSerializerInstance => Some(serializer)
+    case _ => None
+  }
   private val partitioner = streamingShuffleHandle.dependency.partitioner
   private val numPartitions = partitioner.numPartitions
-  private val shuffleWriterId = context.partitionId()
+  // Use the same map identity that is registered in StreamingShuffleOutputTracker and handed to
+  // readers. context.partitionId() happened to work while every writer owned a unique port, but
+  // it is not the same value as mapId for later stages and cannot route a multiplexed server.
+  private[streaming] val shuffleWriterId = Math.toIntExact(mapId)
   // Total size of TCP buffers. Use Long math to avoid 32-bit overflow when numPartitions
   // is large (numPartitions * buffer sizes can exceed Int.MaxValue).
   private val TOTAL_TCPBUF_BYTES: Long =
@@ -89,6 +118,14 @@ class StreamingShuffleWriter[K, V](
       log"minimum for ${MDC(LogKeys.NUM_PARTITIONS, numPartitions)} partitions takes precedence.")
   }
   private val CHECKSUM_ENABLED = conf.get(STREAMING_SHUFFLE_CHECKSUM_ENABLED)
+  // Match the standard sort shuffle's spark.shuffle.compress behavior. Each DataMessage is one
+  // independent raw block; this avoids constructing a framed OutputStream and copying through
+  // it for every message.
+  private val compressionCodec = if (conf.get(SHUFFLE_COMPRESS)) {
+    Some(StreamingShuffleCompression.compressor)
+  } else {
+    None
+  }
   // A row larger than the network buffer cannot be packed with any neighbor and forces its own
   // (oversized) buffer, defeating the batching that BUFFER_SIZE is meant to enable.
   private val largeRowThreshold = BUFFER_SIZE
@@ -124,7 +161,22 @@ class StreamingShuffleWriter[K, V](
   // Holds per-shard state. Public for testing.
   private[streaming] val shards: Array[ShardState] = Array.tabulate(numPartitions)(ShardState(_))
 
+  // With time-based flushing disabled, only the task thread accesses partially-filled buffers.
+  // Keeping them here avoids two AtomicReference.getAndSet operations per record, which is a
+  // material CPU cost for UnsafeRow-heavy shuffles. The atomic ShardState buffers remain the
+  // correctness path whenever the flush thread is enabled.
+  private val singleThreadedBuffers: Array[TimestampedBuffer] =
+    if (TIME_BASED_FLUSH_ENABLED) null else new Array[TimestampedBuffer](numPartitions)
+
   private val allocatedBufferBytesSemaphore: Semaphore = new Semaphore(MAX_BUFFER_BYTES.toInt)
+  private val rawBytesSent = new AtomicLong(0L)
+  private val wireBytesSent = new AtomicLong(0L)
+  private val dataMessagesSent = new AtomicLong(0L)
+  // Counts messages whose TransportClient write callback has not completed. In the relaxed
+  // pipelined lifecycle this is the delivery barrier: it preserves all network writes without
+  // waiting for downstream task termination ACKs, which can form a cross-stage cycle.
+  private val pendingSends = new AtomicLong(0L)
+  private val pendingSendsNotice = new Semaphore(0)
 
   // Data payloads use a dedicated direct-buffer free-list (bufferPool) of fixed BUFFER_SIZE
   // buffers so full-size send buffers can be recycled across the task; the small, variable-size
@@ -140,20 +192,26 @@ class StreamingShuffleWriter[K, V](
   }
 
   private def startShuffleServer(): TransportServer = {
-    val role = conf.get(EXECUTOR_ID).map { id =>
-      if (SparkContext.isDriver(id)) "driver" else "executor"
+    val server = sharedExecutorServer match {
+      case Some(shared) =>
+        shared.register(
+          streamingShuffleHandle.shuffleId, shuffleWriterId, transportServerHandler)
+        shared.server
+      case None =>
+        val role = conf.get(EXECUTOR_ID).map { id =>
+          if (SparkContext.isDriver(id)) "driver" else "executor"
+        }
+        val serverConf = SparkTransportConf.fromSparkConf(
+          conf,
+          s"streaming-shuffle-writer-${streamingShuffleHandle.shuffleId}-${shuffleWriterId}",
+          conf.get(STREAMING_SHUFFLE_WRITER_SERVER_THREADS),
+          role)
+        val serverContext = new TransportContext(serverConf, transportServerHandler)
+        logInfo(log"Creating shuffle server for shuffle writer" +
+          log" ${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}" +
+          log" for shuffle ${MDC(LogKeys.SHUFFLE_ID, streamingShuffleHandle.shuffleId)}")
+        serverContext.createServer()
     }
-
-    val serverConf = SparkTransportConf.fromSparkConf(
-      conf,
-      s"streaming-shuffle-writer-${streamingShuffleHandle.shuffleId}-${shuffleWriterId}",
-      conf.get(RPC_IO_THREADS).getOrElse(0), // zero will use default number of cores
-      role)
-    val serverContext = new TransportContext(serverConf, transportServerHandler)
-    logInfo(log"Creating shuffle server for shuffle writer" +
-      log" ${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}" +
-      log" for shuffle ${MDC(LogKeys.SHUFFLE_ID, streamingShuffleHandle.shuffleId)}")
-    val server = serverContext.createServer()
     val hostname = if (SparkEnv.get.rpcEnv.address != null) {
       // used and not null when running in an actual cluster but may be null for running tests
       SparkEnv.get.rpcEnv.address.host
@@ -177,8 +235,10 @@ class StreamingShuffleWriter[K, V](
   /** A buffer with metadata. Not thread safe: only supports single-threaded access. */
   @NotThreadSafe
   private[streaming] case class TimestampedBuffer(buffer: ByteBuf) {
-    val serializationStream: SerializationStream =
-      serializerInstance.serializeStream(new ByteBufOutputStream(buffer))
+    val serializationStream: Option[SerializationStream] = byteBufSerializer match {
+      case Some(_) => None
+      case None => Some(serializerInstance.serializeStream(new ByteBufOutputStream(buffer)))
+    }
     private val creationTimeNs = System.nanoTime()
     private val shuffleChecksum = if (CHECKSUM_ENABLED) new ShuffleChecksum() else null
 
@@ -231,24 +291,33 @@ class StreamingShuffleWriter[K, V](
         message.release()
       }
 
+      // Count before resolving the client future. A writer may enqueue a message before the
+      // downstream reader has connected; that future must remain part of the send barrier or
+      // task cleanup can cancel it and drop the message.
+      pendingSends.incrementAndGet()
+      def completeSend(): Unit = {
+        pendingSends.decrementAndGet()
+        pendingSendsNotice.release()
+      }
+
       def sendToClient(client: TransportClient): Unit = {
         try {
           client.send(buf).addListener((future: ChannelFuture) => {
             if (!future.isSuccess) {
               errorNotifier.markError(future.cause())
             }
-            done()
+            try done() finally completeSend()
           })
         } catch {
           case e: Throwable =>
             buf.release()
-            done()
+            try done() finally completeSend()
             errorNotifier.markError(e)
             throw e
         }
       }
 
-      client match {
+        client match {
         case Left(c) =>
           sendToClient(c)
         case Right(future) =>
@@ -257,7 +326,7 @@ class StreamingShuffleWriter[K, V](
           val newFuture = future.whenComplete { (client, ex) =>
             ex match {
               case null => sendToClient(client)
-              case _ => buf.release(); done()
+              case _ => buf.release(); try done() finally completeSend()
             }
           }
           // Once the future is completed, stop accumulating CompletionStages.
@@ -267,15 +336,53 @@ class StreamingShuffleWriter[K, V](
 
     // Sends buffer as a DataMessage to the shuffle reader. Takes ownership of the buffer.
     def send(timestampedBuffer: TimestampedBuffer): Unit = synchronized {
-      timestampedBuffer.serializationStream.close()
+      timestampedBuffer.serializationStream.foreach(_.close())
       val rawBuffer = timestampedBuffer.buffer
       val dataSize = rawBuffer.writerIndex()
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
-      val dataMessage = new DataMessage(shuffleWriterId, id, dataSize, rawBuffer, checksumValue)
+      val wireBuffer = compressionCodec match {
+        case Some(compressor) =>
+          // Compress directly between NIO views of the Netty buffers. If compression is not
+          // beneficial, discard the destination and send the original buffer.
+          val maxCompressedSize = compressor.maxCompressedLength(dataSize)
+          val compressed = server.getPooledByteBufAllocator
+            .directBuffer(maxCompressedSize, maxCompressedSize)
+          try {
+            val source = rawBuffer.nioBuffer(rawBuffer.readerIndex(), dataSize)
+            val destination = compressed.nioBuffer(0, maxCompressedSize)
+            val compressedSize = compressor.compress(
+              source, source.position(), dataSize,
+              destination, destination.position(), maxCompressedSize)
+            compressed.writerIndex(compressedSize)
+            if (compressedSize < dataSize) compressed else {
+              compressed.release()
+              rawBuffer
+            }
+          } catch {
+            case t: Throwable =>
+              compressed.release()
+              throw t
+          }
+        case None => rawBuffer
+      }
+      val wireSize = wireBuffer.readableBytes()
+      rawBytesSent.addAndGet(dataSize)
+      wireBytesSent.addAndGet(wireSize)
+      dataMessagesSent.incrementAndGet()
+      val dataMessage = new DataMessage(
+        streamingShuffleHandle.shuffleId, shuffleWriterId, id, wireSize, dataSize,
+        wireBuffer, checksumValue)
 
       // We keep a reference to rawBuffer so we can return it to the pool.
       send(dataMessage, () => {
+        if (wireBuffer ne rawBuffer) {
+          if (wireBuffer.refCnt() != 1) {
+            errorNotifier.markError(new AssertionError(
+              s"INTERNAL ERROR: Unexpected compressed buffer refcnt ${wireBuffer.refCnt()}"))
+          }
+          wireBuffer.release()
+        }
         if (rawBuffer.refCnt() != 1) {
           // Throw an internal exception for unexpected state.
           errorNotifier.markError(new AssertionError(
@@ -288,7 +395,9 @@ class StreamingShuffleWriter[K, V](
           } else {
             bufferPool.offerLast(rawBuffer)
           }
-          allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+          if (WRITER_BACKPRESSURE_ENABLED) {
+            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+          }
         }
       })
     }
@@ -305,7 +414,7 @@ class StreamingShuffleWriter[K, V](
 
     def close(): Unit = {
       send()
-      send(new TerminationControlMessage(shuffleWriterId, id))
+      send(new TerminationControlMessage(streamingShuffleHandle.shuffleId, shuffleWriterId, id))
     }
 
     def cancel(): Unit = {
@@ -381,18 +490,39 @@ class StreamingShuffleWriter[K, V](
       shards.foreach(_.cancel())
     }
     Utils.tryLogNonFatalError {
-      server.close()
+      sharedExecutorServer match {
+        case Some(shared) =>
+          shared.unregister(
+            streamingShuffleHandle.shuffleId, shuffleWriterId, transportServerHandler)
+        case None => server.close()
+      }
     }
     Utils.tryLogNonFatalError {
       val list = new java.util.ArrayList[ByteBuf]()
       bufferPool.drainTo(list)
       list.forEach(buf => { buf.release(); () })
     }
+    if (singleThreadedBuffers != null) {
+      Utils.tryLogNonFatalError {
+        var partitionId = 0
+        while (partitionId < singleThreadedBuffers.length) {
+          val pending = singleThreadedBuffers(partitionId)
+          singleThreadedBuffers(partitionId) = null
+          if (pending != null) pending.buffer.release()
+          partitionId += 1
+        }
+      }
+    }
     Utils.tryLogNonFatalError {
       memoryConsumer.freeMemory(memoryConsumer.getUsed())
     }
     logInfo(log"Resource cleanup took ${MDC(LogKeys.DURATION,
       System.currentTimeMillis() - cleanupStartTime)} ms")
+    val rawBytes = rawBytesSent.get()
+    val wireBytes = wireBytesSent.get()
+    logInfo(s"Streaming shuffle writer transfer summary: messages=${dataMessagesSent.get()}, " +
+      s"rawBytes=$rawBytes, wireBytes=$wireBytes, " +
+      f"wireRatio=${if (rawBytes == 0) 1.0 else wireBytes.toDouble / rawBytes}%.4f")
   }
 
   private def throwErrorIfExists(): Unit = {
@@ -405,10 +535,12 @@ class StreamingShuffleWriter[K, V](
     // byte size, so this bounds in-flight memory only on a best-effort basis: a single
     // serialized row larger than BUFFER_SIZE (rows are not split across buffers, see write())
     // grows its buffer past BUFFER_SIZE and thus exceeds the tracked budget.
-    if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
-      shards.foreach(_.send())
-      while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
-        throwErrorIfExists()
+    if (WRITER_BACKPRESSURE_ENABLED) {
+      if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
+        shards.foreach(_.send())
+        while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
+          throwErrorIfExists()
+        }
       }
     }
     val buffer = bufferPool.pollLast()
@@ -426,40 +558,57 @@ class StreamingShuffleWriter[K, V](
    */
   override def write(records: Iterator[Product2[K, V]]): Unit = {
     val isWriteFinished = new CountDownLatch(1)
-    val flushThread = new Thread(() =>
-      Try {
-        while (!isWriteFinished.await(MAX_BUFFERING_TIME_MS, TimeUnit.MILLISECONDS))
-          shards.foreach(_.send())
-      }.recover { case e => errorNotifier.markError(e) }
-      , "time-based-flush-for-shuffle-writer-" +
-        s"${streamingShuffleHandle.shuffleId}-${shuffleWriterId}")
+    val flushThread = if (TIME_BASED_FLUSH_ENABLED) {
+      Some(new Thread(() =>
+        Try {
+          while (!isWriteFinished.await(MAX_BUFFERING_TIME_MS, TimeUnit.MILLISECONDS))
+            shards.foreach(_.send())
+        }.recover { case e => errorNotifier.markError(e) },
+        "time-based-flush-for-shuffle-writer-" +
+          s"${streamingShuffleHandle.shuffleId}-${shuffleWriterId}"))
+    } else {
+      None
+    }
     try {
       // Reserve the budget with the task memory manager for accounting/visibility. In-flight
       // buffer memory is bounded by allocatedBufferBytesSemaphore; we ignore the return value
       // because we cannot act on a partial grant here (this consumer cannot spill).
-      memoryConsumer.acquireMemory(TOTAL_TCPBUF_BYTES + MAX_BUFFER_BYTES)
-      flushThread.start()
+      if (WRITER_BACKPRESSURE_ENABLED) {
+        memoryConsumer.acquireMemory(TOTAL_TCPBUF_BYTES + MAX_BUFFER_BYTES)
+      }
+      flushThread.foreach(_.start())
       records.foreach { record =>
         val shard = shards(partitioner.getPartition(record._1))
-        var timestampedBuffer = shard.takeBuffer()
+        var timestampedBuffer = if (TIME_BASED_FLUSH_ENABLED) {
+          shard.takeBuffer()
+        } else {
+          singleThreadedBuffers(shard.id)
+        }
         if (timestampedBuffer == null) {
           timestampedBuffer = newBuffer()
+          if (!TIME_BASED_FLUSH_ENABLED) {
+            // Publish immediately to the task-owned array so failure cleanup can release it even
+            // if serialization throws before this record finishes.
+            singleThreadedBuffers(shard.id) = timestampedBuffer
+          }
         }
         val dataStartPos = timestampedBuffer.buffer.writerIndex()
-        val partitionSerializationStream = timestampedBuffer.serializationStream
-        // When UnsafeRowSerializer, the key, record._1, is only used for determining
-        // the partition, and it doesn't need to be sent to the shuffle readers.
-        // However, if JavaSerializer is used (for test mainly), we need to serialize
-        // the key since we will be attempting to read it from the shuffle reader
-        //
         // TODO we are actually not guaranteeing that a buffer used to send data for a
         // partition does not exceed BUFFER_SIZE. We currently are not implementing spanning rows
         // across multiple buffers as it requires interface changes in the serializers
-        if (serializerInstance.isInstanceOf[JavaSerializerInstance]) {
-          partitionSerializationStream.writeKey(record._1.asInstanceOf[Any])
+        byteBufSerializer match {
+          case Some(serializer) =>
+            serializer.writeValueToByteBuf(record._2, timestampedBuffer.buffer)
+          case None =>
+            val partitionSerializationStream = timestampedBuffer.serializationStream.get
+            // UnsafeRowSerializer does not serialize the partitioning key. JavaSerializer is used
+            // primarily by tests and does need the key on the reader side.
+            if (serializerInstance.isInstanceOf[JavaSerializerInstance]) {
+              partitionSerializationStream.writeKey(record._1.asInstanceOf[Any])
+            }
+            partitionSerializationStream.writeValue(record._2.asInstanceOf[Any])
+            partitionSerializationStream.flush()
         }
-        partitionSerializationStream.writeValue(record._2.asInstanceOf[Any])
-        partitionSerializationStream.flush()
 
         // A single row is never split across buffers (see the TODO above), so an oversized row
         // grows its buffer past BUFFER_SIZE and inflates the tracked memory budget. Warn
@@ -483,14 +632,25 @@ class StreamingShuffleWriter[K, V](
 
         // Flush immediately if the buffer is almost full or stale.
         if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&
-            timestampedBuffer.ageMs() < MAX_BUFFERING_TIME_MS) {
-          shard.putBuffer(timestampedBuffer)
+            (!TIME_BASED_FLUSH_ENABLED ||
+              timestampedBuffer.ageMs() < MAX_BUFFERING_TIME_MS)) {
+          if (TIME_BASED_FLUSH_ENABLED) shard.putBuffer(timestampedBuffer)
         } else {
+          if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = null
           shard.send(timestampedBuffer)
           throwErrorIfExists()
         }
       }
       isWriteFinished.countDown()
+      if (!TIME_BASED_FLUSH_ENABLED) {
+        var partitionId = 0
+        while (partitionId < singleThreadedBuffers.length) {
+          val pending = singleThreadedBuffers(partitionId)
+          singleThreadedBuffers(partitionId) = null
+          if (pending != null) shards(partitionId).send(pending)
+          partitionId += 1
+        }
+      }
       shards.foreach(_.close())
       logInfo(log"StreamingShuffleWriter finished writing data and termination messages for " +
         log"shuffle writer ${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Shutting down now.")
@@ -502,15 +662,24 @@ class StreamingShuffleWriter[K, V](
       // on all-acks, on an ErrorNotifier error surfaced by throwErrorIfExists(), or on task
       // cancellation. A reader that dies fails its own reduce task, which restarts the query and
       // tears down this writer too, so writer-side reader-liveness detection is unnecessary.
-      while (!allAcksReceived.await(1, TimeUnit.MILLISECONDS)) {
-        throwErrorIfExists()
+      if (WAIT_FOR_TERMINATION_ACKS) {
+        while (!allAcksReceived.await(1, TimeUnit.MILLISECONDS)) {
+          throwErrorIfExists()
+        }
+        logInfo(log"Received all termination acks for shuffle writer ${MDC(
+          LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Closing server channel.")
+      } else {
+        while (pendingSends.get() != 0) {
+          throwErrorIfExists()
+          pendingSendsNotice.tryAcquire(100, TimeUnit.MILLISECONDS)
+        }
+        logInfo(log"All network sends completed for shuffle writer ${MDC(
+          LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}; skipping termination-ack wait.")
       }
-      logInfo(log"Received all termination acks for shuffle writer ${MDC(
-        LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Closing server channel.")
       throwErrorIfExists()
     } finally {
       isWriteFinished.countDown() // Duplicate countDowns are a no-op.
-      flushThread.join()
+      flushThread.foreach(_.join())
     }
   }
 }

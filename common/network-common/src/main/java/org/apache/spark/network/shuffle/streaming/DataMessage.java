@@ -34,13 +34,25 @@ import io.netty.buffer.CompositeByteBuf;
 public final class DataMessage extends StreamingShuffleMessage {
 
   public final ByteBuf data;
+  public final int shuffleId;
   public final int shuffleWriterId;
   public final int shuffleReaderId;
   public final int dataSize;
+  public final int uncompressedSize;
   public final long checksum;
 
   public DataMessage(int shuffleWriterId, int shuffleReaderId, int dataSize, ByteBuf data,
       long checksum) {
+    this(-1, shuffleWriterId, shuffleReaderId, dataSize, data, checksum);
+  }
+
+  public DataMessage(int shuffleId, int shuffleWriterId, int shuffleReaderId, int dataSize,
+      ByteBuf data, long checksum) {
+    this(shuffleId, shuffleWriterId, shuffleReaderId, dataSize, dataSize, data, checksum);
+  }
+
+  public DataMessage(int shuffleId, int shuffleWriterId, int shuffleReaderId, int dataSize,
+      int uncompressedSize, ByteBuf data, long checksum) {
     if (dataSize < 0) {
       throw new IllegalArgumentException(
         "dataSize must be non-negative: " + dataSize);
@@ -50,9 +62,16 @@ public final class DataMessage extends StreamingShuffleMessage {
         "dataSize must equal data.readableBytes(): " +
           dataSize + " != " + data.readableBytes());
     }
+    if (uncompressedSize < dataSize) {
+      throw new IllegalArgumentException(
+        "uncompressedSize must be at least dataSize: " +
+          uncompressedSize + " < " + dataSize);
+    }
+    this.shuffleId = shuffleId;
     this.shuffleWriterId = shuffleWriterId;
     this.shuffleReaderId = shuffleReaderId;
     this.dataSize = dataSize;
+    this.uncompressedSize = uncompressedSize;
     this.data = data;
     this.ownedBuf = data.retain();
     this.checksum = checksum;
@@ -65,17 +84,19 @@ public final class DataMessage extends StreamingShuffleMessage {
 
   @Override
   public int headerLength() {
-    // 4 bytes EACH for shuffle writer ID, shuffle reader ID, data size
+    // 4 bytes EACH for shuffle ID, writer ID, reader ID, wire size, uncompressed size
     // 8 bytes for checksum
-    return super.headerLength() + 20;
+    return super.headerLength() + 28;
   }
 
   @Override
   public void encode(CompositeByteBuf buf) {
     super.encode(buf);
+    buf.writeInt(shuffleId);
     buf.writeInt(shuffleWriterId);
     buf.writeInt(shuffleReaderId);
     buf.writeInt(dataSize);
+    buf.writeInt(uncompressedSize);
     buf.writeLong(checksum);
 
     // Only encode exactly `dataSize` bytes of `data`, so the wire payload matches the
@@ -100,9 +121,11 @@ public final class DataMessage extends StreamingShuffleMessage {
    * releasing it, since the constructor's {@code data.retain()} never ran.
    */
   public static DataMessage decode(ByteBuf message) {
+    int shuffleId = message.readInt();
     int shuffleWriterId = message.readInt();
     int shuffleReaderId = message.readInt();
     int dataSize = message.readInt();
+    int uncompressedSize = message.readInt();
     long checksum = message.readLong();
     // Each streaming-shuffle frame carries exactly one DataMessage, so after reading the
     // header the remaining readable bytes must equal `dataSize`. Strict equality catches
@@ -113,7 +136,8 @@ public final class DataMessage extends StreamingShuffleMessage {
         "Invalid DataMessage dataSize=" + dataSize +
           ", readable bytes after header=" + message.readableBytes());
     }
-    return new DataMessage(shuffleWriterId, shuffleReaderId, dataSize, message, checksum);
+    return new DataMessage(
+      shuffleId, shuffleWriterId, shuffleReaderId, dataSize, uncompressedSize, message, checksum);
   }
 
   /**

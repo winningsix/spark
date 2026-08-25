@@ -20,11 +20,14 @@ package org.apache.spark.sql.execution
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.util.{HashMap, Properties}
 
+import io.netty.buffer.Unpooled
+
 import org.apache.spark._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests.TEST_MEMORY
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.rdd.RDD
+import org.apache.spark.shuffle.streaming.StreamingShuffleSerializerInstance
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
 import org.apache.spark.sql.{LocalSparkSession, Row, SparkSession}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
@@ -55,6 +58,27 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     val converter = UnsafeProjection.create(schema)
     (row: Row) => {
       converter(CatalystTypeConverters.convertToCatalyst(row).asInstanceOf[InternalRow])
+    }
+  }
+
+  test("streaming shuffle ByteBuf codec preserves UnsafeRow stream format") {
+    val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
+      .asInstanceOf[StreamingShuffleSerializerInstance]
+    val schema = Array[DataType](StringType, IntegerType)
+    val rows = Seq(Row("one", 1), Row("two", 2)).map(toUnsafeRow(_, schema).copy())
+
+    Seq(Unpooled.directBuffer(), Unpooled.buffer()).foreach { buffer =>
+      try {
+        rows.foreach(serializer.writeValueToByteBuf(_, buffer))
+        val decoded = serializer.keyValueIteratorFromByteBuf(buffer).map {
+          case (_, row: UnsafeRow) => row.copy()
+        }.toSeq
+        assert(decoded.map(_.getUTF8String(0).toString) == Seq("one", "two"))
+        assert(decoded.map(_.getInt(1)) == Seq(1, 2))
+        assert(!buffer.isReadable)
+      } finally {
+        buffer.release()
+      }
     }
   }
 

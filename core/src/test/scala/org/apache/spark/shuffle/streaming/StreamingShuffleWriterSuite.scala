@@ -262,9 +262,10 @@ class StreamingShuffleWriterSuite
 
         // Serialize a record through the writer's own buffer/checksum path and send it.
         val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
-        tsBuffer.serializationStream.writeKey(1.asInstanceOf[Any])
-        tsBuffer.serializationStream.writeValue(2.asInstanceOf[Any])
-        tsBuffer.serializationStream.flush()
+        val serializationStream = tsBuffer.serializationStream.get
+        serializationStream.writeKey(1.asInstanceOf[Any])
+        serializationStream.writeValue(2.asInstanceOf[Any])
+        serializationStream.flush()
         writer.shards(0).send(tsBuffer)
 
         sentBuffers.size() should be(1)

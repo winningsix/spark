@@ -25,6 +25,7 @@ import io.netty.channel.{Channel, ChannelOption}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkException, TaskContext}
+import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationAckMessage, TerminationControlMessage}
@@ -59,6 +60,7 @@ class StreamingShuffleClientHandler(
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
   private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
+  @volatile private var perStreamAutoReadEnabled = true
 
   setShuffleIdForLogging(shuffleId)
 
@@ -81,17 +83,25 @@ class StreamingShuffleClientHandler(
     onTermAckResponse = handler
   }
 
+  /** A multiplexed channel cannot safely toggle autoRead for one logical stream. */
+  private[streaming] def useMultiplexedChannel(): Unit = {
+    perStreamAutoReadEnabled = false
+  }
+
   override def channelActive(client: TransportClient): Unit = {
     channel = client.getChannel
     channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
     channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
-    sendCreditControlMessage(client, shuffleWriterId, 1) // Tell upstream writer that we're ready.
+    // This is a connection-discovery message, not a per-buffer acknowledgement. The writer's
+    // flow control is driven by Netty send completion and its in-flight byte semaphore.
+    sendCreditControlMessage(client, shuffleWriterId, 1)
   }
 
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
   private def updateQuota(bytes: Long): Unit = synchronized {
     remainingBytesQuota -= bytes
+    if (!perStreamAutoReadEnabled) return
     val autoRead = remainingBytesQuota > 0
     if (channel.config.isAutoRead != autoRead) {
       channel.config.setAutoRead(autoRead)
@@ -103,14 +113,15 @@ class StreamingShuffleClientHandler(
     }
   }
 
-  private def sendCreditControlMessage(
+  protected def sendCreditControlMessage(
       client: TransportClient,
       shuffleWriterId: Int,
       credit: Int
   ): Unit = {
     var buf: CompositeByteBuf = null
     try {
-      val creditControlMessage = new CreditControlMessage(shuffleWriterId, shuffleReaderId, credit)
+      val creditControlMessage =
+        new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit)
       buf = client.getChannel().alloc().compositeBuffer()
         .capacity(creditControlMessage.headerLength())
       creditControlMessage.encode(buf)
@@ -135,7 +146,8 @@ class StreamingShuffleClientHandler(
   protected def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
     var buf: CompositeByteBuf = null
     try {
-      val terminationAckMessage = new TerminationAckMessage(shuffleWriterId, shuffleReaderId)
+      val terminationAckMessage =
+        new TerminationAckMessage(shuffleId, shuffleWriterId, shuffleReaderId)
       terminationAckMessage.setSeqNum(lastSeqNum)
       buf = client.getChannel().alloc().compositeBuffer()
         .capacity(terminationAckMessage.headerLength())
@@ -166,15 +178,37 @@ class StreamingShuffleClientHandler(
       client: TransportClient,
       message: ByteBuffer,
       callback: RpcResponseCallback): Unit = {
-    // The underlying message gets freed after the call to receive, so we need to copy
-    // the underlying data.
-    //
-    // TODO: in the future, the TransportRequestHandler can be modified to
-    //  not free the underlying data.
+    receiveMessage(client, message, None)
+  }
+
+  override def receive(client: TransportClient, message: ManagedBuffer): Unit = {
+    receiveMessage(client, message.nioByteBuffer(), Some(message))
+  }
+
+  /** Reuses the ByteBuffer already inspected by the executor-level multiplexing router. */
+  private[streaming] def receiveMultiplexed(
+      client: TransportClient,
+      message: ByteBuffer,
+      managedBody: ManagedBuffer): Unit = {
+    receiveMessage(client, message, Some(managedBody))
+  }
+
+  private def receiveMessage(
+      client: TransportClient,
+      message: ByteBuffer,
+      managedBody: Option[ManagedBuffer]): Unit = {
     var buf: ByteBuf = null
+    var shuffleMessage: StreamingShuffleMessage = null
+    var queued = false
     try {
-      buf = Unpooled.wrappedBuffer(message).copy()
-      val shuffleMessage = StreamingShuffleMessage.decode(buf)
+      // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
+      // DataMessage processing is asynchronous, so retain that buffer and release it with the
+      // decoded message. Direct ByteBuffer callers (primarily unit tests) keep the legacy copy.
+      buf = managedBody match {
+        case Some(_) => Unpooled.wrappedBuffer(message)
+        case None => Unpooled.wrappedBuffer(message).copy()
+      }
+      shuffleMessage = StreamingShuffleMessage.decode(buf)
       updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
       // At this point, the message type has been read, so the decoders will read the (optional)
       // length int, followed by the actual content.
@@ -182,9 +216,18 @@ class StreamingShuffleClientHandler(
         case dataMessage: DataMessage =>
           val messageSize = buf.capacity()
           updateQuota(messageSize)
-          dataMessage.setReleaseCallback(() => updateQuota(-messageSize))
-          // we can only release the buf after we have decoded all the rows in the buffer
-          sendCreditControlMessage(client, dataMessage.shuffleWriterId, 1)
+          val retainedBody = managedBody.map(_.retain())
+          dataMessage.setReleaseCallback(() => {
+            try {
+              updateQuota(-messageSize)
+            } finally {
+              retainedBody.foreach(_.release())
+            }
+          })
+          // We can only release the buf after we have decoded all the rows in the buffer. Do not
+          // send another CreditControlMessage here: the writer ignores its numeric credit and
+          // already discovered this client in channelActive. A per-DataMessage response adds a
+          // reverse Netty write and syscall without changing flow control.
         case controlMessage: TerminationControlMessage =>
           // Record termination before sending the ack: the writer only closes its connection
           // after it receives this ack, so setting the flag here guarantees it is visible before
@@ -196,11 +239,15 @@ class StreamingShuffleClientHandler(
             s"${shuffleMessage.messageType()}");
       }
       queue.put(shuffleMessage)
+      queued = true
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)
         errorNotifier.markError(ex)
     } finally {
+      if (!queued && shuffleMessage != null) {
+        shuffleMessage.release()
+      }
       if (buf != null) {
         // If any StreamingShuffleMessage needs buf, then it would have retained it.
         buf.release()

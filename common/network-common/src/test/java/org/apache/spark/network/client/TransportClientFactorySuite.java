@@ -18,13 +18,17 @@
 package org.apache.spark.network.client;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -150,6 +154,41 @@ public class TransportClientFactorySuite {
     assertTrue(c2.isActive());
     assertNotSame(c1, c2);
     factory.close();
+  }
+
+  @Test
+  public void unmanagedClientUsesConnectionSpecificRpcHandler() throws Exception {
+    AtomicReference<TransportClient> reverseClient = new AtomicReference<>();
+    CountDownLatch serverConnectionActive = new CountDownLatch(1);
+    RpcHandler serverHandler = new NoOpRpcHandler() {
+      @Override
+      public void channelActive(TransportClient client) {
+        reverseClient.set(client);
+        serverConnectionActive.countDown();
+      }
+    };
+    RpcHandler clientHandler = new NoOpRpcHandler() {
+      @Override
+      public void receive(
+          TransportClient client,
+          ByteBuffer message,
+          RpcResponseCallback callback) {
+        callback.onSuccess(JavaUtils.stringToBytes("client-handler"));
+      }
+    };
+
+    try (TransportContext serverContext = new TransportContext(conf, serverHandler);
+         TransportServer server = serverContext.createServer();
+         TransportContext clientContext = new TransportContext(conf, new NoOpRpcHandler());
+         TransportClientFactory factory = clientContext.createClientFactory();
+         TransportClient client = factory.createUnmanagedClient(
+           TestUtils.getLocalHost(), server.getPort(), clientHandler)) {
+      assertTrue(client.isActive());
+      assertTrue(serverConnectionActive.await(5, TimeUnit.SECONDS));
+      ByteBuffer response = reverseClient.get().sendRpcSync(
+        JavaUtils.stringToBytes("request"), 5000);
+      assertEquals("client-handler", JavaUtils.bytesToString(response));
+    }
   }
 
   @Test

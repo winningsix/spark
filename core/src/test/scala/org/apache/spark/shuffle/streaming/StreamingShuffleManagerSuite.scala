@@ -24,9 +24,11 @@ import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
 import org.apache.spark.network.shuffle.streaming.{DataMessage, TerminationAckMessage, TerminationControlMessage}
-import org.apache.spark.shuffle.PipelinedShuffleSchedulingProvider
+import org.apache.spark.shuffle.{FullGroupResidency, PipelinedShuffleGroupMetadata,
+  PipelinedShuffleSchedulingProvider, ReaderResidencyWithElasticProducers}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 
 class StreamingShuffleManagerSuite
@@ -95,13 +97,55 @@ class StreamingShuffleManagerSuite
     }
   }
 
-  test("streaming shuffle managers keep conservative full-group scheduling requirements") {
-    assert(!new StreamingShuffleManager().isInstanceOf[PipelinedShuffleSchedulingProvider])
+  test("streaming shuffle manager selects configured producer residency policy") {
+    val metadata = PipelinedShuffleGroupMetadata("group", "attempt", Seq.empty)
+    val conf = new SparkConf()
+      .set(SHUFFLE_MANAGER_INCREMENTAL, classOf[StreamingShuffleManager].getName)
+    withSpark(new SparkContext("local", "StreamingShuffleManagerSuite", conf)) { _ =>
+      val manager = new StreamingShuffleManager()
+      assert(manager.isInstanceOf[PipelinedShuffleSchedulingProvider])
+      manager.schedulingRequirements(metadata).residencyPolicy should be(FullGroupResidency)
+
+      SparkEnv.get.conf.set(STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED, true)
+      manager.schedulingRequirements(metadata).residencyPolicy shouldBe
+        ReaderResidencyWithElasticProducers()
+    }
+
     val multiManager = new MultiShuffleManager(new SparkConf(loadDefaults = false))
     try {
       assert(!multiManager.isInstanceOf[PipelinedShuffleSchedulingProvider])
     } finally {
       multiManager.stop()
+    }
+  }
+
+  test("streaming shuffle writers can share one executor server across shuffles") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    withSpark(new SparkContext("local", "StreamingShuffleManagerSuite", conf)) { sc =>
+      val rdd = sc.parallelize(1 to 2).map(x => (x, x))
+      val dependency = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+      val manager = new StreamingShuffleManager()
+      val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+      tracker.registerShuffle(10, 1, 1, 0)
+      tracker.registerShuffle(11, 1, 1, 0)
+
+      val writer1 = manager.getWriter[Int, Int](
+        manager.registerShuffle(10, dependency), 100, TaskContext.empty(), null)
+        .asInstanceOf[StreamingShuffleWriter[Int, Int]]
+      val writer2 = manager.getWriter[Int, Int](
+        manager.registerShuffle(11, dependency), 100, TaskContext.empty(), null)
+        .asInstanceOf[StreamingShuffleWriter[Int, Int]]
+      try {
+        writer1.shuffleWriterId should be(100)
+        writer2.shuffleWriterId should be(100)
+        writer1.server.getPort should be(writer2.server.getPort)
+      } finally {
+        writer1.cleanupResources()
+        writer2.cleanupResources()
+        manager.stop()
+      }
     }
   }
 

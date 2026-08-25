@@ -788,6 +788,7 @@ object QueryExecution {
       // to satisfy and then silently lose that ordering. (This also matches the AQE rule order,
       // see `AdaptiveSparkPlanExec.queryStagePreparationRules`.)
       RemoveRedundantSorts,
+      MarkPipelinedShufflesForBatch,
       ApplyColumnarRulesAndInsertTransitions(
         sparkSession.sessionState.columnarRules, outputsColumnar = false),
       CollapseCodegenStages()) ++

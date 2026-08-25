@@ -1192,6 +1192,17 @@ object SQLConf {
     .checkValue(_ > 0, "The value of spark.sql.shuffle.partitions must be positive")
     .createWithDefault(200)
 
+  val BATCH_PIPELINED_SHUFFLE_ENABLED =
+    buildConf("spark.sql.shuffle.pipelined.batch.enabled")
+      .internal()
+      .doc("When true, supported batch ShuffleExchangeExec operators use pipelined, " +
+        "incrementally-readable shuffle dependencies. Range exchanges and all exchanges below " +
+        "them remain materialized because range-bound sampling executes its input separately. " +
+        "Adaptive query execution must be disabled.")
+      .version("4.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val SHUFFLE_SPREAD_NULL_JOIN_KEYS_ENABLED =
     buildConf("spark.sql.shuffle.spreadNullJoinKeys.enabled")
       .doc("When true, Spark may spread rows with NULL equi-join keys across shuffle partitions " +

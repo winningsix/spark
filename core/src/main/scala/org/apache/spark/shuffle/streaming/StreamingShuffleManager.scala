@@ -17,8 +17,15 @@
 
 package org.apache.spark.shuffle.streaming
 
-import org.apache.spark.{ShuffleDependency, SparkException, SparkRuntimeException, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkException, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
+  STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED, STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
+import org.apache.spark.network.TransportContext
+import org.apache.spark.network.client.TransportClientFactory
+import org.apache.spark.network.netty.SparkTransportConf
+import org.apache.spark.network.server.NoOpRpcHandler
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.shuffle._
 
@@ -76,9 +83,79 @@ object StreamingShuffleManager extends Logging {
   }
 }
 
-private[spark] class StreamingShuffleManager extends PipelinedShuffleManager with Logging {
+private[spark] class StreamingShuffleManager
+  extends PipelinedShuffleManager
+  with PipelinedShuffleSchedulingProvider
+  with Logging {
 
   logInfo(log"Using StreamingShuffleManager")
+
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    if (SparkEnv.get.conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED)) {
+      PipelinedGroupSchedulingRequirements(
+        residencyPolicy = ReaderResidencyWithElasticProducers())
+    } else {
+      PipelinedGroupSchedulingRequirements()
+    }
+  }
+
+  @volatile private var readerClientFactory: TransportClientFactory = _
+  @volatile private var sharedExecutorClient: StreamingShuffleExecutorClient = _
+  @volatile private var sharedWriterServer: StreamingShuffleExecutorServer = _
+
+  private def getSharedWriterServer: StreamingShuffleExecutorServer = {
+    var server = sharedWriterServer
+    if (server == null) synchronized {
+      server = sharedWriterServer
+      if (server == null) {
+        server = new StreamingShuffleExecutorServer()
+        sharedWriterServer = server
+      }
+    }
+    server
+  }
+
+  /**
+   * A single client factory is shared by all streaming-shuffle readers in this executor. Each
+   * reader still creates an unmanaged connection with its own task-scoped RPC handler, but those
+   * connections share the factory's Netty event loop and allocator instead of creating one event
+   * loop per reader-writer pair.
+   */
+  private def getReaderClientFactory: TransportClientFactory = {
+    var factory = readerClientFactory
+    if (factory == null) synchronized {
+      factory = readerClientFactory
+      if (factory == null) {
+        val conf = SparkEnv.get.conf
+        val role = conf.get(EXECUTOR_ID).map { id =>
+          if (SparkContext.isDriver(id)) "driver" else "executor"
+        }
+        val clientConf = SparkTransportConf.fromSparkConf(
+          conf,
+          "streaming-shuffle-reader-shared",
+          math.max(1, conf.get(EXECUTOR_CORES)),
+          role)
+        val clientContext = new TransportContext(
+          clientConf, new NoOpRpcHandler(), true, true)
+        factory = clientContext.createClientFactory()
+        readerClientFactory = factory
+      }
+    }
+    factory
+  }
+
+  private def getSharedExecutorClient: StreamingShuffleExecutorClient = {
+    var client = sharedExecutorClient
+    if (client == null) synchronized {
+      client = sharedExecutorClient
+      if (client == null) {
+        client = new StreamingShuffleExecutorClient()
+        sharedExecutorClient = client
+      }
+    }
+    client
+  }
 
   override def registerShuffle[K, V, C](
       shuffleId: Int,
@@ -92,7 +169,13 @@ private[spark] class StreamingShuffleManager extends PipelinedShuffleManager wit
       context: TaskContext,
       metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
     val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, V, _]]
-    new StreamingShuffleWriter[K, V](streamingShuffleHandle, mapId, context)
+    val sharedServer = if (SparkEnv.get.conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)) {
+      Some(getSharedWriterServer)
+    } else {
+      None
+    }
+    new StreamingShuffleWriter[K, V](
+      streamingShuffleHandle, mapId, context, sharedExecutorServer = sharedServer)
   }
 
   /**
@@ -108,7 +191,18 @@ private[spark] class StreamingShuffleManager extends PipelinedShuffleManager wit
       context: TaskContext,
       metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] = {
     val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, _, C]]
-    new StreamingShuffleReader[K, C](streamingShuffleHandle, context)
+    val conf = SparkEnv.get.conf
+    val useSharedConnections = conf.get(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+    require(!useSharedConnections || conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED),
+      s"${STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED.key} requires " +
+        s"${STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED.key}")
+    if (useSharedConnections) {
+      new StreamingShuffleReader[K, C](
+        streamingShuffleHandle, context, sharedExecutorClient = Some(getSharedExecutorClient))
+    } else {
+      new StreamingShuffleReader[K, C](
+        streamingShuffleHandle, context, sharedClientFactory = Some(getReaderClientFactory))
+    }
   }
 
   override def unregisterShuffle(shuffleId: Int): Boolean = {
@@ -118,5 +212,18 @@ private[spark] class StreamingShuffleManager extends PipelinedShuffleManager wit
     true
   }
 
-  override def stop(): Unit = {}
+  override def stop(): Unit = synchronized {
+    if (readerClientFactory != null) {
+      readerClientFactory.close()
+      readerClientFactory = null
+    }
+    if (sharedExecutorClient != null) {
+      sharedExecutorClient.close()
+      sharedExecutorClient = null
+    }
+    if (sharedWriterServer != null) {
+      sharedWriterServer.close()
+      sharedWriterServer = null
+    }
+  }
 }

@@ -52,13 +52,14 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testCreditControlRoundTrip() {
-    CreditControlMessage original = new CreditControlMessage(3, 7, 5);
+    CreditControlMessage original = new CreditControlMessage(11, 3, 7, 5);
     ByteBuf encoded = encodeAndSlice(original);
     try {
       StreamingShuffleMessage decoded = StreamingShuffleMessage.decode(encoded);
       assertInstanceOf(CreditControlMessage.class, decoded);
       CreditControlMessage credit = (CreditControlMessage) decoded;
       assertEquals(SEQ_NUM, credit.getSeqNum());
+      assertEquals(11, credit.shuffleId);
       assertEquals(3, credit.shuffleWriterId);
       assertEquals(7, credit.shuffleReaderId);
       assertEquals(5, credit.numMessages);
@@ -71,13 +72,14 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testTerminationControlRoundTrip() {
-    TerminationControlMessage original = new TerminationControlMessage(1, 2);
+    TerminationControlMessage original = new TerminationControlMessage(10, 1, 2);
     ByteBuf encoded = encodeAndSlice(original);
     try {
       StreamingShuffleMessage decoded = StreamingShuffleMessage.decode(encoded);
       assertInstanceOf(TerminationControlMessage.class, decoded);
       TerminationControlMessage term = (TerminationControlMessage) decoded;
       assertEquals(SEQ_NUM, term.getSeqNum());
+      assertEquals(10, term.shuffleId);
       assertEquals(1, term.shuffleWriterId);
       assertEquals(2, term.shuffleReaderId);
     } finally {
@@ -89,13 +91,14 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testTerminationAckRoundTrip() {
-    TerminationAckMessage original = new TerminationAckMessage(4, 8);
+    TerminationAckMessage original = new TerminationAckMessage(12, 4, 8);
     ByteBuf encoded = encodeAndSlice(original);
     try {
       StreamingShuffleMessage decoded = StreamingShuffleMessage.decode(encoded);
       assertInstanceOf(TerminationAckMessage.class, decoded);
       TerminationAckMessage ack = (TerminationAckMessage) decoded;
       assertEquals(SEQ_NUM, ack.getSeqNum());
+      assertEquals(12, ack.shuffleId);
       assertEquals(4, ack.shuffleWriterId);
       assertEquals(8, ack.shuffleReaderId);
     } finally {
@@ -111,7 +114,7 @@ public class StreamingShuffleMessageSuite {
     ByteBuf payloadBuf = Unpooled.wrappedBuffer(payload);
     long checksum = 0xDEADBEEFL;
 
-    DataMessage original = new DataMessage(2, 5, payload.length, payloadBuf, checksum);
+    DataMessage original = new DataMessage(9, 2, 5, payload.length, payloadBuf, checksum);
     ByteBuf encoded = encodeAndSlice(original);
     payloadBuf.release();
 
@@ -120,9 +123,11 @@ public class StreamingShuffleMessageSuite {
       assertInstanceOf(DataMessage.class, decoded);
       DataMessage dm = (DataMessage) decoded;
       assertEquals(SEQ_NUM, dm.getSeqNum());
+      assertEquals(9, dm.shuffleId);
       assertEquals(2, dm.shuffleWriterId);
       assertEquals(5, dm.shuffleReaderId);
       assertEquals(payload.length, dm.dataSize);
+      assertEquals(payload.length, dm.uncompressedSize);
       assertEquals(checksum, dm.checksum);
 
       ByteBuf recordData = dm.getRecordData();
@@ -130,6 +135,24 @@ public class StreamingShuffleMessageSuite {
       recordData.readBytes(out);
       assertArrayEquals(payload, out);
       dm.release();
+    } finally {
+      encoded.release();
+    }
+  }
+
+  @Test
+  public void testCompressedDataMessageRoundTrip() {
+    byte[] payload = "compressed bytes".getBytes();
+    ByteBuf payloadBuf = Unpooled.wrappedBuffer(payload);
+    DataMessage original = new DataMessage(
+      9, 2, 5, payload.length, 128, payloadBuf, 123L);
+    ByteBuf encoded = encodeAndSlice(original);
+    payloadBuf.release();
+    try {
+      DataMessage decoded = (DataMessage) StreamingShuffleMessage.decode(encoded);
+      assertEquals(payload.length, decoded.dataSize);
+      assertEquals(128, decoded.uncompressedSize);
+      decoded.release();
     } finally {
       encoded.release();
     }

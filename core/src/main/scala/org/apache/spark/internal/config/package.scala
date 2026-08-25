@@ -1925,12 +1925,15 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS =
     ConfigBuilder("spark.shuffle.streaming.networkBufferMaxWaitTimeMs")
       .doc("Maximum time in milliseconds a partially-filled network buffer is held before " +
-        "being flushed to the reader. Lower values reduce latency at the cost of smaller, " +
-        "less efficient messages.")
+        "being flushed to the reader. Lower positive values reduce latency at the cost of " +
+        "smaller, less efficient messages. A value of 0 disables time-based flushing; buffers " +
+        "are then flushed only when full or when the writer finishes.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .longConf
+      .checkValue(_ >= 0,
+        "spark.shuffle.streaming.networkBufferMaxWaitTimeMs must be non-negative.")
       .createWithDefault(50)
 
   private[spark] val STREAMING_SHUFFLE_WRITER_MAX_MEMORY =
@@ -1946,6 +1949,89 @@ package object config {
       .intConf
       .checkValue(_ > 0, "spark.shuffle.streaming.writerMaxMemory must be positive.")
       .createWithDefault(32 << 20) // 32 MB
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.writerBackpressure.enabled")
+      .doc("Whether streaming shuffle writers bound in-flight data buffers with the " +
+        "writerMaxMemory semaphore. Disabling this permits a pipelined producer to continue " +
+        "sending while a downstream reader is consuming another input; it is intended for " +
+        "experiments where executor memory and Netty watermarks provide the effective bound.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_SERVER_THREADS =
+    ConfigBuilder("spark.shuffle.streaming.writerServerThreads")
+      .doc("Number of Netty server event-loop threads created by each streaming shuffle writer " +
+        "task. Each writer owns a task-scoped server, so using the host-wide RPC default can " +
+        "multiply the thread count by the number of concurrent map tasks. Two event-loop threads " +
+        "avoid multiplying the host-wide RPC thread default by every map " +
+        "task while retaining concurrent channel processing.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "spark.shuffle.streaming.writerServerThreads must be positive.")
+      .createWithDefault(2)
+
+  private[spark] val STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.sharedWriterServer.enabled")
+      .doc("When true, all streaming shuffle writers in an executor share one multiplexed " +
+        "Netty server instead of creating one server and event-loop group per map task. Reader " +
+        "connections remain task scoped; the shared server removes listener and event-loop " +
+        "multiplication without changing the data protocol or task lifecycle.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.sharedConnections.enabled")
+      .doc("When true, streaming shuffle readers multiplex their logical writer streams over " +
+        "executor-scoped pooled connections. This removes the TCP connection per writer-reader " +
+        "pair while retaining independent message routing and sequence validation.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS =
+    ConfigBuilder("spark.shuffle.streaming.reader.waitForTerminationAcks")
+      .doc("Whether a streaming shuffle reader waits for all termination-ack send callbacks " +
+        "before completing its iterator. Disabling this avoids a termination/back-pressure " +
+        "cycle in chained pipelined shuffles; acknowledgements are still sent asynchronously.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+        .booleanConf
+        .createWithDefault(true)
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS =
+    ConfigBuilder("spark.shuffle.streaming.writer.waitForTerminationAcks")
+      .doc("Whether a streaming shuffle writer waits for all reader termination acknowledgements " +
+        "before completing its task. Disabling this for chained pipelined shuffles waits only " +
+        "for network sends to finish, avoiding a cross-stage backpressure cycle.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.elasticProducers.enabled")
+      .doc("When true, streaming shuffle keeps its reader frontier resident while finite pure " +
+        "producer tasks rotate through the remaining task slots. This allows a batch pipelined " +
+        "stage group to contain more tasks than the cluster can run concurrently without letting " +
+        "blocked readers consume every slot needed by producers.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
 
   private[spark] val SHUFFLE_DETECT_CORRUPT =
     ConfigBuilder("spark.shuffle.detectCorrupt")

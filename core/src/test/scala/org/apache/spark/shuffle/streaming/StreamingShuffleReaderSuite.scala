@@ -153,8 +153,9 @@ class StreamingShuffleReaderSuite
       val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
       val handle = new StreamingShuffleHandle(0, dep)
       val context = createTaskContext(sc.conf, 0)
+      val manager = new StreamingShuffleManager()
       try {
-        val reader = new StreamingShuffleManager()
+        val reader = manager
           .getReader[Int, Int](handle, 0, 1, 0, 1, context, null)
         reader shouldBe a[StreamingShuffleReader[_, _]]
         val streamingReader = reader.asInstanceOf[StreamingShuffleReader[_, _]]
@@ -163,6 +164,7 @@ class StreamingShuffleReaderSuite
         // Constructing the reader starts a background task-discovery thread; the task-completion
         // listener (cleanupResources) shuts it down.
         context.markTaskCompleted(None)
+        manager.stop()
       }
     }
   }
