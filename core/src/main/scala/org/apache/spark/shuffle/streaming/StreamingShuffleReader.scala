@@ -27,7 +27,8 @@ import io.netty.buffer.ByteBufInputStream
 import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID, SHUFFLE_COMPRESS,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
+  STREAMING_SHUFFLE_READER_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
@@ -122,6 +123,8 @@ class StreamingShuffleReader[K, C](
   // We might need to revisit if the size limit is enough. If not, there should be a way to tie it
   // to the per-task memory limit from the task context.
   private val MAX_MEMORY = conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY)
+  private val READER_BACKPRESSURE_ENABLED =
+    conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   // Data and termination messages from all writers are put into this queue.
   private[spark] val messageQueue = new LinkedBlockingQueue[StreamingShuffleMessage]()
 
@@ -271,7 +274,9 @@ class StreamingShuffleReader[K, C](
               assert(totalNumShuffleWriters.get() == numShuffleWriters)
             } else {
               perWriterByteLimit = Math.max(MAX_MEMORY / numShuffleWriters, 1)
-              memoryConsumer.acquireMemory(MAX_MEMORY)
+              if (READER_BACKPRESSURE_ENABLED) {
+                memoryConsumer.acquireMemory(MAX_MEMORY)
+              }
             }
             shuffleWriterLocations
               .foreach {

@@ -849,6 +849,55 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(!failedTaskSet)
   }
 
+  test("pipelined reader residency reserves one lane for every pure producer stage") {
+    val taskScheduler = setupSchedulerWithDeterministicOffers(
+      "local[4]",
+      config.LOCALITY_WAIT.key -> "0")
+
+    def pipelinedTaskSet(
+        numTasks: Int,
+        stageId: Int,
+        isReader: Boolean,
+        isProducer: Boolean): TaskSet = {
+      val taskSet = FakeTask.createTaskSet(numTasks, stageId = stageId, stageAttemptId = 0)
+      new TaskSet(
+        taskSet.tasks,
+        taskSet.stageId,
+        taskSet.stageAttemptId,
+        taskSet.priority,
+        taskSet.properties,
+        taskSet.resourceProfileId,
+        taskSet.shuffleId,
+        isPipelined = true,
+        pipelinedGroupStageCount = 3,
+        pipelinedGroupId = Some("group-0"),
+        pipelinedGroupSchedulingRequirements = elasticPipelinedGroupRequirements(taskScheduler),
+        isPipelinedShuffleReader = isReader,
+        isPipelinedShuffleProducer = isProducer)
+    }
+
+    Seq(
+      pipelinedTaskSet(8, stageId = 0, isReader = false, isProducer = true),
+      pipelinedTaskSet(8, stageId = 1, isReader = false, isProducer = true),
+      pipelinedTaskSet(3, stageId = 2, isReader = true, isProducer = false)).foreach(
+      taskScheduler.submitTasks)
+
+    val tasks = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 4))).flatten
+    val byStage = tasks
+      .map(task => taskScheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId)
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toMap
+
+    assert(tasks.length === 4)
+    assert(byStage.getOrElse(0, 0) === 1)
+    assert(byStage.getOrElse(1, 0) === 1)
+    assert(byStage.getOrElse(2, 0) === 2)
+    assert(!failedTaskSet)
+  }
+
   test("pipelined reader frontier includes downstream producer-reader stages") {
     val taskScheduler = setupSchedulerWithDeterministicOffers(
       "local[19]",

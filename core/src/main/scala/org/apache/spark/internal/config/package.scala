@@ -1911,6 +1911,17 @@ package object config {
       .intConf
       .createWithDefault(32 << 20) // 32 MB
 
+  private[spark] val STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.readerBackpressure.enabled")
+      .doc("Whether streaming shuffle readers apply the per-writer byte quota by toggling " +
+        "Netty auto-read. Disabling this lets chained pipelined readers drain all incoming " +
+        "streams without a quota-induced cross-input cycle; executor memory is then the bound.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
   private[spark] val STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.streaming.networkBufferSize")
       .doc("Target byte size for each network buffer sent from a streaming shuffle writer to a " +
@@ -2020,6 +2031,31 @@ package object config {
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(true)
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER =
+    ConfigBuilder("spark.shuffle.streaming.writer.minClientsPerReader")
+      .doc("Minimum number of downstream clients that a streaming writer waits for per reader " +
+        "partition before sending its first message. This is a CPU POC safeguard for pipelined " +
+        "batches with multiple downstream consumers; one client is the default.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "must be at least one")
+      .createWithDefault(1)
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS =
+    ConfigBuilder("spark.shuffle.streaming.writer.lingerAfterTerminationMs")
+      .doc("How long a streaming shuffle writer keeps its shared server and replay history " +
+        "alive after currently registered readers acknowledge termination. A positive value " +
+        "allows late pipelined readers to connect and receive the replayed stream; zero keeps " +
+        "the normal immediate cleanup behavior.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .longConf
+      .checkValue(_ >= 0, "must be non-negative")
+      .createWithDefault(0L)
 
   private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCERS_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.elasticProducers.enabled")

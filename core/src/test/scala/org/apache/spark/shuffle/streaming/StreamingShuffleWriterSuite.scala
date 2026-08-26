@@ -30,7 +30,7 @@ import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
+import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
@@ -249,7 +249,11 @@ class StreamingShuffleWriterSuite
   }
 
   test("checksum is computed and embedded in the DataMessage sent on the wire") {
-    val conf = newConf().set(STREAMING_SHUFFLE_CHECKSUM_ENABLED, true)
+    // Keep this test focused on the checksum framing itself. Compression checksums are verified
+    // after decompression by the reader and are covered by the end-to-end shuffle tests.
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_CHECKSUM_ENABLED, true)
+      .set(SHUFFLE_COMPRESS, false)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {

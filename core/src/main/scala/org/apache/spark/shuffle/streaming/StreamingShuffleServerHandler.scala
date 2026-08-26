@@ -18,7 +18,9 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.{CompletableFuture, CopyOnWriteArrayList}
+
+import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.{ByteBuf, Unpooled}
 
@@ -52,10 +54,22 @@ class StreamingShuffleServerHandler(
     // One reader per reduce partition, so this equals the writer's numPartitions.
     numReaders: Int,
     val context: TaskContext,
-    errorNotifier: ErrorNotifier) extends RpcHandler with TaskContextAwareLogging {
+    errorNotifier: ErrorNotifier,
+    onTerminationAckReceivedWithClient: (Int, Long, TransportClient) => Unit = (_, _, _) => (),
+    onClientConnected: (Int, TransportClient) => Unit = (_, _) => ())
+    extends RpcHandler with TaskContextAwareLogging {
 
   val futureClients: Array[CompletableFuture[TransportClient]] =
     Array.fill(numReaders)(new CompletableFuture[TransportClient]())
+  // A pipelined batch can have multiple downstream consumers for one partition.
+  // Keep every connection so the writer can fan out the stream instead of
+  // silently serving only the first reader that advertises credit.
+  private val clientsByReader: Array[CopyOnWriteArrayList[TransportClient]] =
+    Array.fill(numReaders)(new CopyOnWriteArrayList[TransportClient]())
+
+  private[streaming] def clientsFor(readerId: Int): Seq[TransportClient] = {
+    clientsByReader(readerId).asScala.toSeq
+  }
 
   setShuffleIdForLogging(shuffleId)
 
@@ -84,13 +98,17 @@ class StreamingShuffleServerHandler(
       shuffleMessage: StreamingShuffleMessage): Unit = {
     shuffleMessage match {
       case creditControlMessage: CreditControlMessage =>
+        clientsByReader(creditControlMessage.shuffleReaderId).addIfAbsent(client)
         futureClients(creditControlMessage.shuffleReaderId).complete(client)
+        onClientConnected(creditControlMessage.shuffleReaderId, client)
       case terminationAck: TerminationAckMessage =>
         logInfo(
           s"Received termination ack message from shuffle reader " +
             s"${terminationAck.shuffleReaderId}"
         )
         onTerminationAckReceived(terminationAck.shuffleReaderId, terminationAck.getSeqNum)
+        onTerminationAckReceivedWithClient(
+          terminationAck.shuffleReaderId, terminationAck.getSeqNum, client)
       case _ =>
         throw new IllegalArgumentException(
           s"Unexpected message type in ShuffleServerHandler: " +

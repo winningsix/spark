@@ -18,10 +18,11 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.concurrent.{CancellationException, CompletableFuture, CountDownLatch, LinkedBlockingDeque, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 import javax.annotation.concurrent.NotThreadSafe
 
 import scala.concurrent.duration.DurationInt
+import scala.collection.mutable
 import scala.util.Try
 
 import io.netty.buffer.{ByteBuf, ByteBufOutputStream, CompositeByteBuf, Unpooled}
@@ -34,6 +35,8 @@ import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED,
   STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED,
+  STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS,
+  STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER,
   STREAMING_SHUFFLE_WRITER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_SERVER_THREADS,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
@@ -78,6 +81,10 @@ class StreamingShuffleWriter[K, V](
   private val TIME_BASED_FLUSH_ENABLED = MAX_BUFFERING_TIME_MS > 0
   private val WAIT_FOR_TERMINATION_ACKS =
     conf.get(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
+  private val MIN_CLIENTS_PER_READER =
+    conf.get(STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER)
+  private val LINGER_AFTER_TERMINATION_MS =
+    conf.get(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS)
   private val WRITER_BACKPRESSURE_ENABLED =
     conf.get(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED)
 
@@ -143,7 +150,9 @@ class StreamingShuffleWriter[K, V](
         streamingShuffleHandle.shuffleId,
         numPartitions,
         context,
-        errorNotifier))
+        errorNotifier,
+        onTerminationAckReceivedWithClient,
+        (readerId, client) => shards(readerId).replayTo(client)))
 
   private[streaming] val server: TransportServer = startShuffleServer()
 
@@ -177,6 +186,7 @@ class StreamingShuffleWriter[K, V](
   // waiting for downstream task termination ACKs, which can form a cross-stage cycle.
   private val pendingSends = new AtomicLong(0L)
   private val pendingSendsNotice = new Semaphore(0)
+  private val cleanupStarted = new AtomicBoolean(false)
 
   // Data payloads use a dedicated direct-buffer free-list (bufferPool) of fixed BUFFER_SIZE
   // buffers so full-size send buffers can be recycled across the task; the small, variable-size
@@ -273,11 +283,26 @@ class StreamingShuffleWriter[K, V](
     val buffer: AtomicReference[TimestampedBuffer] = new AtomicReference(null)
     val lastSentSequenceNum: AtomicLong = new AtomicLong(-1)
     val terminationAckReceived: AtomicBoolean = new AtomicBoolean(false)
+    // Keep encoded messages until the writer send barrier completes. A pipelined shuffle can
+    // have multiple downstream tasks for one reader partition; replay the missing sequence
+    // range when a late client is observed on a subsequent message (including termination).
+    private val replayHistory = new mutable.ArrayBuffer[(Long, ByteBuf)]()
+    private val deferredReplayBuffers = new mutable.ArrayBuffer[ByteBuf]()
+    private val lastEnqueuedByClient = new mutable.HashMap[TransportClient, Long]()
+    private val terminationAckedClients = new mutable.HashSet[TransportClient]()
+    private val firstMessageSent = new AtomicBoolean(false)
 
     // send will never block; push back is instead handled by blocking buffer allocation in write
     // on `allocatedBufferBytesSemaphore`. All send methods are synchronized to preserve message
     // order.
     def send(message: StreamingShuffleMessage, done: () => Unit = () => ()): Unit = synchronized {
+      if (firstMessageSent.compareAndSet(false, true) && MIN_CLIENTS_PER_READER > 1) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+        while (transportServerHandler.clientsFor(id).size < MIN_CLIENTS_PER_READER &&
+            System.nanoTime() < deadline) {
+          Thread.sleep(10)
+        }
+      }
       message.setSeqNum(lastSentSequenceNum.incrementAndGet())
       var buf: CompositeByteBuf = null
       try {
@@ -290,47 +315,139 @@ class StreamingShuffleWriter[K, V](
       } finally {
         message.release()
       }
+      val sequenceNum = lastSentSequenceNum.get()
+      replayHistory += ((sequenceNum, buf.retainedDuplicate()))
 
-      // Count before resolving the client future. A writer may enqueue a message before the
-      // downstream reader has connected; that future must remain part of the send barrier or
-      // task cleanup can cancel it and drop the message.
-      pendingSends.incrementAndGet()
+      // Count only actual network sends in the relaxed delivery barrier.  A shuffle partition
+      // may legitimately have no downstream reader (for example a single-result aggregate),
+      // so an unresolved client-discovery future must not hold the writer forever.
+      def beginSend(): Unit = pendingSends.incrementAndGet()
       def completeSend(): Unit = {
         pendingSends.decrementAndGet()
         pendingSendsNotice.release()
       }
 
       def sendToClient(client: TransportClient): Unit = {
-        try {
-          client.send(buf).addListener((future: ChannelFuture) => {
-            if (!future.isSuccess) {
-              errorNotifier.markError(future.cause())
-            }
-            try done() finally completeSend()
-          })
-        } catch {
-          case e: Throwable =>
-            buf.release()
-            try done() finally completeSend()
-            errorNotifier.markError(e)
-            throw e
+        // The first future establishes the connection. Additional downstream
+        // readers for the same partition are already registered by the time a
+        // large pipelined producer starts; fan out each encoded message to all
+        // of them. The original buffer reference is released after all sends
+        // have taken their own retained reference.
+        val clients = (Seq(client) ++ transportServerHandler.clientsFor(id)).distinct
+        val sends = clients.flatMap { target =>
+          val lastEnqueued = lastEnqueuedByClient.getOrElse(target, -1L)
+          val pending = replayHistory.iterator.filter(_._1 > lastEnqueued).toSeq
+          if (pending.nonEmpty) {
+            lastEnqueuedByClient.update(target, pending.last._1)
+          }
+          pending.map(entry => (target, entry._2))
         }
+        val remaining = new AtomicInteger(sends.size)
+        def completeBroadcast(): Unit = {
+          if (remaining.decrementAndGet() == 0) {
+            try done() finally completeSend()
+          }
+        }
+        // A reader may disconnect between resolving the first client future and
+        // taking the client snapshot.  There is then no Netty callback to drive
+        // the completion path; still retire this send barrier entry so the
+        // writer cannot wait forever on a zero-sized broadcast.
+        if (sends.isEmpty) {
+          try done() finally completeSend()
+        }
+        var synchronousFailure: Throwable = null
+        sends.foreach { case (target, source) =>
+          val outbound = source.retainedDuplicate()
+          try {
+            target.send(outbound).addListener((future: ChannelFuture) => {
+              if (!future.isSuccess) {
+                errorNotifier.markError(future.cause())
+              }
+              completeBroadcast()
+            })
+          } catch {
+            case e: Throwable =>
+              outbound.release()
+              errorNotifier.markError(e)
+              completeBroadcast()
+              if (synchronousFailure == null) synchronousFailure = e
+          }
+        }
+        // Once every currently registered reader has enqueued a sequence, the
+        // replay reference is no longer needed for those readers.  Release the
+        // common prefix eagerly instead of retaining the entire shuffle until
+        // termination ACKs (which can be many GiB for SF1000).
+        trimReplayHistory()
+        buf.release()
+        if (synchronousFailure != null) throw synchronousFailure
       }
 
-        client match {
+      client match {
         case Left(c) =>
+          beginSend()
           sendToClient(c)
         case Right(future) =>
           // Add another completion stage to ensure queued messages are sent in order.
           // If the future is already completed, this will be executed immediately.
           val newFuture = future.whenComplete { (client, ex) =>
             ex match {
-              case null => sendToClient(client)
-              case _ => buf.release(); try done() finally completeSend()
+              case null =>
+                beginSend()
+                sendToClient(client)
+              case _ =>
+                buf.release()
+                done()
             }
           }
           // Once the future is completed, stop accumulating CompletionStages.
           client = if (newFuture.isDone) Left(newFuture.join()) else Right(newFuture)
+      }
+    }
+
+    /** Replay all encoded messages not yet enqueued for a newly registered reader client. */
+    def replayTo(target: TransportClient): Unit = synchronized {
+      val lastEnqueued = lastEnqueuedByClient.getOrElse(target, -1L)
+      val pending = replayHistory.iterator.filter(_._1 > lastEnqueued).toSeq
+      if (pending.nonEmpty) {
+        lastEnqueuedByClient.update(target, pending.last._1)
+        pending.foreach { case (_, source) =>
+          val outbound = source.retainedDuplicate()
+          try {
+            target.send(outbound).addListener((future: ChannelFuture) => {
+              if (!future.isSuccess) errorNotifier.markError(future.cause())
+            })
+          } catch {
+            case e: Throwable =>
+              outbound.release()
+              errorNotifier.markError(e)
+          }
+        }
+        trimReplayHistory()
+      }
+    }
+
+    /** Release replay entries already enqueued for all currently connected clients. */
+    private def trimReplayHistory(): Unit = {
+      val clients = transportServerHandler.clientsFor(id)
+      if (clients.nonEmpty) {
+        val minEnqueued = clients.iterator
+          .map(c => lastEnqueuedByClient.getOrElse(c, -1L))
+          .min
+        while (replayHistory.nonEmpty && replayHistory.head._1 <= minEnqueued) {
+          replayHistory.remove(0)._2.release()
+        }
+      }
+    }
+
+    def markTerminationAck(client: TransportClient): Unit = synchronized {
+      terminationAckedClients += client
+    }
+
+    def allRegisteredClientsAcked: Boolean = synchronized {
+      val clients = transportServerHandler.clientsFor(id)
+      clients.isEmpty match {
+        case true => terminationAckReceived.get()
+        case false => clients.forall(terminationAckedClients.contains)
       }
     }
 
@@ -376,19 +493,13 @@ class StreamingShuffleWriter[K, V](
 
       // We keep a reference to rawBuffer so we can return it to the pool.
       send(dataMessage, () => {
-        if (wireBuffer ne rawBuffer) {
-          if (wireBuffer.refCnt() != 1) {
-            errorNotifier.markError(new AssertionError(
-              s"INTERNAL ERROR: Unexpected compressed buffer refcnt ${wireBuffer.refCnt()}"))
+        if (LINGER_AFTER_TERMINATION_MS > 0) {
+          deferReplayBuffer(wireBuffer, rawBuffer)
+          if (WRITER_BACKPRESSURE_ENABLED) {
+            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
           }
-          wireBuffer.release()
-        }
-        if (rawBuffer.refCnt() != 1) {
-          // Throw an internal exception for unexpected state.
-          errorNotifier.markError(new AssertionError(
-            s"INTERNAL ERROR: Unexpected refcnt ${rawBuffer.refCnt()}"))
-          rawBuffer.release()
         } else {
+          if (wireBuffer ne rawBuffer) wireBuffer.release()
           rawBuffer.clear()
           if (context.isFailed() || context.isCompleted() || rawBuffer.capacity() != BUFFER_SIZE) {
             rawBuffer.release()
@@ -422,6 +533,19 @@ class StreamingShuffleWriter[K, V](
       transportServerHandler.futureClients(id).completeExceptionally(error)
       client.foreach(_.completeExceptionally(error))
       Option(takeBuffer()).foreach(_.buffer.release())
+    }
+
+    def releaseReplayHistory(): Unit = synchronized {
+      replayHistory.foreach { case (_, buffer) => buffer.release() }
+      replayHistory.clear()
+      lastEnqueuedByClient.clear()
+      deferredReplayBuffers.foreach(_.release())
+      deferredReplayBuffers.clear()
+    }
+
+    def deferReplayBuffer(wireBuffer: ByteBuf, rawBuffer: ByteBuf): Unit = synchronized {
+      deferredReplayBuffers += wireBuffer
+      if (wireBuffer ne rawBuffer) deferredReplayBuffers += rawBuffer
     }
 
     // For testing only.
@@ -480,11 +604,34 @@ class StreamingShuffleWriter[K, V](
       LogKeys.NUM_SHUFFLE_READERS, numPartitions)} termination acks")
   }
 
+  private[streaming] def onTerminationAckReceivedWithClient(
+      partitionId: Int, lastSeqNumSeenByReader: Long, client: TransportClient): Unit = {
+    shards(partitionId).markTerminationAck(client)
+  }
+
   /**
    * Cleans up all writer resources.
    * This method should be idempotent.
    */
   private[streaming] def cleanupResources(): Unit = {
+    if (!cleanupStarted.compareAndSet(false, true)) return
+    if (LINGER_AFTER_TERMINATION_MS > 0) {
+      val delayedCleanup = new Thread(() => {
+        try {
+          Thread.sleep(LINGER_AFTER_TERMINATION_MS)
+        } catch {
+          case _: InterruptedException => Thread.currentThread().interrupt()
+        }
+        cleanupResourcesNow()
+      }, s"streaming-shuffle-cleanup-$shuffleWriterId")
+      delayedCleanup.setDaemon(true)
+      delayedCleanup.start()
+    } else {
+      cleanupResourcesNow()
+    }
+  }
+
+  private def cleanupResourcesNow(): Unit = {
     val cleanupStartTime = System.currentTimeMillis()
     Utils.tryLogNonFatalError {
       shards.foreach(_.cancel())
@@ -663,8 +810,9 @@ class StreamingShuffleWriter[K, V](
       // cancellation. A reader that dies fails its own reduce task, which restarts the query and
       // tears down this writer too, so writer-side reader-liveness detection is unnecessary.
       if (WAIT_FOR_TERMINATION_ACKS) {
-        while (!allAcksReceived.await(1, TimeUnit.MILLISECONDS)) {
+        while (!shards.forall(_.allRegisteredClientsAcked)) {
           throwErrorIfExists()
+          Thread.`yield`()
         }
         logInfo(log"Received all termination acks for shuffle writer ${MDC(
           LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Closing server channel.")
@@ -677,6 +825,9 @@ class StreamingShuffleWriter[K, V](
           LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}; skipping termination-ack wait.")
       }
       throwErrorIfExists()
+      if (LINGER_AFTER_TERMINATION_MS == 0) {
+        shards.foreach(_.releaseReplayHistory())
+      }
     } finally {
       isWriteFinished.countDown() // Duplicate countDowns are a no-op.
       flushThread.foreach(_.join())

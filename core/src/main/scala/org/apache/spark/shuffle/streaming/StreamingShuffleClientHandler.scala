@@ -24,7 +24,8 @@ import io.netty.buffer.{ByteBuf, CompositeByteBuf, Unpooled}
 import io.netty.channel.{Channel, ChannelOption}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
-import org.apache.spark.{SparkException, TaskContext}
+import org.apache.spark.{SparkEnv, SparkException, TaskContext}
+import org.apache.spark.internal.config.STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED
 import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
@@ -59,6 +60,8 @@ class StreamingShuffleClientHandler(
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
+  private val backpressureEnabled =
+    SparkEnv.get.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
   @volatile private var perStreamAutoReadEnabled = true
 
@@ -100,6 +103,7 @@ class StreamingShuffleClientHandler(
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
   private def updateQuota(bytes: Long): Unit = synchronized {
+    if (!backpressureEnabled) return
     remainingBytesQuota -= bytes
     if (!perStreamAutoReadEnabled) return
     val autoRead = remainingBytesQuota > 0

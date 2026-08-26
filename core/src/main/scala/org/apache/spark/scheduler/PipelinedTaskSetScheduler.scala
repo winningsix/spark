@@ -551,14 +551,10 @@ private[scheduler] class PipelinedTaskSetScheduler(
 
   private def pureProducerReservationTarget(
       pureProducers: Seq[TaskSetManager]): Int = {
-    if (pureProducers.isEmpty) {
-      0
-    } else {
-      pureProducers.iterator
-        .map(producer => math.min(producer.numTasks,
-          producerMinRunningTasksPerStage(producer.taskSet)))
-        .max
-    }
+    pureProducers.iterator
+      .map(producer => math.min(producer.numTasks,
+        producerMinRunningTasksPerStage(producer.taskSet)))
+      .sum
   }
 
   private def producerMaxRunningTasksFor(taskSet: TaskSet): Int = {
