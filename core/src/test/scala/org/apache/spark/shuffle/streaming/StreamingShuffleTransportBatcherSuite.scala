@@ -17,7 +17,8 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.TimeUnit.SECONDS
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit.{MILLISECONDS, SECONDS}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -115,6 +116,75 @@ class StreamingShuffleTransportBatcherSuite
       eventually(Timeout(Span(5, Seconds))) {
         batcher.peakInFlightBytesForTest shouldBe 16L
       }
+    } finally {
+      batcher.discard()
+    }
+  }
+
+  test("asynchronous admission drain uses the batcher monitor") {
+    val batcher = new StreamingShuffleTransportBatcher(
+      UnpooledByteBufAllocator.DEFAULT,
+      maxBytes = 1,
+      maxWaitTimeMs = 0,
+      maxInFlightBytes = 1,
+      new ErrorNotifier())
+    val client = mock[TransportClient]
+    val firstFuture = mock[ChannelFuture]
+    val secondFuture = mock[ChannelFuture]
+    val firstListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val secondListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val sends = new AtomicInteger(0)
+    val secondSendStarted = new CountDownLatch(1)
+
+    when(firstFuture.isSuccess).thenReturn(true)
+    when(secondFuture.isSuccess).thenReturn(true)
+    when(firstFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        firstListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        firstFuture
+      }
+    when(secondFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        secondListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        secondFuture
+      }
+    when(client.send(any[ByteBuf])).thenAnswer { invocation =>
+      val outbound = invocation.getArgument[ByteBuf](0)
+      outbound.release()
+      sends.incrementAndGet() match {
+        case 1 => firstFuture
+        case 2 =>
+          secondSendStarted.countDown()
+          secondFuture
+      }
+    }
+
+    try {
+      batcher.submit(
+        client,
+        UnpooledByteBufAllocator.DEFAULT.buffer(1).writeZero(1),
+        () => ())
+      batcher.submit(
+        client,
+        UnpooledByteBufAllocator.DEFAULT.buffer(1).writeZero(1),
+        () => ())
+      eventually(Timeout(Span(5, Seconds))) {
+        firstListener.get() should not be null
+        sends.get() shouldBe 1
+      }
+
+      // Completing the first send schedules an admission drain. While this thread owns the
+      // batcher monitor, that drain must not enter the shared FIFO. A bare synchronized block in
+      // the anonymous Runnable locks the Runnable itself and violates this exclusion.
+      batcher.synchronized {
+        firstListener.get().operationComplete(firstFuture)
+        secondSendStarted.await(250, MILLISECONDS) shouldBe false
+      }
+      eventually(Timeout(Span(5, Seconds))) {
+        secondSendStarted.getCount shouldBe 0L
+        secondListener.get() should not be null
+      }
+      secondListener.get().operationComplete(secondFuture)
     } finally {
       batcher.discard()
     }
