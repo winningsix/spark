@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicLong, AtomicReferenceArray}
 
 import scala.jdk.CollectionConverters._
 
@@ -113,10 +113,11 @@ class StreamingShuffleServerHandler(
   // for a sibling whose operator had stopped consuming.  A byte window gives the writer a
   // transport-level admission boundary without coupling the reader task scheduler to Netty's
   // channel-wide autoRead setting.
+  // Presence in this map is also the credit-control marker. Keeping a separate set doubled the
+  // per-writer, per-reader state and required two concurrent lookups on every send. Create the
+  // map only when the first credit-controlled route for that reader connects.
   private val creditByReaderAndClient =
-    Array.fill(numReaders)(new ConcurrentHashMap[TransportClient, AtomicLong]())
-  private val creditControlledRoutes =
-    Array.fill(numReaders)(ConcurrentHashMap.newKeySet[TransportClient]())
+    new AtomicReferenceArray[ConcurrentHashMap[TransportClient, AtomicLong]](numReaders)
   private val creditFlowControlEnabled = Option(SparkEnv.get).forall { env =>
     env.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   }
@@ -126,7 +127,7 @@ class StreamingShuffleServerHandler(
   }
 
   private[streaming] def isCreditControlled(readerId: Int, client: TransportClient): Boolean = {
-    creditFlowControlEnabled && creditControlledRoutes(readerId).contains(client)
+    creditFlowControlEnabled && creditCounter(readerId, client) != null
   }
 
   private[streaming] def allReadersConnectedFuture: CompletableFuture[Void] = {
@@ -141,8 +142,23 @@ class StreamingShuffleServerHandler(
     expectedClientCounts(readerId)
   }
 
+  private def creditMap(readerId: Int): ConcurrentHashMap[TransportClient, AtomicLong] = {
+    var map = creditByReaderAndClient.get(readerId)
+    if (map == null) {
+      val created = new ConcurrentHashMap[TransportClient, AtomicLong]()
+      if (creditByReaderAndClient.compareAndSet(readerId, null, created)) map = created
+      else map = creditByReaderAndClient.get(readerId)
+    }
+    map
+  }
+
   private def creditCounter(readerId: Int, client: TransportClient): AtomicLong = {
-    creditByReaderAndClient(readerId).computeIfAbsent(client, _ => new AtomicLong(0L))
+    val map = creditByReaderAndClient.get(readerId)
+    if (map == null) null else map.get(client)
+  }
+
+  private def enableCreditControl(readerId: Int, client: TransportClient): AtomicLong = {
+    creditMap(readerId).computeIfAbsent(client, _ => new AtomicLong(0L))
   }
 
   /** True when this logical route may admit a body of the supplied encoded size. */
@@ -150,18 +166,16 @@ class StreamingShuffleServerHandler(
       readerId: Int,
       client: TransportClient,
       bytes: Long): Boolean = {
-    !isCreditControlled(readerId, client) || creditCounter(readerId, client).get() > 0
+    val counter = creditCounter(readerId, client)
+    counter == null || counter.get() > 0
   }
 
   /** Current byte credit available to one logical route. */
   private[streaming] def availableDataCredit(
       readerId: Int,
       client: TransportClient): Long = {
-    if (isCreditControlled(readerId, client)) {
-      math.max(0L, creditCounter(readerId, client).get())
-    } else {
-      Long.MaxValue
-    }
+    val counter = creditCounter(readerId, client)
+    if (counter == null) Long.MaxValue else math.max(0L, counter.get())
   }
 
   /** Reserve route credit immediately before a writer submits a body to Netty. */
@@ -169,8 +183,8 @@ class StreamingShuffleServerHandler(
       readerId: Int,
       client: TransportClient,
       bytes: Long): Unit = {
-    if (isCreditControlled(readerId, client) && bytes > 0) {
-      val counter = creditCounter(readerId, client)
+    val counter = creditCounter(readerId, client)
+    if (counter != null && bytes > 0) {
       var done = false
       while (!done) {
         val current = counter.get()
@@ -222,39 +236,36 @@ class StreamingShuffleServerHandler(
         val encodedCredit = creditControlMessage.numMessages.toLong
         val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
         val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
-        if (enablesCreditFlow) {
-          creditControlledRoutes(readerId).add(client)
+        val counter = if (enablesCreditFlow) {
+          enableCreditControl(readerId, client)
+        } else {
+          creditCounter(readerId, client)
         }
-        if (creditFlowControlEnabled &&
-            creditControlledRoutes(readerId).contains(client) && credit > 0) {
+        if (counter != null && credit > 0) {
           if (encodedCredit < 0) {
             // Negative credit is an absolute-window advertisement. Besides the initial route
             // registration, a reader may repeat it after an idle interval to repair a lost final
             // credit update. Raising the counter to this floor (rather than adding it) restores
             // liveness without allowing retries to inflate the bounded receive window.
-            creditCounter(readerId, client).accumulateAndGet(credit, Math.max)
+            counter.accumulateAndGet(credit, Math.max)
           } else {
-            creditCounter(readerId, client).addAndGet(credit)
+            counter.addAndGet(credit)
           }
         }
         // Fence the route before publishing it in clientsByReader. Otherwise a concurrent writer
         // drain can observe the new client and broadcast a queued termination frame before the
         // writer's replayTo callback has installed its replay fence.
-        val newConnectionForReader = clientsByReader(readerId).synchronized {
-          if (clientsByReader(readerId).contains(client)) {
-            false
-          } else {
+        clientsByReader(readerId).synchronized {
+          if (!clientsByReader(readerId).contains(client)) {
             onClientConnected(readerId, client)
             clientsByReader(readerId).add(client)
             if (clientsByReader(readerId).size >= expectedClientCounts(readerId)) {
               expectedClientsConnected(readerId).complete(null.asInstanceOf[Void])
             }
-            true
           }
         }
         futureClients(readerId).complete(client)
-        if (credit > 0 && creditFlowControlEnabled &&
-            creditControlledRoutes(readerId).contains(client)) {
+        if (credit > 0 && counter != null) {
           onCreditAvailable(readerId, client)
         }
       case terminationAck: TerminationAckMessage =>

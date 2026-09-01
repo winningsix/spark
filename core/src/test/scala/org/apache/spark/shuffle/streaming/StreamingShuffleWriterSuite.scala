@@ -38,7 +38,8 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCRE
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
-import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage,
+  StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -114,6 +115,40 @@ class StreamingShuffleWriterSuite
         new StreamingShuffleWriter[Int, Int](handle, 0, context)
       }
       assert(e.getMessage.contains("memory budget"))
+    }
+  }
+
+  test("server handler uses credit-map presence as the route control marker") {
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 0,
+        numReaders = 1,
+        context = context,
+        errorNotifier = new ErrorNotifier())
+      val client = mock[TransportClient]
+
+      try {
+        // A positive grant before the initial negative window is still an unbounded legacy route.
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, 25))
+        handler.isCreditControlled(0, client) shouldBe false
+        handler.availableDataCredit(0, client) shouldBe Long.MaxValue
+
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.isCreditControlled(0, client) shouldBe true
+        handler.availableDataCredit(0, client) shouldBe 100L
+        handler.consumeDataCredit(0, client, 40L)
+        handler.availableDataCredit(0, client) shouldBe 60L
+
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, 25))
+        handler.availableDataCredit(0, client) shouldBe 85L
+        // A repeated absolute advertisement repairs the window without adding it.
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.availableDataCredit(0, client) shouldBe 100L
+      } finally {
+        context.markTaskCompleted(None)
+      }
     }
   }
 
