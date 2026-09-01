@@ -1251,7 +1251,13 @@ class StreamingShuffleWriter[K, V](
         case _ =>
       }
       action match {
-        case ControlAction(_, _) | ReplayAction(_, _) =>
+        // A normal terminal already sits behind every data frame from this logical route. Let it
+        // share the executor batcher's bounded cross-route wait (2 ms by default) so thousands of
+        // writers do not turn their terminal frontier into one Spark transport body per route.
+        // A targeted replay repairs a potentially lost terminal and remains latency-sensitive.
+        case ControlAction(_, _) if CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS == 0L =>
+          sends.map(_._1).distinct.foreach(target => crossRouteBatcher.foreach(_.flush(target)))
+        case ReplayAction(_, _) =>
           sends.map(_._1).distinct.foreach(target => crossRouteBatcher.foreach(_.flush(target)))
         case _ =>
       }

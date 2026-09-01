@@ -39,7 +39,7 @@ import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, Tr
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage,
-  StreamingShuffleMessageType}
+  StreamingShuffleMessageType, TerminationAckMessage}
 import org.apache.spark.util.ThreadUtils
 
 private[streaming] object StreamingShuffleExecutorClient {
@@ -163,6 +163,10 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private case class PendingCreditRepair(
       handler: StreamingShuffleClientHandler,
       message: CreditControlMessage)
+  private case class PendingTerminationAck(
+      handler: StreamingShuffleClientHandler,
+      writerId: Int,
+      sequenceNumber: Long)
 
   // A shuffle partition can be consumed by more than one downstream stage. Those logical readers
   // intentionally share one pooled transport connection and therefore have the same wire route.
@@ -188,7 +192,13 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private val cumulativeCreditReleases = new AtomicLong(0L)
   private val cumulativeCreditWrites = new AtomicLong(0L)
   private val cumulativeCreditFrames = new AtomicLong(0L)
+  private val terminationAckFrames = new AtomicLong(0L)
+  private val terminationAckWrites = new AtomicLong(0L)
   private val closed = new AtomicBoolean(false)
+  private val currentTerminationAckBatch = new ThreadLocal[
+    mutable.LinkedHashMap[
+      StreamingShuffleClientHandler,
+      (TransportClient, PendingTerminationAck)]]()
   private val cumulativeCreditLock = new Object
   private val pendingCumulativeCredits = new java.util.IdentityHashMap[
     TransportClient, mutable.LinkedHashSet[StreamingShuffleClientHandler]]()
@@ -375,7 +385,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       // readers. The router keeps one-route bodies zero-copy and only slices at route transitions.
       val body = message.convertToNetty().asInstanceOf[ByteBuf]
       try {
-        receiveMultiplexedBody(client, body, message)
+        withTerminationAckBatch {
+          receiveMultiplexedBody(client, body, message)
+        }
       } finally {
         body.release()
       }
@@ -444,6 +456,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
     val registration = Registration(handler, client, laneShared, new AtomicBoolean(true))
     handler.setMultiplexedCreditSender(scheduleCumulativeCredit)
+    handler.setMultiplexedTerminationAckSender(scheduleTerminationAck)
     val routeRegistrations = registrations.computeIfAbsent(
       route, _ => new CopyOnWriteArrayList[Registration]())
     require(routeRegistrations.addIfAbsent(registration),
@@ -455,6 +468,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     installed.registration.initialCreditPending.set(false)
     discardPendingCumulativeCredit(installed.registration.handler)
     installed.registration.handler.clearMultiplexedCreditSender()
+    installed.registration.handler.clearMultiplexedTerminationAckSender()
     installed.routeRegistrations.remove(installed.registration)
     if (installed.routeRegistrations.isEmpty) {
       registrations.remove(installed.route, installed.routeRegistrations)
@@ -529,6 +543,86 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     } catch {
       case error: Throwable =>
         repairs.foreach(_.handler.creditRepairBatchSendFailed(client, error))
+    } finally {
+      if (buf != null) buf.release()
+    }
+  }
+
+  /** Combine terminal ACKs produced while routing one physical inbound body. */
+  private def withTerminationAckBatch(body: => Unit): Unit = {
+    require(currentTerminationAckBatch.get() == null,
+      "Nested streaming shuffle termination-ACK batches are not supported")
+    val pending = new mutable.LinkedHashMap[
+      StreamingShuffleClientHandler, (TransportClient, PendingTerminationAck)]()
+    currentTerminationAckBatch.set(pending)
+    try body
+    finally {
+      currentTerminationAckBatch.remove()
+      pending.values.toSeq.groupBy(_._1).foreach { case (client, entries) =>
+        sendTerminationAckBatch(client, entries.map(_._2))
+      }
+    }
+  }
+
+  private def scheduleTerminationAck(
+      client: TransportClient,
+      handler: StreamingShuffleClientHandler,
+      writerId: Int,
+      sequenceNumber: Long): Unit = {
+    val ack = PendingTerminationAck(handler, writerId, sequenceNumber)
+    val pending = currentTerminationAckBatch.get()
+    if (pending == null) {
+      sendTerminationAckBatch(client, Seq(ack))
+    } else {
+      // A duplicate terminal in the same physical body needs only one idempotent ACK.
+      pending.update(handler, client -> ack)
+    }
+  }
+
+  private def sendTerminationAckBatch(
+      client: TransportClient,
+      entries: Seq[PendingTerminationAck]): Unit = {
+    if (entries.isEmpty) return
+    terminationAckWrites.incrementAndGet()
+    terminationAckFrames.addAndGet(entries.size)
+    var buf: CompositeByteBuf = null
+    try {
+      val messages: Seq[(PendingTerminationAck, TerminationAckMessage)] = entries.map { entry =>
+        entry -> entry.handler.prepareMultiplexedTerminationAck(
+          entry.writerId, entry.sequenceNumber)
+      }
+      val encodedBytes = messages.foldLeft(0)(_ + _._2.headerLength())
+      buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
+      messages.foreach(_._2.encode(buf))
+      val transportRef = buf.retain()
+      val sendFuture = try {
+        client.send(transportRef)
+      } catch {
+        case error: Throwable =>
+          transportRef.release()
+          throw error
+      }
+      sendFuture.addListener(
+        new GenericFutureListener[Future[Void]] {
+          override def operationComplete(future: Future[Void]): Unit = {
+            if (future.isSuccess) {
+              entries.foreach { entry =>
+                entry.handler.terminationAckBatchSendSucceeded(entry.writerId)
+              }
+            } else {
+              val cause = Option(future.cause()).getOrElse(
+                new RuntimeException("Unknown termination ACK batch send failure"))
+              entries.foreach { entry =>
+                entry.handler.terminationAckBatchSendFailed(client, entry.writerId, cause)
+              }
+            }
+          }
+        })
+    } catch {
+      case error: Throwable =>
+        entries.foreach { entry =>
+          entry.handler.terminationAckBatchSendFailed(client, entry.writerId, error)
+        }
     } finally {
       if (buf != null) buf.release()
     }
@@ -705,6 +799,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         registration.initialCreditPending.set(false)
         discardPendingCumulativeCredit(handler)
         handler.clearMultiplexedCreditSender()
+        handler.clearMultiplexedTerminationAckSender()
         routeRegistrations.remove(registration)
         if (!registration.laneShared) registration.client.close()
       }
@@ -723,6 +818,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         entry.getValue.asScala.foreach { registration =>
           discardPendingCumulativeCredit(registration.handler)
           registration.handler.clearMultiplexedCreditSender()
+          registration.handler.clearMultiplexedTerminationAckSender()
         }
         entry.getValue.asScala.filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
         entry.getValue.clear()
@@ -744,6 +840,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private[streaming] def cumulativeCreditBatchStats: (Long, Long, Long) =
     (cumulativeCreditReleases.get(), cumulativeCreditWrites.get(), cumulativeCreditFrames.get())
 
+  private[streaming] def terminationAckBatchStats: (Long, Long) =
+    (terminationAckWrites.get(), terminationAckFrames.get())
+
   def close(): Unit = {
     if (!closed.compareAndSet(false, true)) return
     val (creditRegistrations, creditWrites) = initialCreditBatchStats
@@ -754,12 +853,15 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       s"creditRepairWrites=${creditRepairWrites.get()} " +
       s"cumulativeCreditReleases=${cumulativeCreditReleases.get()} " +
       s"cumulativeCreditWrites=${cumulativeCreditWrites.get()} " +
-      s"cumulativeCreditFrames=${cumulativeCreditFrames.get()}")
+      s"cumulativeCreditFrames=${cumulativeCreditFrames.get()} " +
+      s"terminationAckWrites=${terminationAckWrites.get()} " +
+      s"terminationAckFrames=${terminationAckFrames.get()}")
     val activeRegistrations = registrations.values().asScala.flatMap(_.asScala).toSeq
     activeRegistrations.foreach(_.initialCreditPending.set(false))
     activeRegistrations.foreach { registration =>
       discardPendingCumulativeCredit(registration.handler)
       registration.handler.clearMultiplexedCreditSender()
+      registration.handler.clearMultiplexedTerminationAckSender()
     }
     cumulativeCreditExecutor.shutdownNow()
     cumulativeCreditLock.synchronized {
