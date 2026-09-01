@@ -17,7 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{CompletableFuture, CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import io.netty.buffer.Unpooled
@@ -420,6 +420,120 @@ class StreamingShuffleManagerSuite
         client.close()
         server.close()
       }
+    }
+  }
+
+  test("shared writer endpoint replays prepared credit that arrives before writer registration") {
+    withSpark(new SparkContext("local", "prepared-credit-before-writer", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val readerHandler = new StreamingShuffleClientHandler(
+        3,
+        0,
+        new LinkedBlockingQueue[StreamingShuffleMessage](),
+        7,
+        1L << 20,
+        null,
+        new ErrorNotifier())
+      val writerContext = mock[TaskContext]
+      val writerHandler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 7,
+        numReaders = 1,
+        context = writerContext,
+        errorNotifier = new ErrorNotifier())
+      try {
+        val routeClient = client.registerBatch(
+          shuffleId = 7,
+          readerId = 0,
+          remoteHost = "127.0.0.1",
+          remotePort = server.port,
+          handlersByWriter = Seq(3 -> readerHandler))(3)
+        eventually(Timeout(10.seconds)) {
+          server.pendingCreditCount shouldBe 1
+        }
+
+        server.register(7, 3, writerHandler)
+        eventually(Timeout(10.seconds)) {
+          server.pendingCreditCount shouldBe 0
+          writerHandler.clientsFor(0).size shouldBe 1
+        }
+
+        server.unregister(7, 3, writerHandler)
+        readerHandler.repairCreditWindow(routeClient)
+        eventually(Timeout(10.seconds)) {
+          server.pendingCreditCount shouldBe 0
+        }
+      } finally {
+        server.unregister(7, 3, writerHandler)
+        client.unregister(7, 3, 0, readerHandler)
+        client.close()
+        server.close()
+      }
+    }
+  }
+
+  test("shared writer endpoint atomically hands concurrent prepared credits to registration") {
+    withSpark(new SparkContext("local", "concurrent-prepared-credit-handoff", new SparkConf())) {
+      _ =>
+        val server = new StreamingShuffleExecutorServer()
+        val client = new StreamingShuffleExecutorClient()
+        val readers = 16
+        val readerHandlers = Array.tabulate(readers) { readerId =>
+          new StreamingShuffleClientHandler(
+            9,
+            readerId,
+            new LinkedBlockingQueue[StreamingShuffleMessage](),
+            11,
+            1L << 20,
+            null,
+            new ErrorNotifier())
+        }
+        val writerHandler = new StreamingShuffleServerHandler(
+          (_, _) => (),
+          shuffleId = 11,
+          numReaders = readers,
+          context = mock[TaskContext],
+          errorNotifier = new ErrorNotifier())
+        val start = new CountDownLatch(1)
+        val writerRegistered = new AtomicBoolean(false)
+        val pool = ThreadUtils.newDaemonFixedThreadPool(
+          readers + 1, "concurrent-prepared-credit-handoff")
+        try {
+          val writer = CompletableFuture.runAsync(
+            () => {
+              start.await()
+              server.register(11, 9, writerHandler)
+              writerRegistered.set(true)
+            },
+            pool)
+          val credits = readerHandlers.zipWithIndex.map { case (handler, readerId) =>
+            CompletableFuture.runAsync(
+              () => {
+                start.await()
+                client.register(11, 9, readerId, "127.0.0.1", server.port, handler)
+                ()
+              },
+              pool)
+          }
+          start.countDown()
+          CompletableFuture.allOf((credits :+ writer): _*).get(10, TimeUnit.SECONDS)
+
+          eventually(Timeout(10.seconds)) {
+            server.pendingCreditCount shouldBe 0
+            (0 until readers).foreach { readerId =>
+              writerHandler.clientsFor(readerId).size shouldBe 1
+            }
+          }
+        } finally {
+          if (writerRegistered.get()) server.unregister(11, 9, writerHandler)
+          readerHandlers.zipWithIndex.foreach { case (handler, readerId) =>
+            client.unregister(11, 9, readerId, handler)
+          }
+          pool.shutdownNow()
+          client.close()
+          server.close()
+        }
     }
   }
 
