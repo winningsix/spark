@@ -1,0 +1,122 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.shuffle.streaming
+
+import java.util.concurrent.TimeUnit.SECONDS
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.Duration
+
+import io.netty.buffer.{ByteBuf, UnpooledByteBufAllocator}
+import io.netty.channel.ChannelFuture
+import io.netty.util.concurrent.GenericFutureListener
+import org.mockito.ArgumentMatchers.any
+import org.mockito.Mockito.when
+import org.scalatest.concurrent.Eventually.eventually
+import org.scalatest.concurrent.PatienceConfiguration.Timeout
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.{Seconds, Span}
+import org.scalatestplus.mockito.MockitoSugar
+
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.network.client.TransportClient
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
+
+class StreamingShuffleTransportBatcherSuite
+  extends SparkFunSuite
+  with Matchers
+  with MockitoSugar {
+
+  test("a full transport window does not block an unrelated connection") {
+    implicit val executionContext: ExecutionContext = ExecutionContext.global
+    val batcher = new StreamingShuffleTransportBatcher(
+      UnpooledByteBufAllocator.DEFAULT,
+      maxBytes = 16,
+      maxWaitTimeMs = 0,
+      maxInFlightBytes = 16,
+      new ErrorNotifier())
+    val firstClient = mock[TransportClient]
+    val secondClient = mock[TransportClient]
+    val firstFuture = mock[ChannelFuture]
+    val secondFuture = mock[ChannelFuture]
+    val firstListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val secondListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val firstOutbound = new AtomicReference[ByteBuf]()
+    val secondOutbound = new AtomicReference[ByteBuf]()
+    val secondSends = new AtomicInteger(0)
+
+    when(firstFuture.isSuccess).thenReturn(true)
+    when(secondFuture.isSuccess).thenReturn(true)
+    when(firstFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        firstListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        firstFuture
+      }
+    when(secondFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        secondListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        secondFuture
+      }
+    when(firstClient.send(any[ByteBuf])).thenAnswer { invocation =>
+      firstOutbound.set(invocation.getArgument[ByteBuf](0))
+      firstFuture
+    }
+    when(secondClient.send(any[ByteBuf])).thenAnswer { invocation =>
+      secondOutbound.set(invocation.getArgument[ByteBuf](0))
+      secondSends.incrementAndGet()
+      secondFuture
+    }
+
+    try {
+      batcher.submit(
+        firstClient,
+        UnpooledByteBufAllocator.DEFAULT.buffer(16).writeZero(16),
+        () => ())
+      eventually(Timeout(Span(5, Seconds))) {
+        firstListener.get() should not be null
+      }
+
+      // The first connection owns the complete transport window and its future is deliberately
+      // unfinished. Enqueuing a body for another connection must return instead of parking the
+      // caller (the shared outbound dispatcher in production).
+      ThreadUtils.awaitResult(Future {
+        batcher.submit(
+          secondClient,
+          UnpooledByteBufAllocator.DEFAULT.buffer(16).writeZero(16),
+          () => ())
+      }, Duration(5, SECONDS))
+      secondSends.get() shouldBe 0
+
+      firstOutbound.getAndSet(null).release()
+      firstListener.get().operationComplete(firstFuture)
+      eventually(Timeout(Span(5, Seconds))) {
+        secondSends.get() shouldBe 1
+        secondListener.get() should not be null
+      }
+
+      secondOutbound.getAndSet(null).release()
+      secondListener.get().operationComplete(secondFuture)
+      eventually(Timeout(Span(5, Seconds))) {
+        batcher.peakInFlightBytesForTest shouldBe 16L
+      }
+    } finally {
+      batcher.discard()
+    }
+  }
+}
