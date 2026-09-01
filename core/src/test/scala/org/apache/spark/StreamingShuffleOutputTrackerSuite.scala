@@ -28,7 +28,8 @@ import org.scalatest.matchers.should.Matchers
 import org.apache.spark.internal.config.SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
-  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
+  PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
+  StreamingShuffleReceiveInboxId}
 
 class StreamingShuffleOutputTrackerSuite
   extends SparkFunSuite
@@ -108,6 +109,9 @@ class StreamingShuffleOutputTrackerSuite
         case PrepareStreamingShuffleReceiveInbox(id) =>
           prepared += id
           context.reply(true)
+        case PrepareStreamingShuffleReceiveInboxes(ids) =>
+          prepared ++= ids
+          context.reply(true)
       }
     })
     var readyCallbacks = 0
@@ -117,6 +121,11 @@ class StreamingShuffleOutputTrackerSuite
     val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
     tracker.prepareReceiveInbox("executor-1", id) shouldBe true
     prepared should contain only id
+    val batch = Seq(
+      id.copy(partitionId = 6),
+      id.copy(partitionId = 7))
+    tracker.prepareReceiveInboxes("executor-1", batch) shouldBe true
+    prepared should contain theSameElementsInOrderAs id +: batch
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
 
     tracker.markInboxDrainReady("executor-1", id)

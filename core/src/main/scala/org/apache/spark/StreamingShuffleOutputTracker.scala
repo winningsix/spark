@@ -28,7 +28,8 @@ import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREAD
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
-  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
+  PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
+  StreamingShuffleReceiveInboxId}
 import org.apache.spark.util.ThreadUtils
 
 /**
@@ -379,6 +380,18 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       id: StreamingShuffleReceiveInboxId): Boolean = {
     val endpoint = receiveEndpoints.get(executorId)
     endpoint != null && endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInbox(id))
+  }
+
+  private[spark] def prepareReceiveInboxes(
+      executorId: String,
+      ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = {
+    if (ids.isEmpty) {
+      true
+    } else {
+      val endpoint = receiveEndpoints.get(executorId)
+      endpoint != null &&
+        endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
+    }
   }
 
   private[spark] def releaseReceiveInbox(

@@ -48,6 +48,9 @@ private[spark] case class StreamingShuffleReceiveInboxId(
 private[spark] case class PrepareStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
 
+private[spark] case class PrepareStreamingShuffleReceiveInboxes(
+    ids: Seq[StreamingShuffleReceiveInboxId])
+
 private[spark] case class ReleaseStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
 
@@ -138,6 +141,10 @@ private[streaming] class StreamingShuffleReceiveService(
       }
     }
     selected.session.isDefined
+  }
+
+  def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
+    ids.forall(prepare)
   }
 
   def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = {
@@ -251,6 +258,7 @@ private[streaming] class StreamingShuffleReceiveServiceEndpoint(
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
     case PrepareStreamingShuffleReceiveInbox(id) => context.reply(service.prepare(id))
+    case PrepareStreamingShuffleReceiveInboxes(ids) => context.reply(service.prepareAll(ids))
     case ReleaseStreamingShuffleReceiveInbox(id) =>
       context.reply(service.releasePrepared(id))
   }
