@@ -113,11 +113,19 @@ class StreamingShuffleServerHandler(
   // for a sibling whose operator had stopped consuming.  A byte window gives the writer a
   // transport-level admission boundary without coupling the reader task scheduler to Netty's
   // channel-wide autoRead setting.
-  // Presence in this map is also the credit-control marker. Keeping a separate set doubled the
-  // per-writer, per-reader state and required two concurrent lookups on every send. Create the
-  // map only when the first credit-controlled route for that reader connects.
+  // Presence in this map is also the credit-control marker. Each state keeps the bounded window,
+  // bytes submitted on this connection, and the largest cumulative reader release acknowledged.
+  // The cumulative value makes an idle retry idempotent: unlike a repeated additive grant, it
+  // cannot manufacture credit when the original grant was merely delayed rather than lost.
+  private class RouteCreditState {
+    val available = new AtomicLong(0L)
+    val window = new AtomicLong(0L)
+    val sent = new AtomicLong(0L)
+    val released = new AtomicLong(0L)
+  }
+
   private val creditByReaderAndClient =
-    new AtomicReferenceArray[ConcurrentHashMap[TransportClient, AtomicLong]](numReaders)
+    new AtomicReferenceArray[ConcurrentHashMap[TransportClient, RouteCreditState]](numReaders)
   private val creditFlowControlEnabled = Option(SparkEnv.get).forall { env =>
     env.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   }
@@ -127,7 +135,7 @@ class StreamingShuffleServerHandler(
   }
 
   private[streaming] def isCreditControlled(readerId: Int, client: TransportClient): Boolean = {
-    creditFlowControlEnabled && creditCounter(readerId, client) != null
+    creditFlowControlEnabled && creditState(readerId, client) != null
   }
 
   private[streaming] def allReadersConnectedFuture: CompletableFuture[Void] = {
@@ -142,23 +150,23 @@ class StreamingShuffleServerHandler(
     expectedClientCounts(readerId)
   }
 
-  private def creditMap(readerId: Int): ConcurrentHashMap[TransportClient, AtomicLong] = {
+  private def creditMap(readerId: Int): ConcurrentHashMap[TransportClient, RouteCreditState] = {
     var map = creditByReaderAndClient.get(readerId)
     if (map == null) {
-      val created = new ConcurrentHashMap[TransportClient, AtomicLong]()
+      val created = new ConcurrentHashMap[TransportClient, RouteCreditState]()
       if (creditByReaderAndClient.compareAndSet(readerId, null, created)) map = created
       else map = creditByReaderAndClient.get(readerId)
     }
     map
   }
 
-  private def creditCounter(readerId: Int, client: TransportClient): AtomicLong = {
+  private def creditState(readerId: Int, client: TransportClient): RouteCreditState = {
     val map = creditByReaderAndClient.get(readerId)
     if (map == null) null else map.get(client)
   }
 
-  private def enableCreditControl(readerId: Int, client: TransportClient): AtomicLong = {
-    creditMap(readerId).computeIfAbsent(client, _ => new AtomicLong(0L))
+  private def enableCreditControl(readerId: Int, client: TransportClient): RouteCreditState = {
+    creditMap(readerId).computeIfAbsent(client, _ => new RouteCreditState())
   }
 
   /** True when this logical route may admit a body of the supplied encoded size. */
@@ -166,16 +174,16 @@ class StreamingShuffleServerHandler(
       readerId: Int,
       client: TransportClient,
       bytes: Long): Boolean = {
-    val counter = creditCounter(readerId, client)
-    counter == null || counter.get() > 0
+    val state = creditState(readerId, client)
+    state == null || state.available.get() > 0
   }
 
   /** Current byte credit available to one logical route. */
   private[streaming] def availableDataCredit(
       readerId: Int,
       client: TransportClient): Long = {
-    val counter = creditCounter(readerId, client)
-    if (counter == null) Long.MaxValue else math.max(0L, counter.get())
+    val state = creditState(readerId, client)
+    if (state == null) Long.MaxValue else math.max(0L, state.available.get())
   }
 
   /** Reserve route credit immediately before a writer submits a body to Netty. */
@@ -183,11 +191,11 @@ class StreamingShuffleServerHandler(
       readerId: Int,
       client: TransportClient,
       bytes: Long): Unit = {
-    val counter = creditCounter(readerId, client)
-    if (counter != null && bytes > 0) {
+    val state = creditState(readerId, client)
+    if (state != null && bytes > 0) {
       var done = false
       while (!done) {
-        val current = counter.get()
+        val current = state.available.get()
         if (current <= 0) {
           throw new IllegalStateException(
             s"Insufficient streaming shuffle credit for reader $readerId: " +
@@ -196,8 +204,9 @@ class StreamingShuffleServerHandler(
         // A single encoded frame may be larger than the per-writer quota. Admit that one frame
         // so a small quota cannot deadlock the route; its reader-side release returns the exact
         // frame size before another frame is admitted.
-        done = counter.compareAndSet(current, math.max(0L, current - bytes))
+        done = state.available.compareAndSet(current, math.max(0L, current - bytes))
       }
+      state.sent.addAndGet(bytes)
     }
   }
 
@@ -236,21 +245,52 @@ class StreamingShuffleServerHandler(
         val encodedCredit = creditControlMessage.numMessages.toLong
         val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
         val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
-        val counter = if (enablesCreditFlow) {
+        val state = if (enablesCreditFlow) {
           enableCreditControl(readerId, client)
         } else {
-          creditCounter(readerId, client)
+          creditState(readerId, client)
         }
-        if (counter != null && credit > 0) {
-          if (encodedCredit < 0) {
-            // Negative credit is an absolute-window advertisement. Besides the initial route
-            // registration, a reader may repeat it after an idle interval to repair a lost final
-            // credit update. Raising the counter to this floor (rather than adding it) restores
-            // liveness without allowing retries to inflate the bounded receive window.
-            counter.accumulateAndGet(credit, Math.max)
-          } else {
-            counter.addAndGet(credit)
+        var grantedCredit = 0L
+        if (state != null && encodedCredit < 0 && credit > 0) {
+          state.window.accumulateAndGet(credit, Math.max)
+          // An absolute window is safe only as the initial discovery retry. Once the writer has
+          // submitted data, only cumulative release acknowledgements below may reopen the route.
+          if (state.sent.get() == 0L) {
+            val before = state.available.get()
+            val after = state.available.accumulateAndGet(credit, Math.max)
+            grantedCredit = math.max(0L, after - before)
           }
+        } else if (state != null && encodedCredit == 0) {
+          // Sequence number carries total bytes released by this reader on this connection. Clamp
+          // it to bytes actually sent and advance the watermark with CAS so duplicate or reordered
+          // repair frames are harmless.
+          val acknowledged = math.max(0L, math.min(
+            creditControlMessage.getSeqNum, state.sent.get()))
+          var previous = state.released.get()
+          while (acknowledged > previous &&
+              !state.released.compareAndSet(previous, acknowledged)) {
+            previous = state.released.get()
+          }
+          val delta = math.max(0L, acknowledged - previous)
+          if (delta > 0L) {
+            val limit = state.window.get()
+            state.available.updateAndGet(current =>
+              math.min(limit, current + math.min(delta, limit)))
+            // Wake the dispatcher whenever the acknowledgement watermark advances. Deriving this
+            // from before/after credit is racy with a concurrent reservation: the writer could
+            // consume the newly granted bytes between those two observations and lose the wakeup.
+            grantedCredit = delta
+          }
+        } else if (state != null && credit > 0) {
+          // Dedicated connections retain the historical additive-credit mode.
+          val limit = state.window.get()
+          val before = state.available.get()
+          val after = if (limit > 0L) {
+            state.available.updateAndGet(current => math.min(limit, current + credit))
+          } else {
+            state.available.addAndGet(credit)
+          }
+          grantedCredit = math.max(0L, after - before)
         }
         // Fence the route before publishing it in clientsByReader. Otherwise a concurrent writer
         // drain can observe the new client and broadcast a queued termination frame before the
@@ -265,7 +305,7 @@ class StreamingShuffleServerHandler(
           }
         }
         futureClients(readerId).complete(client)
-        if (credit > 0 && counter != null) {
+        if (grantedCredit > 0L) {
           onCreditAvailable(readerId, client)
         }
       case terminationAck: TerminationAckMessage =>

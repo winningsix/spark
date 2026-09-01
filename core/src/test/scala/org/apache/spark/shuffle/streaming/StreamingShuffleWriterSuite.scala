@@ -138,13 +138,30 @@ class StreamingShuffleWriterSuite
         handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
         handler.isCreditControlled(0, client) shouldBe true
         handler.availableDataCredit(0, client) shouldBe 100L
+        // Retrying discovery before any data is sent is an idempotent no-op.
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.availableDataCredit(0, client) shouldBe 100L
+
         handler.consumeDataCredit(0, client, 40L)
         handler.availableDataCredit(0, client) shouldBe 60L
-
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, 25))
-        handler.availableDataCredit(0, client) shouldBe 85L
-        // A repeated absolute advertisement repairs the window without adding it.
+        // An absolute initial-window retry cannot manufacture credit after data is in flight.
         handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.availableDataCredit(0, client) shouldBe 60L
+
+        val released40 = new CreditControlMessage(0, 0, 0, 0)
+        released40.setSeqNum(40L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 100L
+        // Repeating the cumulative acknowledgement does not grant the same bytes twice.
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        handler.consumeDataCredit(0, client, 30L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 70L
+        val released70 = new CreditControlMessage(0, 0, 0, 0)
+        released70.setSeqNum(70L)
+        handler.handleMessage(client, released70)
         handler.availableDataCredit(0, client) shouldBe 100L
       } finally {
         context.markTaskCompleted(None)
