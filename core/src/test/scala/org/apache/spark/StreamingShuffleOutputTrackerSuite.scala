@@ -66,8 +66,12 @@ class StreamingShuffleOutputTrackerSuite
   }
 
   protected def newTrackerWorker(
-      sparkConf: SparkConf = conf): StreamingShuffleOutputTrackerWorker = {
-    val tracker = new StreamingShuffleOutputTrackerWorker(sparkConf)
+      sparkConf: SparkConf = conf,
+      inboxDrainReadyAckDelayMs: Long =
+        StreamingShuffleOutputTrackerWorker.INBOX_DRAIN_READY_ACK_DELAY_MS)
+      : StreamingShuffleOutputTrackerWorker = {
+    val tracker = new StreamingShuffleOutputTrackerWorker(
+      sparkConf, inboxDrainReadyAckDelayMs)
     trackersToStop += tracker
     tracker
   }
@@ -133,12 +137,20 @@ class StreamingShuffleOutputTrackerSuite
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe true
     readyCallbacks shouldBe 2
 
+    val readyBatch = batch :+ batch.last
+    tracker.markInboxesDrainReady("executor-1", readyBatch)
+    readyBatch.foreach { readyId =>
+      tracker.isReceiveInboxDrainReady("executor-1", readyId) shouldBe true
+    }
+    readyCallbacks shouldBe 3
+
     tracker.releaseReceiveInbox("executor-1", id)
     releaseReceived.await(10, TimeUnit.SECONDS) shouldBe true
     released should contain only id
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
 
     tracker.markInboxDrainReady("executor-1", id)
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
     tracker.removeReceiveExecutor("executor-1")
     tracker.receiveExecutorIds shouldBe empty
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
@@ -146,6 +158,82 @@ class StreamingShuffleOutputTrackerSuite
     tracker.registerShuffle(7, numMaps = 1, numReduces = 1, jobId = 1)
     tracker.unregisterShuffle(7)
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
+  }
+
+  test("worker coalesces prepared inbox drain-ready acknowledgements") {
+    val endpointRpcEnv = createRpcEnv("ready-ack-batch-test")
+    val received = ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
+    val messages = new CountDownLatch(1)
+    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-batch", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = endpointRpcEnv
+
+      override def receive: PartialFunction[Any, Unit] = {
+        case StreamingShuffleInboxesDrainReady("executor-1", ids) =>
+          received.synchronized(received ++= ids)
+          messages.countDown()
+      }
+    })
+    val worker = newTrackerWorker(inboxDrainReadyAckDelayMs = TimeUnit.MINUTES.toMillis(1))
+    worker.trackerEndpoint = endpoint
+    val ids = (0 until 8).map { partitionId =>
+      StreamingShuffleReceiveInboxId(7, 11, 2, partitionId, -1L)
+    }
+
+    ids.foreach(worker.markInboxDrainReady("executor-1", _))
+    worker.markInboxDrainReady("executor-1", ids.head)
+    worker.flushPendingInboxDrainReadyAcks()
+
+    messages.await(10, TimeUnit.SECONDS) shouldBe true
+    received.synchronized(received.toSeq) should contain theSameElementsInOrderAs ids
+    worker.inboxDrainReadyAckStats shouldBe (8L -> 1L)
+  }
+
+  test("master accepts readiness racing with prepare reply and rejects failed prepare") {
+    val endpointRpcEnv = createRpcEnv("ready-ack-prepare-race-test")
+    val tracker = newTrackerMaster()
+    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
+    val failedId = id.copy(partitionId = 6)
+    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-prepare-race", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = endpointRpcEnv
+
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInboxes(ids) if ids == Seq(id) =>
+          tracker.markInboxesDrainReady("executor-1", ids)
+          context.reply(true)
+        case PrepareStreamingShuffleReceiveInboxes(ids) if ids == Seq(failedId) =>
+          context.reply(false)
+      }
+    })
+    tracker.registerReceiveEndpoint("executor-1", endpoint) shouldBe true
+
+    tracker.prepareReceiveInboxes("executor-1", Seq(id)) shouldBe true
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe true
+
+    tracker.prepareReceiveInboxes("executor-1", Seq(failedId)) shouldBe false
+    tracker.markInboxDrainReady("executor-1", failedId)
+    tracker.isReceiveInboxDrainReady("executor-1", failedId) shouldBe false
+  }
+
+  test("worker flushes pending inbox drain-ready acknowledgements on stop") {
+    val endpointRpcEnv = createRpcEnv("ready-ack-stop-test")
+    val received = new CountDownLatch(1)
+    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-stop", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = endpointRpcEnv
+
+      override def receive: PartialFunction[Any, Unit] = {
+        case StreamingShuffleInboxesDrainReady("executor-1", ids) if ids.size == 1 =>
+          received.countDown()
+      }
+    })
+    val worker = newTrackerWorker(inboxDrainReadyAckDelayMs = TimeUnit.MINUTES.toMillis(1))
+    worker.trackerEndpoint = endpoint
+    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
+
+    worker.markInboxDrainReady("executor-1", id)
+    worker.stop()
+
+    received.await(10, TimeUnit.SECONDS) shouldBe true
+    worker.inboxDrainReadyAckStats shouldBe (1L -> 1L)
   }
 
   test("prepared receive inbox batches are sent to executors concurrently") {
