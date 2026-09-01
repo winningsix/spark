@@ -91,7 +91,7 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
     val directExchanges = scopes.flatMap(_.collect { case s: ShuffleExchangeExec => s })
     val reuseTargetByChildKey = mutable.HashMap.empty[Int, ShuffleExchangeExec]
     val sameScopeReuseCountByExchangeKey = mutable.HashMap.empty[Int, Int]
-    val sequentialReplayExchangeKeys = mutable.HashSet.empty[Int]
+    val sequentialReplayCountByExchangeKey = mutable.HashMap.empty[Int, Int]
     scopes.foreach { scope =>
       val scopeExchanges = scope.collect { case s: ShuffleExchangeExec => s }
       val reused = scope.collect {
@@ -114,7 +114,9 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
             target.pipelinedReuseKey,
             sameScopeReuseCountByExchangeKey.getOrElse(target.pipelinedReuseKey, 0) + 1)
         } else {
-          sequentialReplayExchangeKeys += target.pipelinedReuseKey
+          sequentialReplayCountByExchangeKey.update(
+            target.pipelinedReuseKey,
+            sequentialReplayCountByExchangeKey.getOrElse(target.pipelinedReuseKey, 0) + 1)
         }
       }
     }
@@ -136,8 +138,8 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
           if (asPipelined) {
             copied.setPipelinedReaderRouteMultiplicity(
               1 + sameScopeReuseCountByExchangeKey.getOrElse(exchange.pipelinedReuseKey, 0))
-            if (sequentialReplayExchangeKeys.contains(exchange.pipelinedReuseKey)) {
-              copied.markPipelinedSequentialReplayRequired()
+            sequentialReplayCountByExchangeKey.get(exchange.pipelinedReuseKey).foreach {
+              copied.addPipelinedSequentialReplays
             }
           }
           copied
@@ -153,7 +155,7 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
     }
 
     if ((sameScopeReuseCountByExchangeKey.nonEmpty && !supportsFanOut) ||
-        (sequentialReplayExchangeKeys.nonEmpty && !supportsSequentialReplay)) {
+        (sequentialReplayCountByExchangeKey.nonEmpty && !supportsSequentialReplay)) {
       // Not a warning: this is a normal, expected fallback (reuse is routine optimizer output,
       // e.g. self-joins), the query still runs correctly as a regular shuffle, and the user has
       // nothing to act on. Log at DEBUG as diagnostic ("why this query did not go pipelined")

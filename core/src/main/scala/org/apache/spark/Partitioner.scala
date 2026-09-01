@@ -177,14 +177,34 @@ class RangePartitioner[K : Ordering : ClassTag, V](
     partitions: Int,
     rdd: RDD[_ <: Product2[K, V]],
     private var ascending: Boolean = true,
-    val samplePointsPerPartitionHint: Int = 20)
+    val samplePointsPerPartitionHint: Int = 20,
+    private[spark] val resampleImbalancedPartitions: Boolean = true)
   extends Partitioner {
 
   // A constructor declared in order to maintain backward compatibility for Java, when we add the
   // 4th constructor parameter samplePointsPerPartitionHint. See SPARK-22160.
   // This is added to make sure from a bytecode point of view, there is still a 3-arg ctor.
   def this(partitions: Int, rdd: RDD[_ <: Product2[K, V]], ascending: Boolean) = {
-    this(partitions, rdd, ascending, samplePointsPerPartitionHint = 20)
+    this(
+      partitions,
+      rdd,
+      ascending,
+      samplePointsPerPartitionHint = 20,
+      resampleImbalancedPartitions = true)
+  }
+
+  // Preserve the original four-argument JVM constructor after adding the internal fifth option.
+  def this(
+      partitions: Int,
+      rdd: RDD[_ <: Product2[K, V]],
+      ascending: Boolean,
+      samplePointsPerPartitionHint: Int) = {
+    this(
+      partitions,
+      rdd,
+      ascending,
+      samplePointsPerPartitionHint,
+      resampleImbalancedPartitions = true)
   }
 
   // We allow partitions = 0, which happens when sorting an empty RDD under the default settings.
@@ -214,7 +234,7 @@ class RangePartitioner[K : Ordering : ClassTag, V](
         val candidates = ArrayBuffer.empty[(K, Float)]
         val imbalancedPartitions = mutable.Set.empty[Int]
         sketched.foreach { case (idx, n, sample) =>
-          if (fraction * n > sampleSizePerPartition) {
+          if (resampleImbalancedPartitions && fraction * n > sampleSizePerPartition) {
             imbalancedPartitions += idx
           } else {
             // The weight is 1 over the sampling probability.
