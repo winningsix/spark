@@ -2553,6 +2553,34 @@ class AdaptiveQueryExecSuite
     }
   }
 
+  test("Force shuffled hash join build side without materialized shuffle statistics") {
+    withTempView("t1", "t2") {
+      spark.sparkContext.parallelize(
+        (1 to 100).map(i => TestData(i, i.toString)), 10)
+        .toDF("c1", "c2").createOrReplaceTempView("t1")
+      spark.sparkContext.parallelize(
+        (1 to 10).map(i => TestData(i, i.toString)), 5)
+        .toDF("c1", "c2").createOrReplaceTempView("t2")
+
+      Seq("left" -> BuildLeft, "right" -> BuildRight).foreach { case (side, expected) =>
+        withSQLConf(
+          SQLConf.SHUFFLE_PARTITIONS.key -> "3",
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+          SQLConf.ADAPTIVE_MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "0",
+          SQLConf.ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_FORCE_BUILD_SIDE.key ->
+            side) {
+          val (origin, adaptive) = runAdaptiveAndVerifyResult(
+            "SELECT t1.c1, t2.c1 FROM t1 JOIN t2 ON t1.c1 = t2.c1")
+          assert(findTopLevelSortMergeJoin(origin).size === 1)
+          val shj = findTopLevelShuffledHashJoin(adaptive)
+          assert(shj.size === 1)
+          assert(shj.head.buildSide === expected)
+          assert(findTopLevelSortMergeJoin(adaptive).isEmpty)
+        }
+      }
+    }
+  }
+
   test("SPARK-58084: Convert sort merge join to shuffled hash join through operators") {
     withTempView("t1", "t2", "t3") {
       spark.sparkContext.parallelize(

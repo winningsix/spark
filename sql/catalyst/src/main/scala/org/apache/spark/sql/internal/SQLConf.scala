@@ -1271,8 +1271,8 @@ object SQLConf {
       .internal()
       .doc("When true, AQE marks every safe visible shuffle exchange pipelined before creating " +
         "query stages. This preserves the selected physical operators but deliberately gives up " +
-        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs with " +
-        "the same join and partitioning configuration.")
+        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs " +
+        "with the same join and partitioning configuration.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -1562,6 +1562,21 @@ object SQLConf {
       .withBindingPolicy(ConfigBindingPolicy.SESSION)
       .booleanConf
       .createWithDefault(false)
+
+  val ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_FORCE_BUILD_SIDE =
+    buildConf("spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.forceBuildSide")
+      .internal()
+      .doc("Diagnostic override for the adaptive sort merge join to shuffled hash join " +
+        "conversion. When set to left or right, converts every eligible non-skew sort merge " +
+        "join using that build side without requiring materialized shuffle statistics. A join " +
+        "that cannot legally build the requested side remains a sort merge join. This may build " +
+        "an arbitrarily large non-spillable hash map and should only be used for controlled " +
+        "plan-parity experiments.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
+      .stringConf
+      .checkValues(Set("none", "left", "right"))
+      .createWithDefault("none")
 
   val ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_MIN_WIDENING_FACTOR =
     buildConf("spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.minWideningFactor")
@@ -8698,6 +8713,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def convertSortMergeJoinToShuffledHashJoinLookThroughOperatorsEnabled: Boolean =
     getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_LOOK_THROUGH_OPERATORS_ENABLED)
+
+  def convertSortMergeJoinToShuffledHashJoinForceBuildSide: String =
+    getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_FORCE_BUILD_SIDE)
 
   def convertSortMergeJoinToShuffledHashJoinMinWideningFactor: Double =
     getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_MIN_WIDENING_FACTOR)
