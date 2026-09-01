@@ -296,6 +296,12 @@ private[spark] class StreamingShuffleManager
       readerClientFactory.close()
       readerClientFactory = null
     }
+    // Prepared receive sessions can still own route registrations and client-creation work.
+    // Stop them before closing the executor-scoped client they unregister from.
+    if (receiveService != null) {
+      receiveService.close()
+      receiveService = null
+    }
     if (sharedExecutorClient != null) {
       sharedExecutorClient.close()
       sharedExecutorClient = null
@@ -303,10 +309,6 @@ private[spark] class StreamingShuffleManager
     if (sharedWriterServer != null) {
       sharedWriterServer.close()
       sharedWriterServer = null
-    }
-    if (receiveService != null) {
-      receiveService.close()
-      receiveService = null
     }
   }
 }

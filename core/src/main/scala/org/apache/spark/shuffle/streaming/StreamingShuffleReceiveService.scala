@@ -19,17 +19,20 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.File
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
-  LinkedBlockingQueue, Semaphore}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+  CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, ScheduledExecutorService, Semaphore,
+  TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, StreamingShuffleTaskLocation,
+  TaskContext}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
+import org.apache.spark.internal.config.{EXECUTOR_CORES,
+  STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
+  STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
-  STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.client.TransportClient
@@ -83,6 +86,31 @@ private[streaming] class StreamingShuffleReceiveService(
       partitionId: Int,
       taskAttemptId: Long)
   private val nextReaderOrdinal = new ConcurrentHashMap[TaskShuffleKey, AtomicInteger]()
+  private case class PreparedResources(
+      discovery: StreamingShufflePreparedReceiveDiscovery,
+      clientCreationExecutor: ExecutorService) {
+    def close(): Unit = {
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+  @volatile private var preparedResources: PreparedResources = _
+
+  private def getPreparedResources: PreparedResources = {
+    var resources = preparedResources
+    if (resources == null) synchronized {
+      resources = preparedResources
+      if (resources == null) {
+        resources = PreparedResources(
+          new StreamingShufflePreparedReceiveDiscovery(conf),
+          ThreadUtils.newDaemonFixedThreadPool(
+            math.max(1, conf.get(EXECUTOR_CORES)),
+            "streaming-shuffle-prepared-client"))
+        preparedResources = resources
+      }
+    }
+    resources
+  }
 
   def acquire(
       shuffleId: Int,
@@ -127,10 +155,13 @@ private[streaming] class StreamingShuffleReceiveService(
       try {
         val executorClient = sharedClient().getOrElse(throw new IllegalStateException(
           "Prepared receive inbox requires the shared executor client"))
+        val resources = getPreparedResources
         selected.startPreparedSession(new StreamingShufflePreparedReceiveSession(
           selected,
           executorClient,
           conf,
+          resources.discovery,
+          resources.clientCreationExecutor,
           () => onDrainReady(id)))
         logDebug(s"Prepared streaming shuffle receive inbox $id")
       } catch {
@@ -163,11 +194,16 @@ private[streaming] class StreamingShuffleReceiveService(
     }
   }
 
-  def close(): Unit = {
+  def close(): Unit = synchronized {
     inboxes.entrySet().asScala.foreach { entry =>
       if (inboxes.remove(entry.getKey, entry.getValue)) {
         entry.getValue.close()
       }
+    }
+    val resources = preparedResources
+    if (resources != null) {
+      resources.close()
+      preparedResources = null
     }
   }
 
@@ -264,27 +300,111 @@ private[streaming] class StreamingShuffleReceiveServiceEndpoint(
   }
 }
 
+/**
+ * Executor-scoped writer-location discovery for prepared receive inboxes.
+ *
+ * All resident inboxes for one shuffle consume the same tracker snapshot. This changes the
+ * control-plane cost from one polling thread per reducer inbox to one bounded polling loop per
+ * executor. Inbox queues and transport handlers remain independent; only immutable location
+ * discovery and the client-creation pool are shared.
+ */
+private[streaming] class StreamingShufflePreparedReceiveDiscovery(
+    conf: SparkConf,
+    snapshotProvider: Int => Option[ShuffleLocationResponse] = shuffleId =>
+      SparkEnv.get.streamingShuffleOutputTracker.get
+        .getAvailableShuffleWriterTaskLocations(shuffleId)) extends Logging {
+  private val closed = new AtomicBoolean(false)
+  private val sessions =
+    new ConcurrentHashMap[Int, CopyOnWriteArrayList[StreamingShufflePreparedReceiveSession]]()
+  private val activeSessions = new AtomicInteger(0)
+  private val peakActiveSessions = new AtomicInteger(0)
+  private val snapshotRequests = new AtomicLong(0L)
+  private val snapshotDeliveries = new AtomicLong(0L)
+  private val refreshIntervalMs = conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL)
+  private val executor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+      "streaming-shuffle-prepared-discovery")
+
+  executor.scheduleWithFixedDelay(
+    () => poll(), 0L, refreshIntervalMs, TimeUnit.MILLISECONDS)
+
+  def register(session: StreamingShufflePreparedReceiveSession): Unit = {
+    require(!closed.get(), "Prepared receive discovery is closed")
+    val added = sessions.computeIfAbsent(
+      session.shuffleId, _ => new CopyOnWriteArrayList[StreamingShufflePreparedReceiveSession]())
+      .add(session)
+    require(added, s"Prepared receive session ${session.shuffleId} is already registered")
+    val current = activeSessions.incrementAndGet()
+    peakActiveSessions.accumulateAndGet(current, Math.max)
+  }
+
+  def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
+    val shuffleSessions = sessions.get(session.shuffleId)
+    if (shuffleSessions != null) {
+      if (shuffleSessions.remove(session)) activeSessions.decrementAndGet()
+      if (shuffleSessions.isEmpty) sessions.remove(session.shuffleId, shuffleSessions)
+    }
+  }
+
+  private def poll(): Unit = {
+    sessions.entrySet().asScala.foreach { entry =>
+      val active = entry.getValue.asScala.filterNot(_.isClosed).toSeq
+      if (active.nonEmpty) {
+        try {
+          snapshotRequests.incrementAndGet()
+          snapshotProvider(entry.getKey).foreach { snapshot =>
+            snapshotDeliveries.addAndGet(active.size)
+            active.foreach { session =>
+              try session.onWriterSnapshot(snapshot)
+              catch {
+                case error: Throwable => session.failDiscovery(error)
+              }
+            }
+          }
+        } catch {
+          case error: Throwable => active.foreach(_.failDiscovery(error))
+        }
+      }
+    }
+  }
+
+  private[streaming] def stats: (Int, Int, Long, Long) =
+    (activeSessions.get(), peakActiveSessions.get(),
+      snapshotRequests.get(), snapshotDeliveries.get())
+
+  def close(): Unit = {
+    if (closed.compareAndSet(false, true)) {
+      executor.shutdownNow()
+      logInfo(
+        s"Closing prepared shuffle discovery: activeSessions=${activeSessions.get()} " +
+          s"peakActiveSessions=${peakActiveSessions.get()} " +
+          s"snapshotRequests=${snapshotRequests.get()} " +
+          s"snapshotDeliveries=${snapshotDeliveries.get()}")
+      sessions.clear()
+      activeSessions.set(0)
+    }
+  }
+}
+
 /** Network-only reader lifecycle that starts before the compute task is launched. */
 private[streaming] class StreamingShufflePreparedReceiveSession(
     inbox: StreamingShuffleReceiveInbox,
     sharedClient: StreamingShuffleExecutorClient,
     conf: SparkConf,
+    discovery: StreamingShufflePreparedReceiveDiscovery,
+    clientCreationExecutor: ExecutorService,
     signalDrainReady: () => Unit) extends Logging {
-  // Published writer locations are connected incrementally. Polling at a coarser cadence than a
-  // task reader keeps the driver's control plane bounded while limiting discovery latency to
-  // 50 ms.
-  private val discoveryPollIntervalMs = 50L
   private val closed = new AtomicBoolean(false)
+  private val discoveryComplete = new AtomicBoolean(false)
   private val drainReady = new AtomicBoolean(false)
   private val drainReadyBytes = conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES)
-  private val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
   private val clients = new ConcurrentHashMap[Long, TransportClient]()
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleClientHandler]()
-  private val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
-    conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
-    s"streaming-shuffle-prepared-client-${inbox.id.shuffleId}-${inbox.id.partitionId}")
-  private val discoveryExecutor = ThreadUtils.newDaemonSingleThreadExecutor(
-    s"streaming-shuffle-prepared-discovery-${inbox.id.shuffleId}-${inbox.id.partitionId}")
+  private val clientFutures = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
+  private val mapIndexes = mutable.HashSet.empty[Int]
+  private val routeLifecycleLock = new Object
+
+  val shuffleId: Int = inbox.id.shuffleId
 
   val totalNumShuffleWriters = new AtomicInteger(-1)
   val errorNotifier = new ErrorNotifier()
@@ -307,7 +427,9 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     case _ =>
   }
 
-  def start(): Unit = discoveryExecutor.execute(() => discoverWriters())
+  def start(): Unit = discovery.register(this)
+
+  def isClosed: Boolean = closed.get()
 
   /** Re-advertise bounded route windows for writers that have not terminated yet. */
   def repairIdleCreditWindows(): Unit = {
@@ -317,110 +439,117 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     }
   }
 
-  private def discoverWriters(): Unit = {
-    val futures = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
-    val mapIndexes = mutable.HashSet.empty[Int]
-    try {
-      while (!closed.get() &&
-          (totalNumShuffleWriters.get() < 0 || futures.size() < totalNumShuffleWriters.get())) {
-        tracker.getAvailableShuffleWriterTaskLocations(inbox.id.shuffleId).foreach {
-          case ShuffleLocationResponse(locations, numWriters) =>
-            totalNumShuffleWriters.compareAndSet(-1, numWriters)
-            require(totalNumShuffleWriters.get() == numWriters,
-              s"Writer count changed for prepared inbox ${inbox.id}")
-            // With no map partitions there can be no data or termination frame to trigger the
-            // normal ready path. Discovery itself proves that the inbox can be attached and
-            // drained as an empty input.
-            if (numWriters == 0) markDrainReady()
-            // Only the configured elastic producer window can publish concurrently for this
-            // shuffle. Dividing the receive budget by every lifetime map task gives a 1777-map
-            // scan an ~18 KiB route window even though at most 52 writers are live, forcing one
-            // credit round trip for almost every frame. Size the route window from the live
-            // producer frontier; the queue remains the executor-side memory/spill boundary.
-            val liveWriterWindow = conf
-              .get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
-              .map(math.min(numWriters, _))
-              .getOrElse(numWriters)
-            val perWriterByteLimit = math.max(
-              conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY) /
-                math.max(1, liveWriterWindow), 1L)
-            val newlyPublished = locations.filter { case (mapId, location) =>
-              val duplicate = location.mapIndex >= 0 && mapIndexes.contains(location.mapIndex)
-              if (!duplicate && !futures.containsKey(mapId)) {
-                if (location.mapIndex >= 0) mapIndexes += location.mapIndex
-                true
-              } else {
-                false
-              }
-            }
-            // Locations published in one tracker snapshot normally represent one elastic wave of
-            // producers. Register all routes to the same remote executor together so tens or
-            // hundreds of 28-byte discovery frames become one transport write per physical lane.
-            newlyPublished.groupBy { case (_, location) =>
-              (location.host, location.port)
-            }.foreach { case ((host, port), routeLocations) =>
-              val future = CompletableFuture.runAsync(() => {
-                val routeHandlers = routeLocations.map { case (mapId, _) =>
-                  val handler = new StreamingShuffleClientHandler(
-                    mapId.toInt,
-                    inbox.id.partitionId,
-                    inbox.queue,
-                    inbox.id.shuffleId,
-                    perWriterByteLimit,
-                    null,
-                    errorNotifier,
-                    () => maybeMarkDrainReady())
-                  handler.setOnTermAckResponseHandler { writerId =>
-                    terminationAckControlMessageSet.add(writerId.toLong)
-                    if (terminationAckControlMessageSet.size() == totalNumShuffleWriters.get()) {
-                      allTermAcksSentNotice.release()
-                      markDrainReady()
-                    }
-                  }
-                  mapId -> handler
-                }
-                val routeClients = sharedClient.registerBatch(
-                  inbox.id.shuffleId,
-                  inbox.id.partitionId,
-                  host,
-                  port,
-                  routeHandlers.toSeq.map { case (mapId, handler) => mapId.toInt -> handler })
-                routeHandlers.foreach { case (mapId, handler) =>
-                  handlers.put(mapId, handler)
-                  clients.put(mapId, routeClients(mapId.toInt))
-                }
-              }, clientCreationExecutor)
-              routeLocations.foreach { case (mapId, _) => futures.put(mapId, future) }
-            }
-        }
-        if (totalNumShuffleWriters.get() < 0 || futures.size() < totalNumShuffleWriters.get()) {
-          Thread.sleep(discoveryPollIntervalMs)
+  def onWriterSnapshot(snapshot: ShuffleLocationResponse): Unit = {
+    if (closed.get() || discoveryComplete.get()) return
+    val ShuffleLocationResponse(locations, numWriters) = snapshot
+    totalNumShuffleWriters.compareAndSet(-1, numWriters)
+    require(totalNumShuffleWriters.get() == numWriters,
+      s"Writer count changed for prepared inbox ${inbox.id}")
+    // With no map partitions there can be no data or termination frame to trigger the normal
+    // ready path. Discovery itself proves that the inbox can be attached and drained empty.
+    if (numWriters == 0) markDrainReady()
+    // Only the configured elastic producer window can publish concurrently for this shuffle.
+    // Size the route window from that frontier instead of every lifetime map task.
+    val liveWriterWindow = conf
+      .get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
+      .map(math.min(numWriters, _))
+      .getOrElse(numWriters)
+    val perWriterByteLimit = math.max(
+      conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY) /
+        math.max(1, liveWriterWindow), 1L)
+    val newlyPublished = locations.filter { case (mapId, location) =>
+      val duplicate = location.mapIndex >= 0 && mapIndexes.contains(location.mapIndex)
+      if (!duplicate && !clientFutures.containsKey(mapId)) {
+        if (location.mapIndex >= 0) mapIndexes += location.mapIndex
+        true
+      } else {
+        false
+      }
+    }
+    // Register every route in one snapshot that targets the same executor as one initial-credit
+    // transport body. The shared creation pool bounds this work across all prepared inboxes.
+    newlyPublished.groupBy { case (_, location) =>
+      (location.host, location.port)
+    }.foreach { case ((host, port), routeLocations) =>
+      val future = CompletableFuture.runAsync(() =>
+        registerRoutes(host, port, routeLocations.toSeq, perWriterByteLimit),
+        clientCreationExecutor)
+      future.whenComplete { (_, error) =>
+        if (error != null) failDiscovery(Option(error.getCause).getOrElse(error))
+      }
+      routeLocations.foreach { case (mapId, _) => clientFutures.put(mapId, future) }
+    }
+    if (clientFutures.size() >= totalNumShuffleWriters.get() &&
+        discoveryComplete.compareAndSet(false, true)) {
+      discovery.unregister(this)
+    }
+  }
+
+  private def registerRoutes(
+      host: String,
+      port: Int,
+      routeLocations: Seq[(Long, StreamingShuffleTaskLocation)],
+      perWriterByteLimit: Long): Unit = {
+    val routeHandlers = routeLocations.map { case (mapId, _) =>
+      val handler = new StreamingShuffleClientHandler(
+        mapId.toInt,
+        inbox.id.partitionId,
+        inbox.queue,
+        inbox.id.shuffleId,
+        perWriterByteLimit,
+        null,
+        errorNotifier,
+        () => maybeMarkDrainReady())
+      handler.setOnTermAckResponseHandler { writerId =>
+        terminationAckControlMessageSet.add(writerId.toLong)
+        if (terminationAckControlMessageSet.size() == totalNumShuffleWriters.get()) {
+          allTermAcksSentNotice.release()
+          markDrainReady()
         }
       }
-      if (!closed.get()) {
-        CompletableFuture.allOf(futures.values().asScala.toSeq: _*).get()
+      mapId -> handler
+    }
+    val routeClients = sharedClient.registerBatch(
+      inbox.id.shuffleId,
+      inbox.id.partitionId,
+      host,
+      port,
+      routeHandlers.map { case (mapId, handler) => mapId.toInt -> handler })
+    routeLifecycleLock.synchronized {
+      if (closed.get()) {
+        routeHandlers.foreach { case (mapId, handler) =>
+          sharedClient.unregister(
+            inbox.id.shuffleId, Math.toIntExact(mapId), inbox.id.partitionId, handler)
+        }
+      } else {
+        routeHandlers.foreach { case (mapId, handler) =>
+          handlers.put(mapId, handler)
+          clients.put(mapId, routeClients(mapId.toInt))
+        }
       }
-    } catch {
-      case _: InterruptedException => Thread.currentThread().interrupt()
-      case t: Throwable =>
-        logError(s"Prepared receive session failed for ${inbox.id}", t)
-        errorNotifier.markError(t)
-        markDrainReady()
-    } finally {
-      clientCreationExecutor.shutdown()
+    }
+  }
+
+  def failDiscovery(error: Throwable): Unit = {
+    if (discoveryComplete.compareAndSet(false, true)) discovery.unregister(this)
+    if (!closed.get()) {
+      logError(s"Prepared receive session failed for ${inbox.id}", error)
+      errorNotifier.markError(error)
+      markDrainReady()
     }
   }
 
   def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
-      discoveryExecutor.shutdownNow()
-      clientCreationExecutor.shutdownNow()
-      handlers.forEach { (writerId, handler) =>
-        sharedClient.unregister(
-          inbox.id.shuffleId, Math.toIntExact(writerId), inbox.id.partitionId, handler)
+      discovery.unregister(this)
+      routeLifecycleLock.synchronized {
+        handlers.forEach { (writerId, handler) =>
+          sharedClient.unregister(
+            inbox.id.shuffleId, Math.toIntExact(writerId), inbox.id.partitionId, handler)
+        }
+        handlers.clear()
+        clients.clear()
       }
-      handlers.clear()
-      clients.clear()
     }
   }
 }

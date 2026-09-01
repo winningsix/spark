@@ -2259,9 +2259,9 @@ package object config {
 
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")
-      .doc("Number of threads used by one pipelined shuffle reader to create its writer clients. " +
-        "Client creation is control-plane work and should not consume the executor's full task " +
-        "parallelism for every resident reader task.")
+      .doc("Number of threads used by a task-owned pipelined shuffle reader to create its " +
+        "writer clients. Prepared readers instead share an executor-scoped pool bounded by " +
+        "spark.executor.cores, avoiding one thread pool per resident inbox.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
