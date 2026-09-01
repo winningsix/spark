@@ -1,0 +1,268 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.scheduler
+
+import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
+
+import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
+
+import org.apache.spark.{SparkConf, SparkEnv, StreamingShuffleOutputTrackerMaster}
+import org.apache.spark.internal.config._
+import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
+
+/**
+ * Driver-side admission and placement state for executor-owned pipelined-shuffle inboxes.
+ *
+ * The ordinary scheduler remains responsible for locality, resource profiles, exclusions, and
+ * task serialization. This coordinator contributes only the transport-specific decisions:
+ * prepare an inbox before assigning its task, prioritize an inbox that has begun draining, and
+ * bound pure producers until their direct reader frontier has started.
+ */
+private[scheduler] final class PipelinedShuffleTaskCoordinator(
+    conf: SparkConf,
+    timer: ScheduledExecutorService,
+    reviveOffers: () => Unit) {
+
+  private case class ReaderKey(stageId: Int, stageAttemptId: Int, taskIndex: Int)
+  private case class ReaderAssignment(
+      executorId: String,
+      inboxes: Seq[StreamingShuffleReceiveInboxId])
+
+  private val assignments = new HashMap[ReaderKey, ReaderAssignment]
+  private val readyTaskIndices = new HashMap[(Int, Int, String), HashSet[Int]]
+  private val enabled = conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+  private val producerMaxTasks =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
+  private val soleProducerMaxTasks =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
+  private val readerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
+  private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
+  private val revivePending = new AtomicBoolean(false)
+
+  private lazy val trackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
+    SparkEnv.get.streamingShuffleOutputTracker.collect {
+      case tracker: StreamingShuffleOutputTrackerMaster => tracker
+    }
+  }
+
+  def initialize(): Unit = {
+    if (enabled) {
+      trackerMaster.foreach(_.setInboxReadyCallback(() => requestReviveOffers()))
+    }
+  }
+
+  private def requestReviveOffers(): Unit = {
+    if (revivePending.compareAndSet(false, true)) {
+      timer.schedule(
+        new Runnable {
+          override def run(): Unit = {
+            revivePending.set(false)
+            reviveOffers()
+          }
+        },
+        PipelinedShuffleTaskCoordinator.INBOX_READY_REVIVE_COALESCE_MS,
+        TimeUnit.MILLISECONDS)
+    }
+  }
+
+  /** Prepare missing reader inboxes, then rebuild the ready-task view for this offer pass. */
+  def prepareForOffers(
+      taskSets: Iterable[TaskSetManager],
+      activeExecutors: Set[String]): Unit = {
+    if (!enabled) return
+    trackerMaster.foreach { tracker =>
+      val receiveExecutors = tracker.receiveExecutorIds.filter(activeExecutors.contains).sorted
+      if (activeExecutors.nonEmpty && receiveExecutors.size == activeExecutors.size) {
+        val pending = new ArrayBuffer[(ReaderKey, ReaderAssignment)]
+        taskSets.iterator.filter { taskSet =>
+          !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+            taskSet.taskSet.pipelinedReaderShuffleIds.nonEmpty
+        }.foreach { taskSet =>
+          taskSet.tasks.indices.foreach { taskIndex =>
+            val key = ReaderKey(taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
+            if (!assignments.contains(key)) {
+              val executorId = receiveExecutors(taskIndex % receiveExecutors.size)
+              val partitionId = taskSet.tasks(taskIndex).partitionId
+              val nextOrdinalByShuffle = new HashMap[Int, Int]
+              val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
+                val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
+                nextOrdinalByShuffle.update(shuffleId, readerOrdinal + 1)
+                StreamingShuffleReceiveInboxId(
+                  shuffleId,
+                  taskSet.stageId,
+                  taskSet.taskSet.stageAttemptId,
+                  partitionId,
+                  -1L,
+                  readerOrdinal)
+              }
+              pending += key -> ReaderAssignment(executorId, inboxes)
+            }
+          }
+        }
+
+        // One prepare batch per executor avoids an RPC round trip per reduce partition.
+        val assignmentsByExecutor = pending.groupBy(_._2.executorId)
+        val preparedExecutors = tracker.prepareReceiveInboxesByExecutor(
+          assignmentsByExecutor.map { case (executorId, executorAssignments) =>
+            executorId -> executorAssignments.flatMap(_._2.inboxes).toSeq
+          })
+        assignmentsByExecutor.foreach { case (executorId, executorAssignments) =>
+          if (preparedExecutors.contains(executorId)) {
+            executorAssignments.foreach { case (key, assignment) =>
+              assignments.put(key, assignment)
+            }
+          }
+        }
+      }
+    }
+    rebuildReadyTaskIndices(taskSets)
+  }
+
+  private def rebuildReadyTaskIndices(taskSets: Iterable[TaskSetManager]): Unit = {
+    readyTaskIndices.clear()
+    val managersByStage = taskSets.iterator.map { manager =>
+      (manager.stageId, manager.taskSet.stageAttemptId) -> manager
+    }.toMap
+    trackerMaster.foreach { tracker =>
+      assignments.foreach { case (key, assignment) =>
+        managersByStage.get((key.stageId, key.stageAttemptId)).foreach { manager =>
+          val required = requiredReaderInboxes(manager.taskSet, assignment.inboxes)
+          if (manager.isTaskPendingForOffer(key.taskIndex) && required.forall {
+              tracker.isReceiveInboxDrainReady(assignment.executorId, _)
+            }) {
+            readyTaskIndices.getOrElseUpdate(
+              (key.stageId, key.stageAttemptId, assignment.executorId), new HashSet[Int]) +=
+              key.taskIndex
+          }
+        }
+      }
+    }
+  }
+
+  def requiredReaderInboxes(
+      taskSet: TaskSet,
+      inboxes: Seq[StreamingShuffleReceiveInboxId]): Seq[StreamingShuffleReceiveInboxId] = {
+    val startupInboxes = inboxes.filter { inbox =>
+      taskSet.pipelinedReaderStartupShuffleIds.contains(inbox.shuffleId)
+    }
+    // If the declared startup ids do not resolve to this task, retain the conservative all-input
+    // gate. This also preserves the default for non-SQL RDD consumers.
+    if (startupInboxes.nonEmpty) startupInboxes else inboxes
+  }
+
+  def taskIndexAllowed(
+      taskSet: TaskSetManager,
+      executorId: String,
+      taskIndex: Int): Boolean = {
+    if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      readyTaskIndices.get((taskSet.stageId, taskSet.taskSet.stageAttemptId, executorId))
+        .exists(_.contains(taskIndex))
+    }
+  }
+
+  def taskLaunched(taskSet: TaskSetManager, executorId: String, taskIndex: Int): Unit = {
+    if (taskIndex >= 0) {
+      readyTaskIndices.get((taskSet.stageId, taskSet.taskSet.stageAttemptId, executorId))
+        .foreach(_ -= taskIndex)
+    }
+  }
+
+  def taskSetReady(taskSet: TaskSetManager): Boolean = {
+    if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      readyTaskIndices.keysIterator.exists { case (stageId, attemptId, _) =>
+        stageId == taskSet.stageId && attemptId == taskSet.taskSet.stageAttemptId
+      }
+    }
+  }
+
+  def isReadyReader(taskSet: TaskSetManager): Boolean = {
+    taskSet.taskSet.isPipelinedShuffleReader && taskSetReady(taskSet)
+  }
+
+  def isActivePureProducer(taskSet: TaskSetManager): Boolean = {
+    !taskSet.isZombie && taskSet.tasksSuccessful < taskSet.numTasks &&
+      taskSet.taskSet.isPipelinedShuffleProducer &&
+      !taskSet.taskSet.isPipelinedShuffleReader
+  }
+
+  def readerFrontierStarted(
+      producer: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): Boolean = {
+    producer.taskSet.shuffleId.exists { shuffleId =>
+      val directReaders = taskSets.iterator.filter { taskSet =>
+        !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+          taskSet.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
+      }.toSeq
+      // The producer TaskSet can be submitted before its direct consumer. Do not open the wider
+      // sole-producer window until every submitted direct reader has actually started.
+      directReaders.nonEmpty && directReaders.forall { reader =>
+        reader.runningTasks > 0 || reader.tasksSuccessful > 0
+      }
+    }
+  }
+
+  def producerLaunchAllowed(
+      taskSet: TaskSetManager,
+      soleActivePureProducer: Boolean): Boolean = {
+    val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
+      !taskSet.taskSet.isPipelinedShuffleReader
+    val taskLimit = if (soleActivePureProducer) {
+      soleProducerMaxTasks.orElse(producerMaxTasks)
+    } else {
+      producerMaxTasks
+    }
+    !enabled || !pureProducer || taskLimit.forall(taskSet.runningTasks < _)
+  }
+
+  def taskCpus(taskSet: TaskSet, profileTaskCpus: BigDecimal): BigDecimal = {
+    if (taskSet.isPipelinedShuffleReader && taskSet.isPipelinedShuffleProducer) {
+      readerProducerTaskCpus.getOrElse(profileTaskCpus)
+    } else if (taskSet.isPipelinedShuffleReader) {
+      readerTaskCpus.getOrElse(profileTaskCpus)
+    } else {
+      profileTaskCpus
+    }
+  }
+
+  def removeTaskSet(taskSet: TaskSetManager): Unit = {
+    assignments.keysIterator.filter { key =>
+      key.stageId == taskSet.taskSet.stageId &&
+        key.stageAttemptId == taskSet.taskSet.stageAttemptId
+    }.toSeq.foreach { key =>
+      assignments.remove(key).foreach { assignment =>
+        trackerMaster.foreach { tracker =>
+          assignment.inboxes.foreach(tracker.releaseReceiveInbox(assignment.executorId, _))
+        }
+      }
+    }
+  }
+
+  def removeExecutor(executorId: String): Unit = {
+    assignments.filterInPlace { case (_, assignment) => assignment.executorId != executorId }
+    trackerMaster.foreach(_.removeReceiveExecutor(executorId))
+  }
+}
+
+private object PipelinedShuffleTaskCoordinator {
+  val INBOX_READY_REVIVE_COALESCE_MS = 10L
+}
