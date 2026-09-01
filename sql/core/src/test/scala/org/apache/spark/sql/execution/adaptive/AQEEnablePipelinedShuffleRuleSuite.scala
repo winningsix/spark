@@ -110,7 +110,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
 
   test("full-plan mode changes exchange transport without changing the join operator") {
     withSQLConf(
-        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.shuffle.localPipelined.enabled" -> "true",
         "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true",
         "spark.sql.exchange.reuse" -> "false") {
       import testImplicits._
@@ -129,7 +129,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
 
   test("a reused broadcast exchange does not block a pipelined shuffle") {
     withSQLConf(
-        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.shuffle.localPipelined.enabled" -> "true",
         "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
       import testImplicits._
       val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
@@ -147,7 +147,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
 
   test("a reused shuffle is rewired to one shared pipelined exchange") {
     withSQLConf(
-        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.shuffle.localPipelined.enabled" -> "true",
         "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
       import testImplicits._
       val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
@@ -182,7 +182,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
     try {
       withSQLConf(
-          "spark.sql.pipelinedShuffle.enabled" -> "true",
+          "spark.sql.shuffle.localPipelined.enabled" -> "true",
           "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
         import testImplicits._
         val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan

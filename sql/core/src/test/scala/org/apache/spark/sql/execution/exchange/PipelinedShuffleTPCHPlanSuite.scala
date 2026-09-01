@@ -56,12 +56,12 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
     test(s"$name is transport-only fully streaming at p52") {
       val queryText = resourceToString(s"tpch/$name.sql",
         classLoader = Thread.currentThread().getContextClassLoader)
-      val bspPlan = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "false") {
+      val bspPlan = withSQLConf(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "false") {
         sql(queryText).queryExecution.executedPlan
       }
 
       val rtmPlan = withSQLConf(
-          SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true",
+          SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "true",
           SQLConf.PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED.key -> "true") {
         AQEEnablePipelinedShuffle().apply(bspPlan)
       }
@@ -88,7 +88,7 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
       // same rewrite in its real query-stage preparation pipeline before any BSP stage is made.
       val adaptiveInitialPlan = withSQLConf(
           SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
-          SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true",
+          SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "true",
           SQLConf.PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED.key -> "true") {
         sql(queryText).queryExecution.executedPlan
           .asInstanceOf[AdaptiveSparkPlanExec].initialPlan
@@ -111,7 +111,7 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
 
   test("prepared transport pipelines a limit operator's hidden single-partition shuffle") {
     def newPlan(enabled: Boolean): SparkPlan = withSQLConf(
-        SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> enabled.toString) {
+        SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> enabled.toString) {
       spark.range(0, 100, 1, 4).orderBy(org.apache.spark.sql.functions.desc("id"))
         .limit(3).queryExecution.executedPlan
     }
@@ -142,10 +142,10 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
     assert(rtmPlan.canonicalized == bspPlan.canonicalized,
       s"hidden-shuffle transport changed the visible physical plan:\n$bspPlan\n$rtmPlan")
 
-    val bspShuffles = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "false") {
+    val bspShuffles = withSQLConf(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "false") {
       shuffleDependencies(bspPlan.execute())
     }
-    val rtmShuffles = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true") {
+    val rtmShuffles = withSQLConf(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "true") {
       shuffleDependencies(rtmPlan.execute())
     }
     assert(bspShuffles.size === 1 && rtmShuffles.size === 1,
