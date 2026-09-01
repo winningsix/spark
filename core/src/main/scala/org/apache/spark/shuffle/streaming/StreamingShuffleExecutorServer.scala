@@ -23,6 +23,7 @@ import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, S
 import java.util.concurrent.atomic.AtomicLong
 
 import io.netty.buffer.{ByteBuf, Unpooled}
+import io.netty.channel.ChannelOption
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
@@ -30,6 +31,7 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
+  STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
   STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS}
 import org.apache.spark.network.TransportContext
@@ -136,6 +138,18 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   }
 
   private val rpcHandler = new RpcHandler {
+    override def channelActive(client: TransportClient): Unit = {
+      // The community implementation used a 512-byte receive buffer because each map-to-reduce
+      // route had its own connection and only returned that route's credit/terminal ACKs.  The
+      // executor endpoint multiplexes thousands of those control streams on one physical lane;
+      // retaining the per-route buffer collapses the TCP advertised window (about 1152 bytes on
+      // Linux) and can leave a complete cumulative-credit batch permanently queued at the peer.
+      // Configure the aggregate lane once here, before any writer observes and reuses it.
+      val socketBufferSize = conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)
+      client.getChannel.config.setOption(ChannelOption.SO_SNDBUF, Int.box(socketBufferSize))
+      client.getChannel.config.setOption(ChannelOption.SO_RCVBUF, Int.box(socketBufferSize))
+    }
+
     override def receive(
         client: TransportClient,
         message: ByteBuffer,
