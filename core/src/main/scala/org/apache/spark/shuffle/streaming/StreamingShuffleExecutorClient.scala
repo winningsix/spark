@@ -288,16 +288,17 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     // writer may have already sent a prefix to the first consumer, while this consumer needs a
     // fresh sequence starting at zero. Give only duplicate routes an unmanaged connection; the
     // common one-consumer case keeps the pooled connection and its lower connection count.
-    val (client, laneShared) = registrations.synchronized {
-      val existing = registrations.get(route)
-      if ((existing == null || existing.isEmpty) && usedRoutes.add(route)) {
-        val lane = ConnectionLane(shuffleId, remoteHost, remotePort)
-        (laneClients.computeIfAbsent(
-          lane,
-          _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler)), true)
-      } else {
-        (clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler), false)
-      }
+    // usedRoutes atomically grants the pooled lane to exactly one lifetime consumer of this
+    // route. ConnectionLane.computeIfAbsent then serializes creation only for that physical lane;
+    // do not hold an executor-wide lock while opening TCP connections to unrelated shuffles or
+    // remote executors, since prepared inbox registration deliberately runs those in parallel.
+    val (client, laneShared) = if (usedRoutes.add(route)) {
+      val lane = ConnectionLane(shuffleId, remoteHost, remotePort)
+      (laneClients.computeIfAbsent(
+        lane,
+        _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler)), true)
+    } else {
+      (clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler), false)
     }
     val registration = Registration(handler, client, laneShared)
     val routeRegistrations = registrations.computeIfAbsent(
