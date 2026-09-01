@@ -25,12 +25,16 @@ import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
 import io.netty.util.concurrent.GenericFutureListener
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.when
+import org.scalatest.concurrent.Eventually.eventually
+import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.SpanSugar._
 import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
+import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
@@ -161,7 +165,7 @@ class StreamingShuffleWriterSuite
     writer.transportServerHandler.futureClients(shardId).complete(client)
   }
 
-  test("a synchronous send failure is surfaced through the ErrorNotifier") {
+  test("a synchronous transport failure is surfaced through the ErrorNotifier") {
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
       val errorNotifier = new ErrorNotifier()
@@ -177,12 +181,11 @@ class StreamingShuffleWriterSuite
         when(client.send(any[ByteBuf])).thenThrow(new RuntimeException("send failed"))
         writer.transportServerHandler.futureClients(0).complete(client)
 
-        intercept[RuntimeException] {
-          writer.shards(0).send(new TerminationControlMessage(0, 0))
+        writer.shards(0).send(new TerminationControlMessage(0, 0))
+        eventually(Timeout(10.seconds)) {
+          writer.errorNotifier.getError() shouldBe defined
+          writer.errorNotifier.getError().get.getMessage should include("send failed")
         }
-        // The failure is recorded synchronously on this thread (the future is already complete).
-        writer.errorNotifier.getError() shouldBe defined
-        writer.errorNotifier.getError().get.getMessage should include("send failed")
       } finally {
         context.markTaskCompleted(None)
       }
@@ -221,8 +224,10 @@ class StreamingShuffleWriterSuite
 
         writer.shards(0).send(new TerminationControlMessage(0, 0))
 
-        writer.errorNotifier.getError() shouldBe defined
-        writer.errorNotifier.getError().get.getMessage should include("write failed")
+        eventually(Timeout(10.seconds)) {
+          writer.errorNotifier.getError() shouldBe defined
+          writer.errorNotifier.getError().get.getMessage should include("write failed")
+        }
       } finally {
         context.markTaskCompleted(None)
       }
@@ -249,7 +254,11 @@ class StreamingShuffleWriterSuite
   }
 
   test("checksum is computed and embedded in the DataMessage sent on the wire") {
-    val conf = newConf().set(STREAMING_SHUFFLE_CHECKSUM_ENABLED, true)
+    // Keep the wire bytes identical to the uncompressed record bytes whose checksum is stored in
+    // DataMessage. Compression/decompression correctness is covered by the end-to-end suite.
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_CHECKSUM_ENABLED, true)
+      .set(SHUFFLE_COMPRESS, false)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {
@@ -262,12 +271,15 @@ class StreamingShuffleWriterSuite
 
         // Serialize a record through the writer's own buffer/checksum path and send it.
         val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
-        tsBuffer.serializationStream.writeKey(1.asInstanceOf[Any])
-        tsBuffer.serializationStream.writeValue(2.asInstanceOf[Any])
-        tsBuffer.serializationStream.flush()
+        val serializationStream = tsBuffer.serializationStream.get
+        serializationStream.writeKey(1.asInstanceOf[Any])
+        serializationStream.writeValue(2.asInstanceOf[Any])
+        serializationStream.flush()
         writer.shards(0).send(tsBuffer)
 
-        sentBuffers.size() should be(1)
+        eventually(Timeout(10.seconds)) {
+          sentBuffers.size() should be(1)
+        }
         val decoded = StreamingShuffleMessage.decode(sentBuffers.get(0))
         decoded shouldBe a[DataMessage]
         val dataMessage = decoded.asInstanceOf[DataMessage]

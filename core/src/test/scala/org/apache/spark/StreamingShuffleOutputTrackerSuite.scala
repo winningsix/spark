@@ -17,7 +17,7 @@
 
 package org.apache.spark
 
-import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.{CountDownLatch, CyclicBarrier, TimeUnit}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
@@ -26,7 +26,9 @@ import org.scalatest.BeforeAndAfter
 import org.scalatest.matchers.should.Matchers
 
 import org.apache.spark.internal.config.SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS
-import org.apache.spark.rpc.RpcEnv
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
+import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
+  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
 
 class StreamingShuffleOutputTrackerSuite
   extends SparkFunSuite
@@ -85,6 +87,56 @@ class StreamingShuffleOutputTrackerSuite
     tracker.trackerEndpoint = rpcEnv.setupEndpoint(
       StreamingShuffleOutputTracker.ENDPOINT_NAME,
       new StreamingShuffleOutputTrackerMasterEndpoint(rpcEnv, tracker, conf))
+  }
+
+  test("prepared receive endpoint acknowledges prepare and reports drain readiness once") {
+    val endpointRpcEnv = createRpcEnv("receive-endpoint-test")
+    val tracker = newTrackerMaster()
+    val prepared = ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
+    val released = ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
+    val releaseReceived = new CountDownLatch(1)
+    val endpoint = endpointRpcEnv.setupEndpoint("receive-endpoint", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = endpointRpcEnv
+
+      override def receive: PartialFunction[Any, Unit] = {
+        case ReleaseStreamingShuffleReceiveInbox(id) =>
+          released += id
+          releaseReceived.countDown()
+      }
+
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInbox(id) =>
+          prepared += id
+          context.reply(true)
+      }
+    })
+    var readyCallbacks = 0
+    tracker.setInboxReadyCallback(() => readyCallbacks += 1)
+    tracker.registerReceiveEndpoint("executor-1", endpoint) shouldBe true
+
+    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
+    tracker.prepareReceiveInbox("executor-1", id) shouldBe true
+    prepared should contain only id
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
+
+    tracker.markInboxDrainReady("executor-1", id)
+    tracker.markInboxDrainReady("executor-1", id)
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe true
+    readyCallbacks shouldBe 2
+
+    tracker.releaseReceiveInbox("executor-1", id)
+    releaseReceived.await(10, TimeUnit.SECONDS) shouldBe true
+    released should contain only id
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
+
+    tracker.markInboxDrainReady("executor-1", id)
+    tracker.removeReceiveExecutor("executor-1")
+    tracker.receiveExecutorIds shouldBe empty
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
+
+    tracker.registerShuffle(7, numMaps = 1, numReduces = 1, jobId = 1)
+    tracker.unregisterShuffle(7)
+    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
   }
 
   test("test tracker workflow") {

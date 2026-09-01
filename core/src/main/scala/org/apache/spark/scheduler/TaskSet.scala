@@ -39,7 +39,14 @@ private[spark] class TaskSet(
     // isolation, so any task failure must fail the whole group rather than be retried per-task;
     // the TaskSetManager uses this to fail fast (maxTaskFailures = 1) and to count every failure,
     // including otherwise-uncounted ones like executor loss. Defaults to false.
-    val isPipelined: Boolean = false) {
+    val isPipelined: Boolean = false,
+    // True when this stage directly reads one or more pipelined shuffle dependencies. Distributed
+    // transports use this metadata to prepare and place executor-owned receive inboxes.
+    val isPipelinedShuffleReader: Boolean = false,
+    val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty,
+    // True when this stage writes a pipelined shuffle. A reader that also writes one is a combined
+    // stage; only a pure producer is governed by the elastic producer launch window.
+    val isPipelinedShuffleProducer: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

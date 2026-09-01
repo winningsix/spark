@@ -71,6 +71,8 @@ private[spark] class PipelinedChannelShuffleManager(conf: SparkConf)
   // rendezvous from the conf at construction, before any writer/reader creates a queue.
   ChannelShuffleRendezvous.setCapacity(conf.get(config.SHUFFLE_PIPELINED_CHANNEL_QUEUE_CAPACITY))
 
+  override def requiresSingleExecutor: Boolean = true
+
   override def usesStreamingShuffleOutputTracker: Boolean = false
 
   // Records cross the channel as object references read by a concurrent consumer thread; the

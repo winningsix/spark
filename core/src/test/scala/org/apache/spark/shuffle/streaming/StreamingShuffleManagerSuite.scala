@@ -24,7 +24,10 @@ import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
+  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
+  STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
 import org.apache.spark.network.shuffle.streaming.{DataMessage, TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 
@@ -91,6 +94,45 @@ class StreamingShuffleManagerSuite
       val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(2))
       val handle = new StreamingShuffleManager().registerShuffle(0, dep)
       assert(handle.isInstanceOf[StreamingShuffleHandle[_, _, _]])
+    }
+  }
+
+  test("executor receive service owns and releases task-attempt inboxes") {
+    withSpark(new SparkContext("local", "StreamingShuffleManagerSuite", new SparkConf())) { _ =>
+      val service = new StreamingShuffleReceiveService(SparkEnv.get.conf)
+      val first = service.acquire(10, TaskContext.empty())
+      service.activeInboxCount shouldBe 1
+
+      service.unregisterShuffle(11)
+      service.activeInboxCount shouldBe 1
+
+      first.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
+      service.activeInboxCount shouldBe 0
+      first.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
+
+      val second = service.acquire(12, TaskContext.empty())
+      service.activeInboxCount shouldBe 1
+      service.unregisterShuffle(12)
+      service.activeInboxCount shouldBe 0
+      second.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
+    }
+  }
+
+  test("prepared receive service enables elastic group admission") {
+    Seq(false -> true, true -> false).foreach { case (receiveServiceEnabled, requiresWholeGroup) =>
+      val conf = new SparkConf()
+        .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, receiveServiceEnabled)
+        .set(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, receiveServiceEnabled)
+        .set(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
+          if (receiveServiceEnabled) 1024L else 0L)
+        .set(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, receiveServiceEnabled)
+        .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, receiveServiceEnabled)
+      withSpark(new SparkContext("local", "StreamingShuffleManagerSuite", conf)) { _ =>
+        SparkEnv.get.pipelinedShuffleManager.requiresWholeGroupSlotAdmission shouldBe
+          requiresWholeGroup
+        SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
+          receiveServiceEnabled
+      }
     }
   }
 

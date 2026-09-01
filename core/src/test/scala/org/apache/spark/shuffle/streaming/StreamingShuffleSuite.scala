@@ -39,17 +39,36 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
+import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
-import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.{RDD, ShuffledRDD}
 import org.apache.spark.scheduler.MyRDD
 import org.apache.spark.serializer.JavaSerializerInstance
 import org.apache.spark.shuffle.ShuffleHandle
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.{ErrorNotifier, NextIterator, ThreadUtils}
+
+/**
+ * Test-only RDD that selects the incremental shuffle manager through a pipelined dependency.
+ */
+private class DistributedPipelinedShuffledRDD[
+    K: ClassTag,
+    V: ClassTag,
+    C: ClassTag](
+    prev: RDD[_ <: Product2[K, V]],
+    part: Partitioner)
+  extends ShuffledRDD[K, V, C](prev, part) {
+
+  override def getDependencies: Seq[Dependency[_]] =
+    List(new PipelinedShuffleDependency[K, V, C](prev, part, SparkEnv.get.serializer))
+
+  override def getPreferredLocations(partition: Partition): Seq[String] = Nil
+}
 
 class StreamingShuffleSuite
   extends SparkFunSuite
@@ -232,6 +251,42 @@ class StreamingShuffleSuite
     def sendDataMessage(writerId: Int, readerId: Int, datum: T): Unit = {
       val dataMsgFunc = StreamingShuffleSuite.newDataMsgFunc(dep, readerId)
       writers(writerId).shards(readerId).send(dataMsgFunc(writerId, datum))
+    }
+  }
+
+  test("prepared inbox routes and drains a distributed shuffle beyond cluster slots") {
+    val conf = new SparkConf()
+      .setMaster("local-cluster[2,2,1024]")
+      .setAppName("distributed-prepared-streaming-shuffle-test")
+      .set(SHUFFLE_MANAGER_INCREMENTAL, classOf[StreamingShuffleManager].getName)
+      .set("spark.shuffle.streaming.executorReceiveService.enabled", "true")
+      .set("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
+      .set("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
+      .set("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
+      .set("spark.shuffle.streaming.sharedConnections.enabled", "true")
+      .set("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
+      .set("spark.speculation", "false")
+      .set("spark.ui.enabled", "false")
+    val sc = new SparkContext(conf)
+    try {
+      sc.setLocalProperty("spark.sql.execution.id", "distributed-prepared-inbox-test")
+      val numInputs = 6
+      val numOutputs = 2
+      val partitioner = new HashPartitioner(numOutputs)
+      val keyed = sc.parallelize(0 until 10000, numInputs).map(v => (v, v * 2))
+      val shuffled = new DistributedPipelinedShuffledRDD[Int, Int, Int](keyed, partitioner)
+      val actual = shuffled.mapPartitionsWithIndex { (partitionId, rows) =>
+        rows.map { case (key, value) => (partitionId, key, value) }
+      }.collect()
+
+      assert(actual.length === 10000)
+      assert(actual.map(_._2).toSet === (0 until 10000).toSet)
+      actual.foreach { case (partitionId, key, value) =>
+        assert(partitioner.getPartition(key) === partitionId)
+        assert(value === key * 2)
+      }
+    } finally {
+      sc.stop()
     }
   }
 
@@ -549,12 +604,13 @@ class StreamingShuffleSuite
     }
 
     // Encode a TerminationControlMessage on the wire and hand it to receive(), exactly as a real
-    // writer would. The header is: message-type id (int), sequence number (long), writer id (int),
-    // reader id (int); the sequence number must be 0 since the handler expects a gapless sequence
-    // starting at 0.
-    val encoded = ByteBuffer.allocate(20)
+    // writer would. The header is: message-type id (int), sequence number (long), shuffle id
+    // (int), writer id (int), reader id (int); the sequence number must be 0 since the handler
+    // expects a gapless sequence starting at 0.
+    val encoded = ByteBuffer.allocate(24)
     encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
     encoded.putLong(0L)
+    encoded.putInt(shuffleId)
     encoded.putInt(0) // shuffleWriterId
     encoded.putInt(0) // shuffleReaderId
     encoded.flip()
@@ -746,6 +802,9 @@ class StreamingShuffleSuite
     withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf
         .set(STREAMING_SHUFFLE_WRITER_MAX_MEMORY, 128 << 10)
         .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 64 << 10)
+        // Keep the producer buffer as the network-send owner so this test isolates the writer
+        // semaphore backpressure path. Compressed envelopes use replay spill as their bound.
+        .set(SHUFFLE_COMPRESS, false)
         .set(STREAMING_SHUFFLE_READER_MAX_MEMORY, 1))) { sc =>
       val g = new ShuffleGroup[Int](sc, 1, 1)
 
@@ -1517,7 +1576,7 @@ class StreamingShuffleSuite
             logError("Simulated server handler receive failure", testError)
           }
         }),
-        writerErrorNotifier)
+        errorNotifier = writerErrorNotifier)
 
       // Server should be running initially.
       writer.server.channelFuture() should not be null

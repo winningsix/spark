@@ -376,6 +376,12 @@ object ShuffleExchangeExec {
         // produces partition IDs, so we use PartitionIdPassthrough to pass them through directly.
         new PartitionIdPassthrough(n)
       case RangePartitioning(sortingExpressions, numPartitions) =>
+        // RangePartitioner runs a sampling job before the exchange's real job. A pipelined
+        // dependency in the input therefore has two sequential consumers and must retain one
+        // bounded replay generation rather than being treated as an ordinary single-use stream.
+        if (SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay) {
+          markPipelinedDependenciesReplayable(rdd)
+        }
         // Extract only fields used for sorting to avoid collecting large fields that does not
         // affect sorting result when deciding partition bounds in RangePartitioner
         val rddForSampling = rdd.mapPartitionsInternal { iter =>
@@ -592,6 +598,22 @@ object ShuffleExchangeExec {
       }
 
     dependency
+  }
+
+  private def markPipelinedDependenciesReplayable(rdd: RDD[_]): Unit = {
+    val visited = mutable.HashSet.empty[RDD[_]]
+    val pending = mutable.ArrayDeque[RDD[_]](rdd)
+    while (pending.nonEmpty) {
+      val current = pending.removeHead()
+      if (visited.add(current)) {
+        current.dependencies.foreach {
+          case dependency: PipelinedShuffleDependency[_, _, _] =>
+            dependency.markReplayLeaseAvailable()
+          case dependency =>
+            pending.append(dependency.rdd)
+        }
+      }
+    }
   }
 
   /**

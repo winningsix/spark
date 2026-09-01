@@ -17,15 +17,18 @@
 
 package org.apache.spark
 
-import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadPoolExecutor}
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
 import org.apache.spark.internal.{Logging, LogKeys}
-import org.apache.spark.internal.config.SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS
+import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS,
+  STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
+import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
+  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
 import org.apache.spark.util.ThreadUtils
 
 /**
@@ -53,10 +56,35 @@ private[spark] case class UpdateStreamingShuffleTaskLocation(
     location: StreamingShuffleTaskLocation)
   extends StreamingShuffleTaskLocationTrackerMessage
 
+/**
+ * Fire-and-forget publication used by executor writers. Streaming writers retain replay state,
+ * so readers can safely discover them on a later poll without blocking the producer's scan on a
+ * driver RPC round trip. Keep [[UpdateStreamingShuffleTaskLocation]] as the synchronous API used
+ * by compatibility callers and tests that need the registration result.
+ */
+private[spark] case class PublishStreamingShuffleTaskLocation(
+    shuffleId: Int,
+    mapId: Long,
+    location: StreamingShuffleTaskLocation)
+  extends StreamingShuffleTaskLocationTrackerMessage
+
 private[spark] case class GetAllStreamingShuffleTaskLocations(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
 private[spark] case class GetAvailableStreamingShuffleTaskLocations(shuffleId: Int)
+  extends StreamingShuffleTaskLocationTrackerMessage
+
+private[spark] case class IsStreamingShuffleRegistered(shuffleId: Int)
+  extends StreamingShuffleTaskLocationTrackerMessage
+
+private[spark] case class RegisterStreamingShuffleReceiveEndpoint(
+    executorId: String,
+    endpoint: RpcEndpointRef)
+  extends StreamingShuffleTaskLocationTrackerMessage
+
+private[spark] case class StreamingShuffleInboxDrainReady(
+    executorId: String,
+    id: StreamingShuffleReceiveInboxId)
   extends StreamingShuffleTaskLocationTrackerMessage
 
 private[spark] case object StopStreamingShuffleOutputTracker
@@ -81,10 +109,18 @@ private[spark] case class GetAvailableStreamingShuffleTaskLocationsMasterMessage
   context: RpcCallContext)
   extends StreamingShuffleTaskLocationTrackerMasterMessage
 
+private[spark] case class IsStreamingShuffleRegisteredMasterMessage(
+    shuffleId: Int,
+    context: RpcCallContext)
+  extends StreamingShuffleTaskLocationTrackerMasterMessage
+
 private[spark] case class StreamingShuffleTaskLocation(
     executorId: String,
     host: String,
-    port: Int)
+    port: Int,
+    // Streaming writers use task-attempt ids as map ids. Keep the logical map index so a retried
+    // attempt can replace the stale location instead of exposing both attempts to readers.
+    mapIndex: Int = -1)
 
 private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
     override val rpcEnv: RpcEnv,
@@ -102,12 +138,18 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
     case GetAvailableStreamingShuffleTaskLocations(shuffleId) =>
       tracker.post(GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context))
 
+    case IsStreamingShuffleRegistered(shuffleId) =>
+      tracker.post(IsStreamingShuffleRegisteredMasterMessage(shuffleId, context))
+
     case UpdateStreamingShuffleTaskLocation(
           shuffleId: Int,
           mapId: Long,
           location: StreamingShuffleTaskLocation) =>
       tracker.post(
         UpdateStreamingShuffleTaskLocationMasterMessage(shuffleId, mapId, location, context))
+
+    case RegisterStreamingShuffleReceiveEndpoint(executorId, endpoint) =>
+      context.reply(tracker.registerReceiveEndpoint(executorId, endpoint))
 
     case StopStreamingShuffleOutputTracker =>
       logInfo(log"StreamingShuffleOutputTrackerMasterEndpoint stopped!")
@@ -122,6 +164,14 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
       // stop().
       stop()
       context.reply(true)
+  }
+
+  override def receive: PartialFunction[Any, Unit] = {
+    case PublishStreamingShuffleTaskLocation(shuffleId, mapId, location) =>
+      tracker.registerShuffleWriterTask(shuffleId, mapId, location)
+
+    case StreamingShuffleInboxDrainReady(executorId, id) =>
+      tracker.markInboxDrainReady(executorId, id)
   }
 }
 
@@ -189,6 +239,17 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
       location: StreamingShuffleTaskLocation): Boolean
 
   /**
+   * Publish a writer location without requiring the writer task to wait for the driver. The
+   * default remains synchronous for in-process/master implementations; workers override it.
+   */
+  def publishShuffleWriterTask(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation): Unit = {
+    registerShuffleWriterTask(shuffleId, mapId, location)
+  }
+
+  /**
    * Get all shuffle writer tasks that are part of the shuffle. This API will return None until
    * all shuffle writer task location info is available.
    * @param shuffleId  The id of the shuffle to get the location information about writer tasks
@@ -208,6 +269,13 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
    *         total number of shuffle writers to expect.
    */
   def getAvailableShuffleWriterTaskLocations(shuffleId: Int): Option[ShuffleLocationResponse]
+
+  /** Whether the driver still owns the shuffle's lifecycle state. */
+  def containsShuffle(shuffleId: Int): Boolean
+
+  def registerReceiveEndpoint(executorId: String, endpoint: RpcEndpointRef): Boolean
+
+  def markInboxDrainReady(executorId: String, id: StreamingShuffleReceiveInboxId): Unit
 }
 
 private[spark] case class StreamingShuffleInfo(numMaps: Int, numReduces: Int, jobId: Int)
@@ -221,6 +289,10 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     new ConcurrentHashMap[Int, ConcurrentHashMap[Long, StreamingShuffleTaskLocation]]()
 
   private val shuffleInfos = new ConcurrentHashMap[Int, StreamingShuffleInfo]()
+  private val receiveEndpoints = new ConcurrentHashMap[String, RpcEndpointRef]()
+  private val drainReadyInboxes =
+    ConcurrentHashMap.newKeySet[(String, StreamingShuffleReceiveInboxId)]()
+  @volatile private var inboxReadyCallback: () => Unit = () => ()
 
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
@@ -236,7 +308,6 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     }
     pool
   }
-
   override def registerShuffle(shuffleId: Int, numMaps: Int, numReduces: Int, jobId: Int): Unit = {
     logInfo(log"Registering shuffleId ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} with ${
       MDC(LogKeys.NUM_MAPPERS, numMaps)} mappers and ${
@@ -280,6 +351,55 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     // Either way, no orphan remains. See registerShuffleWriterTask.
     shuffleInfos.remove(shuffleId)
     taskLocations.remove(shuffleId)
+    drainReadyInboxes.removeIf { case (_, id) => id.shuffleId == shuffleId }
+  }
+
+  override def registerReceiveEndpoint(
+      executorId: String,
+      endpoint: RpcEndpointRef): Boolean = {
+    receiveEndpoints.put(executorId, endpoint)
+    inboxReadyCallback()
+    true
+  }
+
+  override def markInboxDrainReady(
+      executorId: String,
+      id: StreamingShuffleReceiveInboxId): Unit = {
+    if (drainReadyInboxes.add((executorId, id))) inboxReadyCallback()
+  }
+
+  private[spark] def setInboxReadyCallback(callback: () => Unit): Unit = {
+    inboxReadyCallback = callback
+  }
+
+  private[spark] def receiveExecutorIds: Seq[String] = receiveEndpoints.keySet().asScala.toSeq
+
+  private[spark] def prepareReceiveInbox(
+      executorId: String,
+      id: StreamingShuffleReceiveInboxId): Boolean = {
+    val endpoint = receiveEndpoints.get(executorId)
+    endpoint != null && endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInbox(id))
+  }
+
+  private[spark] def releaseReceiveInbox(
+      executorId: String,
+      id: StreamingShuffleReceiveInboxId): Unit = {
+    drainReadyInboxes.remove((executorId, id))
+    Option(receiveEndpoints.get(executorId)).foreach(
+      _.send(ReleaseStreamingShuffleReceiveInbox(id)))
+  }
+
+  private[spark] def removeReceiveExecutor(executorId: String): Unit = {
+    receiveEndpoints.remove(executorId)
+    drainReadyInboxes.removeIf { case (readyExecutorId, _) =>
+      readyExecutorId == executorId
+    }
+  }
+
+  private[spark] def isReceiveInboxDrainReady(
+      executorId: String,
+      id: StreamingShuffleReceiveInboxId): Boolean = {
+    drainReadyInboxes.contains((executorId, id))
   }
 
   def post(message: StreamingShuffleTaskLocationTrackerMasterMessage): Unit = {
@@ -308,6 +428,9 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
               case GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context) =>
                 val ret = getAvailableShuffleWriterTaskLocations(shuffleId)
                 context.reply(ret)
+
+              case IsStreamingShuffleRegisteredMasterMessage(shuffleId, context) =>
+                context.reply(containsShuffle(shuffleId))
 
               case UpdateStreamingShuffleTaskLocationMasterMessage(
                     shuffleId,
@@ -366,6 +489,13 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
             new ConcurrentHashMap[Long, StreamingShuffleTaskLocation]()
           } else {
             shuffleTaskLocationMap
+          }
+          if (location.mapIndex >= 0) {
+            newShuffleTaskLocationMap.asScala.collect {
+              case (existingMapId, existingLocation)
+                  if existingMapId != mapId && existingLocation.mapIndex == location.mapIndex =>
+                existingMapId
+            }.toSeq.foreach(newShuffleTaskLocationMap.remove)
           }
           newShuffleTaskLocationMap.put(mapId, location)
           newShuffleTaskLocationMap
@@ -437,11 +567,34 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
 private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
   extends StreamingShuffleOutputTracker(conf) {
 
+  private case class CachedAvailableLocations(
+      response: Option[ShuffleLocationResponse], refreshedAtNanos: Long)
+  private val availableLocationCache =
+    new ConcurrentHashMap[Int, CachedAvailableLocations]()
+  private val availableLocationRefreshLocks = new ConcurrentHashMap[Int, Object]()
+  private val locationRefreshNanos = TimeUnit.MILLISECONDS.toNanos(
+    conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL))
+
+  private def freshCachedLocations(
+      shuffleId: Int,
+      nowNanos: Long): Option[Option[ShuffleLocationResponse]] = {
+    Option(availableLocationCache.get(shuffleId)).filter { cached =>
+      nowNanos - cached.refreshedAtNanos < locationRefreshNanos
+    }.map(_.response)
+  }
+
   override def registerShuffleWriterTask(
       shuffleId: Int,
       mapId: Long,
       location: StreamingShuffleTaskLocation): Boolean = {
     askTracker[Boolean](UpdateStreamingShuffleTaskLocation(shuffleId, mapId, location))
+  }
+
+  override def publishShuffleWriterTask(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation): Unit = {
+    trackerEndpoint.send(PublishStreamingShuffleTaskLocation(shuffleId, mapId, location))
   }
 
   override def getAllShuffleWriterTaskLocations(
@@ -452,8 +605,36 @@ private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
 
   override def getAvailableShuffleWriterTaskLocations(
       shuffleId: Int): Option[ShuffleLocationResponse] = {
-    askTracker[Option[ShuffleLocationResponse]](
-      GetAvailableStreamingShuffleTaskLocations(shuffleId))
+    val now = System.nanoTime()
+    freshCachedLocations(shuffleId, now).getOrElse {
+      val refreshLock = availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
+      refreshLock.synchronized {
+        val lockedNow = System.nanoTime()
+        freshCachedLocations(shuffleId, lockedNow).getOrElse {
+          val response = askTracker[Option[ShuffleLocationResponse]](
+            GetAvailableStreamingShuffleTaskLocations(shuffleId))
+          availableLocationCache.put(
+            shuffleId, CachedAvailableLocations(response, System.nanoTime()))
+          response
+        }
+      }
+    }
+  }
+
+  override def containsShuffle(shuffleId: Int): Boolean = {
+    askTracker[Boolean](IsStreamingShuffleRegistered(shuffleId))
+  }
+
+  override def registerReceiveEndpoint(
+      executorId: String,
+      endpoint: RpcEndpointRef): Boolean = {
+    askTracker[Boolean](RegisterStreamingShuffleReceiveEndpoint(executorId, endpoint))
+  }
+
+  override def markInboxDrainReady(
+      executorId: String,
+      id: StreamingShuffleReceiveInboxId): Unit = {
+    trackerEndpoint.send(StreamingShuffleInboxDrainReady(executorId, id))
   }
 }
 

@@ -23,11 +23,10 @@ import io.netty.buffer.CompositeByteBuf;
 /**
  * Reader → writer control message.
  *
- * Current function: serves as a connection-establishment and per-consumption "ready"
- * signal. The writer uses receipt of any CreditControlMessage as the trigger that the
- * reader is ready to receive, and does not act on the numeric value of {@link
- * #numMessages}. Backpressure today is handled at the TCP layer via channel autoRead,
- * not via this message.
+ * Current function: serves as a one-time connection-establishment signal. The writer
+ * uses its receipt to associate the connection with a reader and does not act on the
+ * numeric value of {@link #numMessages}. Backpressure today is handled by Netty send
+ * completion, the writer's in-flight byte semaphore, and reader channel autoRead.
  *
  * Future function: this message is reserved as the carrier for a future credit-based
  * flow-control extension. When that extension lands, {@link #numMessages} will carry
@@ -35,12 +34,13 @@ import io.netty.buffer.CompositeByteBuf;
  * previously-granted credit (i.e., a credit-grant delta).
  */
 public final class CreditControlMessage extends StreamingShuffleMessage {
+  public final int shuffleId;
   public final int shuffleWriterId;
   public final int shuffleReaderId;
 
   /**
-   * In the current protocol revision the writer ignores this value and treats any
-   * CreditControlMessage as a "reader is ready" signal; senders should pass 1.
+   * In the current protocol revision the writer ignores this value and treats the first
+   * CreditControlMessage as a reader connection-discovery signal; senders should pass 1.
    *
    * Reserved for the future credit-based flow-control extension, in which this field
    * will carry the number of additional DataMessages the writer may send beyond any
@@ -49,6 +49,12 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
   public final int numMessages;
 
   public CreditControlMessage(int shuffleWriterId, int shuffleReaderId, int numMessages) {
+    this(-1, shuffleWriterId, shuffleReaderId, numMessages);
+  }
+
+  public CreditControlMessage(
+      int shuffleId, int shuffleWriterId, int shuffleReaderId, int numMessages) {
+    this.shuffleId = shuffleId;
     this.shuffleWriterId = shuffleWriterId;
     this.shuffleReaderId = shuffleReaderId;
     this.numMessages = numMessages;
@@ -61,15 +67,15 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
 
   @Override
   public int headerLength() {
-    // 4 bytes for the shuffle writer ID, 4 bytes for the shuffle reader ID,
-    // 4 bytes for the number of messages
-    return super.headerLength() + 12;
+    // 4 bytes each for shuffle, writer, and reader IDs, plus 4 bytes for message credit.
+    return super.headerLength() + 16;
   }
 
   @Override
   public void encode(CompositeByteBuf buf) {
     super.encode(buf);
 
+    buf.writeInt(shuffleId);
     // Write the shuffle writer ID
     buf.writeInt(shuffleWriterId);
     // Write the shuffle reader ID
@@ -79,6 +85,7 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
   }
 
   public static CreditControlMessage decode(ByteBuf buf) {
+    int shuffleId = buf.readInt();
     // Read the shuffle writer ID
     int shuffleWriterId = buf.readInt();
     // Read the shuffle reader ID
@@ -86,6 +93,6 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
     // Read the number of messages
     int numMessages = buf.readInt();
 
-    return new CreditControlMessage(shuffleWriterId, shuffleReaderId, numMessages);
+    return new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, numMessages);
   }
 }
