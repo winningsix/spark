@@ -288,13 +288,16 @@ private[spark] class TaskSchedulerImpl(
             }
           }
         }
-        // Preparing each reduce partition with one synchronous driver -> executor RPC serializes
-        // the resource-offer path (p52 with two inputs means at least 104 round trips). Send one
-        // batch to each executor, then publish assignments only after that executor acknowledged
-        // every inbox in the batch.
-        pendingAssignments.groupBy(_._2.executorId).foreach { case (executorId, assignments) =>
-          if (tracker.prepareReceiveInboxes(
-              executorId, assignments.flatMap(_._2.inboxes).toSeq)) {
+        // Preparing each reduce partition separately would take at least 104 round trips for p52
+        // with two inputs. Send one batch per executor concurrently, then publish assignments only
+        // after that executor acknowledged every inbox in its batch.
+        val assignmentsByExecutor = pendingAssignments.groupBy(_._2.executorId)
+        val preparedExecutors = tracker.prepareReceiveInboxesByExecutor(
+          assignmentsByExecutor.map { case (executorId, assignments) =>
+            executorId -> assignments.flatMap(_._2.inboxes).toSeq
+          })
+        assignmentsByExecutor.foreach { case (executorId, assignments) =>
+          if (preparedExecutors.contains(executorId)) {
             assignments.foreach { case (key, assignment) =>
               preTaskReaderAssignments.put(key, assignment)
             }

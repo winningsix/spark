@@ -19,6 +19,7 @@ package org.apache.spark
 
 import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
+import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
@@ -30,7 +31,7 @@ import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
   PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
   StreamingShuffleReceiveInboxId}
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.{RpcUtils, ThreadUtils}
 
 /**
  * The driver-side registry for a shuffle's output. A regular shuffle is served by the
@@ -412,6 +413,31 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       endpoint != null &&
         endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
     }
+  }
+
+  /**
+   * Prepare one inbox batch per executor concurrently. The task scheduler calls this while making
+   * resource offers, so serial `askSync` calls would add one full RPC round trip per executor to
+   * the first reader launch of every pipelined group.
+   */
+  private[spark] def prepareReceiveInboxesByExecutor(
+      idsByExecutor: Map[String, Seq[StreamingShuffleReceiveInboxId]]): Set[String] = {
+    implicit val executionContext: ExecutionContext = ThreadUtils.sameThread
+    val requests = idsByExecutor.toSeq.map { case (executorId, ids) =>
+      val endpoint = receiveEndpoints.get(executorId)
+      if (ids.isEmpty) {
+        Future.successful(executorId -> true)
+      } else if (endpoint == null) {
+        Future.successful(executorId -> false)
+      } else {
+        endpoint.ask[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
+          .map(executorId -> _)
+      }
+    }
+    ThreadUtils.awaitResult(
+      Future.sequence(requests), RpcUtils.askRpcTimeout(conf).duration).collect {
+      case (executorId, true) => executorId
+    }.toSet
   }
 
   private[spark] def releaseReceiveInbox(
