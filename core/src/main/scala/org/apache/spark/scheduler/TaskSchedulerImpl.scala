@@ -260,6 +260,7 @@ private[spark] class TaskSchedulerImpl(
       val activeExecutors = executorIdToRunningTaskIds.keySet.toSet
       val receiveExecutors = tracker.receiveExecutorIds.filter(activeExecutors.contains).sorted
       if (activeExecutors.nonEmpty && receiveExecutors.size == activeExecutors.size) {
+        val pendingAssignments = new ArrayBuffer[(PreTaskReaderKey, PreTaskReaderAssignment)]
         taskSets.iterator.filter { taskSet =>
           !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
             taskSet.taskSet.pipelinedReaderShuffleIds.nonEmpty
@@ -282,10 +283,20 @@ private[spark] class TaskSchedulerImpl(
                   -1L,
                   readerOrdinal)
               }
-              if (inboxes.forall(tracker.prepareReceiveInbox(executorId, _))) {
-                preTaskReaderAssignments.put(
-                  key, PreTaskReaderAssignment(executorId, inboxes))
-              }
+              pendingAssignments +=
+                key -> PreTaskReaderAssignment(executorId, inboxes)
+            }
+          }
+        }
+        // Preparing each reduce partition with one synchronous driver -> executor RPC serializes
+        // the resource-offer path (p52 with two inputs means at least 104 round trips). Send one
+        // batch to each executor, then publish assignments only after that executor acknowledged
+        // every inbox in the batch.
+        pendingAssignments.groupBy(_._2.executorId).foreach { case (executorId, assignments) =>
+          if (tracker.prepareReceiveInboxes(
+              executorId, assignments.flatMap(_._2.inboxes).toSeq)) {
+            assignments.foreach { case (key, assignment) =>
+              preTaskReaderAssignments.put(key, assignment)
             }
           }
         }
