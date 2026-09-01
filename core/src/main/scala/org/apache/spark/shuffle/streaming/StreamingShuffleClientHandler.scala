@@ -19,6 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -68,6 +69,9 @@ class StreamingShuffleClientHandler(
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
+  // Total encoded data bytes released by the task on this connection. Multiplexed routes send
+  // this as an absolute acknowledgement watermark, so an idle retry is idempotent.
+  private val cumulativeReleasedBytes = new AtomicLong(0L)
   private val backpressureEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
   private val messageBatchingEnabled =
@@ -160,17 +164,15 @@ class StreamingShuffleClientHandler(
     errorNotifier.markError(error)
   }
 
-  /** Repair route discovery while no writer frame has reached this logical route yet. */
+  /** Repair initial route discovery or repeat the latest idempotent release acknowledgement. */
   private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
-    val sequence = lastSeqNum
-    val available = availableReceiveBytes
-    if (backpressureEnabled && !perStreamAutoReadEnabled && !terminationReceived &&
-        sequence < 0 && available > 0) {
-      // The initial negative advertisement is an idempotent absolute window and also serves as
-      // the route-ready message. Repeating it is safe only before the first frame: once data can
-      // be in flight, re-advertising an absolute window could manufacture credit. Every consumed
-      // frame returns an exact additive delta below, so an established route needs no repair.
-      sendAvailableCreditFloor(client, available)
+    if (backpressureEnabled && !perStreamAutoReadEnabled && !terminationReceived) {
+      if (lastSeqNum < 0) {
+        val available = availableReceiveBytes
+        if (available > 0) sendAvailableCreditFloor(client, available)
+      } else {
+        sendCumulativeCreditAck(client, cumulativeReleasedBytes.get())
+      }
     }
   }
 
@@ -208,15 +210,31 @@ class StreamingShuffleClientHandler(
     }
   }
 
+  protected def sendCumulativeCreditAck(
+      client: TransportClient,
+      releasedBytes: Long): Unit = {
+    sendCreditControlMessage(client, shuffleWriterId, 0, releasedBytes)
+  }
+
   protected def sendCreditControlMessage(
       client: TransportClient,
       shuffleWriterId: Int,
       credit: Int
   ): Unit = {
+    sendCreditControlMessage(client, shuffleWriterId, credit, 0L)
+  }
+
+  private def sendCreditControlMessage(
+      client: TransportClient,
+      shuffleWriterId: Int,
+      credit: Int,
+      sequenceNumber: Long
+  ): Unit = {
     var buf: CompositeByteBuf = null
     try {
       val creditControlMessage =
         new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit)
+      creditControlMessage.setSeqNum(sequenceNumber)
       buf = client.getChannel().alloc().compositeBuffer()
         .capacity(creditControlMessage.headerLength())
       creditControlMessage.encode(buf)
@@ -396,14 +414,11 @@ class StreamingShuffleClientHandler(
                       shuffleWriterId,
                       math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
                   } else {
-                    // The release callback runs exactly once for this decoded frame. Return its
-                    // encoded size as an additive grant: unlike an absolute floor, the delta
-                    // cannot be consumed before it reaches the writer and then become a stale,
-                    // permanently-lost wake-up while EOS is queued behind zero-credit data.
-                    sendCreditControlMessage(
-                      client,
-                      shuffleWriterId,
-                      math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                    // Carry an absolute released-byte watermark. Repeating it after an idle
+                    // interval repairs a delayed final wake-up without adding the same credit
+                    // twice or advertising receive capacity that may still be in flight.
+                    val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                    sendCumulativeCreditAck(client, released)
                   }
                 }
               } finally {

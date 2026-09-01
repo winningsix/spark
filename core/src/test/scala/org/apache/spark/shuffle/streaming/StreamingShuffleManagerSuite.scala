@@ -17,6 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.nio.ByteBuffer
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CountDownLatch,
   LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
@@ -40,7 +41,7 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREM
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
-  TerminationAckMessage, TerminationControlMessage}
+  StreamingShuffleMessageType, TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 
@@ -604,6 +605,82 @@ class StreamingShuffleManagerSuite
           server.pendingCreditCount shouldBe 0
         }
       } finally {
+        server.unregister(7, 3, writerHandler)
+        client.unregister(7, 3, 0, readerHandler)
+        client.close()
+        server.close()
+      }
+    }
+  }
+
+  test("prepared route repairs a lost cumulative credit ack after receiving data") {
+    withSpark(new SparkContext("local", "prepared-credit-after-data", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+      val byteLimit = 40L
+      val suppressedAck = new AtomicBoolean(false)
+      val readerHandler = new StreamingShuffleClientHandler(
+          3, 0, queue, 7, byteLimit, null, new ErrorNotifier()) {
+        override protected def sendCumulativeCreditAck(
+            routeClient: TransportClient,
+            releasedBytes: Long): Unit = {
+          if (!suppressedAck.compareAndSet(false, true)) {
+            super.sendCumulativeCreditAck(routeClient, releasedBytes)
+          }
+        }
+      }
+      val writerHandler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 7,
+        numReaders = 1,
+        context = mock[TaskContext],
+        errorNotifier = new ErrorNotifier())
+      var queuedData: StreamingShuffleMessage = null
+      try {
+        val routeClient = client.registerBatch(
+          shuffleId = 7,
+          readerId = 0,
+          remoteHost = "127.0.0.1",
+          remotePort = server.port,
+          handlersByWriter = Seq(3 -> readerHandler))(3)
+        server.register(7, 3, writerHandler)
+        eventually(Timeout(10.seconds)) {
+          writerHandler.clientsFor(0).size shouldBe 1
+          writerHandler.availableDataCredit(0, writerHandler.clientsFor(0).head) shouldBe byteLimit
+        }
+
+        // Advance the reader sequence so this is no longer an initial-discovery repair. The empty
+        // encoded data frame is exactly 40 bytes on the wire and consumes the complete route
+        // window. Suppress its first cumulative release ACK to model a delayed/lost final wake-up.
+        val encoded = ByteBuffer.allocate(40)
+        encoded.putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id())
+        encoded.putLong(0L)
+        encoded.putInt(7)
+        encoded.putInt(3)
+        encoded.putInt(0)
+        encoded.putInt(0)
+        encoded.putInt(0)
+        encoded.putLong(0L)
+        encoded.flip()
+        readerHandler.receive(routeClient, encoded, null)
+        queuedData = queue.poll(10, TimeUnit.SECONDS)
+        queuedData should not be null
+
+        val writerRouteClient = writerHandler.clientsFor(0).head
+        writerHandler.consumeDataCredit(0, writerRouteClient, byteLimit)
+        writerHandler.availableDataCredit(0, writerRouteClient) shouldBe 0L
+        queuedData.release()
+        queuedData = null
+        suppressedAck.get() shouldBe true
+        writerHandler.availableDataCredit(0, writerRouteClient) shouldBe 0L
+
+        readerHandler.repairCreditWindow(routeClient)
+        eventually(Timeout(10.seconds)) {
+          writerHandler.availableDataCredit(0, writerRouteClient) shouldBe byteLimit
+        }
+      } finally {
+        if (queuedData != null) queuedData.release()
         server.unregister(7, 3, writerHandler)
         client.unregister(7, 3, 0, readerHandler)
         client.close()
