@@ -42,6 +42,8 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 /** Executor-scoped transport listener that multiplexes reader control messages to map writers. */
 private[streaming] class StreamingShuffleExecutorServer extends Logging {
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
+  private val controlBodies = new AtomicLong(0L)
+  private val controlFrames = new AtomicLong(0L)
 
   private def key(shuffleId: Int, writerId: Int): Long =
     (shuffleId.toLong << 32) | (writerId.toLong & 0xffffffffL)
@@ -49,8 +51,10 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   private[streaming] def handleControlBody(client: TransportClient, buf: ByteBuf): Unit = {
     // One transport body may contain discovery frames for many logical map -> reduce routes.
     // Decoding only the first frame silently strands every later route in a batched body.
+    controlBodies.incrementAndGet()
     while (buf.isReadable) {
       val decoded = StreamingShuffleMessage.decode(buf)
+      controlFrames.incrementAndGet()
       val route = decoded match {
         case credit: CreditControlMessage => (credit.shuffleId, credit.shuffleWriterId)
         case ack: TerminationAckMessage => (ack.shuffleId, ack.shuffleWriterId)
@@ -153,6 +157,9 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
 
   val port: Int = server.getPort
 
+  private[streaming] def controlBodyStats: (Long, Long) =
+    (controlBodies.get(), controlFrames.get())
+
   def register(
       shuffleId: Int,
       writerId: Int,
@@ -170,9 +177,11 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
 
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
+    val (bodies, frames) = controlBodyStats
     logInfo(
       s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
-        s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
+        s"submitted=$submitted completed=$completed peakQueued=$peakQueued " +
+        s"controlBodies=$bodies controlFrames=$frames")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()
