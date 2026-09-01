@@ -47,7 +47,7 @@ import org.apache.spark.security.CryptoStreamUtils
 import org.apache.spark.serializer.{JavaSerializer, Serializer, SerializerManager}
 import org.apache.spark.shuffle.{BlockingShuffleManager, PipelinedShuffleManager}
 import org.apache.spark.shuffle.{ShuffleBlockResolver, ShuffleManager}
-import org.apache.spark.shuffle.streaming.{MultiShuffleManager, StreamingShuffleManager}
+import org.apache.spark.shuffle.streaming.MultiShuffleManager
 import org.apache.spark.storage._
 import org.apache.spark.udf.worker.UDFWorkerSpecification
 import org.apache.spark.udf.worker.core.{UDFDispatcherFactory, UDFDispatcherManager, WorkerDispatcher}
@@ -489,10 +489,7 @@ class SparkEnv (
     }
     _streamingShuffleOutputTracker = Some(tracker)
     if (!SparkContext.isDriver(executorId)) {
-      _pipelinedShuffleManager match {
-        case manager: StreamingShuffleManager => manager.initializeReceiveServiceEndpoint()
-        case _ =>
-      }
+      _pipelinedShuffleManager.initializeExecutor()
     }
   }
 

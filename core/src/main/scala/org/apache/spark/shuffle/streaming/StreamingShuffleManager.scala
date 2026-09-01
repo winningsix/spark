@@ -135,7 +135,7 @@ private[spark] class StreamingShuffleManager
     service
   }
 
-  private[spark] def initializeReceiveServiceEndpoint(): Unit = synchronized {
+  override def initializeExecutor(): Unit = synchronized {
     val env = SparkEnv.get
     if (env.conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)) {
       require(preparedReceiveServiceConfigured,
