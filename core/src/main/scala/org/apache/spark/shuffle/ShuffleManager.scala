@@ -160,6 +160,13 @@ private[spark] trait PipelinedShuffleManager extends ShuffleManager {
   def supportsSequentialReplay: Boolean = false
 
   /**
+   * Whether one pipelined producer can deliver each reducer shard to more than one reader route.
+   * A manager returning true must retain the writer generation until every configured route has
+   * acknowledged end-of-stream. This is required by exchange reuse and other branching RDD graphs.
+   */
+  def supportsFanOut: Boolean = false
+
+  /**
    * Whether this manager relies on a `StreamingShuffleOutputTracker` to discover writer task
    * locations. The RPC streaming transport needs it (writers publish their host/port; readers
    * look them up to open connections). An in-process transport that finds writer and reader

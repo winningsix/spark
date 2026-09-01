@@ -806,11 +806,10 @@ private[spark] class DAGScheduler(
    * mis-scheduling. Inert for a regular ShuffleDependency.
    *
    * Group-level idioms are handled elsewhere, since they are properties of the group rather than a
-   * single producer stage: fan-out (a producer with more than one consumer) and a group with a
-   * non-default resource profile are rejected up front at job submission by
-   * `checkPipelinedGroupsSupportedInRDDGraph` (before any stage is created). A regular shuffle
-   * internal to a group does not arise for the all-pipelined job shape (groups are split at
-   * regular-shuffle boundaries) and so is not checked.
+   * single producer stage: unsupported fan-out and a group with a non-default resource profile are
+   * rejected up front at job submission by `checkPipelinedGroupsSupportedInRDDGraph` (before any
+   * stage is created). A regular shuffle internal to a group does not arise for the all-pipelined
+   * job shape (groups are split at regular-shuffle boundaries) and so is not checked.
    */
   private def checkPipelinedProducerSupported(shuffleDep: ShuffleDependency[_, _, _]): Unit = {
     if (!shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]) {
@@ -1309,10 +1308,10 @@ private[spark] class DAGScheduler(
    * hasPipelined): the resource-profile check below is not keyed on a pipelined dependency, so on a
    * regular job it would reject an ordinary RDD.withResources(...) use. Throws
    * PIPELINED_SHUFFLE_UNSUPPORTED on violation. Enforces:
-   *  - Fan-out: a pipelined producer feeding more than one consumer. 1:N is a supported model not
-   *    yet built (it needs multicast to N live readers), so it is rejected for now. A
-   *    PipelinedShuffleDependency's producer is `dep.rdd`; a "consumer" is any RDD that lists that
-   *    dependency. More than one distinct consumer RDD for the same pipelined shuffle is fan-out.
+   *  - Fan-out: a pipelined producer feeding more than one consumer is rejected unless the
+   *    configured manager supports multicast. A PipelinedShuffleDependency's producer is
+   *    `dep.rdd`; a "consumer" is any RDD that lists that dependency. For a capable manager the
+   *    same graph walk configures the number of independent reader routes instead.
    *  - Reliable RDD checkpoint in a group member's within-stage chain (producer OR consumer side):
    *    a reliable `checkpoint()` writes a durable, lineage-truncated snapshot, which both
    *    reintroduces cross-time reuse of a transient edge and requires a post-success recompute
@@ -1336,6 +1335,7 @@ private[spark] class DAGScheduler(
     // RDDs that read it (for the fan-out check), the producer RDDs that write it (roots of producer
     // member stages), and every reliably-checkpointed RDD (to locate ones inside a member stage).
     val consumersByShuffleId = new HashMap[Int, HashSet[Int]]
+    val dependencyByShuffleId = new HashMap[Int, PipelinedShuffleDependency[_, _, _]]
     val producerRoots = new HashSet[RDD[_]]           // RDDs that WRITE a pipelined shuffle
     val reliablyCheckpointed = new HashSet[RDD[_]]     // RDDs with a reliable checkpoint pending
     var hasNonDefaultResourceProfile = false          // any member RDD with a non-default RP
@@ -1354,15 +1354,25 @@ private[spark] class DAGScheduler(
       rdd.dependencies.foreach {
         case pd: PipelinedShuffleDependency[_, _, _] =>
           consumersByShuffleId.getOrElseUpdate(pd.shuffleId, new HashSet[Int]) += rdd.id
+          dependencyByShuffleId.getOrElseUpdate(pd.shuffleId, pd)
           producerRoots += pd.rdd
           enqueue(pd.rdd)
         case dep =>
           enqueue(dep.rdd)
       }
     }
-    if (consumersByShuffleId.values.exists(_.size > 1)) {
+    val supportsFanOut = SparkEnv.get.pipelinedShuffleManager.supportsFanOut
+    if (!supportsFanOut &&
+        consumersByShuffleId.values.exists(_.size > 1)) {
       throw pipelinedUnsupportedError(
         "a pipelined producer with more than one consumer (fan-out / branching)")
+    }
+    if (supportsFanOut) {
+      consumersByShuffleId.foreach { case (shuffleId, consumers) =>
+        val dependency = dependencyByShuffleId(shuffleId)
+        dependency.setReaderRouteMultiplicity(
+          math.max(dependency.readerRouteMultiplicity, consumers.size))
+      }
     }
     // Resource profile. The gang slot check compares one demand against one profile's capacity
     // (maxNumConcurrentTasks is defined per profile) and measures it against the DEFAULT profile,
@@ -1421,16 +1431,22 @@ private[spark] class DAGScheduler(
 
   /** Pipelined shuffle ids read directly by the stage containing `rdd`. */
   private def pipelinedShuffleIdsReadByStage(rdd: RDD[_]): Seq[Int] = {
-    val shuffleIds = new HashSet[Int]
+    val multiplicityByShuffleId = new HashMap[Int, Int]
     traverseParentRDDsWithinStage(rdd, { current =>
       current.dependencies.foreach {
         case dependency: PipelinedShuffleDependency[_, _, _] =>
-          shuffleIds += dependency.shuffleId
+          multiplicityByShuffleId.update(
+            dependency.shuffleId,
+            math.max(
+              multiplicityByShuffleId.getOrElse(dependency.shuffleId, 0),
+              dependency.readerRouteMultiplicity))
         case _ =>
       }
       true
     })
-    shuffleIds.toSeq.sorted
+    multiplicityByShuffleId.toSeq.sortBy(_._1).flatMap { case (shuffleId, multiplicity) =>
+      Seq.fill(multiplicity)(shuffleId)
+    }
   }
 
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
@@ -2355,8 +2371,8 @@ private[spark] class DAGScheduler(
     }
     var finalStage: ResultStage = null
     try {
-      // Reject group-level unsupported pipelined idioms (e.g. fan-out, a non-default resource
-      // profile, a reliable checkpoint in a member stage) from the RDD graph, up front -- before
+      // Reject group-level unsupported pipelined idioms (e.g. fan-out on an incapable manager, a
+      // non-default resource profile, a reliable checkpoint in a member stage) up front -- before
       // any stage is created, so a rejection leaves no partial scheduler state. Gated on
       // hasPipelined: every idiom this checks concerns a pipelined group, so it must not run for a
       // job with no pipelined dependency (the resource-profile check in particular is not keyed on
@@ -2927,7 +2943,13 @@ private[spark] class DAGScheduler(
             dependency.setExpectedReaderRoutes(routes)
           case _ =>
         }
-        setExpectedReaderRoutes(Array.fill(sms.shuffleDep.partitioner.numPartitions)(1))
+        val routeMultiplicity = sms.shuffleDep match {
+          case dependency: PipelinedShuffleDependency[_, _, _] =>
+            dependency.readerRouteMultiplicity
+          case _ => 1
+        }
+        setExpectedReaderRoutes(
+          Array.fill(sms.shuffleDep.partitioner.numPartitions)(routeMultiplicity))
         val resultStage = jobIdToActiveJob.get(jobId).map(_.finalStage)
           .collect { case rs: ResultStage => rs }
         resultStage.foreach { rs =>
@@ -2940,7 +2962,7 @@ private[spark] class DAGScheduler(
           liveReduceSet(rs.rdd, rs.partitions.toSet, sms.shuffleDep.shuffleId) match {
             case Some(reduceSet) =>
               val routes = Array.fill(sms.shuffleDep.partitioner.numPartitions)(0)
-              reduceSet.foreach(partition => routes(partition) = 1)
+              reduceSet.foreach(partition => routes(partition) = routeMultiplicity)
               setExpectedReaderRoutes(routes)
               properties.setProperty(
                 SparkContext.SPARK_PIPELINED_LIVE_REDUCE_PARTITIONS,
@@ -5134,9 +5156,9 @@ private[spark] object DAGScheduler {
 }
 
 /**
- * Thrown when a job uses a pipelined-shuffle idiom that is not supported (fan-out, a barrier /
- * indeterminate / checksum-retry / push-merge producer, a reliable checkpoint in a member's chain,
- * or a non-default resource profile on a member). `handleJobSubmitted` matches on this
+ * Thrown when a job uses a pipelined-shuffle idiom that is not supported (fan-out on an incapable
+ * manager, a barrier / indeterminate / checksum-retry / push-merge producer, a reliable checkpoint
+ * in a member's chain, or a non-default resource profile on a member). `handleJobSubmitted` matches
  * TYPE to distinguish an up-front idiom rejection from an ordinary stage-creation failure, not on
  * the error-condition string (which a rename or a wrapped cause would silently break). Carries the
  * `PIPELINED_SHUFFLE_UNSUPPORTED` error class so the user-facing message is unchanged.

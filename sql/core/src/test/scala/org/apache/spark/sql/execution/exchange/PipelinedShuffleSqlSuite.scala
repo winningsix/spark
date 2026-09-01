@@ -64,7 +64,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
     }
   }
 
-  private def withDistributedPipelinedSession(body: SparkSession => Unit): Unit = {
+  private def withDistributedPipelinedSession(
+      adaptive: Boolean = true)(body: SparkSession => Unit): Unit = {
     SparkSession.getActiveSession.orElse(SparkSession.getDefaultSession).foreach(_.stop())
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
@@ -80,7 +81,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
       .config("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
       .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
-      .config("spark.sql.adaptive.enabled", "false")
+      .config("spark.sql.adaptive.enabled", adaptive.toString)
+      .config("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled", "true")
       .config("spark.sql.pipelinedShuffle.enabled", "true")
       .config("spark.sql.shuffle.partitions", "2")
       .config("spark.speculation", "false")
@@ -205,7 +207,7 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
   }
 
   test("distributed prepared receive replays hash input for a range exchange") {
-    withDistributedPipelinedSession { spark =>
+    withDistributedPipelinedSession() { spark =>
       import spark.implicits._
       val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
         .groupBy($"k").count().orderBy($"k")
@@ -221,6 +223,42 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       assert(exchanges.size >= 2 && exchanges.forall(_.pipelined))
       assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
         org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows === expected)
+    }
+  }
+
+  test("distributed prepared receive multicasts a reused shuffle") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      val aggregated = spark.range(0, 1000, 1, 2)
+        .withColumn("k", ($"id" % 17))
+        .groupBy($"k").count()
+      val left = aggregated.select($"k".as("lk"), $"count".as("lc"))
+      val right = aggregated.select($"k".as("rk"), $"count".as("rc"))
+      val joined = left.join(right, $"lk" === $"rk").select($"lk", $"lc", $"rc")
+      val result = joined.as[(Long, Long, Long)]
+      val rows = result.collect().toSeq.sortBy(_._1)
+      val plan = result.queryExecution.executedPlan
+      val reusedShuffles = collect(plan) {
+        case reused @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => reused
+      }
+      val visibleShuffles = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+
+      assert(reusedShuffles.nonEmpty, s"expected shuffle exchange reuse; plan:\n$plan")
+      assert(visibleShuffles.nonEmpty && visibleShuffles.forall(_.pipelined),
+        s"every visible shuffle must be pipelined; plan:\n$plan")
+      assert(reusedShuffles.forall(
+        _.child.asInstanceOf[ShuffleExchangeExec].pipelined),
+        s"every reused shuffle must point at a pipelined exchange; plan:\n$plan")
+      assert(reusedShuffles.forall(reused => visibleShuffles.exists(_ eq reused.child)),
+        "the original and reused branches must share the same exchange instance; " +
+          s"directIds=${visibleShuffles.map(_.id)}, " +
+          s"reusedChildIds=${reusedShuffles.map(_.child.id)}; plan:\n$plan")
+
+      val expected = (0L until 1000L).groupBy(_ % 17).map { case (key, values) =>
+        (key, values.size.toLong, values.size.toLong)
+      }.toSeq.sortBy(_._1)
       assert(rows === expected)
     }
   }
@@ -320,53 +358,35 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
     }
   }
 
-  test("cross-subquery exchange reuse cannot create a shared pipelined exchange") {
-    // The no-reuse gate checks subquery plans too (collectWithSubqueries). Probing every
-    // SQL route to a reused PIPELINED exchange showed each is closed by a different layer,
-    // and this test pins the observed facts so a change in any layer surfaces here:
-    //   1. Same-tree reuse: the gate skips the plan (also covered by the join/q68 shapes).
-    //   2. Main-vs-subquery reuse: never fires -- each subquery runs its own preparation
-    //      pass (PlanSubqueries -> prepareExecutedPlan, which includes
-    //      EnablePipelinedShuffle), so its exchanges are already pipelined=true when the
-    //      outer ReuseExchangeAndSubquery compares canonical forms against the outer
-    //      not-yet-pipelined exchange: no match.
-    //   3. Subquery-vs-subquery duplication: collapsed into ONE subquery by
-    //      MergeScalarSubqueries / subquery reuse before exchange reuse is considered.
-    withPipelinedSession { spark =>
+  test("distributed prepared receive replays an exchange reused by a scalar subquery") {
+    // The scalar subquery executes as an earlier Spark job. Its grouping exchange is also used by
+    // the outer query, so the first generation must remain replayable after the subquery finishes.
+    // This is the same sequential reuse shape as TPC-H Q11.
+    withDistributedPipelinedSession(adaptive = false) { spark =>
       import spark.implicits._
       spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7)).createOrReplaceTempView("t")
 
-      // Main plan and subquery share an identical inner groupBy (route 2).
       val df = spark.sql("""
         SELECT k, COUNT(*) AS c FROM t GROUP BY k
         HAVING COUNT(*) > (SELECT AVG(c2) FROM (SELECT COUNT(*) AS c2 FROM t GROUP BY k) s)
       """)
-      // Two DIFFERENT subqueries share an identical inner groupBy (routes 2 + 3).
-      val df2 = spark.sql("""
-        SELECT k, COUNT(*) AS c FROM t GROUP BY k
-        HAVING COUNT(*) > (SELECT AVG(c2) FROM (SELECT COUNT(*) AS c2 FROM t GROUP BY k) a)
-           AND COUNT(*) <= (SELECT MAX(c3) FROM (SELECT COUNT(*) AS c3 FROM t GROUP BY k) b)
-      """)
-
-      Seq(df, df2).foreach { d =>
-        val plan = d.queryExecution.executedPlan
-        // No reused exchange materializes anywhere (main tree or subqueries)...
-        assert(plan.collectWithSubqueries { case r: ReusedExchangeExec => r }.isEmpty,
-          s"unexpected reused exchange; plan:\n$plan")
-        // ... so the gate does not fire and the plan (and its independently-prepared
-        // subqueries) pipeline.
-        assert(collect(plan) { case s: ShuffleExchangeExec if s.pipelined => s }.nonEmpty,
-          s"main plan should be pipelined; plan:\n$plan")
-        assert(plan.collectWithSubqueries {
-            case s: ShuffleExchangeExec if s.pipelined => s
-          }.size > collect(plan) { case s: ShuffleExchangeExec => s }.size,
-          s"subquery exchanges should be pipelined by their own preparation; plan:\n$plan")
+      // Execute first so AQE has installed the final plan and its reuse nodes.
+      val rows = df.collect()
+      val plan = df.queryExecution.executedPlan
+      val reused = collectWithSubqueries(plan) {
+        case r @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => r
       }
+      val directShuffles = collectWithSubqueries(plan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+      assert(reused.nonEmpty, s"expected cross-subquery shuffle reuse; plan:\n$plan")
+      assert(directShuffles.nonEmpty && directShuffles.forall(_.pipelined),
+        s"every direct shuffle must be pipelined; plan:\n$plan")
+      assert(reused.forall(_.child.asInstanceOf[ShuffleExchangeExec].pipelined),
+        s"every reused shuffle must point at a pipelined exchange; plan:\n$plan")
 
-      // Both execute correctly: 1000 = 7*142 + 6, so keys 0..5 have 143 rows (> avg
-      // 142.86) and key 6 has 142.
-      assert(df.collect().length === 6)
-      assert(df2.collect().length === 6)
+      // 1000 = 7*142 + 6, so keys 0..5 have 143 rows (> average 142.86).
+      assert(rows.length === 6)
     }
   }
 

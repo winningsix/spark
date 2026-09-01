@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import scala.collection.mutable
+
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
@@ -42,8 +44,9 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
  * id (SinglePartition is the numPartitions == 1 degenerate case).
  *
  * These shapes make the rule leave the whole plan regular:
- *   - reuse: a pipelined producer with more than one consumer (fan-out) is rejected, so if any
- *     exchange in the plan is reused the rule bails out.
+ *   - shuffle reuse when the configured manager does not support fan-out. A fan-out-capable
+ *     manager preserves exchange reuse by routing every reader to the same pipelined exchange.
+ *     Reused broadcast exchanges never consume the pipelined transport and do not block rewrite.
  *   - an UNSUPPORTED CONSUMER reading a shuffle (see [[readsShuffleThroughUnsupportedConsumer]]):
  *     an operator that would drain a shuffle in a way the channel transport cannot serve, or that
  *     builds its own hidden regular shuffle. If such an operator sits above any shuffle the rule
@@ -78,27 +81,86 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
     // mode also invokes it directly after the adaptive plan is visible.
     if (!PipelinedShuffleEligibility.enabled(plan, conf)) return plan
 
-    val shuffles = plan.collect { case s: ShuffleExchangeExec => s }
+    val shuffles = plan.collectWithSubqueries { case s: ShuffleExchangeExec => s }
     if (shuffles.isEmpty) return plan
 
-    // A reused exchange has more than one consumer; a pipelined producer cannot fan out, so
-    // leave the whole plan regular rather than produce a rejected job. Check subquery plans
-    // too (plan.exists walks the operator tree only): today no SQL shape can place a reused
-    // PIPELINED exchange there -- same-tree reuse is caught here, main-vs-subquery reuse
-    // never fires because the subquery's own preparation pass (PlanSubqueries ->
-    // prepareExecutedPlan, which includes this rule) flips its exchanges pipelined BEFORE
-    // the outer ReuseExchangeAndSubquery compares canonical forms, and subquery-vs-subquery
-    // duplication is collapsed by MergeScalarSubqueries / subquery reuse first -- but the
-    // second mechanism is an accident of rule ordering and the third is optimizer behavior,
-    // so this gate does not rely on either.
-    if (plan.collectWithSubqueries { case r: ReusedExchangeExec => r }.nonEmpty) {
+    // Treat the main plan and each subquery as separate execution scopes. Reuse inside one scope
+    // is concurrent fan-out; reuse whose selected exchange lives in another scope is a sequential
+    // consumer and needs retained replay instead of an additional current-job reader inbox.
+    val scopes = plan +: plan.subqueriesAll
+    val directExchanges = scopes.flatMap(_.collect { case s: ShuffleExchangeExec => s })
+    val reuseTargetByChildKey = mutable.HashMap.empty[Int, ShuffleExchangeExec]
+    val sameScopeReuseCountByExchangeKey = mutable.HashMap.empty[Int, Int]
+    val sequentialReplayExchangeKeys = mutable.HashSet.empty[Int]
+    scopes.foreach { scope =>
+      val scopeExchanges = scope.collect { case s: ShuffleExchangeExec => s }
+      val reused = scope.collect {
+        case r @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => r
+      }
+      reused.foreach { reusedExchange =>
+        val reusedChild = reusedExchange.child.asInstanceOf[ShuffleExchangeExec]
+        // AQE's result-stage codegen may copy the direct exchange while ReusedExchangeExec, a
+        // leaf, still wraps the pre-codegen instance. Fall back to canonical identity so the
+        // final transport rewrite reconnects both branches to the actual direct exchange.
+        val target = scopeExchanges.find(_.pipelinedReuseKey == reusedChild.pipelinedReuseKey)
+          .orElse(scopeExchanges.find(_.canonicalized == reusedChild.canonicalized))
+          .orElse(directExchanges.find(
+            _.pipelinedReuseKey == reusedChild.pipelinedReuseKey))
+          .orElse(directExchanges.find(_.canonicalized == reusedChild.canonicalized))
+          .getOrElse(reusedChild)
+        reuseTargetByChildKey.update(reusedChild.pipelinedReuseKey, target)
+        if (scopeExchanges.exists(_.pipelinedReuseKey == target.pipelinedReuseKey)) {
+          sameScopeReuseCountByExchangeKey.update(
+            target.pipelinedReuseKey,
+            sameScopeReuseCountByExchangeKey.getOrElse(target.pipelinedReuseKey, 0) + 1)
+        } else {
+          sequentialReplayExchangeKeys += target.pipelinedReuseKey
+        }
+      }
+    }
+    val supportsFanOut = SparkEnv.get.pipelinedShuffleManager.supportsFanOut
+    val supportsSequentialReplay =
+      SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay
+
+    def rewriteExchanges(asPipelined: Boolean): SparkPlan = {
+      val rewrittenByExchangeKey = mutable.HashMap.empty[Int, ShuffleExchangeExec]
+      def rewritten(exchange: ShuffleExchangeExec): ShuffleExchangeExec = {
+        rewrittenByExchangeKey.getOrElseUpdate(exchange.pipelinedReuseKey, {
+          val copied = if (exchange.pipelined == asPipelined) {
+            exchange
+          } else {
+            val result = exchange.copy(pipelined = asPipelined)
+            result.copyPipelinedTransportStateFrom(exchange)
+            result
+          }
+          if (asPipelined) {
+            copied.setPipelinedReaderRouteMultiplicity(
+              1 + sameScopeReuseCountByExchangeKey.getOrElse(exchange.pipelinedReuseKey, 0))
+            if (sequentialReplayExchangeKeys.contains(exchange.pipelinedReuseKey)) {
+              copied.markPipelinedSequentialReplayRequired()
+            }
+          }
+          copied
+        })
+      }
+      plan.transformUpWithSubqueries {
+        // ReusedExchangeExec is a leaf in the SparkPlan tree, so its wrapped exchange is not
+        // visited by an ordinary transformUp. Rewire it explicitly to the same copied instance.
+        case r @ ReusedExchangeExec(_, s: ShuffleExchangeExec) =>
+          r.copy(child = rewritten(reuseTargetByChildKey.getOrElse(s.pipelinedReuseKey, s)))
+        case s: ShuffleExchangeExec => rewritten(s)
+      }
+    }
+
+    if ((sameScopeReuseCountByExchangeKey.nonEmpty && !supportsFanOut) ||
+        (sequentialReplayExchangeKeys.nonEmpty && !supportsSequentialReplay)) {
       // Not a warning: this is a normal, expected fallback (reuse is routine optimizer output,
       // e.g. self-joins), the query still runs correctly as a regular shuffle, and the user has
       // nothing to act on. Log at DEBUG as diagnostic ("why this query did not go pipelined")
       // rather than WARN, which would fire on every reuse-bearing query and read as a fault.
-      logDebug("EnablePipelinedShuffle: plan has a reused exchange; leaving it regular to " +
-        "avoid a fan-out pipelined job.")
-      return plan
+      logDebug("EnablePipelinedShuffle: plan has a reused shuffle exchange but the configured " +
+        "manager lacks fan-out or sequential replay; leaving it regular.")
+      return rewriteExchanges(asPipelined = false)
     }
 
     // An operator that would read a shuffle in a way the configured transport cannot serve, or that
@@ -110,12 +172,10 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
       logDebug("EnablePipelinedShuffle: a shuffle is read through an operator the configured " +
         "transport cannot serve (coalesce / cartesian product / a limit operator that builds a " +
         "hidden shuffle); leaving the plan regular.")
-      return plan
+      return rewriteExchanges(asPipelined = false)
     }
 
-    plan.transformUp {
-      case s: ShuffleExchangeExec if !s.pipelined => s.copy(pipelined = true)
-    }
+    rewriteExchanges(asPipelined = true)
   }
 
   /**

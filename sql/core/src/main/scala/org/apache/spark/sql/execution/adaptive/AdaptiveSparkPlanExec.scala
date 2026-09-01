@@ -707,10 +707,18 @@ case class AdaptiveSparkPlanExec(
       resultHandler: SparkPlan => Any,
       plan: SparkPlan): ResultQueryStageExec = {
     // Run the final plan when there's no more unfinished stages.
-    val optimizedRootPlan = applyPhysicalRules(
+    val postProcessedRootPlan = applyPhysicalRules(
       optimizeQueryStage(plan, isFinalStage = true),
       postStageCreationRules(supportsColumnar),
       "AQE Post Stage Creation")
+    // Whole-stage codegen above may copy a direct pipelined exchange while a ReusedExchangeExec
+    // leaf still wraps its pre-codegen instance. Re-run the full-plan transport rule after those
+    // final copies so reuse is rewired to one producer before DAGScheduler sees the RDD graph.
+    val optimizedRootPlan = if (conf.pipelinedShuffleFullPlanAQEEnabled) {
+      AQEEnablePipelinedShuffle().apply(postProcessedRootPlan)
+    } else {
+      postProcessedRootPlan
+    }
     val resultStage = ResultQueryStageExec(currentStageId, optimizedRootPlan, resultHandler)
     currentStageId += 1
     setLogicalLinkForNewQueryStage(resultStage, plan)

@@ -339,6 +339,16 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   // The route contract travels with the shuffle task to executors. Result stages may consume only
   // a prefix of the reduce partitions, while sibling consumers may require more than one route.
   private[spark] var configuredExpectedReaderRoutes: Array[Int] = null
+  private[spark] var configuredReaderRouteMultiplicity: Int = 1
+
+  private[spark] def setReaderRouteMultiplicity(multiplicity: Int): Unit = synchronized {
+    require(multiplicity > 0, s"Reader route multiplicity must be positive: $multiplicity")
+    configuredReaderRouteMultiplicity = multiplicity
+  }
+
+  private[spark] def readerRouteMultiplicity: Int = synchronized {
+    configuredReaderRouteMultiplicity
+  }
 
   private[spark] def setExpectedReaderRoutes(routes: Array[Int]): Unit = synchronized {
     require(routes.length == partitioner.numPartitions,

@@ -266,4 +266,14 @@ class ExchangeSuite extends SharedSparkSession {
       assert(s.contains("[plan_id="), s"the plan_id suffix should be preserved, but was: $s")
     }
   }
+
+  test("ShuffleExchangeExec canonicalization ignores the transport") {
+    val plan = spark.range(10).selectExpr("id % 4 AS key").queryExecution.executedPlan
+    val partitioning = HashPartitioning(Seq(Literal(1)), 4)
+    val regular = ShuffleExchangeExec(partitioning, plan)
+    val pipelined = regular.copy(pipelined = true)
+
+    assert(regular.canonicalized == pipelined.canonicalized,
+      "exchange reuse must see the same relational plan across regular and pipelined transport")
+  }
 }

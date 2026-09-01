@@ -6989,19 +6989,13 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
-  test("pipelined shuffle: admission counts a reused producer once (diamond rejected for " +
-      "fan-out, not for slots)") {
+  test("pipelined shuffle: admission counts a multicast producer once and configures two routes") {
     // Fan-out/diamond: ONE PipelinedShuffleDependency (one producer, one shuffle id) is read by TWO
-    // consumers that are then narrow-joined into the result. Fan-out is unsupported, so the group
-    // is ultimately rejected -- but WHICH rejection it gets proves the admission demand is deduped.
-    // The up-front slot admission (rejectUnadmittablePipelinedGroup) runs BEFORE the fan-out idiom
-    // check (checkPipelinedGroupsSupportedInRDDGraph). Execution creates ONE producer stage
-    // (getOrCreateShuffleMapStage keys on shuffle id), so the real concurrent demand is
-    // producer(2) + result(2) = 4. Counting the producer once per consumer EDGE would inflate it
-    // to 6. Pinning capacity to exactly 4: the deduped group PASSES the slot check and is then
-    // rejected for fan-out (PIPELINED_SHUFFLE_UNSUPPORTED); a double-counted group (6 > 4) would
-    // instead be rejected earlier for CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT. So a dedup regression
-    // flips the error class -- which this test detects.
+    // consumers that are then narrow-joined into the result. Execution creates ONE producer stage
+    // (getOrCreateShuffleMapStage keys on shuffle id), so real concurrent demand is producer(2) +
+    // result(2) = 4. Counting the producer once per consumer edge would inflate it to 6 and reject
+    // at the capacity pinned below. The multicast manager instead admits it and configures two
+    // independent reader routes for the shared shuffle.
     val producerRdd = new MyRDD(sc, 2, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 4
@@ -7015,13 +7009,14 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       val resultRdd = new MyRDD(
         sc, 2, List(new OneToOneDependency(consumer1), new OneToOneDependency(consumer2)),
         tracker = mapOutputTracker)
-      val failure = submitAndCaptureFailure(resultRdd, Array(0, 1))
-      // Rejected for fan-out (demand fit within capacity 4), NOT for slots -- proving the reused
-      // producer was counted once.
-      assertPipelinedUnsupported(failure, "more than one consumer")
-      assert(!failure.getMessage.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT"),
-        s"a reused producer must be counted once (fit capacity 4), got a slot rejection: " +
-          s"${failure.getMessage}")
+      submit(resultRdd, Array(0, 1))
+      assert(taskSets.size === 2)
+      assert(pipelinedDep.readerRouteMultiplicity === 2)
+      assert(taskSets(1).pipelinedReaderShuffleIds ===
+        Seq(pipelinedDep.shuffleId, pipelinedDep.shuffleId))
+      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+      complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
       assertDataStructuresEmpty()
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
@@ -7029,13 +7024,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
-  test("pipelined shuffle: admission counts a reused producer once across a wide fan-out " +
-      "(rejected for fan-out, not for slots)") {
+  test("pipelined shuffle: wide multicast configures three routes without triple-counting stage") {
     // Wider fan-out: ONE producer feeds THREE consumers, all narrow-joined into the result. Real
     // demand is still producer(2) + result(2) = 4; a per-edge count would be 2 + 3*2 = 8. At
-    // capacity 4 the deduped group passes the slot check and is rejected for fan-out; a
-    // double-counted group (8 > 4) would be rejected first for insufficient slots. See the diamond
-    // test above for the ordering rationale.
+    // capacity 4 the deduped group is admitted; a per-edge stage count (8 > 4) would reject it.
     val producerRdd = new MyRDD(sc, 2, Nil)
     val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
     myScheduler.maxConcurrentTasksForTest = 4
@@ -7046,11 +7038,14 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         new OneToOneDependency(new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker))
       }.toList
       val resultRdd = new MyRDD(sc, 2, consumers, tracker = mapOutputTracker)
-      val failure = submitAndCaptureFailure(resultRdd, Array(0, 1))
-      assertPipelinedUnsupported(failure, "more than one consumer")
-      assert(!failure.getMessage.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT"),
-        s"a reused producer must be counted once (fit capacity 4), got a slot rejection: " +
-          s"${failure.getMessage}")
+      submit(resultRdd, Array(0, 1))
+      assert(taskSets.size === 2)
+      assert(pipelinedDep.readerRouteMultiplicity === 3)
+      assert(taskSets(1).pipelinedReaderShuffleIds ===
+        Seq.fill(3)(pipelinedDep.shuffleId))
+      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+      complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
       assertDataStructuresEmpty()
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
@@ -8128,12 +8123,9 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
-  test("pipelined shuffle: a producer feeding more than one consumer (fan-out) is rejected") {
-    // 1:N fan-out is deferred to a later version and rejected up front here. Fan-out is
-    // detected at the RDD level -- two DISTINCT RDDs listing the same pipelined shuffle as a
-    // dependency -- so it is expressible in an all-pipelined job without any regular shuffle: two
-    // consumer RDDs both read the same pipelined producer, unioned by a narrow dependency into the
-    // result. checkPipelinedGroupsSupportedInRDDGraph counts 2 distinct consumers for the shuffle.
+  test("pipelined shuffle: a multicast manager admits a producer with two consumers") {
+    // Two distinct consumer RDDs read one pipelined dependency. The graph walk must configure two
+    // routes and the consumer TaskSet must prepare two inboxes per task for that shuffle.
     val producerRdd = new MyRDD(sc, 2, Nil)
     val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
     val consumerA = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
@@ -8141,8 +8133,14 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val union = new MyRDD(sc, 2,
       List(new OneToOneDependency(consumerA), new OneToOneDependency(consumerB)),
       tracker = mapOutputTracker)
-    assertPipelinedUnsupported(
-      submitAndCaptureFailure(union, Array(0, 1)), "more than one consumer")
+    submit(union, Array(0, 1))
+    assert(taskSets.size === 2)
+    assert(pipelinedDep.readerRouteMultiplicity === 2)
+    assert(taskSets(1).pipelinedReaderShuffleIds ===
+      Seq(pipelinedDep.shuffleId, pipelinedDep.shuffleId))
+    completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+    complete(taskSets(1), Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
 

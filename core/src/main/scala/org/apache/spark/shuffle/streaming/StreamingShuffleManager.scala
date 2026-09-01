@@ -109,6 +109,8 @@ private[spark] class StreamingShuffleManager
 
   override def supportsSequentialReplay: Boolean = true
 
+  override def supportsFanOut: Boolean = true
+
   logInfo(log"Using StreamingShuffleManager")
 
   @volatile private var readerClientFactory: TransportClientFactory = _
