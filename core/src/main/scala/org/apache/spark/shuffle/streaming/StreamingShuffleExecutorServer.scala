@@ -18,6 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, Semaphore}
 import java.util.concurrent.atomic.AtomicLong
 
@@ -41,12 +42,63 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 
 /** Executor-scoped transport listener that multiplexes reader control messages to map writers. */
 private[streaming] class StreamingShuffleExecutorServer extends Logging {
+  private case class PendingCredit(client: TransportClient, message: CreditControlMessage)
+
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
+  // Prepared inboxes advertise their receive windows before producer tasks are launched. The
+  // executor endpoint therefore has to retain discovery credits that race ahead of a writer's
+  // handler registration; dropping them turns a successful prepareInbox ACK into a route that is
+  // visible only on the reader side.
+  private val pendingCredits =
+    new ConcurrentHashMap[Long, ArrayDeque[PendingCredit]]()
+  // A retry credit can already be in the physical lane when the last terminal ACK retires a
+  // writer. Remember completed route identities so that late control frames are ignored rather
+  // than retained forever as if they belonged to a producer that has not launched yet.
+  private val retiredRoutes = ConcurrentHashMap.newKeySet[Long]()
+  // Registration and early-credit retention must be one atomic route transition. A concurrent
+  // queue alone is insufficient: register() can remove and finish draining the queue after a
+  // receiver has obtained its reference but before that receiver appends its credit, stranding the
+  // append in an object that is no longer reachable from pendingCredits. Striped locks keep the
+  // transition bounded without allocating one monitor for every map task.
+  private val routeLocks = Array.fill(256)(new Object)
   private val controlBodies = new AtomicLong(0L)
   private val controlFrames = new AtomicLong(0L)
 
   private def key(shuffleId: Int, writerId: Int): Long =
     (shuffleId.toLong << 32) | (writerId.toLong & 0xffffffffL)
+
+  private def routeLock(routeKey: Long): Object = {
+    val mixed = routeKey ^ (routeKey >>> 32)
+    routeLocks(mixed.toInt & (routeLocks.length - 1))
+  }
+
+  /** Must be called while holding routeLock(routeKey). */
+  private def drainPendingCreditsLocked(
+      routeKey: Long,
+      handler: StreamingShuffleServerHandler): Unit = {
+    val pending = pendingCredits.remove(routeKey)
+    if (pending != null) {
+      var credit = pending.pollFirst()
+      while (credit != null) {
+        handler.handleMessage(credit.client, credit.message)
+        credit = pending.pollFirst()
+      }
+    }
+  }
+
+  private def handlerOrRetainEarlyCredit(
+      routeKey: Long,
+      client: TransportClient,
+      credit: CreditControlMessage): StreamingShuffleServerHandler = {
+    routeLock(routeKey).synchronized {
+      val registered = handlers.get(routeKey)
+      if (registered == null && !retiredRoutes.contains(routeKey)) {
+        pendingCredits.computeIfAbsent(routeKey, _ => new ArrayDeque[PendingCredit]())
+          .addLast(PendingCredit(client, credit))
+      }
+      registered
+    }
+  }
 
   private[streaming] def handleControlBody(client: TransportClient, buf: ByteBuf): Unit = {
     // One transport body may contain discovery frames for many logical map -> reduce routes.
@@ -62,16 +114,23 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
           throw new IllegalArgumentException(
             s"Unexpected message type in shared shuffle server: ${other.messageType()}")
       }
-      val handler = handlers.get(key(route._1, route._2))
-      if (handler == null) {
-        // A shared physical reader connection may flush a final credit or termination ACK after
-        // the corresponding map task has already unregistered its writer. This is a normal
-        // late-message race during relaxed cleanup.
-        logDebug(
-          s"Ignoring late streaming shuffle control message for shuffle ${route._1}, " +
-            s"writer ${route._2}")
-      } else {
-        handler.handleMessage(client, decoded)
+      val routeKey = key(route._1, route._2)
+      decoded match {
+        case credit: CreditControlMessage =>
+          val handler = handlerOrRetainEarlyCredit(routeKey, client, credit)
+          if (handler != null) handler.handleMessage(client, credit)
+        case ack: TerminationAckMessage =>
+          val handler = handlers.get(routeKey)
+          if (handler == null) {
+            // A shared physical reader connection may flush a final ACK after the corresponding
+            // map task has already unregistered its writer. This is a normal cleanup race.
+            logDebug(
+              s"Ignoring late streaming shuffle termination ACK for shuffle ${route._1}, " +
+                s"writer ${route._2}")
+          } else {
+            handler.handleMessage(client, ack)
+          }
+        case _ =>
       }
     }
   }
@@ -164,15 +223,27 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       shuffleId: Int,
       writerId: Int,
       handler: StreamingShuffleServerHandler): Unit = {
-    val existing = handlers.putIfAbsent(key(shuffleId, writerId), handler)
-    require(existing == null, s"Streaming shuffle $shuffleId writer $writerId is already active")
+    val routeKey = key(shuffleId, writerId)
+    routeLock(routeKey).synchronized {
+      retiredRoutes.remove(routeKey)
+      val existing = handlers.putIfAbsent(routeKey, handler)
+      require(existing == null,
+        s"Streaming shuffle $shuffleId writer $writerId is already active")
+      // Drain while holding the same route lock used by early-credit retention. When this returns,
+      // every credit that observed an absent handler is owned by this handler, and every later
+      // credit observes the installed handler directly.
+      drainPendingCreditsLocked(routeKey, handler)
+    }
   }
 
   def unregister(
       shuffleId: Int,
       writerId: Int,
       handler: StreamingShuffleServerHandler): Unit = {
-    handlers.remove(key(shuffleId, writerId), handler)
+    val routeKey = key(shuffleId, writerId)
+    routeLock(routeKey).synchronized {
+      if (handlers.remove(routeKey, handler)) retiredRoutes.add(routeKey)
+    }
   }
 
   def close(): Unit = {
@@ -185,8 +256,14 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()
+    pendingCredits.clear()
+    retiredRoutes.clear()
     server.close()
   }
+
+  private[streaming] def pendingCreditCount: Int =
+    pendingCredits.values().toArray(new Array[ArrayDeque[PendingCredit]](0))
+      .iterator.map(_.size()).sum
 }
 
 /** Executor-wide reusable direct buffers for relaxed streaming writers. */

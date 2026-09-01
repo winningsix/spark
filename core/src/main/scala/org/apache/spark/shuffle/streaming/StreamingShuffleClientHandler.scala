@@ -57,7 +57,7 @@ class StreamingShuffleClientHandler(
   private val RECVBUF_SIZE: Integer = Option(SparkEnv.get)
     .map(env => Integer.valueOf(env.conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)))
     .getOrElse(Integer.valueOf(32 << 10))
-  private val SENDBUF_SIZE: Integer = 512
+  private val DEDICATED_CONTROL_SENDBUF_SIZE = 512
 
   @volatile private var lastSeqNum = -1L  // The most recent sequence number we have seen.
   // Set once this writer's TerminationControlMessage has been received, so that channelInactive
@@ -101,11 +101,24 @@ class StreamingShuffleClientHandler(
     perStreamAutoReadEnabled = false
   }
 
+  /**
+   * A dedicated reader connection sends only one route's credit and terminal ACK frames, for
+   * which the historical 512-byte socket buffer is sufficient.  An executor lane multiplexes
+   * thousands of routes, though, so retaining that per-route setting serializes late discovery
+   * credits behind the complete ACK backlog of the earlier writers.  Use the configured data
+   * socket buffer as the aggregate control-plane window for a multiplexed lane.
+   */
+  private[streaming] def configuredSendBufferSize: Int = {
+    if (perStreamAutoReadEnabled) DEDICATED_CONTROL_SENDBUF_SIZE
+    else math.max(DEDICATED_CONTROL_SENDBUF_SIZE, RECVBUF_SIZE.intValue())
+  }
+
   private def bindChannel(client: TransportClient, configureSocket: Boolean): Unit = {
     channel = client.getChannel
     if (configureSocket) {
       channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
-      channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
+      channel.config.setOption(
+        ChannelOption.SO_SNDBUF, Integer.valueOf(configuredSendBufferSize))
     }
   }
 
@@ -343,6 +356,7 @@ class StreamingShuffleClientHandler(
     var buf: ByteBuf = null
     var shuffleMessage: StreamingShuffleMessage = null
     val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
+    val pendingTerminationAcks = new ArrayBuffer[Int]()
     var publishedMessage = false
     try {
       // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
@@ -401,11 +415,13 @@ class StreamingShuffleClientHandler(
             // physical channel cannot continue filling this logical route while its queue is
             // waiting behind another sibling input.
           case controlMessage: TerminationControlMessage =>
-            // Record termination before sending the ack: the writer only closes its connection
-            // after it receives this ack, so setting the flag here guarantees it is visible before
-            // the resulting channelInactive fires, avoiding a false premature-disconnect error.
+            // Mark the route terminated immediately so a later channelInactive is classified
+            // correctly, but do not ACK until this body has been published to the inbox queue.
+            // The ACK is the writer's cleanup fence; sending it after decode but before queue
+            // ownership allowed a relaxed writer to discard its endpoint while the task-visible
+            // terminal was still in this callback.
             terminationReceived = true
-            sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+            pendingTerminationAcks += controlMessage.shuffleWriterId
           case _ =>
             throw new IllegalArgumentException(
               s"Unexpected message type in ShuffleClientHandler: ${shuffleMessage.messageType()}")
@@ -453,6 +469,9 @@ class StreamingShuffleClientHandler(
       if (publishedMessage) {
         onMessageAvailable()
       }
+      // Queue publication is the end-to-end delivery point for a prepared inbox. Duplicate
+      // terminals are not republished, but are ACKed again here so a lost ACK remains repairable.
+      pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)

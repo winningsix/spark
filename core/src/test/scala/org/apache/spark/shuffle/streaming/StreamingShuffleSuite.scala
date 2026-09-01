@@ -20,6 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.nio.ByteBuffer
 import java.util.Properties
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.language.reflectiveCalls
@@ -595,6 +596,16 @@ class StreamingShuffleSuite
     error.get.getMessage should include("closed before termination")
   }
 
+  test("multiplexed client lane scales its control socket send buffer") {
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
+      context = null, errorNotifier = new ErrorNotifier())
+
+    handler.configuredSendBufferSize shouldBe 512
+    handler.useMultiplexedChannel()
+    handler.configuredSendBufferSize shouldBe (32 << 10)
+  }
+
   test("client handler records no error when the connection closes after termination") {
     // The mirror of the premature-disconnect test: once a TerminationControlMessage has been
     // received, the subsequent channelInactive (a clean end-of-stream close) must NOT be treated
@@ -627,6 +638,32 @@ class StreamingShuffleSuite
     // A clean close after termination: the handler must record no error.
     handler.channelInactive(null)
     errorNotifier.getError() should be(None)
+  }
+
+  test("client handler acknowledges termination only after inbox publication") {
+    val errorNotifier = new ErrorNotifier()
+    val publishError = new RuntimeException("inbox publication failed")
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]() {
+      override def put(message: StreamingShuffleMessage): Unit = throw publishError
+    }
+    val acknowledgements = new AtomicInteger(0)
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errorNotifier) {
+      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit =
+        acknowledgements.incrementAndGet()
+    }
+    val encoded = ByteBuffer.allocate(24)
+    encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
+    encoded.putLong(0L)
+    encoded.putInt(shuffleId)
+    encoded.putInt(0)
+    encoded.putInt(0)
+    encoded.flip()
+
+    handler.receive(null, encoded, null)
+
+    acknowledgements.get() shouldBe 0
+    errorNotifier.getError() shouldBe Some(publishError)
   }
 
   test("reader catches out of order message sequence number from writer - duplicate") {
