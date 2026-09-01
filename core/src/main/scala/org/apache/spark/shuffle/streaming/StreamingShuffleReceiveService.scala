@@ -310,9 +310,9 @@ private[streaming] class StreamingShuffleReceiveServiceEndpoint(
  */
 private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     conf: SparkConf,
-    snapshotProvider: Int => Option[ShuffleLocationResponse] = shuffleId =>
+    snapshotProvider: Seq[Int] => Map[Int, ShuffleLocationResponse] = shuffleIds =>
       SparkEnv.get.streamingShuffleOutputTracker.get
-        .getAvailableShuffleWriterTaskLocations(shuffleId)) extends Logging {
+        .getAvailableShuffleWriterTaskLocationsBatch(shuffleIds)) extends Logging {
   private val closed = new AtomicBoolean(false)
   private val sessions =
     new ConcurrentHashMap[Int, CopyOnWriteArrayList[StreamingShufflePreparedReceiveSession]]()
@@ -347,12 +347,16 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
   }
 
   private def poll(): Unit = {
-    sessions.entrySet().asScala.foreach { entry =>
+    val activeByShuffle = sessions.entrySet().asScala.flatMap { entry =>
       val active = entry.getValue.asScala.filterNot(_.isClosed).toSeq
-      if (active.nonEmpty) {
-        try {
-          snapshotRequests.incrementAndGet()
-          snapshotProvider(entry.getKey).foreach { snapshot =>
+      if (active.nonEmpty) Some(entry.getKey -> active) else None
+    }.toMap
+    if (activeByShuffle.nonEmpty) {
+      try {
+        snapshotRequests.incrementAndGet()
+        val snapshots = snapshotProvider(activeByShuffle.keys.toSeq)
+        activeByShuffle.foreach { case (shuffleId, active) =>
+          snapshots.get(shuffleId).foreach { snapshot =>
             snapshotDeliveries.addAndGet(active.size)
             active.foreach { session =>
               try session.onWriterSnapshot(snapshot)
@@ -361,9 +365,9 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
               }
             }
           }
-        } catch {
-          case error: Throwable => active.foreach(_.failDiscovery(error))
         }
+      } catch {
+        case error: Throwable => activeByShuffle.values.flatten.foreach(_.failDiscovery(error))
       }
     }
   }
