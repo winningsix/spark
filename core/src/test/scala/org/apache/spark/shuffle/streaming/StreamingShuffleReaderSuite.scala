@@ -18,9 +18,11 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, Semaphore}
+import java.util.concurrent.atomic.AtomicInteger
 
 import io.netty.buffer.Unpooled
+import org.mockito.Mockito.when
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 
@@ -31,6 +33,7 @@ import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
+import org.apache.spark.util.ErrorNotifier
 
 /**
  * Reader-side unit tests that do not require a shuffle writer. End-to-end writer <-> reader
@@ -178,6 +181,36 @@ class StreamingShuffleReaderSuite
         // Constructing the reader starts a background task-discovery thread; the task-completion
         // listener (cleanupResources) shuts it down.
         context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("prepared reader does not create task-owned discovery or client executors") {
+    withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
+      val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+      val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+      val context = createTaskContext(sc.conf, 0)
+      val session = mock[StreamingShufflePreparedReceiveSession]
+      when(session.errorNotifier).thenReturn(new ErrorNotifier())
+      when(session.totalNumShuffleWriters).thenReturn(new AtomicInteger(0))
+      when(session.terminationAckControlMessageSet)
+        .thenReturn(ConcurrentHashMap.newKeySet[Long]())
+      when(session.allTermAcksSentNotice).thenReturn(new Semaphore(0))
+      val inbox = new StreamingShuffleReceiveInbox(
+        StreamingShuffleReceiveInboxId(0, 0, 0, 0, -1L),
+        new LinkedBlockingQueue[StreamingShuffleMessage]())
+      inbox.startPreparedSession(session)
+      val lease = new StreamingShuffleReceiveInboxLease(inbox, () => inbox.close())
+      try {
+        val reader = new StreamingShuffleReader[Int, Int](
+          new StreamingShuffleHandle(0, dep),
+          context,
+          sharedExecutorClient = Some(mock[StreamingShuffleExecutorClient]),
+          receiveInbox = Some(lease))
+        reader.taskOwnedExecutorsCreated shouldBe (false, false)
+      } finally {
+        context.markTaskCompleted(None)
+        lease.close()
       }
     }
   }

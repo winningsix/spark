@@ -148,12 +148,17 @@ class StreamingShuffleReader[K, C](
     1, // a client should only need to use 1 thread
     role)
 
-  private[spark] val taskDiscoveryExecutor =
+  private val preparedSession = receiveInbox.flatMap(_.preparedSession)
+  @volatile private var taskDiscoveryExecutorCreated = false
+  @volatile private var clientCreationExecutorCreated = false
+
+  private[spark] lazy val taskDiscoveryExecutor = {
+    taskDiscoveryExecutorCreated = true
     ThreadUtils.newDaemonSingleThreadExecutor(
       s"streaming-shuffle-task-discovery-thread-" +
         s"${streamingShuffleHandle.shuffleId}-${context.partitionId()}")
+  }
 
-  private val preparedSession = receiveInbox.flatMap(_.preparedSession)
   private val activeErrorNotifier = preparedSession.map(_.errorNotifier).getOrElse(errorNotifier)
   private val totalNumShuffleWriters: AtomicInteger = preparedSession
     .map(_.totalNumShuffleWriters)
@@ -206,10 +211,17 @@ class StreamingShuffleReader[K, C](
     .map(_.allTermAcksSentNotice)
     .getOrElse(new Semaphore(0))
 
-  // thread pool used to perform client creation in parallel
-  private[spark] val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
-    conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
-    s"streaming-shuffle-async-client-creation-${context.partitionId()}")
+  // Only task-owned readers need these executors. A prepared reader attaches to the executor-owned
+  // session after it has already performed writer discovery and route registration.
+  private[spark] lazy val clientCreationExecutor = {
+    clientCreationExecutorCreated = true
+    ThreadUtils.newDaemonFixedThreadPool(
+      conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
+      s"streaming-shuffle-async-client-creation-${context.partitionId()}")
+  }
+
+  private[streaming] def taskOwnedExecutorsCreated: (Boolean, Boolean) =
+    (taskDiscoveryExecutorCreated, clientCreationExecutorCreated)
 
   // Signals to other threads that task discovery should stop. For example, we may receive all
   // the termination messages before we actually put the clients in the client map. In that
@@ -256,10 +268,12 @@ class StreamingShuffleReader[K, C](
     val cleanupStartTime = System.currentTimeMillis()
 
     Utils.tryLogNonFatalError {
-      stopTaskDiscovery()
+      if (preparedSession.isEmpty) stopTaskDiscovery()
     }
     Utils.tryLogNonFatalError {
-      shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
+      if (preparedSession.isEmpty) {
+        shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
+      }
     }
     sharedExecutorClient match {
       case Some(executorClient) =>
@@ -455,9 +469,6 @@ class StreamingShuffleReader[K, C](
         System.currentTimeMillis() - startTime)} ms")
     }
     })
-  } else {
-    taskDiscoveryExecutor.shutdown()
-    clientCreationExecutor.shutdown()
   }
 
   private def stopTaskDiscovery(): Unit = {
