@@ -2892,7 +2892,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "the producer must not launch another task while its two-task window is full")
   }
 
-  test("prepared receive mode expands only a sole pure producer") {
+  test("prepared receive mode does not expand a sole producer before its reader is submitted") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
@@ -2913,8 +2913,53 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     val offers = (0 until 8).map { i =>
       new WorkerOffer(s"executor$i", s"host$i", 1)
     }
-    assert(taskScheduler.resourceOffers(offers).flatten.length === 4,
-      "the only pure producer should expand from its base window to the sole-stage window")
+    assert(taskScheduler.resourceOffers(offers).flatten.length === 2,
+      "a producer-only offer race must stay at the base window until its reader is submitted")
+  }
+
+  test("prepared receive mode does not expand a sole producer before its reader starts") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS.key -> "4")
+    val producer = new TaskSet(
+      Array.tabulate[Task[_]](6)(i => new FakeTask(0, i)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](4)(i => new FakeTask(1, i)),
+      stageId = 1,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(1))
+    taskScheduler.submitTasks(producer)
+    taskScheduler.submitTasks(reader)
+
+    val offers = (0 until 8).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    val firstWave = taskScheduler.resourceOffers(offers).flatten
+    assert(firstWave.length === 2)
+    assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 2,
+      "the producer must stay at its base window until a direct reader has started")
+
+    // Model the reader frontier after its first ready task has launched. The next offer may now
+    // expand the same producer to the sole-stage window and fill otherwise idle CPU slots.
+    taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasksSet += Long.MaxValue
+    val secondWave = taskScheduler.resourceOffers(offers).flatten
+    assert(secondWave.length === 2)
+    assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 4)
   }
 
   test("prepared receive mode keeps sibling pure producers at their base windows") {

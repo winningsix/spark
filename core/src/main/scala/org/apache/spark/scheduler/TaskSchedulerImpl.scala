@@ -348,6 +348,25 @@ private[spark] class TaskSchedulerImpl(
       !taskSet.taskSet.isPipelinedShuffleReader
   }
 
+  private def readerFrontierStartedForProducer(
+      producer: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): Boolean = {
+    producer.taskSet.shuffleId.exists { shuffleId =>
+      val directReaders = taskSets.iterator.filter { taskSet =>
+        !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+          taskSet.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
+      }.toSeq
+      // submitTasks(producer) can trigger a resource offer before DAGScheduler has submitted the
+      // direct consumer. Treat that transient absence as NOT started; otherwise this race lets the
+      // producer consume the entire sole-stage window and recreates a producer-then-consumer
+      // boundary. Ready readers are ordered first in the same offer pass, so the condition becomes
+      // true immediately after every submitted direct reader launches.
+      directReaders.nonEmpty && directReaders.forall { reader =>
+        reader.runningTasks > 0 || reader.tasksSuccessful > 0
+      }
+    }
+  }
+
   private def elasticProducerLaunchAllowed(
       taskSet: TaskSetManager,
       soleActivePureProducer: Boolean): Boolean = {
@@ -815,12 +834,16 @@ private[spark] class TaskSchedulerImpl(
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
+        // Compute this once per task set and offer pass. Ready readers were moved ahead of their
+        // producers above, so their freshly-launched runningTasks are already visible here.
+        val useSoleProducerWindow = solePureProducer.contains(taskSet) &&
+          readerFrontierStartedForProducer(taskSet, sortedTaskSets)
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks, solePureProducer.contains(taskSet))
+              availableResources, tasks, useSoleProducerWindow)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
