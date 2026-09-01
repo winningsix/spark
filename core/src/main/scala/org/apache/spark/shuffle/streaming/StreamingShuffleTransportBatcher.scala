@@ -17,7 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{ScheduledExecutorService, ScheduledFuture, Semaphore, TimeUnit}
+import java.util.concurrent.{ScheduledExecutorService, ScheduledFuture, TimeUnit}
 
 import scala.collection.mutable
 
@@ -55,15 +55,11 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   require(maxInFlightBytes >= maxBytes,
     "maxInFlightBytes must be at least maxBytes so one transport batch can be admitted")
 
-  // Admission is expressed in MiB units to keep Semaphore's permit count within Int while
-  // bounding the aggregate direct memory held by all completed-at-transport writers on this
-  // executor. A permit remains held until TransportClient's completion callback, not merely until
-  // the body is handed to Netty, because the latter can still retain the direct payload in the
-  // channel's outbound queue.
-  private val permitUnitBytes = 1L << 20
-  private val maxPermits = Math.toIntExact(
-    (maxInFlightBytes + permitUnitBytes - 1) / permitUnitBytes)
-  private val inFlightPermits = new Semaphore(maxPermits)
+  // A reservation remains held until TransportClient's completion callback, not merely until the
+  // body is handed to Netty, because the latter can still retain the direct payload in the
+  // channel's outbound queue. Admission must not block the executor's shared outbound dispatcher:
+  // a connection whose socket is full would otherwise park every dispatcher thread and prevent
+  // unrelated connections with ready readers from sending data or end-of-stream controls.
   private val inFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
   private val peakInFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
 
@@ -77,27 +73,43 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   // TransportClient uses object identity for its channel state. IdentityHashMap avoids ever
   // merging two wrappers that happen to compare equal in a future implementation.
   private val pending = new java.util.IdentityHashMap[TransportClient, PendingBatch]()
+  // Batches that are complete but waiting for executor-global transport admission. Keep a FIFO
+  // per physical connection to preserve the sequence order in which logical route bodies were
+  // submitted, and rotate connections globally so one backlogged peer cannot monopolize each
+  // newly released byte window.
+  private val awaitingAdmission =
+    new java.util.IdentityHashMap[TransportClient, java.util.ArrayDeque[PendingBatch]]()
+  private val admissionReadyClients = new java.util.ArrayDeque[TransportClient]()
+  private val admissionReadySet =
+    java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[TransportClient, java.lang.Boolean]())
   private val scheduledFlushes =
     new java.util.IdentityHashMap[TransportClient, ScheduledFuture[_]]()
   private val flushExecutor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("streaming-shuffle-cross-route-flush")
+  private var admissionDrainScheduled = false
   private var closed = false
 
-  private def permitsFor(bytes: Int): Int = {
-    Math.toIntExact((bytes.toLong + permitUnitBytes - 1) / permitUnitBytes)
+  private def tryAcquire(bytes: Int): Boolean = {
+    val requested = bytes.toLong
+    var acquired = false
+    while (!acquired) {
+      val current = inFlightBytes.get()
+      // Admit an oversized body only into an empty window. A single encoded record can be larger
+      // than maxBytes/maxInFlightBytes and must still make progress without silently weakening the
+      // bound for concurrent batches.
+      if (current > 0L && current + requested > maxInFlightBytes) return false
+      if (current == 0L || current + requested <= maxInFlightBytes) {
+        acquired = inFlightBytes.compareAndSet(current, current + requested)
+        if (acquired) peakInFlightBytes.accumulateAndGet(current + requested, Math.max)
+      }
+    }
+    true
   }
 
-  private def acquire(bytes: Int): Int = {
-    val permits = permitsFor(bytes)
-    inFlightPermits.acquire(permits)
-    val current = inFlightBytes.addAndGet(bytes.toLong)
-    peakInFlightBytes.accumulateAndGet(current, Math.max)
-    permits
-  }
-
-  private def release(bytes: Int, permits: Int): Unit = {
+  private def release(bytes: Int): Unit = {
     inFlightBytes.addAndGet(-bytes.toLong)
-    inFlightPermits.release(permits)
+    scheduleAdmissionDrain()
   }
 
   /** Takes ownership of body and queues it for client. */
@@ -151,22 +163,26 @@ private[streaming] final class StreamingShuffleTransportBatcher(
 
   /** Remove one writer's unsent bodies without affecting other writers on the channel. */
   def discardOwner(owner: AnyRef): Unit = synchronized {
+    def discardOwnedBodies(batch: PendingBatch): Unit = {
+      val removed = batch.bodies.filter(_.owner eq owner)
+      if (removed.nonEmpty) {
+        batch.bodies --= removed
+        batch.bytes = batch.bodies.iterator.map(_.body.readableBytes()).sum
+        removed.foreach { body =>
+          body.body.release()
+          try body.onComplete()
+          catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
+        }
+      }
+    }
+
     val clients = pending.keySet().iterator()
     val emptyClients = new mutable.ArrayBuffer[TransportClient]()
     while (clients.hasNext) {
       val client = clients.next()
       val batch = pending.get(client)
       if (batch != null) {
-        val removed = batch.bodies.filter(_.owner eq owner)
-        if (removed.nonEmpty) {
-          batch.bodies --= removed
-          batch.bytes = batch.bodies.iterator.map(_.body.readableBytes()).sum
-          removed.foreach { body =>
-            body.body.release()
-            try body.onComplete()
-            catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
-          }
-        }
+        discardOwnedBodies(batch)
         if (batch.bodies.isEmpty) emptyClients += client
       }
     }
@@ -174,6 +190,25 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       pending.remove(client)
       val scheduled = scheduledFlushes.remove(client)
       if (scheduled != null) scheduled.cancel(false)
+    }
+
+    val awaitingClients = awaitingAdmission.keySet().iterator()
+    val emptyAwaitingClients = new mutable.ArrayBuffer[TransportClient]()
+    while (awaitingClients.hasNext) {
+      val client = awaitingClients.next()
+      val batches = awaitingAdmission.get(client)
+      val batchIterator = batches.iterator()
+      while (batchIterator.hasNext) {
+        val batch = batchIterator.next()
+        discardOwnedBodies(batch)
+        if (batch.bodies.isEmpty) batchIterator.remove()
+      }
+      if (batches.isEmpty) emptyAwaitingClients += client
+    }
+    emptyAwaitingClients.foreach { client =>
+      awaitingAdmission.remove(client)
+      admissionReadySet.remove(client)
+      admissionReadyClients.remove(client)
     }
   }
 
@@ -194,6 +229,20 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       }
     }
     pending.clear()
+    val awaitingIterator = awaitingAdmission.values().iterator()
+    while (awaitingIterator.hasNext) {
+      val batches = awaitingIterator.next().iterator()
+      while (batches.hasNext) {
+        batches.next().bodies.foreach { body =>
+          body.body.release()
+          try body.onComplete()
+          catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
+        }
+      }
+    }
+    awaitingAdmission.clear()
+    admissionReadyClients.clear()
+    admissionReadySet.clear()
   }
 
   private def flushLocked(client: TransportClient): Unit = {
@@ -202,13 +251,65 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     val batch = pending.remove(client)
     if (batch == null || batch.bodies.isEmpty) return
 
+    var batches = awaitingAdmission.get(client)
+    if (batches == null) {
+      batches = new java.util.ArrayDeque[PendingBatch]()
+      awaitingAdmission.put(client, batches)
+    }
+    batches.addLast(batch)
+    enqueueAdmissionReadyClientLocked(client)
+    drainAdmissionsLocked()
+  }
+
+  private def enqueueAdmissionReadyClientLocked(client: TransportClient): Unit = {
+    if (admissionReadySet.add(client)) admissionReadyClients.addLast(client)
+  }
+
+  /** Schedule a retry without running transport admission on a Netty completion thread. */
+  private def scheduleAdmissionDrain(): Unit = synchronized {
+    if (!closed && !admissionDrainScheduled && !admissionReadyClients.isEmpty) {
+      admissionDrainScheduled = true
+      flushExecutor.execute(new Runnable {
+        override def run(): Unit = synchronized {
+          admissionDrainScheduled = false
+          drainAdmissionsLocked()
+        }
+      })
+    }
+  }
+
+  /** Fill the available window while preserving FIFO order within each physical connection. */
+  private def drainAdmissionsLocked(): Unit = {
+    var consecutiveBlockedClients = 0
+    while (!closed && !admissionReadyClients.isEmpty &&
+        consecutiveBlockedClients < admissionReadyClients.size()) {
+      val client = admissionReadyClients.removeFirst()
+      admissionReadySet.remove(client)
+      val batches = awaitingAdmission.get(client)
+      if (batches == null || batches.isEmpty) {
+        awaitingAdmission.remove(client)
+      } else {
+        val batch = batches.peekFirst()
+        if (tryAcquire(batch.bytes)) {
+          batches.removeFirst()
+          if (batches.isEmpty) awaitingAdmission.remove(client)
+          else enqueueAdmissionReadyClientLocked(client)
+          consecutiveBlockedClients = 0
+          sendAdmittedBatch(client, batch)
+        } else {
+          enqueueAdmissionReadyClientLocked(client)
+          consecutiveBlockedClients += 1
+        }
+      }
+    }
+  }
+
+  /** Submit a batch whose bytes have already been reserved by drainAdmissionsLocked(). */
+  private def sendAdmittedBatch(client: TransportClient, batch: PendingBatch): Unit = {
     var outbound: ByteBuf = null
     var addedBodies = 0
-    var admittedBytes = 0
-    var admittedPermits = 0
+    val admittedBytes = batch.bytes
     try {
-      admittedBytes = batch.bytes
-      admittedPermits = acquire(admittedBytes)
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
@@ -224,7 +325,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       // by the synchronous-failure path after send() returns.
       outbound = null
       future.addListener((future: ChannelFuture) => {
-        release(admittedBytes, admittedPermits)
+        release(admittedBytes)
         val error = if (future.isSuccess) null else future.cause()
         complete(batch, if (isExpectedConnectionClose(client, error)) null else error)
       })
@@ -234,7 +335,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
         // Components already added to the aggregate were released above. Bodies after the
         // failing component still own their original reference.
         batch.bodies.drop(addedBodies).foreach(_.body.release())
-        if (admittedPermits > 0) release(admittedBytes, admittedPermits)
+        release(admittedBytes)
         if (!isExpectedConnectionClose(client, e)) {
           errorNotifier.markError(e)
         }
