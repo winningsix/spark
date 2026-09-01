@@ -51,6 +51,7 @@ class StreamingShuffleReaderIteratorFactory {
       handleTerminationMessage: TerminationControlMessage => Boolean,
       handleDataMessage: DataMessage => Iterator[(K, C)],
       checkTaskFailure: () => Unit,
+      inputExhausted: () => Boolean = () => false,
       repairIdleCreditWindows: () => Unit = () => (),
       recordQueueWaitNanos: Long => Unit = _ => ()
     ): Iterator[Product2[K, C]] = {
@@ -65,6 +66,12 @@ class StreamingShuffleReaderIteratorFactory {
       def getNext(): Product2[K, C] = {
         while (!rowIterator.hasNext) {
           checkTaskFailure()
+          // A shuffle with zero map partitions never publishes a data or termination frame.
+          // Discovery is therefore the only end-of-input signal for this case.
+          if (inputExhausted()) {
+            finished = true
+            return null.asInstanceOf[Product2[K, C]]
+          }
           val immediate = messageQueue.poll()
           val message = if (immediate != null) {
             immediate
@@ -353,7 +360,7 @@ class StreamingShuffleReader[K, C](
                   s"first=$expected current=$numShuffleWriters " +
                   s"locations=${shuffleWriterLocations.toSeq.sortBy(_._1)}")
             } else {
-              perWriterByteLimit = Math.max(MAX_MEMORY / numShuffleWriters, 1)
+              perWriterByteLimit = Math.max(MAX_MEMORY / math.max(1, numShuffleWriters), 1)
               if (READER_BACKPRESSURE_ENABLED) {
                 memoryConsumer.acquireMemory(MAX_MEMORY)
               }
@@ -685,6 +692,7 @@ class StreamingShuffleReader[K, C](
       handleTerminationMessage,
       handleDataMessage,
       checkTaskFailure,
+      () => totalNumShuffleWriters.get() == 0,
       () => preparedSession match {
         case Some(session) => session.repairIdleCreditWindows()
         case None =>

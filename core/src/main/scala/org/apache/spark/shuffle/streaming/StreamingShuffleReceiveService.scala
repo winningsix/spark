@@ -328,6 +328,10 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
             totalNumShuffleWriters.compareAndSet(-1, numWriters)
             require(totalNumShuffleWriters.get() == numWriters,
               s"Writer count changed for prepared inbox ${inbox.id}")
+            // With no map partitions there can be no data or termination frame to trigger the
+            // normal ready path. Discovery itself proves that the inbox can be attached and
+            // drained as an empty input.
+            if (numWriters == 0) markDrainReady()
             // Only the configured elastic producer window can publish concurrently for this
             // shuffle. Dividing the receive budget by every lifetime map task gives a 1777-map
             // scan an ~18 KiB route window even though at most 52 writers are live, forcing one

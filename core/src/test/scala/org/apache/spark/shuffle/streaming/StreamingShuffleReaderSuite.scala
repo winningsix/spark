@@ -140,6 +140,21 @@ class StreamingShuffleReaderSuite
     dataHandled should be(false)
   }
 
+  test("iterator terminates when discovery reports a zero-writer shuffle") {
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    var checked = 0
+    val it = factory.create[Int, Int](
+      queue,
+      handleTerminationMessage = _ => false,
+      handleDataMessage = _ => Iterator.empty,
+      checkTaskFailure = () => checked += 1,
+      inputExhausted = () => true)
+
+    it.hasNext shouldBe false
+    checked shouldBe 1
+    queue shouldBe empty
+  }
+
   test("getReader routes to a StreamingShuffleReader wired with the given context") {
     // A construction/routing smoke test: the manager must dispatch to the streaming reader (not a
     // fallback shuffle reader), the reader must construct successfully (its constructor asserts the

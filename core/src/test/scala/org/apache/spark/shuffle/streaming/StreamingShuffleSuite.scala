@@ -285,6 +285,13 @@ class StreamingShuffleSuite
         assert(partitioner.getPartition(key) === partitionId)
         assert(value === key * 2)
       }
+
+      // A zero-partition input has no writer task and therefore emits no data or termination
+      // frame. The prepared receive session must become ready from tracker discovery alone, and
+      // the attached reader must complete without polling its empty inbox forever.
+      val empty = new DistributedPipelinedShuffledRDD[Int, Int, Int](
+        sc.emptyRDD[(Int, Int)], partitioner).collect()
+      assert(empty.isEmpty)
     } finally {
       sc.stop()
     }
