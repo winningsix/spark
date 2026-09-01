@@ -2001,6 +2001,30 @@ package object config {
       .checkValue(_ >= 0, "prepared inbox ready bytes must be non-negative")
       .createWithDefaultString("0b")
 
+  private[spark] val STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS =
+    ConfigBuilder("spark.shuffle.streaming.preparedInbox.clientCreationThreads")
+      .doc("Maximum executor-scoped threads used to install prepared reader routes and create " +
+        "their physical shuffle lanes. Keeping this below executor cores bounds the distributed " +
+        "connection frontier when many reader inboxes become ready together.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "prepared inbox client creation threads must be at least one")
+      .createWithDefault(4)
+
+  private[spark] val STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT =
+    ConfigBuilder("spark.shuffle.streaming.preparedInbox.routeRegistrationTimeout")
+      .doc("Maximum time a prepared reader route may remain queued or blocked during physical " +
+        "lane creation. A timeout fails the reader through its normal task error path instead of " +
+        "allowing an undiscoverable route to wait forever.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 1L, "prepared route registration timeout must be positive")
+      .createWithDefaultString("30s")
+
   private[spark] val STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.streaming.dataSocketBufferSize")
       .doc("Socket send and receive buffer size for streaming shuffle data channels. This is " +
@@ -2255,6 +2279,38 @@ package object config {
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
       .checkValue(_ >= 1, "must be at least one")
+      .createOptional
+
+  private[spark] val STREAMING_SHUFFLE_READER_TASK_CPUS =
+    ConfigBuilder("spark.shuffle.streaming.reader.taskCpus")
+      .doc("Optional CPU amount charged to a task that only consumes pipelined shuffles. This " +
+        "changes scheduler slot accounting, not the task's physical CPU affinity. Fractional " +
+        "values let blocked readers overlap producers without changing shuffle partitioning.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .decimalConf
+      .checkValue(v => v >= CpuAmount.MIN_AMOUNT && v <= CpuAmount.MAX_AMOUNT,
+        "Pipelined reader task CPUs must be a positive representable CPU amount.")
+      .checkValue(CpuAmount.stripTrailingZeros(_).scale <= CpuAmount.SCALE,
+        s"Pipelined reader task CPUs support at most ${CpuAmount.SCALE} decimal places.")
+      .transform(CpuAmount.normalize)
+      .createOptional
+
+  private[spark] val STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS =
+    ConfigBuilder("spark.shuffle.streaming.readerProducer.taskCpus")
+      .doc("Optional CPU amount charged to a task that both consumes and produces a pipelined " +
+        "shuffle. This role is configured independently from reader-only tasks because it can " +
+        "perform substantial operator and serialization work while its inputs are available.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .decimalConf
+      .checkValue(v => v >= CpuAmount.MIN_AMOUNT && v <= CpuAmount.MAX_AMOUNT,
+        "Pipelined reader-producer task CPUs must be a positive representable CPU amount.")
+      .checkValue(CpuAmount.stripTrailingZeros(_).scale <= CpuAmount.SCALE,
+        s"Pipelined reader-producer task CPUs support at most ${CpuAmount.SCALE} decimal places.")
+      .transform(CpuAmount.normalize)
       .createOptional
 
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =

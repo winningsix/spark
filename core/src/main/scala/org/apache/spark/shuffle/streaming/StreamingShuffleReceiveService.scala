@@ -20,7 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.io.File
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
   CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, RejectedExecutionException,
-  ScheduledExecutorService, Semaphore, TimeUnit}
+  ScheduledExecutorService, Semaphore, TimeoutException, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
@@ -32,7 +32,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
+  STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
+  STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
   STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.client.TransportClient
@@ -106,7 +108,9 @@ private[streaming] class StreamingShuffleReceiveService(
         resources = PreparedResources(
           new StreamingShufflePreparedReceiveDiscovery(conf),
           ThreadUtils.newDaemonFixedThreadPool(
-            math.max(1, conf.get(EXECUTOR_CORES)),
+            math.max(1, math.min(
+              conf.get(EXECUTOR_CORES),
+              conf.get(STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS))),
             "streaming-shuffle-prepared-client"))
         preparedResources = resources
       }
@@ -454,6 +458,8 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     }.toMap
     if (activeByShuffle.nonEmpty) {
       try {
+        val nowNanos = System.nanoTime()
+        activeByShuffle.values.flatten.foreach(_.checkRouteRegistrationTimeout(nowNanos))
         snapshotRequests.incrementAndGet()
         val snapshots = snapshotProvider(activeByShuffle.keys.toSeq)
         routeRegistrationLock.synchronized {
@@ -526,8 +532,12 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
   private val clients = new ConcurrentHashMap[Long, TransportClient]()
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleClientHandler]()
   private val clientFutures = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
+  private val clientFutureStartedNanos =
+    new ConcurrentHashMap[CompletableFuture[Void], Long]()
   private val mapIndexes = mutable.HashSet.empty[Int]
   private val routeLifecycleLock = new Object
+  private val routeRegistrationTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(
+    conf.get(STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT))
 
   val shuffleId: Int = inbox.id.shuffleId
 
@@ -598,13 +608,46 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     }.foreach { case ((host, port), routeLocations) =>
       val future = discovery.submitRouteRegistration(host, port, clientCreationExecutor)(() =>
         registerRoutes(host, port, routeLocations.toSeq, perWriterByteLimit))
+      clientFutureStartedNanos.putIfAbsent(future, System.nanoTime())
       future.whenComplete { (_, error) =>
-        if (error != null) failDiscovery(Option(error.getCause).getOrElse(error))
+        clientFutureStartedNanos.remove(future)
+        if (error != null) {
+          failDiscovery(Option(error.getCause).getOrElse(error))
+        } else {
+          maybeCompleteDiscovery()
+        }
       }
       routeLocations.foreach { case (mapId, _) => clientFutures.put(mapId, future) }
     }
-    if (clientFutures.size() >= totalNumShuffleWriters.get() &&
-        discoveryComplete.compareAndSet(false, true)) {
+    maybeCompleteDiscovery()
+  }
+
+  private[streaming] def checkRouteRegistrationTimeout(nowNanos: Long): Unit = {
+    if (closed.get() || discoveryComplete.get()) return
+    clientFutureStartedNanos.entrySet().asScala.find { entry =>
+      !entry.getKey.isDone && nowNanos - entry.getValue >= routeRegistrationTimeoutNanos
+    }.foreach { _ =>
+      val completed = clientFutures.values().asScala.count(_.isDone)
+      failDiscovery(new TimeoutException(
+        s"Prepared shuffle route registration timed out for ${inbox.id}: " +
+          s"completed=$completed, advertised=${clientFutures.size()}, " +
+          s"expected=${totalNumShuffleWriters.get()}"))
+    }
+  }
+
+  /**
+   * Stop polling only after every advertised writer route has actually installed its handler and
+   * successfully flushed its initial-credit write. Merely submitting the registration worker is
+   * not enough: a synchronous transport connection can still be queued or blocked at that point,
+   * and removing this session from discovery would leave such a route with neither polling nor
+   * credit repair.
+   */
+  private def maybeCompleteDiscovery(): Unit = {
+    val numWriters = totalNumShuffleWriters.get()
+    if (numWriters >= 0 && clientFutures.size() >= numWriters &&
+        clientFutures.values().asScala.forall { future =>
+          future.isDone && !future.isCompletedExceptionally && !future.isCancelled
+        } && discoveryComplete.compareAndSet(false, true)) {
       discovery.unregister(this)
     }
   }
@@ -673,6 +716,7 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
         }
         handlers.clear()
         clients.clear()
+        clientFutureStartedNanos.clear()
       }
     }
   }

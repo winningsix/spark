@@ -17,7 +17,8 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{CompletableFuture, CountDownLatch, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CountDownLatch,
+  LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import io.netty.buffer.Unpooled
@@ -34,6 +35,7 @@ import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
+  STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
 import org.apache.spark.network.client.TransportClient
@@ -312,12 +314,72 @@ class StreamingShuffleManagerSuite
         Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)),
         1))
       registerEntered.await(10, TimeUnit.SECONDS) shouldBe true
+      // A published location is not a completed route. Keep discovery alive while the physical
+      // lane is still being created so a stuck registration cannot silently become an eternal
+      // reader wait.
+      discovery.stats._1 shouldBe 1
       session.close()
       finishRegister.countDown()
       eventually(Timeout(10.seconds)) {
         verify(sharedClient).unregister(
           eqTo(7), eqTo(3), eqTo(0), any[StreamingShuffleClientHandler])
       }
+    } finally {
+      finishRegister.countDown()
+      session.close()
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
+  test("prepared session fails a blocked route registration within a bounded timeout") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
+      .set(STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT, 50L)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(1, "prepared-route-timeout-test-client")
+    val sharedClient = mock[StreamingShuffleExecutorClient]
+    val transportClient = mock[TransportClient]
+    val registerEntered = new CountDownLatch(1)
+    val finishRegister = new CountDownLatch(1)
+    val drainReady = new CountDownLatch(1)
+    when(sharedClient.registerBatch(
+      eqTo(7),
+      eqTo(0),
+      eqTo("writer-host"),
+      eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenAnswer { _ =>
+        registerEntered.countDown()
+        finishRegister.await(10, TimeUnit.SECONDS)
+        Map(3 -> transportClient)
+      }
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox,
+      sharedClient,
+      conf,
+      discovery,
+      clientCreationExecutor,
+      () => drainReady.countDown())
+    try {
+      session.start()
+      session.onWriterSnapshot(ShuffleLocationResponse(
+        Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)),
+        1))
+      registerEntered.await(10, TimeUnit.SECONDS) shouldBe true
+
+      eventually(Timeout(10.seconds)) {
+        session.errorNotifier.getError().map(_.getMessage) shouldBe
+          Some("Prepared shuffle route registration timed out for " +
+            "StreamingShuffleReceiveInboxId(7,9,0,0,-1,0): " +
+            "completed=0, advertised=1, expected=1")
+        discovery.stats._1 shouldBe 0
+      }
+      drainReady.await(10, TimeUnit.SECONDS) shouldBe true
     } finally {
       finishRegister.countDown()
       session.close()
@@ -371,6 +433,83 @@ class StreamingShuffleManagerSuite
       }
       discovery.routeRegistrationStats shouldBe (sessions.size.toLong, 1L)
     } finally {
+      sessions.foreach(_.close())
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
+  test("prepared discovery stays active across an executor-sized blocked lane frontier") {
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
+    val writerExecutors = 26
+    val reducerInboxes = 52
+    val snapshot = ShuffleLocationResponse(
+      (0 until writerExecutors).map { writerId =>
+        writerId.toLong -> StreamingShuffleTaskLocation(
+          s"executor-$writerId", s"writer-host-$writerId", 7300 + writerId, writerId)
+      }.toMap,
+      writerExecutors)
+    val publishSnapshot = new AtomicBoolean(false)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(
+      conf, shuffleIds => {
+        if (publishSnapshot.get()) shuffleIds.map(_ -> snapshot).toMap else Map.empty
+      })
+    // Match a 15-core executor: the first wave can occupy every synchronous lane-creation worker
+    // while the remaining endpoint groups stay queued.
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(15, "prepared-executor-frontier-test-client")
+    val sharedClient = mock[StreamingShuffleExecutorClient]
+    val transportClient = mock[TransportClient]
+    val blockedEndpoints = ConcurrentHashMap.newKeySet[String]()
+    val blockedEntrances = new CountDownLatch(15)
+    val releaseBlockedEndpoints = new CountDownLatch(1)
+    val registrations = new AtomicInteger(0)
+    when(sharedClient.registerBatch(
+      eqTo(7),
+      any[Int],
+      any[String],
+      any[Int],
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenAnswer { invocation =>
+        val host = invocation.getArgument[String](2)
+        val hostIndex = host.stripPrefix("writer-host-").toInt
+        if (hostIndex < 15 && blockedEndpoints.add(host)) {
+          blockedEntrances.countDown()
+          releaseBlockedEndpoints.await(10, TimeUnit.SECONDS)
+        }
+        registrations.incrementAndGet()
+        invocation.getArgument[Seq[(Int, StreamingShuffleClientHandler)]](4)
+          .map { case (writerId, _) => writerId -> transportClient }.toMap
+      }
+    val sessions = (0 until reducerInboxes).map { partitionId =>
+      val inbox = new StreamingShuffleReceiveInbox(
+        StreamingShuffleReceiveInboxId(7, 9, 0, partitionId, -1L),
+        new LinkedBlockingQueue[StreamingShuffleMessage]())
+      new StreamingShufflePreparedReceiveSession(
+        inbox,
+        sharedClient,
+        conf,
+        discovery,
+        clientCreationExecutor,
+        () => ())
+    }
+    try {
+      sessions.foreach(_.start())
+      publishSnapshot.set(true)
+      discovery.writerLocationsAvailable()
+
+      blockedEntrances.await(10, TimeUnit.SECONDS) shouldBe true
+      discovery.stats._1 shouldBe reducerInboxes
+
+      releaseBlockedEndpoints.countDown()
+      eventually(Timeout(10.seconds)) {
+        registrations.get() shouldBe writerExecutors * reducerInboxes
+        discovery.stats._1 shouldBe 0
+      }
+      discovery.routeRegistrationStats shouldBe
+        (writerExecutors.toLong * reducerInboxes, writerExecutors.toLong)
+    } finally {
+      releaseBlockedEndpoints.countDown()
       sessions.foreach(_.close())
       discovery.close()
       clientCreationExecutor.shutdownNow()
