@@ -18,7 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList}
+import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList, TimeoutException, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable
@@ -29,7 +29,8 @@ import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID}
+import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
+  STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.buffer.{ManagedBuffer, NettyManagedBuffer}
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
@@ -102,7 +103,7 @@ private[streaming] object StreamingShuffleExecutorClient {
       (entry.owner, entry.client)
     }.values.foreach { entries =>
       try {
-        entries.head.owner.sendInitialCreditBatch(
+        entries.head.owner.sendAndAwaitInitialCreditBatch(
           entries.map(_.handler).toSeq, entries.head.client)
       } catch {
         case error: Throwable =>
@@ -379,6 +380,12 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   }
   private val clientConf = SparkTransportConf.fromSparkConf(
     conf, "streaming-shuffle-reader-multiplexed", math.max(1, conf.get(EXECUTOR_CORES)), role)
+  private val routeRegistrationTimeoutMs =
+    conf.get(STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT)
+  private val initialCreditWriteTimeoutMs = Option(clientConf.connectionTimeoutMs().toLong)
+    .filter(_ > 0L)
+    .map(math.min(_, routeRegistrationTimeoutMs))
+    .getOrElse(routeRegistrationTimeoutMs)
   private val transportContext = new TransportContext(clientConf, rpcHandler, true, true)
   private val clientFactory: TransportClientFactory = transportContext.createClientFactory()
 
@@ -425,7 +432,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
 
   private def sendInitialCreditBatch(
       handlers: Seq[StreamingShuffleClientHandler],
-      client: TransportClient): Unit = {
+      client: TransportClient): Future[Void] = {
     require(handlers.nonEmpty, "Initial credit batch must not be empty")
     initialCreditWrites.incrementAndGet()
     var buf: CompositeByteBuf = null
@@ -448,6 +455,33 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         })
     } finally {
       if (buf != null) buf.release()
+    }
+  }
+
+  /**
+   * A completed prepared-route future means the discovery frame reached Netty, not just its FIFO.
+   */
+  private def sendAndAwaitInitialCreditBatch(
+      handlers: Seq[StreamingShuffleClientHandler],
+      client: TransportClient): Unit = {
+    val write = sendInitialCreditBatch(handlers, client)
+    try {
+      if (!write.await(initialCreditWriteTimeoutMs, TimeUnit.MILLISECONDS)) {
+        val timeout = new TimeoutException(
+          s"Streaming shuffle initial credit batch did not flush within " +
+            s"$initialCreditWriteTimeoutMs ms")
+        handlers.foreach(_.initialCreditBatchSendFailed(timeout))
+        throw timeout
+      }
+    } catch {
+      case interrupted: InterruptedException =>
+        Thread.currentThread().interrupt()
+        handlers.foreach(_.initialCreditBatchSendFailed(interrupted))
+        throw interrupted
+    }
+    if (!write.isSuccess) {
+      throw Option(write.cause()).getOrElse(
+        new RuntimeException("Unknown initial credit batch send failure"))
     }
   }
 

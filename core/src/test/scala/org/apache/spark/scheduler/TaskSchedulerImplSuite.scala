@@ -2893,6 +2893,54 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "the producer must not launch another task while its two-task window is full")
   }
 
+  test("pipelined task roles use independent fractional CPU slot charges") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.25",
+      config.STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS.key -> "0.5")
+
+    def taskSet(reader: Boolean, producer: Boolean): TaskSet = new TaskSet(
+      Array(new FakeTask(0, 0)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = if (producer) Some(1) else None,
+      isPipelined = reader || producer,
+      isPipelinedShuffleReader = reader,
+      isPipelinedShuffleProducer = producer)
+
+    assert(taskScheduler.taskCpusForTaskSet(
+      taskSet(reader = true, producer = false), BigDecimal(1)) === BigDecimal("0.25"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      taskSet(reader = true, producer = true), BigDecimal(1)) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      taskSet(reader = false, producer = true), BigDecimal(1)) === BigDecimal(1))
+    assert(taskScheduler.taskCpusForTaskSet(
+      taskSet(reader = false, producer = false), BigDecimal(2)) === BigDecimal(2))
+  }
+
+  test("fractional pipelined reader charge leaves executor slots for producers") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.25")
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](8)(i => new FakeTask(0, i)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true)
+    taskScheduler.submitTasks(reader)
+
+    val launched = taskScheduler.resourceOffers(
+      IndexedSeq(new WorkerOffer("executor0", "host0", 1))).flatten
+    assert(launched.length === 4)
+    launched.foreach(task => assert(task.cpus === BigDecimal("0.25")))
+  }
+
   test("prepared receive mode waits only for declared startup shuffle inboxes") {
     val taskScheduler = setupScheduler()
     val inboxes = Seq(

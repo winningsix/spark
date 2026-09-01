@@ -231,6 +231,9 @@ private[spark] class TaskSchedulerImpl(
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
   private val elasticProducerSoleStageMaxTasks =
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
+  private val pipelinedReaderTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
+  private val pipelinedReaderProducerTaskCpus =
+    conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
   private val inboxReadyRevivePending = new AtomicBoolean(false)
 
   private lazy val streamingTrackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
@@ -405,6 +408,18 @@ private[spark] class TaskSchedulerImpl(
     }
     !executorReceiveServiceEnabled || !pureProducer ||
       taskLimit.forall(taskSet.runningTasks < _)
+  }
+
+  private[scheduler] def taskCpusForTaskSet(
+      taskSet: TaskSet,
+      profileTaskCpus: BigDecimal): BigDecimal = {
+    if (taskSet.isPipelinedShuffleReader && taskSet.isPipelinedShuffleProducer) {
+      pipelinedReaderProducerTaskCpus.getOrElse(profileTaskCpus)
+    } else if (taskSet.isPipelinedShuffleReader) {
+      pipelinedReaderTaskCpus.getOrElse(profileTaskCpus)
+    } else {
+      profileTaskCpus
+    }
   }
 
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
@@ -652,7 +667,8 @@ private[spark] class TaskSchedulerImpl(
     // would otherwise re-derive it for every slot.
     val taskSetProf = sc.resourceProfileManager
       .resourceProfileFromId(taskSet.taskSet.resourceProfileId)
-    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
+    val profileTaskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
+    val taskCpus = taskCpusForTaskSet(taskSet.taskSet, profileTaskCpus)
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
     for (i <- shuffledOffers.indices) {
