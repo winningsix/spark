@@ -32,7 +32,7 @@ import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREAD
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
   PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
-  StreamingShuffleReceiveInboxId}
+  StreamingShuffleReceiveInboxId, StreamingShuffleWriterLocationsAvailable}
 import org.apache.spark.util.{RpcUtils, ThreadUtils}
 
 /**
@@ -302,6 +302,9 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
     }.toMap
   }
 
+  /** Drop worker-side snapshots after the driver reports a new writer publication. */
+  def invalidateAvailableShuffleWriterTaskLocations(shuffleIds: Seq[Int]): Unit = {}
+
   /** Whether the driver still owns the shuffle's lifecycle state. */
   def containsShuffle(shuffleId: Int): Boolean
 
@@ -318,7 +321,10 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
 
 private[spark] case class StreamingShuffleInfo(numMaps: Int, numReduces: Int, jobId: Int)
 
-private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
+private[spark] class StreamingShuffleOutputTrackerMaster(
+    conf: SparkConf,
+    writerLocationNotificationDelayMs: Long =
+      StreamingShuffleOutputTrackerMaster.WRITER_LOCATION_NOTIFICATION_DELAY_MS)
   extends StreamingShuffleOutputTracker(conf) with ShuffleOutputTrackerMaster {
 
   // map that stores task location information organized in the following fashion
@@ -335,6 +341,21 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     ConcurrentHashMap.newKeySet[(String, StreamingShuffleReceiveInboxId)]()
   @volatile private var inboxReadyCallback: () => Unit = () => ()
 
+  // Writer tasks publish independently, but all publications in one launch wave target the same
+  // small set of executors with prepared inboxes. Notify each executor once per short window and
+  // let it fetch the authoritative batched snapshot; do not broadcast the location payload once
+  // per reducer inbox.
+  private val writerLocationNotificationLock = new Object
+  private val pendingWriterLocationNotifications =
+    mutable.HashMap.empty[String, mutable.HashSet[Int]]
+  private val writerLocationNotificationExecutor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+      "streaming-shuffle-writer-location-notifier")
+  private var writerLocationNotificationScheduled = false
+  private var writerLocationNotifierStopped = false
+  private var writerLocationNotificationShuffles = 0L
+  private var writerLocationNotificationMessages = 0L
+
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
 
@@ -349,6 +370,57 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     }
     pool
   }
+
+  private def queueWriterLocationNotification(shuffleId: Int): Unit = {
+    val executorIds = receiveInboxStateLock.synchronized {
+      preparedReceiveInboxes.asScala.iterator.collect {
+        case (executorId, id) if id.shuffleId == shuffleId => executorId
+      }.toSet
+    }
+    if (executorIds.nonEmpty) writerLocationNotificationLock.synchronized {
+      if (!writerLocationNotifierStopped) {
+        executorIds.foreach { executorId =>
+          pendingWriterLocationNotifications
+            .getOrElseUpdate(executorId, mutable.HashSet.empty) += shuffleId
+        }
+        if (!writerLocationNotificationScheduled) {
+          writerLocationNotificationScheduled = true
+          writerLocationNotificationExecutor.schedule(
+            new Runnable {
+              override def run(): Unit = flushPendingWriterLocationNotifications()
+            },
+            writerLocationNotificationDelayMs,
+            TimeUnit.MILLISECONDS)
+        }
+      }
+    }
+  }
+
+  private[spark] def flushPendingWriterLocationNotifications(): Unit = {
+    val notifications = writerLocationNotificationLock.synchronized {
+      writerLocationNotificationScheduled = false
+      val ready = pendingWriterLocationNotifications.iterator.map { case (executorId, shuffleIds) =>
+        executorId -> shuffleIds.toSeq.sorted
+      }.toSeq
+      pendingWriterLocationNotifications.clear()
+      ready
+    }
+    notifications.foreach { case (executorId, shuffleIds) =>
+      Option(receiveEndpoints.get(executorId)).foreach { endpoint =>
+        endpoint.send(StreamingShuffleWriterLocationsAvailable(shuffleIds))
+        writerLocationNotificationLock.synchronized {
+          writerLocationNotificationShuffles += shuffleIds.size
+          writerLocationNotificationMessages += 1L
+        }
+      }
+    }
+  }
+
+  private[spark] def writerLocationNotificationStats: (Long, Long) =
+    writerLocationNotificationLock.synchronized {
+      writerLocationNotificationShuffles -> writerLocationNotificationMessages
+    }
+
   override def registerShuffle(shuffleId: Int, numMaps: Int, numReduces: Int, jobId: Int): Unit = {
     logInfo(log"Registering shuffleId ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} with ${
       MDC(LogKeys.NUM_MAPPERS, numMaps)} mappers and ${
@@ -668,6 +740,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
         log"Shuffle ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} was unregistered " +
           log"during registration of writer task ${MDC(LogKeys.MAP_ID, mapId)}")
     }
+    if (registered) queueWriterLocationNotification(shuffleId)
     registered
   }
 
@@ -694,6 +767,22 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   }
 
   override def stop(): Unit = {
+    val stopWriterLocationNotifier = writerLocationNotificationLock.synchronized {
+      if (writerLocationNotifierStopped) {
+        false
+      } else {
+        writerLocationNotifierStopped = true
+        true
+      }
+    }
+    if (stopWriterLocationNotifier) {
+      flushPendingWriterLocationNotifications()
+      writerLocationNotificationExecutor.shutdownNow()
+      writerLocationNotificationExecutor.awaitTermination(10, TimeUnit.SECONDS)
+      val (shuffles, messages) = writerLocationNotificationStats
+      logInfo(log"Sent ${MDC(LogKeys.COUNT, messages)} executor messages carrying " +
+        log"${MDC(LogKeys.SHUFFLE_IDS, shuffles)} streaming shuffle location notifications")
+    }
     trackerMasterMessages.offer(PoisonPill)
     threadpool.shutdown()
     if (trackerEndpoint != null) {
@@ -878,6 +967,20 @@ private[spark] class StreamingShuffleOutputTrackerWorker(
     }.toMap
   }
 
+  override def invalidateAvailableShuffleWriterTaskLocations(shuffleIds: Seq[Int]): Unit = {
+    val distinctShuffleIds = shuffleIds.distinct.sorted
+
+    def invalidateUnderLocks(remainingLocks: List[Object]): Unit = remainingLocks match {
+      case lock :: tail => lock.synchronized(invalidateUnderLocks(tail))
+      case Nil => distinctShuffleIds.foreach(availableLocationCache.remove)
+    }
+
+    val locks = distinctShuffleIds.map { shuffleId =>
+      availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
+    }.toList
+    invalidateUnderLocks(locks)
+  }
+
   override def containsShuffle(shuffleId: Int): Boolean = {
     askTracker[Boolean](IsStreamingShuffleRegistered(shuffleId))
   }
@@ -922,6 +1025,10 @@ private[spark] class StreamingShuffleOutputTrackerWorker(
 
 private[spark] object StreamingShuffleOutputTrackerWorker {
   private[spark] val INBOX_DRAIN_READY_ACK_DELAY_MS = 1L
+}
+
+private[spark] object StreamingShuffleOutputTrackerMaster {
+  private[spark] val WRITER_LOCATION_NOTIFICATION_DELAY_MS = 1L
 }
 
 private[spark] object StreamingShuffleOutputTracker extends Logging {

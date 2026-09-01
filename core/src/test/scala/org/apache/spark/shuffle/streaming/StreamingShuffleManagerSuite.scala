@@ -233,6 +233,49 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("writer-location notification wakes discovery before the periodic refresh") {
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
+    val initialPoll = new CountDownLatch(1)
+    val ready = new CountDownLatch(1)
+    val publishSnapshot = new AtomicBoolean(false)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(
+      conf,
+      shuffleIds => {
+        initialPoll.countDown()
+        if (publishSnapshot.get()) {
+          shuffleIds.map(_ -> ShuffleLocationResponse(Map.empty, 0)).toMap
+        } else {
+          Map.empty
+        }
+      })
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(1, "prepared-discovery-push-test-client")
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox,
+      mock[StreamingShuffleExecutorClient],
+      conf,
+      discovery,
+      clientCreationExecutor,
+      () => ready.countDown())
+    try {
+      session.start()
+      initialPoll.await(10, TimeUnit.SECONDS) shouldBe true
+      publishSnapshot.set(true)
+
+      discovery.writerLocationsAvailable()
+
+      ready.await(10, TimeUnit.SECONDS) shouldBe true
+      discovery.stats._3 shouldBe 2L
+    } finally {
+      session.close()
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
   test("prepared session unregisters a route that completes after inbox close") {
     val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
     val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
