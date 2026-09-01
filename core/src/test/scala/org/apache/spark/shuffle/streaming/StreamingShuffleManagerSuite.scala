@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.collection.mutable
 
 import io.netty.buffer.Unpooled
+import io.netty.channel.ChannelOption
 import org.mockito.ArgumentMatchers.{any, eq => eqTo}
 import org.mockito.Mockito.{verify, when}
 import org.scalatest.concurrent.Eventually.eventually
@@ -37,6 +38,7 @@ import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
+  STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
@@ -567,7 +569,9 @@ class StreamingShuffleManagerSuite
   }
 
   test("prepared routes coalesce idle credit repairs on one physical lane") {
-    withSpark(new SparkContext("local", "prepared-credit-repair-batch", new SparkConf())) { _ =>
+    val socketBufferSize = 128 << 10
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE, socketBufferSize)
+    withSpark(new SparkContext("local", "prepared-credit-repair-batch", conf)) { _ =>
       val server = new StreamingShuffleExecutorServer()
       val client = new StreamingShuffleExecutorClient()
       val readerHandlers = (0 until 9).map { writerId =>
@@ -600,6 +604,10 @@ class StreamingShuffleManagerSuite
             handler.clientsFor(0).size shouldBe 1
           }
         }
+        val sharedLane = writerHandlers.head._2.clientsFor(0).head
+        // Linux commonly reports twice the requested value after applying its socket accounting.
+        sharedLane.getChannel.config.getOption(ChannelOption.SO_RCVBUF).intValue() should be >=
+          socketBufferSize
 
         client.repairCreditWindows(readerHandlers.map { case (writerId, handler) =>
           routeClients(writerId) -> handler

@@ -443,8 +443,13 @@ class StreamingShuffleWriter[K, V](
     // client may be accessed from other threads via cancel(); @volatile to be safe.
     @volatile private var client: Either[TransportClient, CompletableFuture[TransportClient]] =
       Right(transportServerHandler.futureClients(id).thenApply(c => {
-        c.getChannel.config.setOption(ChannelOption.SO_SNDBUF, SEND_BUFFER_SIZE)
-        c.getChannel.config.setOption(ChannelOption.SO_RCVBUF, RECV_BUFFER_SIZE)
+        if (sharedExecutorServer.isEmpty) {
+          // Dedicated community connections carry one route's tiny reverse control stream. The
+          // executor-shared endpoint configures its aggregate physical lane when the channel is
+          // accepted; never shrink that multiplexed receive window back to the legacy 512 bytes.
+          c.getChannel.config.setOption(ChannelOption.SO_SNDBUF, SEND_BUFFER_SIZE)
+          c.getChannel.config.setOption(ChannelOption.SO_RCVBUF, RECV_BUFFER_SIZE)
+        }
         c
       }))
     val buffer: AtomicReference[TimestampedBuffer] = new AtomicReference(null)
