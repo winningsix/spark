@@ -8157,6 +8157,36 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("pipelined shuffle: TaskSet identifies an operator's startup input") {
+    val streamedProducer = new MyRDD(sc, 2, Nil)
+    val buildProducer = new MyRDD(sc, 2, Nil)
+    val streamedDep = new PipelinedShuffleDependency(
+      streamedProducer, new HashPartitioner(2))
+    val buildDep = new PipelinedShuffleDependency(buildProducer, new HashPartitioner(2))
+    val streamedInput = new MyRDD(sc, 2, List(streamedDep), tracker = mapOutputTracker)
+    val buildInput = new MyRDD(sc, 2, List(buildDep), tracker = mapOutputTracker)
+    val resultRdd = new MyRDD(
+      sc,
+      2,
+      List(new OneToOneDependency(streamedInput), new OneToOneDependency(buildInput)),
+      tracker = mapOutputTracker)
+      .setPipelinedStartupInputs(Seq(buildInput))
+
+    submit(resultRdd, Array(0, 1))
+    assert(taskSets.size === 3)
+    val readerTaskSet = taskSets.find(_.isPipelinedShuffleReader).get
+    assert(readerTaskSet.pipelinedReaderShuffleIds.toSet ===
+      Set(streamedDep.shuffleId, buildDep.shuffleId))
+    assert(readerTaskSet.pipelinedReaderStartupShuffleIds === Set(buildDep.shuffleId))
+
+    taskSets.filter(_.shuffleId.nonEmpty).foreach { producerTaskSet =>
+      completeShuffleMapStageSuccessfully(producerTaskSet.stageId, 0, 2)
+    }
+    complete(readerTaskSet, Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
+
   // Resource-profile rejection. The gang slot check measures capacity against the DEFAULT
   // resource profile, so the whole group must run on the default profile; any member with an
   // explicit non-default profile is rejected. The three shapes below must all be rejected; the

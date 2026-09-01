@@ -1449,6 +1449,16 @@ private[spark] class DAGScheduler(
     }
   }
 
+  /** Pipelined inputs that an operator in this stage must consume before other inputs. */
+  private def pipelinedStartupShuffleIdsReadByStage(rdd: RDD[_]): Set[Int] = {
+    val startupInputRoots = new HashSet[RDD[_]]
+    traverseParentRDDsWithinStage(rdd, { current =>
+      startupInputRoots ++= current.pipelinedStartupInputs
+      true
+    })
+    startupInputRoots.iterator.flatMap(pipelinedShuffleIdsReadByStage).toSet
+  }
+
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
   private def eagerlyComputePartitionsForRddAndAncestors(rdd: RDD[_]): Unit = {
     val startTime = System.nanoTime
@@ -3155,12 +3165,18 @@ private[spark] class DAGScheduler(
       } else {
         Seq.empty
       }
+      val pipelinedReaderStartupShuffleIds = if (pipelinedReaderShuffleIds.nonEmpty) {
+        pipelinedStartupShuffleIdsReadByStage(stage.rdd)
+      } else {
+        Set.empty[Int]
+      }
       val isPipelinedShuffleProducer = isPipelinedProducer(stage)
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
         stage.resourceProfileId, shuffleId, isPipelined = isPipelined,
         isPipelinedShuffleReader = pipelinedReaderShuffleIds.nonEmpty,
         pipelinedReaderShuffleIds = pipelinedReaderShuffleIds,
+        pipelinedReaderStartupShuffleIds = pipelinedReaderStartupShuffleIds,
         isPipelinedShuffleProducer = isPipelinedShuffleProducer))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark

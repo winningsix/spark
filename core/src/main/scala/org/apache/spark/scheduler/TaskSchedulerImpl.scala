@@ -317,7 +317,8 @@ private[spark] class TaskSchedulerImpl(
     streamingTrackerMaster.foreach { tracker =>
       preTaskReaderAssignments.foreach { case (key, assignment) =>
         managersByStage.get((key.stageId, key.stageAttemptId)).foreach { manager =>
-          if (manager.isTaskPendingForOffer(key.taskIndex) && assignment.inboxes.forall {
+          val requiredInboxes = requiredPreTaskReaderInboxes(manager.taskSet, assignment.inboxes)
+          if (manager.isTaskPendingForOffer(key.taskIndex) && requiredInboxes.forall {
               tracker.isReceiveInboxDrainReady(assignment.executorId, _)
             }) {
             offerReadyPreTaskReaderIndices.getOrElseUpdate(
@@ -327,6 +328,17 @@ private[spark] class TaskSchedulerImpl(
         }
       }
     }
+  }
+
+  private[scheduler] def requiredPreTaskReaderInboxes(
+      taskSet: TaskSet,
+      inboxes: Seq[StreamingShuffleReceiveInboxId]): Seq[StreamingShuffleReceiveInboxId] = {
+    val startupInboxes = inboxes.filter { inbox =>
+      taskSet.pipelinedReaderStartupShuffleIds.contains(inbox.shuffleId)
+    }
+    // An explicit startup set is useful only when it resolves to one of this task's inboxes.
+    // Otherwise retain the all-input gate, including for non-SQL RDD consumers.
+    if (startupInboxes.nonEmpty) startupInboxes else inboxes
   }
 
   private def preTaskReaderIndexAllowed(

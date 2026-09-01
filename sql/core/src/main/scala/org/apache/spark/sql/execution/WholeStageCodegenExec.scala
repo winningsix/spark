@@ -770,10 +770,13 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
     // but the output must be rows.
     val rdds = child.asInstanceOf[CodegenSupport].inputRDDs()
     assert(rdds.size <= 2, "Up to two input RDDs can be supported")
+    val pipelinedStartupRDDs = child.collect {
+      case join: ShuffledHashJoinExec => join.pipelinedBuildInputRDD()
+    }
     val cleanedSourceOpt = tryBroadcastCleanedSource(cleanedSource)
     val evaluatorFactory = new WholeStageCodegenEvaluatorFactory(
       cleanedSourceOpt, durationMs, references)
-    if (rdds.length == 1) {
+    val outputRDD = if (rdds.length == 1) {
       if (conf.usePartitionEvaluator) {
         rdds.head.mapPartitionsWithEvaluator(evaluatorFactory)
       } else {
@@ -797,6 +800,7 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
         }
       }
     }
+    outputRDD.setPipelinedStartupInputs(pipelinedStartupRDDs)
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {

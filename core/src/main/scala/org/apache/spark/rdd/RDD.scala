@@ -151,6 +151,19 @@ abstract class RDD[T: ClassTag](
   /** A friendly name for this RDD */
   @transient var name: String = _
 
+  // Driver-only execution metadata for a pipelined-shuffle consumer. Operators that must consume
+  // one input before they can make progress on the others (for example, ShuffledHashJoin's build
+  // side) attach those input roots here. DAGScheduler translates the roots to shuffle ids before
+  // task serialization; the field is transient so it never changes executor-side RDD behavior.
+  @transient private var _pipelinedStartupInputs: Seq[RDD[_]] = Seq.empty
+
+  private[spark] def setPipelinedStartupInputs(inputs: Seq[RDD[_]]): this.type = {
+    _pipelinedStartupInputs = inputs
+    this
+  }
+
+  private[spark] def pipelinedStartupInputs: Seq[RDD[_]] = _pipelinedStartupInputs
+
   /** Assign a name to this RDD */
   def setName(_name: String): this.type = {
     name = _name
