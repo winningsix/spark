@@ -2866,4 +2866,30 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskScheduler.outstandingTasksForOtherWorkInProfile(defaultRp, Set(0)) === 0)
   }
 
+  test("prepared receive mode bounds each pure producer stage by its elastic window") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2")
+    val tasks = Array.tabulate[Task[_]](4)(i => new FakeTask(0, i))
+    val producer = new TaskSet(
+      tasks,
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    taskScheduler.submitTasks(producer)
+
+    val offers = (0 until 4).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    val launched = taskScheduler.resourceOffers(offers).flatten
+    assert(launched.length === 2)
+    assert(taskScheduler.resourceOffers(offers).flatten.isEmpty,
+      "the producer must not launch another task while its two-task window is full")
+  }
+
 }

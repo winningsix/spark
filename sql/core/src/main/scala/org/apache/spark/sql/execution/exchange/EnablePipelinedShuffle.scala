@@ -17,24 +17,26 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.execution.joins.CartesianProductExec
 
 /**
  * Opt-in (SPARK-57399). Rewrites EVERY [[ShuffleExchangeExec]] in a
- * batch physical plan to `pipelined = true`, so each shuffle is served by the in-process
- * pipelined channel manager and the concurrent-stage scheduler runs the map and reduce stages
- * together. This is the minimal SQL entry point that lets a batch query exercise the
- * pipelined channel execution path; a production version would be a targeted,
+ * batch physical plan to `pipelined = true`, so each shuffle is served by the configured
+ * pipelined shuffle manager and the concurrent-stage scheduler runs the map and reduce stages
+ * together. This is the minimal SQL entry point that lets a batch query exercise a
+ * pipelined execution path; a production version would be a targeted,
  * cost/shape-aware replacement rather than a blanket rewrite.
  *
  * Enabled only when `spark.sql.shuffle.localPipelined.enabled=true`. It runs in the non-AQE
  * `preparations` list, so it also requires AQE to be off (under AQE the plan is hidden behind
  * an opaque `AdaptiveSparkPlanExec` leaf and this rule sees no exchanges).
  *
- * Rewriting ALL shuffles (not just hash-partitioning ones) keeps the job all-pipelined, which
- * the DAGScheduler requires: a mix of pipelined and regular shuffles in one job is rejected.
+ * Rewriting ALL visible shuffles (not just hash-partitioning ones) keeps the job all-pipelined.
+ * A manager with executor-owned prepared inboxes may additionally support a hidden regular
+ * boundary above the pipeline; other unmaterialized mixed shapes are rejected by DAGScheduler.
  * SinglePartition and RangePartitioning exchanges pipeline fine -- the channel transport only
  * routes by `partitioner.getPartition(key)` and does not care which partitioning produced the
  * id (SinglePartition is the numPartitions == 1 degenerate case).
@@ -45,8 +47,8 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
  *   - an UNSUPPORTED CONSUMER reading a shuffle (see [[readsShuffleThroughUnsupportedConsumer]]):
  *     an operator that would drain a shuffle in a way the channel transport cannot serve, or that
  *     builds its own hidden regular shuffle. If such an operator sits above any shuffle the rule
- *     leaves the WHOLE plan regular (leaving only that one exchange regular would put a pipelined
- *     exchange below a regular boundary, which the scheduler rejects -- so it is all-or-nothing).
+ *     leaves the WHOLE plan regular unless the configured manager explicitly supports the hidden
+ *     regular boundary above a pipeline.
  *     The query runs correctly, just not pipelined. The unsupported consumers are:
  *       - `CoalesceExec` (user `.coalesce(n)`): its `CoalescedRDD` makes ONE reduce task drain
  *         SEVERAL reduce partitions sequentially. The single-threaded writer parks on a full
@@ -63,16 +65,17 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
  *         hidden regular (`pipelined = false`) shuffle inside `doExecute` via
  *         `prepareShuffleDependency`, invisible to this plan walk. A flipped exchange below one of
  *         them would sit under that unmaterialized regular boundary and the job would hard-fail at
- *         submission (`classifyJobShuffleShape`'s pipelined-below-regular rejection). (`.collect()`
+ *         submission unless the manager supports executor-owned prepared receive. (`.collect()`
  *         on a limit takes `executeTake` and never hits `doExecute`; `.write` / `.toLocalIterator`
  *         / a non-root position do.)
  */
 case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    // Shared environment gate (opt-in flag, single-executor local mode, channel manager active),
+    // Shared environment gate (opt-in flag and manager-specific deployment requirements),
     // identical to the AQE rule's -- see PipelinedShuffleEligibility for why it is a correctness
-    // gate. It also requires AQE off implicitly: under AQE this rule sees no exchanges.
+    // gate. Under normal query preparation AQE hides the exchanges from this rule; AQE full-plan
+    // mode also invokes it directly after the adaptive plan is visible.
     if (!PipelinedShuffleEligibility.enabled(plan, conf)) return plan
 
     val shuffles = plan.collect { case s: ShuffleExchangeExec => s }
@@ -98,11 +101,13 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
       return plan
     }
 
-    // An operator that would read a shuffle in a way the channel transport cannot serve, or that
+    // An operator that would read a shuffle in a way the configured transport cannot serve, or that
     // builds its own hidden regular shuffle, forces the whole plan regular (see class doc). Like
     // the reuse fallback this is a normal, expected outcome, so log at DEBUG rather than WARN.
-    if (readsShuffleThroughUnsupportedConsumer(plan)) {
-      logDebug("EnablePipelinedShuffle: a shuffle is read through an operator the channel " +
+    val supportsUnmaterializedRegularBoundary =
+      SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
+    if (readsShuffleThroughUnsupportedConsumer(plan, supportsUnmaterializedRegularBoundary)) {
+      logDebug("EnablePipelinedShuffle: a shuffle is read through an operator the configured " +
         "transport cannot serve (coalesce / cartesian product / a limit operator that builds a " +
         "hidden shuffle); leaving the plan regular.")
       return plan
@@ -114,11 +119,12 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
   }
 
   /**
-   * True if any [[ShuffleExchangeExec]] in `plan` is read by an operator the channel transport
+   * True if any [[ShuffleExchangeExec]] in `plan` is read by an operator the configured transport
    * cannot serve. The unsupported operators (see class doc for why each is fatal) are
-   * `CoalesceExec`, `CartesianProductExec`, and the limit operators `CollectLimitExec` /
-   * `CollectTailExec` / `TakeOrderedAndProjectExec`. For each such operator anywhere in the plan,
-   * check whether a shuffle is reachable below it.
+   * `CoalesceExec`, `CartesianProductExec`, and, when the manager cannot prepare a regular
+   * boundary above a pipeline, the limit operators `CollectLimitExec` / `CollectTailExec` /
+   * `TakeOrderedAndProjectExec`. For each such operator anywhere in the plan, check whether a
+   * shuffle is reachable below it.
    *
    * The reachability walk descends through EVERY child of a non-exchange node -- not only unary
    * children -- so a shuffle behind a `UnionExec`/join (a `BinaryExecNode`) beneath the operator
@@ -126,14 +132,17 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
    * than that first one is not read by this operator (the intervening exchange's own reader reads
    * one reduce partition per task), so it is not this operator's concern.
    */
-  private def readsShuffleThroughUnsupportedConsumer(plan: SparkPlan): Boolean = {
+  private def readsShuffleThroughUnsupportedConsumer(
+      plan: SparkPlan,
+      supportsUnmaterializedRegularBoundary: Boolean): Boolean = {
     def reachesShuffle(p: SparkPlan): Boolean = p match {
       case _: ShuffleExchangeExec => true
       case other => other.children.exists(reachesShuffle)
     }
     def isUnsupportedConsumer(p: SparkPlan): Boolean = p match {
-      case _: CoalesceExec | _: CartesianProductExec |
-          _: CollectLimitExec | _: CollectTailExec | _: TakeOrderedAndProjectExec => true
+      case _: CoalesceExec | _: CartesianProductExec => true
+      case _: CollectLimitExec | _: CollectTailExec | _: TakeOrderedAndProjectExec =>
+        !supportsUnmaterializedRegularBoundary
       case _ => false
     }
     plan.exists {

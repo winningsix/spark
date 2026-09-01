@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 
 import org.apache.spark.internal.SparkLogger;
 import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.client.MergedBlockMetaResponseCallback;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.StreamCallbackWithID;
@@ -101,6 +102,16 @@ public abstract class RpcHandler {
    */
   public void receive(TransportClient client, ByteBuffer message) {
     receive(client, message, ONE_WAY_CALLBACK);
+  }
+
+  /**
+   * Receives a one-way RPC while preserving access to the transport's managed buffer.
+   *
+   * The default implementation keeps the existing ByteBuffer API behavior. Handlers that need to
+   * consume the message asynchronously may override this method and retain the managed buffer.
+   */
+  public void receive(TransportClient client, ManagedBuffer message) throws Exception {
+    receive(client, message.nioByteBuffer());
   }
 
   public MergedBlockMetaReqHandler getMergedBlockMetaReqHandler() {

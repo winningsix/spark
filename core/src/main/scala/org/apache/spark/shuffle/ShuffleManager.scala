@@ -131,6 +131,35 @@ private[spark] trait BlockingShuffleManager extends ShuffleManager {
  */
 private[spark] trait PipelinedShuffleManager extends ShuffleManager {
   /**
+   * Whether this transport can only connect producers and consumers in the same JVM. SQL uses
+   * this capability to reject cluster-mode plans before task submission. Distributed transports
+   * return false (the default); an in-process channel manager overrides it to true.
+   */
+  def requiresSingleExecutor: Boolean = false
+
+  /**
+   * Whether every task in a connected pipelined stage group must fit in the cluster at once.
+   * In-process transports need this because a producer can block while holding its task slot.
+   * A distributed transport with executor-owned receive inboxes can admit the group elastically:
+   * data starts draining before the reader task is attached, and a ready reader is prioritized.
+   */
+  def requiresWholeGroupSlotAdmission: Boolean = true
+
+  /**
+   * Whether a regular shuffle-map stage may consume a pipelined boundary below it. Executor-owned
+   * receive inboxes make this safe by decoupling network progress from reader task residency. It
+   * does not permit a pipelined suffix to start before an unrelated regular prefix materializes.
+   */
+  def supportsUnmaterializedRegularBoundary: Boolean = false
+
+  /**
+   * Whether completed writers retain a bounded generation for a second sequential consumer.
+   * The distributed streaming transport uses this for RangePartitioner sampling. The local
+   * channel instead reruns the producer with a fresh epoch and must keep this disabled.
+   */
+  def supportsSequentialReplay: Boolean = false
+
+  /**
    * Whether this manager relies on a `StreamingShuffleOutputTracker` to discover writer task
    * locations. The RPC streaming transport needs it (writers publish their host/port; readers
    * look them up to open connections). An in-process transport that finds writer and reader
@@ -178,4 +207,3 @@ private[spark] object ShuffleManager {
     shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
   }
 }
-

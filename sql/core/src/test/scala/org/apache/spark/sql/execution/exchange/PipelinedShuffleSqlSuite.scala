@@ -64,6 +64,37 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
     }
   }
 
+  private def withDistributedPipelinedSession(body: SparkSession => Unit): Unit = {
+    SparkSession.getActiveSession.orElse(SparkSession.getDefaultSession).foreach(_.stop())
+    SparkSession.clearActiveSession()
+    SparkSession.clearDefaultSession()
+    val spark = SparkSession.builder()
+      .master("local-cluster[2,2,1024]")
+      .appName("distributed-pipelined-shuffle-sql")
+      .config("spark.shuffle.manager.incremental",
+        "org.apache.spark.shuffle.streaming.StreamingShuffleManager")
+      .config("spark.shuffle.streaming.executorReceiveService.enabled", "true")
+      .config("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
+      .config("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
+      .config("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
+      .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
+      .config("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
+      .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
+      .config("spark.sql.adaptive.enabled", "false")
+      .config("spark.sql.pipelinedShuffle.enabled", "true")
+      .config("spark.sql.shuffle.partitions", "2")
+      .config("spark.speculation", "false")
+      .config("spark.ui.enabled", "false")
+      .getOrCreate()
+    try {
+      body(spark)
+    } finally {
+      spark.stop()
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+    }
+  }
+
   test("batch repartition($k) runs end-to-end through the pipelined channel shuffle") {
     withPipelinedSession { spark =>
       import spark.implicits._
@@ -170,6 +201,27 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
           assert(max1 <= min2, s"partitions $p1 and $p2 overlap: max($p1)=$max1 > min($p2)=$min2")
         case _ =>
       }
+    }
+  }
+
+  test("distributed prepared receive replays hash input for a range exchange") {
+    withDistributedPipelinedSession { spark =>
+      import spark.implicits._
+      val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
+        .groupBy($"k").count().orderBy($"k")
+
+      val rows = df.as[(Long, Long)].collect().toSeq
+      val expected = (0L until 1000L).groupBy(_ % 7).map { case (key, values) =>
+        (key, values.size.toLong)
+      }.toSeq.sortBy(_._1)
+      val exchanges = collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined))
+      assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows === expected)
     }
   }
 

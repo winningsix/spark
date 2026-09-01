@@ -326,6 +326,52 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   // this, ShuffleWriteProcessor.write would reach the push path and dereference the incremental
   // manager's shuffleBlockResolver, which the streaming manager does not support.
   setShuffleMergeAllowed(false)
+
+  /**
+   * Whether this dependency is consumed by an internal preparation pass before its real consumer.
+   * Range partitioning is the current example: RangePartitioner samples the child in one Spark
+   * job and the range exchange consumes the same child in a later job. Such a dependency needs a
+   * bounded replay lease instead of being treated as an ordinary once-through shuffle.
+   */
+  private[spark] var replayableForInternalConsumer = false
+  @transient private var replayLeaseAvailable = false
+
+  // The route contract travels with the shuffle task to executors. Result stages may consume only
+  // a prefix of the reduce partitions, while sibling consumers may require more than one route.
+  private[spark] var configuredExpectedReaderRoutes: Array[Int] = null
+
+  private[spark] def setExpectedReaderRoutes(routes: Array[Int]): Unit = synchronized {
+    require(routes.length == partitioner.numPartitions,
+      s"Expected reader route count has ${routes.length} entries, but shuffle " +
+        s"${shuffleId} has ${partitioner.numPartitions} reduce partitions")
+    configuredExpectedReaderRoutes = routes.clone()
+  }
+
+  private[spark] def expectedReaderRoutes: Array[Int] = synchronized {
+    if (configuredExpectedReaderRoutes == null) {
+      Array.fill(partitioner.numPartitions)(1)
+    } else {
+      configuredExpectedReaderRoutes.clone()
+    }
+  }
+
+  private[spark] def markReplayLeaseAvailable(): Unit = synchronized {
+    replayableForInternalConsumer = true
+    replayLeaseAvailable = true
+  }
+
+  private[spark] def isReplayLeaseAvailable: Boolean = synchronized {
+    replayLeaseAvailable
+  }
+
+  private[spark] def consumeReplayLease(): Boolean = synchronized {
+    if (replayLeaseAvailable) {
+      replayLeaseAvailable = false
+      true
+    } else {
+      false
+    }
+  }
 }
 
 

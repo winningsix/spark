@@ -17,10 +17,12 @@
 
 package org.apache.spark.sql.execution.adaptive
 
+import org.apache.spark.SparkEnv
+import org.apache.spark.internal.config
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{SparkPlan, UnionExec}
+import org.apache.spark.sql.execution.{SparkPlan, TakeOrderedAndProjectExec, UnionExec}
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.joins.SortMergeJoinExec
 import org.apache.spark.sql.test.SharedSparkSession
@@ -101,6 +103,66 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       }
       assert(blockedExchanges == Seq(false),
         s"the join-input twin must stay regular; plan:\n$flipped")
+    }
+  }
+
+  test("full-plan mode changes exchange transport without changing the join operator") {
+    withSQLConf(
+        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true",
+        "spark.sql.exchange.reuse" -> "false") {
+      import testImplicits._
+      val left = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val right = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val leftExchange = ShuffleExchangeExec(HashPartitioning(left.output, 4), left)
+      val rightExchange = ShuffleExchangeExec(HashPartitioning(right.output, 4), right)
+      val join = SortMergeJoinExec(
+        left.output, right.output, Inner, None, leftExchange, rightExchange)
+
+      val rewritten = AQEEnablePipelinedShuffle().apply(join)
+      assert(rewritten.isInstanceOf[SortMergeJoinExec])
+      assert(exchangesWithPipelined(rewritten) === Seq(true, true))
+    }
+  }
+
+  test("prepared receive mode pipelines below a limit's hidden regular boundary") {
+    val previousEnabled = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+    val previousBatching = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+    val previousQueue = SparkEnv.get.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+    val previousSharedConnections = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+    val previousSharedServer = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    try {
+      withSQLConf(
+          "spark.sql.pipelinedShuffle.enabled" -> "true",
+          "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+        import testImplicits._
+        val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+        val exchange = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+        val limit = TakeOrderedAndProjectExec(1, Nil, exchange.output, exchange)
+
+        val rewritten = AQEEnablePipelinedShuffle().apply(limit)
+        assert(rewritten.isInstanceOf[TakeOrderedAndProjectExec])
+        assert(exchangesWithPipelined(rewritten) === Seq(true))
+      }
+    } finally {
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+      SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, previousSharedConnections)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
     }
   }
 }

@@ -1,0 +1,257 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.shuffle.streaming
+
+import java.nio.ByteBuffer
+import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, Semaphore}
+import java.util.concurrent.atomic.AtomicLong
+
+import io.netty.buffer.{ByteBuf, Unpooled}
+
+import org.apache.spark.{SparkContext, SparkEnv}
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
+  STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
+  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS}
+import org.apache.spark.network.TransportContext
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
+import org.apache.spark.network.netty.SparkTransportConf
+import org.apache.spark.network.server.{RpcHandler, StreamManager, TransportServer}
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, StreamingShuffleMessage,
+  TerminationAckMessage}
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
+
+/** Executor-scoped transport listener that multiplexes reader control messages to map writers. */
+private[streaming] class StreamingShuffleExecutorServer extends Logging {
+  private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
+
+  private def key(shuffleId: Int, writerId: Int): Long =
+    (shuffleId.toLong << 32) | (writerId.toLong & 0xffffffffL)
+
+  private[streaming] def handleControlBody(client: TransportClient, buf: ByteBuf): Unit = {
+    // One transport body may contain discovery frames for many logical map -> reduce routes.
+    // Decoding only the first frame silently strands every later route in a batched body.
+    while (buf.isReadable) {
+      val decoded = StreamingShuffleMessage.decode(buf)
+      val route = decoded match {
+        case credit: CreditControlMessage => (credit.shuffleId, credit.shuffleWriterId)
+        case ack: TerminationAckMessage => (ack.shuffleId, ack.shuffleWriterId)
+        case other =>
+          throw new IllegalArgumentException(
+            s"Unexpected message type in shared shuffle server: ${other.messageType()}")
+      }
+      val handler = handlers.get(key(route._1, route._2))
+      if (handler == null) {
+        // A shared physical reader connection may flush a final credit or termination ACK after
+        // the corresponding map task has already unregistered its writer. This is a normal
+        // late-message race during relaxed cleanup.
+        logDebug(
+          s"Ignoring late streaming shuffle control message for shuffle ${route._1}, " +
+            s"writer ${route._2}")
+      } else {
+        handler.handleMessage(client, decoded)
+      }
+    }
+  }
+
+  private val rpcHandler = new RpcHandler {
+    override def receive(
+        client: TransportClient,
+        message: ByteBuffer,
+        callback: RpcResponseCallback): Unit = {
+      var buf: ByteBuf = null
+      try {
+        buf = Unpooled.wrappedBuffer(message)
+        handleControlBody(client, buf)
+      } catch {
+        case e: Throwable => logError("Shared streaming shuffle server failed to route message", e)
+      } finally {
+        if (buf != null) buf.release()
+      }
+    }
+
+    override def getStreamManager: StreamManager = null
+  }
+
+  private val conf = SparkEnv.get.conf
+  private val role = conf.get(EXECUTOR_ID).map { id =>
+    if (SparkContext.isDriver(id)) "driver" else "executor"
+  }
+  private val transportConf = SparkTransportConf.fromSparkConf(
+    conf,
+    "streaming-shuffle-writer-shared",
+    conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS),
+    role)
+  private val transportContext = new TransportContext(transportConf, rpcHandler)
+  private[streaming] val server: TransportServer = transportContext.createServer()
+
+  // Route drains used to run in ForkJoinPool.commonPool from every map writer. The common pool is
+  // sized from all processors visible to the JVM rather than this Spark executor's core grant, so
+  // many small executor JVMs on one host collectively created thousands of competing drain
+  // workers. Own the dispatcher at the same executor scope as the listener and transport batcher.
+  // This bounds runnable network work to the executor's configured CPU domain and gives all map
+  // writers one FIFO ready queue instead of one unconstrained work-stealing domain per JVM.
+  private val outboundThreads = math.max(1, math.min(
+    conf.get(EXECUTOR_CORES),
+    conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS)))
+  private val outboundPool = ThreadUtils.newDaemonFixedThreadPool(
+    outboundThreads, "streaming-shuffle-outbound-dispatcher")
+  private val outboundSubmitted = new AtomicLong(0L)
+  private val outboundCompleted = new AtomicLong(0L)
+  private val outboundPeakQueued = new AtomicLong(0L)
+
+  private[streaming] val outboundExecutor: Executor = (command: Runnable) => {
+    outboundSubmitted.incrementAndGet()
+    val queued = outboundPool.getQueue.size().toLong + 1L
+    outboundPeakQueued.accumulateAndGet(queued, Math.max)
+    outboundPool.execute(() => {
+      try command.run()
+      finally outboundCompleted.incrementAndGet()
+    })
+  }
+
+  private[streaming] def outboundDispatcherStats: (Int, Long, Long, Long) = {
+    (outboundThreads, outboundSubmitted.get(), outboundCompleted.get(), outboundPeakQueued.get())
+  }
+
+  // All writers on this executor send through the same physical reader connection when shared
+  // connections are enabled. Keep one batcher at that scope so bodies from different map tasks
+  // can be coalesced; a writer-specific batcher can only combine that writer's own routes.
+  private[streaming] val crossRouteBatcher = new StreamingShuffleTransportBatcher(
+    server.getPooledByteBufAllocator,
+    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE),
+    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS),
+    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES),
+    new ErrorNotifier())
+
+  // Raw serialization buffers used to be allocated and cached independently by every map task.
+  // In a full-streaming multi-input join, three producer stages can have dozens of live writers
+  // and thousands of completed writers waiting for downstream ACKs. An executor-scoped pool is
+  // the admission boundary: writers can lend idle buffers to siblings without either allocating
+  // up to MaxDirectMemorySize or blocking each other behind private semaphores.
+  private[streaming] val rawBufferPool = new StreamingShuffleRawBufferPool(
+    conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE),
+    conf.get(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY))
+
+  val port: Int = server.getPort
+
+  def register(
+      shuffleId: Int,
+      writerId: Int,
+      handler: StreamingShuffleServerHandler): Unit = {
+    val existing = handlers.putIfAbsent(key(shuffleId, writerId), handler)
+    require(existing == null, s"Streaming shuffle $shuffleId writer $writerId is already active")
+  }
+
+  def unregister(
+      shuffleId: Int,
+      writerId: Int,
+      handler: StreamingShuffleServerHandler): Unit = {
+    handlers.remove(key(shuffleId, writerId), handler)
+  }
+
+  def close(): Unit = {
+    val (_, submitted, completed, peakQueued) = outboundDispatcherStats
+    logInfo(
+      s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
+        s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
+    outboundPool.shutdownNow()
+    crossRouteBatcher.discard()
+    rawBufferPool.close()
+    server.close()
+  }
+}
+
+/** Executor-wide reusable direct buffers for relaxed streaming writers. */
+private[streaming] final class StreamingShuffleRawBufferPool(
+    bufferSize: Int,
+    maxMemoryBytes: Long) {
+  require(bufferSize > 0, "bufferSize must be positive")
+  require(maxMemoryBytes >= bufferSize,
+    "raw buffer pool must admit at least one serialization buffer")
+
+  private val maxBuffers = math.min(
+    Int.MaxValue.toLong, math.max(1L, maxMemoryBytes / bufferSize)).toInt
+  // A permit represents an allocation slot not yet materialized. Once allocated, the slot moves
+  // between borrowers and the available deque until the pool closes or rejects an oversized buf.
+  private val unallocated = new Semaphore(maxBuffers)
+  private val available = new LinkedBlockingDeque[ByteBuf]()
+  @volatile private var closed = false
+
+  def tryBorrow(): ByteBuf = {
+    val cached = available.pollLast()
+    if (cached != null) {
+      cached.clear()
+      cached
+    } else if (!closed && unallocated.tryAcquire()) {
+      try Unpooled.directBuffer(bufferSize)
+      catch {
+        case error: Throwable =>
+          unallocated.release()
+          throw error
+      }
+    } else {
+      null
+    }
+  }
+
+  def awaitBorrow(waitMillis: Long): ByteBuf = {
+    val cached = available.pollLast(waitMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    if (cached != null) cached.clear()
+    cached
+  }
+
+  def recycle(buffer: ByteBuf): Unit = {
+    buffer.clear()
+    if (!closed && buffer.capacity() == bufferSize) {
+      available.offerLast(buffer)
+      // Close the race where close() drains immediately before this offer.
+      if (closed && available.removeLastOccurrence(buffer)) destroy(buffer)
+    } else {
+      destroy(buffer)
+    }
+  }
+
+  /**
+   * Permanently retire a borrowed buffer instead of returning it to the free list.
+   *
+   * A writer uses this path when it is being torn down and can no longer safely reuse the
+   * producer-owned reference. The allocation permit must be returned as well: otherwise the
+   * direct buffer can reach refCnt zero while the pool still accounts its slot as allocated,
+   * eventually leaving every writer blocked with an empty free list and zero permits.
+   */
+  def discard(buffer: ByteBuf): Unit = {
+    buffer.release()
+    unallocated.release()
+  }
+
+  private def destroy(buffer: ByteBuf): Unit = {
+    buffer.release()
+    unallocated.release()
+  }
+
+  def close(): Unit = {
+    closed = true
+    val buffers = new java.util.ArrayList[ByteBuf]()
+    available.drainTo(buffers)
+    buffers.forEach(buffer => { destroy(buffer); () })
+  }
+}

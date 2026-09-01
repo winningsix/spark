@@ -21,7 +21,8 @@ import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{BinaryExecNode, CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
-import org.apache.spark.sql.execution.exchange.{PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle,
+  PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ShuffledJoin
 
 /**
@@ -59,18 +60,24 @@ import org.apache.spark.sql.execution.joins.ShuffledJoin
 case class AQEEnablePipelinedShuffle() extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    // Shared environment gate (opt-in flag, single-executor local mode, channel manager active),
+    // Shared environment gate (opt-in flag and manager-specific deployment requirements),
     // identical to the non-AQE rule's -- see PipelinedShuffleEligibility for why it is a
     // correctness gate that must not drift between the two rules.
     if (!PipelinedShuffleEligibility.enabled(plan, conf)) return plan
 
-    flipEligibleExchanges(plan)
+    if (conf.pipelinedShuffleFullPlanAQEEnabled) {
+      // Reuse the non-AQE all-visible-exchanges rewrite and its fan-out/consumer safety gates.
+      // This changes only shuffle transport flags; join algorithms and build sides are untouched.
+      EnablePipelinedShuffle().apply(plan)
+    } else {
+      flipEligibleExchanges(plan)
+    }
   }
 
   /**
    * The plan-shape core of the rule, factored out of [[apply]]'s environment guards (opt-in flag,
-   * local mode, channel manager) so it can be unit-tested on a hand-built plan directly. Collects
-   * the eligible exchanges and returns the plan with each flipped to `pipelined = true`.
+   * manager deployment requirements) so it can be unit-tested on a hand-built plan directly.
+   * Collects eligible exchanges and returns the plan with each flipped to `pipelined = true`.
    */
   private[adaptive] def flipEligibleExchanges(plan: SparkPlan): SparkPlan = {
     val shared = if (conf.exchangeReuseEnabled) duplicatedShuffleForms(plan) else Set.empty[Any]
@@ -170,11 +177,12 @@ case class AQEEnablePipelinedShuffle() extends Rule[SparkPlan] {
    *   - [[CoalesceExec]] reads its child shuffle multi-partition-per-task (a `CoalescedRDD` over
    *     the `ShuffledRowRDD`), which the channel transport cannot serve; the shuffle it reads
    *     must stay regular.
-   *   - the limit operators [[CollectLimitExec]] / [[CollectTailExec]] /
+   *   - in selective mode, the limit operators [[CollectLimitExec]] / [[CollectTailExec]] /
    *     [[TakeOrderedAndProjectExec]] each build a hidden regular (`pipelined = false`) shuffle
    *     inside `doExecute` (via `prepareShuffleDependency`) that no plan walk can see; a flipped
    *     exchange below one of them would sit under that unmaterialized regular boundary and the
-   *     job would hard-fail at submission (pipelined-below-regular).
+   *     job would hard-fail at submission for transports without prepared receive. AQE full-plan
+   *     mode delegates to [[EnablePipelinedShuffle]], which checks the manager capability.
    * Blocking here keeps the shuffle below -- and everything deeper -- regular, so no pipelined
    * exchange ends up below the operator's regular boundary. See the non-AQE
    * `EnablePipelinedShuffle` for the full rationale on each operator.

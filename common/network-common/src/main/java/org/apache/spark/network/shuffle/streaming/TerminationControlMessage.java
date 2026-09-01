@@ -28,10 +28,16 @@ import io.netty.buffer.CompositeByteBuf;
  * that no further DataMessages will arrive from this writer.
  */
 public final class TerminationControlMessage extends StreamingShuffleMessage {
+  public final int shuffleId;
   public final int shuffleWriterId;
   public final int shuffleReaderId;
 
   public TerminationControlMessage(int shuffleWriterId, int shuffleReaderId) {
+    this(-1, shuffleWriterId, shuffleReaderId);
+  }
+
+  public TerminationControlMessage(int shuffleId, int shuffleWriterId, int shuffleReaderId) {
+    this.shuffleId = shuffleId;
     this.shuffleWriterId = shuffleWriterId;
     this.shuffleReaderId = shuffleReaderId;
   }
@@ -43,14 +49,15 @@ public final class TerminationControlMessage extends StreamingShuffleMessage {
 
   @Override
   public int headerLength() {
-    // 4 bytes for the shuffle writer ID, 4 bytes for the shuffle reader ID
-    return super.headerLength() + 8;
+    // 4 bytes each for the shuffle, writer, and reader IDs.
+    return super.headerLength() + 12;
   }
 
   @Override
   public void encode(CompositeByteBuf buf) {
     super.encode(buf);
 
+    buf.writeInt(shuffleId);
     // Write the shuffle writer ID
     buf.writeInt(shuffleWriterId);
     // Write the shuffle reader ID
@@ -58,11 +65,12 @@ public final class TerminationControlMessage extends StreamingShuffleMessage {
   }
 
   public static TerminationControlMessage decode(ByteBuf buf) {
+    int shuffleId = buf.readInt();
     // Read the shuffle writer ID
     int shuffleWriterId = buf.readInt();
     // Read the shuffle reader ID
     int shuffleReaderId = buf.readInt();
 
-    return new TerminationControlMessage(shuffleWriterId, shuffleReaderId);
+    return new TerminationControlMessage(shuffleId, shuffleWriterId, shuffleReaderId);
   }
 }

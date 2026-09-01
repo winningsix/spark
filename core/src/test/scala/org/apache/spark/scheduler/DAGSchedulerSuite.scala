@@ -6458,6 +6458,49 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("pipelined shuffle: prepared receive mode allows a regular stage above a pipeline") {
+    val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+    val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+    val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+    val previousSharedConnections =
+      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+    val previousSharedServer =
+      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+    sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    try {
+      val producerRdd = new MyRDD(sc, 2, Nil)
+      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+      val pipelinedConsumer =
+        new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+      val regularDep = new ShuffleDependency(pipelinedConsumer, new HashPartitioner(2))
+      val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+
+      submit(resultRdd, Array(0, 1))
+      assert(taskSets.size === 2,
+        "the pipelined producer and its regular shuffle-map consumer must run together")
+      assert(taskSets.head.isPipelinedShuffleProducer)
+      assert(taskSets(1).isPipelinedShuffleReader)
+
+      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+      completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
+      assert(taskSets.size === 3, "the final regular-shuffle reader starts after materialization")
+      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
+      assertDataStructuresEmpty()
+    } finally {
+      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+        previousSharedConnections)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+    }
+  }
+
   test("pipelined shuffle: a fully-materialized regular prefix below the suffix is accepted") {
     // The materialized-prefix mixed shape (the one adaptive execution produces: prior jobs
     // materialize the prefix stages, the final job runs the pipelined tail). First job
@@ -7727,6 +7770,31 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     complete(job0Consumer, Seq((Success, 42), (Success, 43)))
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
+  }
+
+  test("pipelined shuffle: an internal replay job attaches only the retained direct stage") {
+    val source = new MyRDD(sc, 2, Nil)
+    val lowerDep = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    val middle = new MyRDD(sc, 2, List(lowerDep), tracker = mapOutputTracker)
+    val directDep = new PipelinedShuffleDependency(middle, new HashPartitioner(2))
+    val firstConsumer = new MyRDD(sc, 2, List(directDep), tracker = mapOutputTracker)
+    lowerDep.markReplayLeaseAvailable()
+    directDep.markReplayLeaseAvailable()
+
+    submit(firstConsumer, Array(0, 1))
+    val lowerStage = scheduler.shuffleIdToMapStage(lowerDep.shuffleId)
+    val directStage = scheduler.shuffleIdToMapStage(directDep.shuffleId)
+    completeShuffleMapStageSuccessfully(lowerStage.id, 0, 2)
+    completeShuffleMapStageSuccessfully(directStage.id, 0, 2)
+    assert(lowerStage.isAvailable && directStage.isAvailable)
+
+    val replayConsumer = new MyRDD(sc, 2, List(directDep), tracker = mapOutputTracker)
+    submit(replayConsumer, Array(0, 1))
+
+    assert(directStage.jobIds === Set(0, 1))
+    assert(lowerStage.jobIds === Set(0))
+    assert(scheduler.jobIdToStageIds(1).contains(directStage.id))
+    assert(!scheduler.jobIdToStageIds(1).contains(lowerStage.id))
   }
 
   test("pipelined shuffle: sequential re-run of the same producer is sound (fresh stage per job)") {
