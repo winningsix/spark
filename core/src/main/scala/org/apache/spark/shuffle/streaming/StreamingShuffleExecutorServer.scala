@@ -263,10 +263,15 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
     val (bodies, frames) = controlBodyStats
+    val (batchBodies, batchWrites, transportedBodies, peakBodiesPerWrite) =
+      crossRouteBatcher.transportBatchStats
     logInfo(
       s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
         s"submitted=$submitted completed=$completed peakQueued=$peakQueued " +
-        s"controlBodies=$bodies controlFrames=$frames")
+        s"controlBodies=$bodies controlFrames=$frames " +
+        s"crossRouteSubmittedBodies=$batchBodies crossRouteTransportWrites=$batchWrites " +
+        s"crossRouteTransportedBodies=$transportedBodies " +
+        s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()

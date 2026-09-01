@@ -62,6 +62,10 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   // unrelated connections with ready readers from sending data or end-of-stream controls.
   private val inFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
   private val peakInFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val submittedBodies = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val transportWrites = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val transportedBodies = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val peakBodiesPerWrite = new java.util.concurrent.atomic.AtomicLong(0L)
 
   private case class PendingBody(
       body: ByteBuf,
@@ -133,6 +137,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       onComplete()
       return
     }
+    submittedBodies.incrementAndGet()
     var batch = pending.get(client)
     if (batch != null && batch.bytes > 0 && batch.bytes + body.readableBytes() > maxBytes) {
       flushLocked(client)
@@ -310,6 +315,9 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     var addedBodies = 0
     val admittedBytes = batch.bytes
     try {
+      transportWrites.incrementAndGet()
+      transportedBodies.addAndGet(batch.bodies.length.toLong)
+      peakBodiesPerWrite.accumulateAndGet(batch.bodies.length.toLong, Math.max)
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
@@ -389,4 +397,9 @@ private[streaming] final class StreamingShuffleTransportBatcher(
 
   /** Exposed for executor diagnostics and tests; this is a transport in-flight high-water mark. */
   private[streaming] def peakInFlightBytesForTest: Long = peakInFlightBytes.get()
+
+  /** Number of logical submissions versus physical transport writes. */
+  private[streaming] def transportBatchStats: (Long, Long, Long, Long) =
+    (submittedBodies.get(), transportWrites.get(), transportedBodies.get(),
+      peakBodiesPerWrite.get())
 }

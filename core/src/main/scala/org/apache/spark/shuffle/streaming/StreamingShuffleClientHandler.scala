@@ -83,6 +83,11 @@ class StreamingShuffleClientHandler(
   // newest watermark for this logical route and publish many routes in one control body.
   @volatile private var multiplexedCreditSender:
       (TransportClient, StreamingShuffleClientHandler) => Unit = _
+  // Terminal frames can arrive for many logical routes in one executor-lane body. Defer their
+  // ACK writes to the executor client so that body produces one ACK body, not one transport write
+  // per writer/reader route.
+  @volatile private var multiplexedTerminationAckSender:
+      (TransportClient, StreamingShuffleClientHandler, Int, Long) => Unit = _
 
   setShuffleIdForLogging(shuffleId)
 
@@ -117,6 +122,43 @@ class StreamingShuffleClientHandler(
 
   private[streaming] def clearMultiplexedCreditSender(): Unit = {
     multiplexedCreditSender = null
+  }
+
+  private[streaming] def setMultiplexedTerminationAckSender(
+      sender: (TransportClient, StreamingShuffleClientHandler, Int, Long) => Unit): Unit = {
+    multiplexedTerminationAckSender = sender
+  }
+
+  private[streaming] def clearMultiplexedTerminationAckSender(): Unit = {
+    multiplexedTerminationAckSender = null
+  }
+
+  private[streaming] def prepareMultiplexedTerminationAck(
+      writerId: Int,
+      sequenceNumber: Long): TerminationAckMessage = {
+    val message = new TerminationAckMessage(shuffleId, writerId, shuffleReaderId)
+    message.setSeqNum(sequenceNumber)
+    message
+  }
+
+  private[streaming] def terminationAckBatchSendSucceeded(writerId: Int): Unit = {
+    onTermAckResponse(writerId)
+  }
+
+  private[streaming] def terminationAckBatchSendFailed(
+      client: TransportClient,
+      writerId: Int,
+      cause: Throwable): Unit = {
+    if (terminationAckFailureIsExpected(cause, client)) {
+      logWarning(log"Ignoring batched termination acknowledgment failure after the writer " +
+        log"has already closed its endpoint for shuffle writer ${MDC(
+          LogKeys.SHUFFLE_WRITER_ID, writerId)}", cause)
+    } else {
+      val error = new RuntimeException(
+        s"Error sending batched termination acknowledgment to shuffle writer $writerId", cause)
+      logError(log"Streaming shuffle batched termination acknowledgment failed", error)
+      errorNotifier.markError(error)
+    }
   }
 
   /**
@@ -315,6 +357,11 @@ class StreamingShuffleClientHandler(
   }
 
   protected def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
+    val sender = multiplexedTerminationAckSender
+    if (!perStreamAutoReadEnabled && sender != null) {
+      sender(client, this, shuffleWriterId, lastSeqNum)
+      return
+    }
     var buf: CompositeByteBuf = null
     try {
       val terminationAckMessage =

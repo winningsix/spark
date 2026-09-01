@@ -694,6 +694,92 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared routes return one terminal ACK body for one multiplexed terminal body") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS, 100L)
+    withSpark(new SparkContext("local", "prepared-terminal-ack-batch", conf)) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val writerCount = 9
+      val queues = Array.fill(writerCount)(new LinkedBlockingQueue[StreamingShuffleMessage]())
+      val clientAckCompletions = new AtomicInteger(0)
+      val terminalSendCompletions = new AtomicInteger(0)
+      val writerAcks = ConcurrentHashMap.newKeySet[Int]()
+      val readerHandlers = (0 until writerCount).map { writerId =>
+        val handler = new StreamingShuffleClientHandler(
+          writerId, 0, queues(writerId), 7, 1L << 20, null, new ErrorNotifier())
+        handler.setOnTermAckResponseHandler(_ => clientAckCompletions.incrementAndGet())
+        writerId -> handler
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => { writerAcks.add(writerId); () },
+          shuffleId = 7,
+          numReaders = 1,
+          context = mock[TaskContext],
+          errorNotifier = new ErrorNotifier())
+      }
+      val queued = new mutable.ArrayBuffer[StreamingShuffleMessage]()
+      try {
+        client.registerBatch(7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          server.controlBodyStats shouldBe (1L, writerCount.toLong)
+          writerHandlers.foreach { case (_, handler) =>
+            handler.clientsFor(0).size shouldBe 1
+          }
+        }
+        val writerClients = writerHandlers.flatMap(_._2.clientsFor(0)).distinct
+        writerClients.size shouldBe 1
+
+        val terminalOwner = new Object()
+        val terminalErrors = new ErrorNotifier()
+        (0 until writerCount).foreach { writerId =>
+          val body = Unpooled.compositeBuffer().capacity(24)
+          val terminal = new TerminationControlMessage(7, writerId, 0)
+          terminal.setSeqNum(0L)
+          terminal.encode(body)
+          server.crossRouteBatcher.submit(
+            writerClients.head,
+            body,
+            () => terminalSendCompletions.incrementAndGet(),
+            terminalOwner,
+            terminalErrors)
+        }
+        // Model the bounded timer firing after all concurrently completing writers reached the
+        // shared executor batcher. Their individually encoded terminals become one wire body.
+        server.crossRouteBatcher.flush(writerClients.head)
+
+        (0 until writerCount).foreach { writerId =>
+          val message = queues(writerId).poll(10, TimeUnit.SECONDS)
+          message should not be null
+          queued += message
+        }
+        eventually(Timeout(10.seconds)) {
+          writerAcks.size shouldBe writerCount
+          terminalSendCompletions.get() shouldBe writerCount
+          clientAckCompletions.get() shouldBe writerCount
+          client.terminationAckBatchStats shouldBe (1L, writerCount.toLong)
+          server.controlBodyStats shouldBe (2L, writerCount.toLong * 2L)
+          server.crossRouteBatcher.transportBatchStats shouldBe
+            (writerCount.toLong, 1L, writerCount.toLong, writerCount.toLong)
+        }
+      } finally {
+        queued.foreach(_.release())
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
+        client.close()
+        server.close()
+      }
+    }
+  }
+
   test("shared writer endpoint replays prepared credit that arrives before writer registration") {
     withSpark(new SparkContext("local", "prepared-credit-before-writer", new SparkConf())) { _ =>
       val server = new StreamingShuffleExecutorServer()
