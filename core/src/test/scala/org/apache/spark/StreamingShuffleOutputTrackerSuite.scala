@@ -164,11 +164,12 @@ class StreamingShuffleOutputTrackerSuite
     val numMaps = 2
     val numReduces = 2
     val jobId = 0
-    val taskMap =
+    val taskMap: Map[Long, StreamingShuffleTaskLocation] =
       Map(
-        0 -> StreamingShuffleTaskLocation("executor-1", "host-1", 0),
-        1 -> StreamingShuffleTaskLocation("executor-2", "host-2", 0))
+        0L -> StreamingShuffleTaskLocation("executor-1", "host-1", 0),
+        1L -> StreamingShuffleTaskLocation("executor-2", "host-2", 0))
     master.registerShuffle(shuffleId, numMaps, numReduces, jobId)
+    master.registerShuffle(shuffleId + 1, numMaps = 0, numReduces = numReduces, jobId = jobId)
     // register one shuffle write task
     worker.registerShuffleWriterTask(shuffleId, 0, taskMap(0))
     // Get all shuffle write task location information.  Should return None since
@@ -178,10 +179,16 @@ class StreamingShuffleOutputTrackerSuite
     worker.registerShuffleWriterTask(shuffleId, 1, taskMap(1))
     // should get all the shuffle task location information now
     worker.getAllShuffleWriterTaskLocations(shuffleId) should be(Some(taskMap))
+    val availableBatch = worker.getAvailableShuffleWriterTaskLocationsBatch(
+      Seq(shuffleId, shuffleId + 1, shuffleId + 2))
+    availableBatch.keySet shouldBe Set(shuffleId, shuffleId + 1)
+    availableBatch(shuffleId) shouldBe ShuffleLocationResponse(taskMap, numMaps)
+    availableBatch(shuffleId + 1) shouldBe ShuffleLocationResponse(Map.empty, 0)
 
     // should be a no-op for the worker
     worker.unregisterShuffle(shuffleId)
     master.unregisterShuffle(shuffleId)
+    master.unregisterShuffle(shuffleId + 1)
 
     master.getShuffleInfo(shuffleId) should be(None)
   }

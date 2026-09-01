@@ -154,19 +154,19 @@ class StreamingShuffleManagerSuite
     }
   }
 
-  test("prepared inboxes for one shuffle share one executor location snapshot") {
+  test("prepared inboxes share one executor location snapshot across active shuffles") {
     val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
     val polls = new AtomicInteger(0)
     val ready = new AtomicInteger(0)
     val publishSnapshot = new AtomicBoolean(false)
     val discovery = new StreamingShufflePreparedReceiveDiscovery(
       conf,
-      _ => {
+      shuffleIds => {
         if (publishSnapshot.get()) {
           polls.incrementAndGet()
-          Some(ShuffleLocationResponse(Map.empty, 0))
+          shuffleIds.map(_ -> ShuffleLocationResponse(Map.empty, 0)).toMap
         } else {
-          None
+          Map.empty
         }
       })
     val clientCreationExecutor =
@@ -174,7 +174,7 @@ class StreamingShuffleManagerSuite
     val sharedClient = mock[StreamingShuffleExecutorClient]
     val sessions = (0 until 8).map { partitionId =>
       val inbox = new StreamingShuffleReceiveInbox(
-        StreamingShuffleReceiveInboxId(7, 9, 0, partitionId, -1L),
+        StreamingShuffleReceiveInboxId(7 + partitionId % 2, 9, 0, partitionId, -1L),
         new LinkedBlockingQueue[StreamingShuffleMessage]())
       new StreamingShufflePreparedReceiveSession(
         inbox,
@@ -205,7 +205,7 @@ class StreamingShuffleManagerSuite
 
   test("prepared session unregisters a route that completes after inbox close") {
     val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
-    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => None)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
     val clientCreationExecutor =
       ThreadUtils.newDaemonFixedThreadPool(1, "prepared-close-race-test-client")
     val sharedClient = mock[StreamingShuffleExecutorClient]

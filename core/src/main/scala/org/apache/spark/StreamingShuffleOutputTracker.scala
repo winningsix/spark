@@ -75,6 +75,9 @@ private[spark] case class GetAllStreamingShuffleTaskLocations(shuffleId: Int)
 private[spark] case class GetAvailableStreamingShuffleTaskLocations(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
+private[spark] case class GetAvailableStreamingShuffleTaskLocationsBatch(shuffleIds: Seq[Int])
+  extends StreamingShuffleTaskLocationTrackerMessage
+
 private[spark] case class IsStreamingShuffleRegistered(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
@@ -110,6 +113,11 @@ private[spark] case class GetAvailableStreamingShuffleTaskLocationsMasterMessage
   context: RpcCallContext)
   extends StreamingShuffleTaskLocationTrackerMasterMessage
 
+private[spark] case class GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(
+  shuffleIds: Seq[Int],
+  context: RpcCallContext)
+  extends StreamingShuffleTaskLocationTrackerMasterMessage
+
 private[spark] case class IsStreamingShuffleRegisteredMasterMessage(
     shuffleId: Int,
     context: RpcCallContext)
@@ -138,6 +146,10 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
 
     case GetAvailableStreamingShuffleTaskLocations(shuffleId) =>
       tracker.post(GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context))
+
+    case GetAvailableStreamingShuffleTaskLocationsBatch(shuffleIds) =>
+      tracker.post(
+        GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(shuffleIds, context))
 
     case IsStreamingShuffleRegistered(shuffleId) =>
       tracker.post(IsStreamingShuffleRegisteredMasterMessage(shuffleId, context))
@@ -270,6 +282,14 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
    *         total number of shuffle writers to expect.
    */
   def getAvailableShuffleWriterTaskLocations(shuffleId: Int): Option[ShuffleLocationResponse]
+
+  /** Get the currently available writer locations for several active shuffles in one request. */
+  def getAvailableShuffleWriterTaskLocationsBatch(
+      shuffleIds: Seq[Int]): Map[Int, ShuffleLocationResponse] = {
+    shuffleIds.distinct.flatMap { shuffleId =>
+      getAvailableShuffleWriterTaskLocations(shuffleId).map(shuffleId -> _)
+    }.toMap
+  }
 
   /** Whether the driver still owns the shuffle's lifecycle state. */
   def containsShuffle(shuffleId: Int): Boolean
@@ -441,6 +461,11 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
               case GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context) =>
                 val ret = getAvailableShuffleWriterTaskLocations(shuffleId)
                 context.reply(ret)
+
+              case GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(
+                    shuffleIds,
+                    context) =>
+                context.reply(getAvailableShuffleWriterTaskLocationsBatch(shuffleIds))
 
               case IsStreamingShuffleRegisteredMasterMessage(shuffleId, context) =>
                 context.reply(containsShuffle(shuffleId))
@@ -632,6 +657,46 @@ private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
         }
       }
     }
+  }
+
+  override def getAvailableShuffleWriterTaskLocationsBatch(
+      shuffleIds: Seq[Int]): Map[Int, ShuffleLocationResponse] = {
+    val distinctShuffleIds = shuffleIds.distinct.sorted
+    val initialNow = System.nanoTime()
+    val initiallyFresh = distinctShuffleIds.flatMap { shuffleId =>
+      freshCachedLocations(shuffleId, initialNow).map(shuffleId -> _)
+    }.toMap
+    val initiallyStale = distinctShuffleIds.filterNot(initiallyFresh.contains)
+
+    def refreshUnderLocks(remainingLocks: List[Object]): Unit = remainingLocks match {
+      case lock :: tail => lock.synchronized(refreshUnderLocks(tail))
+      case Nil =>
+        val lockedNow = System.nanoTime()
+        val stale = initiallyStale.filter(
+          freshCachedLocations(_, lockedNow).isEmpty)
+        if (stale.nonEmpty) {
+          val responses = askTracker[Map[Int, ShuffleLocationResponse]](
+            GetAvailableStreamingShuffleTaskLocationsBatch(stale))
+          val refreshedAt = System.nanoTime()
+          stale.foreach { shuffleId =>
+            availableLocationCache.put(
+              shuffleId, CachedAvailableLocations(responses.get(shuffleId), refreshedAt))
+          }
+        }
+    }
+
+    if (initiallyStale.nonEmpty) {
+      // A task-owned reader can refresh one shuffle concurrently with the prepared discovery's
+      // batch. Acquire the same per-shuffle locks in shuffle-id order so the batch neither races a
+      // stale cache overwrite nor deadlocks with another overlapping batch.
+      val locks = initiallyStale.sorted.map { shuffleId =>
+        availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
+      }.toList
+      refreshUnderLocks(locks)
+    }
+    distinctShuffleIds.flatMap { shuffleId =>
+      Option(availableLocationCache.get(shuffleId)).flatMap(_.response).map(shuffleId -> _)
+    }.toMap
   }
 
   override def containsShuffle(shuffleId: Int): Boolean = {
