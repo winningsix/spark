@@ -25,9 +25,10 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode, LazilyGeneratedOrdering}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.util.truncatedString
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.exchange.{PipelinedShuffleEligibility, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.metric.{SQLShuffleReadMetricsReporter, SQLShuffleWriteMetricsReporter}
 import org.apache.spark.sql.execution.python.HybridRowQueue
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.collection.Utils
 
 /**
@@ -86,7 +87,9 @@ case class CollectLimitExec(limit: Int = -1, child: SparkPlan, offset: Int = 0) 
             child.output,
             SinglePartition,
             serializer,
-            writeMetrics),
+            writeMetrics,
+            pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
+              SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       if (limit >= 0) {
@@ -145,7 +148,9 @@ case class CollectTailExec(limit: Int, child: SparkPlan) extends LimitExec {
             child.output,
             SinglePartition,
             serializer,
-            writeMetrics),
+            writeMetrics,
+            pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
+              SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       singlePartitionRDD.mapPartitionsInternal(takeRight)
@@ -368,7 +373,9 @@ case class TakeOrderedAndProjectExec(
             child.output,
             SinglePartition,
             serializer,
-            writeMetrics),
+            writeMetrics,
+            pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
+              SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       singlePartitionRDD.mapPartitionsWithIndexInternal { (idx, iter) =>

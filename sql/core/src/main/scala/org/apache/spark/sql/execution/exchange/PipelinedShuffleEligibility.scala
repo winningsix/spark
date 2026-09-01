@@ -33,12 +33,7 @@ import org.apache.spark.sql.internal.SQLConf
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
-  /**
-   * Whether the configured pipelined transport may be used for `plan` at all, independent of plan
-   * shape. The manager declares whether it requires a single executor; distributed transports can
-   * therefore run in cluster mode without weakening the in-process channel's safety check.
-   */
-  def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
+  private def enabled(conf: SQLConf, isLocal: Boolean): Boolean = {
     if (!conf.localPipelinedShuffleEnabled) {
       return false
     }
@@ -48,12 +43,31 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
         "leaving the plan regular.")
       return false
     }
-    if (manager.requiresSingleExecutor &&
-        (plan.session == null || !plan.session.sparkContext.isLocal)) {
+    if (manager.requiresSingleExecutor && !isLocal) {
       logDebug("The configured pipelined shuffle manager requires a single executor; leaving " +
         "the cluster-mode plan regular.")
       return false
     }
     true
+  }
+
+  /**
+   * Whether the configured pipelined transport may be used for `plan` at all, independent of plan
+   * shape. The manager declares whether it requires a single executor; distributed transports can
+   * therefore run in cluster mode without weakening the in-process channel's safety check.
+   */
+  def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
+    enabled(conf, plan.session != null && plan.session.sparkContext.isLocal)
+  }
+
+  /**
+   * Whether a shuffle dependency created inside an operator's `doExecute` may use the pipelined
+   * transport. Such a dependency is invisible to the physical-plan rules. Restrict this to the
+   * prepared-receive transport: it can admit the hidden producer/consumer boundary elastically,
+   * while the local channel still relies on conservative whole-plan shape checks.
+   */
+  def hiddenShuffleEnabled(conf: SQLConf, isLocal: Boolean): Boolean = {
+    enabled(conf, isLocal) &&
+      SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
   }
 }

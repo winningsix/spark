@@ -227,6 +227,27 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
     }
   }
 
+  test("distributed prepared receive executes a limit's hidden shuffle as pipelined") {
+    withDistributedPipelinedSession(adaptive = false) { spark =>
+      import spark.implicits._
+      withTempDir { dir =>
+        val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 20))
+          .groupBy($"k").count().orderBy($"count".desc).limit(5)
+        val visibleExchanges = collect(df.queryExecution.executedPlan) {
+          case exchange: ShuffleExchangeExec => exchange
+        }
+        assert(visibleExchanges.nonEmpty && visibleExchanges.forall(_.pipelined),
+          s"all visible exchanges must be pipelined:\n${df.queryExecution.executedPlan}")
+
+        // DataFrameWriter calls TakeOrderedAndProjectExec.doExecute, which builds the hidden
+        // SinglePartition dependency rather than using the driver's executeCollect fast path.
+        val output = new java.io.File(dir, "hidden-limit-output").getAbsolutePath
+        df.write.parquet(output)
+        assert(spark.read.parquet(output).count() === 5L)
+      }
+    }
+  }
+
   test("distributed range replay uses one sampling pass for skewed hash input") {
     withDistributedPipelinedSession() { spark =>
       import spark.implicits._
