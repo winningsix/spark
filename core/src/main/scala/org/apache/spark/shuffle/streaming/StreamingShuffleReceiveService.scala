@@ -320,6 +320,18 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
   private val peakActiveSessions = new AtomicInteger(0)
   private val snapshotRequests = new AtomicLong(0L)
   private val snapshotDeliveries = new AtomicLong(0L)
+  private val routeRegistrationRequests = new AtomicLong(0L)
+  private val routeRegistrationTasks = new AtomicLong(0L)
+  private case class PendingRouteRegistration(
+      host: String,
+      port: Int,
+      executor: ExecutorService,
+      registration: () => Unit,
+      result: CompletableFuture[Void])
+  private val routeRegistrationLock = new Object
+  private val pendingRouteRegistrations =
+    new mutable.ArrayBuffer[PendingRouteRegistration]()
+  private var collectingSnapshotRoutes = false
   private val refreshIntervalMs = conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL)
   private val executor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor(
@@ -346,6 +358,56 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     }
   }
 
+  /**
+   * Queue one inbox's routes for an endpoint. During a discovery poll, all inboxes see the same
+   * immutable writer snapshot, so delay submission until snapshot delivery finishes and execute
+   * every request for the same endpoint as one worker task. Route handlers, futures, and failures
+   * remain per inbox; only the executor scheduling envelope is shared.
+   */
+  def submitRouteRegistration(
+      host: String,
+      port: Int,
+      executor: ExecutorService)(registration: () => Unit): CompletableFuture[Void] = {
+    val result = new CompletableFuture[Void]()
+    val ready = routeRegistrationLock.synchronized {
+      routeRegistrationRequests.incrementAndGet()
+      pendingRouteRegistrations +=
+        PendingRouteRegistration(host, port, executor, registration, result)
+      if (collectingSnapshotRoutes) Seq.empty else drainPendingRouteRegistrations()
+    }
+    submitRouteRegistrationTasks(ready)
+    result
+  }
+
+  private def drainPendingRouteRegistrations(): Seq[PendingRouteRegistration] = {
+    val ready = pendingRouteRegistrations.toSeq
+    pendingRouteRegistrations.clear()
+    ready
+  }
+
+  private def submitRouteRegistrationTasks(
+      requests: Seq[PendingRouteRegistration]): Unit = {
+    requests.groupBy(request => (request.executor, request.host, request.port)).foreach {
+      case ((executor, _, _), endpointRequests) =>
+        routeRegistrationTasks.incrementAndGet()
+        try {
+          CompletableFuture.runAsync(
+            () => endpointRequests.foreach { request =>
+              try {
+                request.registration()
+                request.result.complete(null)
+              } catch {
+                case error: Throwable => request.result.completeExceptionally(error)
+              }
+            },
+            executor)
+        } catch {
+          case error: Throwable =>
+            endpointRequests.foreach(_.result.completeExceptionally(error))
+        }
+    }
+  }
+
   private def poll(): Unit = {
     val activeByShuffle = sessions.entrySet().asScala.flatMap { entry =>
       val active = entry.getValue.asScala.filterNot(_.isClosed).toSeq
@@ -355,16 +417,27 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
       try {
         snapshotRequests.incrementAndGet()
         val snapshots = snapshotProvider(activeByShuffle.keys.toSeq)
-        activeByShuffle.foreach { case (shuffleId, active) =>
-          snapshots.get(shuffleId).foreach { snapshot =>
-            snapshotDeliveries.addAndGet(active.size)
-            active.foreach { session =>
-              try session.onWriterSnapshot(snapshot)
-              catch {
-                case error: Throwable => session.failDiscovery(error)
+        routeRegistrationLock.synchronized {
+          collectingSnapshotRoutes = true
+        }
+        try {
+          activeByShuffle.foreach { case (shuffleId, active) =>
+            snapshots.get(shuffleId).foreach { snapshot =>
+              snapshotDeliveries.addAndGet(active.size)
+              active.foreach { session =>
+                try session.onWriterSnapshot(snapshot)
+                catch {
+                  case error: Throwable => session.failDiscovery(error)
+                }
               }
             }
           }
+        } finally {
+          val ready = routeRegistrationLock.synchronized {
+            collectingSnapshotRoutes = false
+            drainPendingRouteRegistrations()
+          }
+          submitRouteRegistrationTasks(ready)
         }
       } catch {
         case error: Throwable => activeByShuffle.values.flatten.foreach(_.failDiscovery(error))
@@ -376,6 +449,9 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     (activeSessions.get(), peakActiveSessions.get(),
       snapshotRequests.get(), snapshotDeliveries.get())
 
+  private[streaming] def routeRegistrationStats: (Long, Long) =
+    (routeRegistrationRequests.get(), routeRegistrationTasks.get())
+
   def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
       executor.shutdownNow()
@@ -383,7 +459,9 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
         s"Closing prepared shuffle discovery: activeSessions=${activeSessions.get()} " +
           s"peakActiveSessions=${peakActiveSessions.get()} " +
           s"snapshotRequests=${snapshotRequests.get()} " +
-          s"snapshotDeliveries=${snapshotDeliveries.get()}")
+          s"snapshotDeliveries=${snapshotDeliveries.get()} " +
+          s"routeRegistrationRequests=${routeRegistrationRequests.get()} " +
+          s"routeRegistrationTasks=${routeRegistrationTasks.get()}")
       sessions.clear()
       activeSessions.set(0)
     }
@@ -475,9 +553,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     newlyPublished.groupBy { case (_, location) =>
       (location.host, location.port)
     }.foreach { case ((host, port), routeLocations) =>
-      val future = CompletableFuture.runAsync(() =>
-        registerRoutes(host, port, routeLocations.toSeq, perWriterByteLimit),
-        clientCreationExecutor)
+      val future = discovery.submitRouteRegistration(host, port, clientCreationExecutor)(() =>
+        registerRoutes(host, port, routeLocations.toSeq, perWriterByteLimit))
       future.whenComplete { (_, error) =>
         if (error != null) failDiscovery(Option(error.getCause).getOrElse(error))
       }

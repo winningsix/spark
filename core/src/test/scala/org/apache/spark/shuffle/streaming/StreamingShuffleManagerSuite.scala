@@ -253,6 +253,57 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared discovery batches inbox route registration tasks by endpoint") {
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
+    val snapshot = ShuffleLocationResponse(
+      Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)),
+      1)
+    val publishSnapshot = new AtomicBoolean(false)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(
+      conf, shuffleIds => {
+        if (publishSnapshot.get()) shuffleIds.map(_ -> snapshot).toMap else Map.empty
+      })
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(2, "prepared-route-batch-test-client")
+    val sharedClient = mock[StreamingShuffleExecutorClient]
+    val transportClient = mock[TransportClient]
+    val registrations = new AtomicInteger(0)
+    when(sharedClient.registerBatch(
+      eqTo(7),
+      any[Int],
+      eqTo("writer-host"),
+      eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenAnswer { _ =>
+        registrations.incrementAndGet()
+        Map(3 -> transportClient)
+      }
+    val sessions = (0 until 8).map { partitionId =>
+      val inbox = new StreamingShuffleReceiveInbox(
+        StreamingShuffleReceiveInboxId(7, 9, 0, partitionId, -1L),
+        new LinkedBlockingQueue[StreamingShuffleMessage]())
+      new StreamingShufflePreparedReceiveSession(
+        inbox,
+        sharedClient,
+        conf,
+        discovery,
+        clientCreationExecutor,
+        () => ())
+    }
+    try {
+      sessions.foreach(_.start())
+      publishSnapshot.set(true)
+      eventually(Timeout(10.seconds)) {
+        registrations.get() shouldBe sessions.size
+      }
+      discovery.routeRegistrationStats shouldBe (sessions.size.toLong, 1L)
+    } finally {
+      sessions.foreach(_.close())
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
   // ---- SparkEnv tracker initialization gating ----
 
   private def assertTrackerInitialized(
