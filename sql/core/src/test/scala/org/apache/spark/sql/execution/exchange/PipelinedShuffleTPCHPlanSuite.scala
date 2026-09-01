@@ -23,7 +23,7 @@ import org.apache.spark.{PipelinedShuffleDependency, ShuffleDependency, SparkCon
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{BenchmarkQueryTest, TPCHBase}
 import org.apache.spark.sql.catalyst.util.resourceToString
-import org.apache.spark.sql.execution.TakeOrderedAndProjectExec
+import org.apache.spark.sql.execution.{SparkPlan, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEEnablePipelinedShuffle}
 import org.apache.spark.sql.internal.SQLConf
 
@@ -110,7 +110,7 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
   }
 
   test("prepared transport pipelines a limit operator's hidden single-partition shuffle") {
-    def newPlan(enabled: Boolean) = withSQLConf(
+    def newPlan(enabled: Boolean): SparkPlan = withSQLConf(
         SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> enabled.toString) {
       spark.range(0, 100, 1, 4).orderBy(org.apache.spark.sql.functions.desc("id"))
         .limit(3).queryExecution.executedPlan

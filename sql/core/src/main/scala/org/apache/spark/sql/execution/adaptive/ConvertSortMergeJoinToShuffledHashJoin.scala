@@ -115,28 +115,37 @@ case class ConvertSortMergeJoinToShuffledHashJoin(ensureRequirements: EnsureRequ
           // non-binary-stable string keys), since a hash join matches keys by binary equality and
           // would return wrong results. This mirrors the guard on the other SHJ-planning paths.
           if !hasSortMergeJoinHint(smj) && hashJoinSupported(leftKeys, rightKeys) =>
-        val leftStage = findShuffleStage(left, lookThroughOperatorsEnabled)
-        val rightStage = findShuffleStage(right, lookThroughOperatorsEnabled)
-        // `wideningFactor` scales the input shuffle bytes by how much the traversed operators
-        // widen each row, so its second argument must be the input shuffle stage's output (not the
-        // join child's own output, which would always yield a ratio of 1.0). Compute it only when
-        // the stage is known-defined.
-        val leftFactor = leftStage.map(s => wideningFactor(smj.left.output, s.output))
-        val rightFactor = rightStage.map(s => wideningFactor(smj.right.output, s.output))
-        val canBuildLeft = leftStage.isDefined && canBuildShuffledHashJoinLeft(smj.joinType) &&
-          preferShuffledHashJoin(leftStage.get.mapStats.get, leftFactor.get)
-        val canBuildRight = rightStage.isDefined && canBuildShuffledHashJoinRight(smj.joinType) &&
-          preferShuffledHashJoin(rightStage.get.mapStats.get, rightFactor.get)
-        val buildSide = if (canBuildLeft && canBuildRight) {
-          val leftSize = leftStage.get.mapStats.get.bytesByPartitionId.sum * leftFactor.get
-          val rightSize = rightStage.get.mapStats.get.bytesByPartitionId.sum * rightFactor.get
-          if (leftSize < rightSize) Some(BuildLeft) else Some(BuildRight)
-        } else if (canBuildLeft) {
-          Some(BuildLeft)
-        } else if (canBuildRight) {
-          Some(BuildRight)
-        } else {
-          None
+        val buildSide = conf.convertSortMergeJoinToShuffledHashJoinForceBuildSide match {
+          case "left" =>
+            Option.when(canBuildShuffledHashJoinLeft(smj.joinType))(BuildLeft)
+          case "right" =>
+            Option.when(canBuildShuffledHashJoinRight(smj.joinType))(BuildRight)
+          case "none" =>
+            val leftStage = findShuffleStage(left, lookThroughOperatorsEnabled)
+            val rightStage = findShuffleStage(right, lookThroughOperatorsEnabled)
+            // `wideningFactor` scales the input shuffle bytes by how much the traversed operators
+            // widen each row, so its second argument must be the input shuffle stage's output (not
+            // the join child's own output, which would always yield a ratio of 1.0). Compute it
+            // only when the stage is known-defined.
+            val leftFactor = leftStage.map(s => wideningFactor(smj.left.output, s.output))
+            val rightFactor = rightStage.map(s => wideningFactor(smj.right.output, s.output))
+            val canBuildLeft = leftStage.isDefined &&
+              canBuildShuffledHashJoinLeft(smj.joinType) &&
+              preferShuffledHashJoin(leftStage.get.mapStats.get, leftFactor.get)
+            val canBuildRight = rightStage.isDefined &&
+              canBuildShuffledHashJoinRight(smj.joinType) &&
+              preferShuffledHashJoin(rightStage.get.mapStats.get, rightFactor.get)
+            if (canBuildLeft && canBuildRight) {
+              val leftSize = leftStage.get.mapStats.get.bytesByPartitionId.sum * leftFactor.get
+              val rightSize = rightStage.get.mapStats.get.bytesByPartitionId.sum * rightFactor.get
+              if (leftSize < rightSize) Some(BuildLeft) else Some(BuildRight)
+            } else if (canBuildLeft) {
+              Some(BuildLeft)
+            } else if (canBuildRight) {
+              Some(BuildRight)
+            } else {
+              None
+            }
         }
 
         buildSide match {
