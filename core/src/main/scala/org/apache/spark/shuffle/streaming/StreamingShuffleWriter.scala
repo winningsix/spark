@@ -682,7 +682,10 @@ class StreamingShuffleWriter[K, V](
 
     /** Wake a blocked route when its reader returns receive-window credit. */
     private[streaming] def creditAvailable(): Unit = synchronized {
-      scheduleDrainTaskLocked()
+      // Idle readers repeat their cumulative acknowledgement as a liveness probe. Avoid
+      // submitting an empty dispatcher runnable for writers that have already drained, while
+      // reliably rescheduling an ordered tail that is still waiting for data credit or EOS.
+      if (outboundActions.nonEmpty) scheduleDrainTaskLocked()
     }
 
     private def connectedTargets(connected: TransportClient): Seq[TransportClient] = {

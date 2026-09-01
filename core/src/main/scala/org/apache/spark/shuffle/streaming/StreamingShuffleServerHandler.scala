@@ -251,6 +251,7 @@ class StreamingShuffleServerHandler(
           creditState(readerId, client)
         }
         var grantedCredit = 0L
+        var repairWakeup = false
         if (state != null && encodedCredit < 0 && credit > 0) {
           state.window.accumulateAndGet(credit, Math.max)
           // An absolute window is safe only as the initial discovery retry. Once the writer has
@@ -261,6 +262,10 @@ class StreamingShuffleServerHandler(
             grantedCredit = math.max(0L, after - before)
           }
         } else if (state != null && encodedCredit == 0) {
+          // A repeated cumulative acknowledgement is also an idempotent liveness probe. The
+          // reader sends it only after its inbox has remained idle; wake a shard whose ordered
+          // data/terminal tail lost its dispatcher notification without granting any new bytes.
+          repairWakeup = true
           // Sequence number carries total bytes released by this reader on this connection. Clamp
           // it to bytes actually sent and advance the watermark with CAS so duplicate or reordered
           // repair frames are harmless.
@@ -305,7 +310,7 @@ class StreamingShuffleServerHandler(
           }
         }
         futureClients(readerId).complete(client)
-        if (grantedCredit > 0L) {
+        if (grantedCredit > 0L || repairWakeup) {
           onCreditAvailable(readerId, client)
         }
       case terminationAck: TerminationAckMessage =>

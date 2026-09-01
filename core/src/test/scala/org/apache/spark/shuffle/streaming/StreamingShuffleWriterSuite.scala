@@ -121,12 +121,14 @@ class StreamingShuffleWriterSuite
   test("server handler uses credit-map presence as the route control marker") {
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
+      var creditWakeups = 0
       val handler = new StreamingShuffleServerHandler(
         (_, _) => (),
         shuffleId = 0,
         numReaders = 1,
         context = context,
-        errorNotifier = new ErrorNotifier())
+        errorNotifier = new ErrorNotifier(),
+        onCreditAvailable = (_, _) => creditWakeups += 1)
       val client = mock[TransportClient]
 
       try {
@@ -152,9 +154,11 @@ class StreamingShuffleWriterSuite
         released40.setSeqNum(40L)
         handler.handleMessage(client, released40)
         handler.availableDataCredit(0, client) shouldBe 100L
+        val wakeupsBeforeRepair = creditWakeups
         // Repeating the cumulative acknowledgement does not grant the same bytes twice.
         handler.handleMessage(client, released40)
         handler.availableDataCredit(0, client) shouldBe 100L
+        creditWakeups shouldBe (wakeupsBeforeRepair + 1)
 
         handler.consumeDataCredit(0, client, 30L)
         handler.handleMessage(client, released40)
