@@ -19,8 +19,8 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.File
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
-  CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, ScheduledExecutorService, Semaphore,
-  TimeUnit}
+  CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, RejectedExecutionException,
+  ScheduledExecutorService, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
@@ -333,12 +333,13 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     new mutable.ArrayBuffer[PendingRouteRegistration]()
   private var collectingSnapshotRoutes = false
   private val refreshIntervalMs = conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL)
+  private val immediatePollScheduled = new AtomicBoolean(false)
   private val executor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor(
       "streaming-shuffle-prepared-discovery")
 
   executor.scheduleWithFixedDelay(
-    () => poll(), 0L, refreshIntervalMs, TimeUnit.MILLISECONDS)
+    () => poll(), refreshIntervalMs, refreshIntervalMs, TimeUnit.MILLISECONDS)
 
   def register(session: StreamingShufflePreparedReceiveSession): Unit = {
     require(!closed.get(), "Prepared receive discovery is closed")
@@ -348,6 +349,29 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     require(added, s"Prepared receive session ${session.shuffleId} is already registered")
     val current = activeSessions.incrementAndGet()
     peakActiveSessions.accumulateAndGet(current, Math.max)
+    requestImmediatePoll()
+  }
+
+  private def requestImmediatePoll(): Unit = {
+    if (!closed.get() && immediatePollScheduled.compareAndSet(false, true)) {
+      try {
+        executor.schedule(
+          new Runnable {
+            override def run(): Unit = {
+              immediatePollScheduled.set(false)
+              if (!closed.get()) poll()
+            }
+          },
+          StreamingShufflePreparedReceiveDiscovery.IMMEDIATE_POLL_DELAY_MS,
+          TimeUnit.MILLISECONDS)
+      } catch {
+        case _: RejectedExecutionException if closed.get() =>
+          immediatePollScheduled.set(false)
+        case error: Throwable =>
+          immediatePollScheduled.set(false)
+          throw error
+      }
+    }
   }
 
   def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
@@ -468,6 +492,10 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
       activeSessions.set(0)
     }
   }
+}
+
+private[streaming] object StreamingShufflePreparedReceiveDiscovery {
+  private val IMMEDIATE_POLL_DELAY_MS = 1L
 }
 
 /** Network-only reader lifecycle that starts before the compute task is launched. */

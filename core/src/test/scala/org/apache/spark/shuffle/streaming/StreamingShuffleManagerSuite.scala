@@ -203,6 +203,36 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared session registration wakes discovery before the periodic refresh") {
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
+    val ready = new CountDownLatch(1)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(
+      conf,
+      shuffleIds => shuffleIds.map(_ -> ShuffleLocationResponse(Map.empty, 0)).toMap)
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(1, "prepared-discovery-wakeup-test-client")
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox,
+      mock[StreamingShuffleExecutorClient],
+      conf,
+      discovery,
+      clientCreationExecutor,
+      () => ready.countDown())
+    try {
+      session.start()
+
+      ready.await(10, TimeUnit.SECONDS) shouldBe true
+      discovery.stats._3 shouldBe 1L
+    } finally {
+      session.close()
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
   test("prepared session unregisters a route that completes after inbox close") {
     val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
     val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
