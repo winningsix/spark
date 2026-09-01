@@ -148,6 +148,38 @@ class StreamingShuffleOutputTrackerSuite
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
   }
 
+  test("prepared receive inbox batches are sent to executors concurrently") {
+    val firstRpcEnv = createRpcEnv("parallel-receive-endpoint-1")
+    val secondRpcEnv = createRpcEnv("parallel-receive-endpoint-2")
+    val tracker = newTrackerMaster()
+    val secondEntered = new CountDownLatch(1)
+    val firstEndpoint = firstRpcEnv.setupEndpoint("parallel-receive-1", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = firstRpcEnv
+
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInboxes(_) =>
+          context.reply(secondEntered.await(5, TimeUnit.SECONDS))
+      }
+    })
+    val secondEndpoint = secondRpcEnv.setupEndpoint("parallel-receive-2", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = secondRpcEnv
+
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInboxes(_) =>
+          secondEntered.countDown()
+          context.reply(true)
+      }
+    })
+    tracker.registerReceiveEndpoint("executor-1", firstEndpoint) shouldBe true
+    tracker.registerReceiveEndpoint("executor-2", secondEndpoint) shouldBe true
+    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
+
+    tracker.prepareReceiveInboxesByExecutor(Map(
+      "executor-1" -> Seq(id),
+      "executor-2" -> Seq(id.copy(partitionId = 6)))) shouldBe
+      Set("executor-1", "executor-2")
+  }
+
   test("test tracker workflow") {
     val master = newTrackerMaster()
     val worker = newTrackerWorker()
