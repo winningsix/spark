@@ -17,10 +17,14 @@
 
 package org.apache.spark.sql.execution.exchange
 
-import org.apache.spark.SparkConf
+import scala.collection.mutable
+
+import org.apache.spark.{PipelinedShuffleDependency, ShuffleDependency, SparkConf}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{BenchmarkQueryTest, TPCHBase}
 import org.apache.spark.sql.catalyst.util.resourceToString
-import org.apache.spark.sql.execution.adaptive.AQEEnablePipelinedShuffle
+import org.apache.spark.sql.execution.TakeOrderedAndProjectExec
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEEnablePipelinedShuffle}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -79,6 +83,76 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
       assert(rtmPlan.canonicalized == bspPlan.canonicalized,
         s"TPC-H $name changed its canonical physical plan instead of only its transport:\n" +
           s"BSP:\n$bspPlan\nRTM:\n$rtmPlan")
+
+      // Do not rely only on invoking the rule directly: AdaptiveSparkPlanExec must install the
+      // same rewrite in its real query-stage preparation pipeline before any BSP stage is made.
+      val adaptiveInitialPlan = withSQLConf(
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+          SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true",
+          SQLConf.PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED.key -> "true") {
+        sql(queryText).queryExecution.executedPlan
+          .asInstanceOf[AdaptiveSparkPlanExec].initialPlan
+      }
+      val adaptiveDirectShuffles = adaptiveInitialPlan.collectWithSubqueries {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+      val adaptiveReusedShuffles = adaptiveInitialPlan.collectWithSubqueries {
+        case reused @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => reused
+      }
+      assert(adaptiveDirectShuffles.nonEmpty && adaptiveDirectShuffles.forall(_.pipelined),
+        s"TPC-H $name retained a BSP shuffle in the actual AQE initial plan:\n" +
+          adaptiveInitialPlan)
+      assert(adaptiveReusedShuffles.forall(
+        _.child.asInstanceOf[ShuffleExchangeExec].pipelined),
+        s"TPC-H $name retained a reused BSP shuffle in the actual AQE initial plan:\n" +
+          adaptiveInitialPlan)
     }
+  }
+
+  test("prepared transport pipelines a limit operator's hidden single-partition shuffle") {
+    def newPlan(enabled: Boolean) = withSQLConf(
+        SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> enabled.toString) {
+      spark.range(0, 100, 1, 4).orderBy(org.apache.spark.sql.functions.desc("id"))
+        .limit(3).queryExecution.executedPlan
+    }
+
+    def shuffleDependencies(root: RDD[_]): Seq[ShuffleDependency[_, _, _]] = {
+      val visited = mutable.HashSet.empty[Int]
+      val pending = mutable.ArrayDeque[RDD[_]](root)
+      val shuffles = mutable.ArrayBuffer.empty[ShuffleDependency[_, _, _]]
+      while (pending.nonEmpty) {
+        val rdd = pending.removeHead()
+        if (visited.add(rdd.id)) {
+          rdd.dependencies.foreach { dependency =>
+            dependency match {
+              case shuffle: ShuffleDependency[_, _, _] => shuffles += shuffle
+              case _ =>
+            }
+            pending.append(dependency.rdd)
+          }
+        }
+      }
+      shuffles.toSeq
+    }
+
+    val bspPlan = newPlan(enabled = false)
+    val rtmPlan = newPlan(enabled = true)
+    assert(rtmPlan.exists(_.isInstanceOf[TakeOrderedAndProjectExec]),
+      s"expected TakeOrderedAndProjectExec, got:\n$rtmPlan")
+    assert(rtmPlan.canonicalized == bspPlan.canonicalized,
+      s"hidden-shuffle transport changed the visible physical plan:\n$bspPlan\n$rtmPlan")
+
+    val bspShuffles = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "false") {
+      shuffleDependencies(bspPlan.execute())
+    }
+    val rtmShuffles = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true") {
+      shuffleDependencies(rtmPlan.execute())
+    }
+    assert(bspShuffles.size === 1 && rtmShuffles.size === 1,
+      s"expected one hidden shuffle in each plan, got BSP=${bspShuffles.size}, " +
+        s"RTM=${rtmShuffles.size}")
+    assert(!bspShuffles.head.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+    assert(rtmShuffles.head.isInstanceOf[PipelinedShuffleDependency[_, _, _]],
+      s"hidden limit shuffle remained BSP: ${rtmShuffles.head.getClass.getName}")
   }
 }
