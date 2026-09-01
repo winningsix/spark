@@ -1466,22 +1466,27 @@ private[spark] class DAGScheduler(
 
   /** Pipelined shuffle ids read directly by the stage containing `rdd`. */
   private def pipelinedShuffleIdsReadByStage(rdd: RDD[_]): Seq[Int] = {
-    val multiplicityByShuffleId = new HashMap[Int, Int]
-    traverseParentRDDsWithinStage(rdd, { current =>
+    // Count boundary occurrences in THIS stage, not the dependency's query-wide route
+    // multiplicity. A shuffle reused by two different consumer stages has a global multiplicity
+    // of two, but each stage owns only one reader route. Expanding that global value in both
+    // TaskSets creates four physical consumers while the producer correctly waits for two; it can
+    // then retire after the first two ACKs and strand a late prepared inbox.
+    //
+    // Deliberately walk paths rather than distinct RDD ids. ReusedExchangeExec can make two
+    // operator branches point at the same ShuffledRowRDD inside one stage. Those are two iterator
+    // consumers and therefore need two independently replayed inboxes even though the shared RDD
+    // object is encountered twice. Shuffle boundaries terminate a path as usual.
+    val shuffleIds = mutable.ArrayBuffer.empty[Int]
+    def visit(current: RDD[_]): Unit = {
       current.dependencies.foreach {
         case dependency: PipelinedShuffleDependency[_, _, _] =>
-          multiplicityByShuffleId.update(
-            dependency.shuffleId,
-            math.max(
-              multiplicityByShuffleId.getOrElse(dependency.shuffleId, 0),
-              dependency.readerRouteMultiplicity))
-        case _ =>
+          shuffleIds += dependency.shuffleId
+        case _: ShuffleDependency[_, _, _] =>
+        case dependency => visit(dependency.rdd)
       }
-      true
-    })
-    multiplicityByShuffleId.toSeq.sortBy(_._1).flatMap { case (shuffleId, multiplicity) =>
-      Seq.fill(multiplicity)(shuffleId)
     }
+    visit(rdd)
+    shuffleIds.sorted.toSeq
   }
 
   /** Pipelined inputs that an operator in this stage must consume before other inputs. */

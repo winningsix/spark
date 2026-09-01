@@ -236,7 +236,7 @@ class StreamingShuffleWriter[K, V](
             shards(readerId).beginReplay(client)
             sendCompletionExecutor.execute(() => shards(readerId).replayTo(client))
           },
-        (readerId, _) => shards(readerId).creditAvailable(),
+        (readerId, client) => shards(readerId).creditAvailable(client),
         expectedReaderRoutes))
 
   private val memoryConsumer = new MemoryConsumer(
@@ -286,9 +286,13 @@ class StreamingShuffleWriter[K, V](
     if (TIME_BASED_FLUSH_ENABLED) null else new Array[TimestampedBuffer](numPartitions)
 
   private val allocatedBufferBytesSemaphore: Semaphore = new Semaphore(MAX_BUFFER_BYTES.toInt)
+  private[streaming] def writerBufferPermitStats: (Int, Int) =
+    (allocatedBufferBytesSemaphore.availablePermits(), MAX_BUFFER_BYTES.toInt)
   private val rawBytesSent = new AtomicLong(0L)
   private val wireBytesSent = new AtomicLong(0L)
   private val dataMessagesSent = new AtomicLong(0L)
+  private[streaming] def transferStats: (Long, Long, Long) =
+    (rawBytesSent.get(), wireBytesSent.get(), dataMessagesSent.get())
   private val replaySpilledBytes = new AtomicLong(0L)
   // Counts messages whose TransportClient write callback has not completed. In the relaxed
   // pipelined lifecycle this is the second half of the delivery barrier, after every shard's
@@ -536,6 +540,9 @@ class StreamingShuffleWriter[K, V](
     // completed. Keep a separate fence so the periodic ACK repair cannot send a terminal directly
     // and overtake sequence zero on a replacement connection.
     private val terminalWriteCompletedClients = new mutable.HashSet[TransportClient]()
+    // Coalesce repeated idle probes while one targeted terminal repair is queued on the bounded
+    // executor dispatcher. Network event loops must never perform transport admission directly.
+    private val terminalRepairScheduledClients = new mutable.HashSet[TransportClient]()
     // Uncompressed data keeps the producer-owned reference until both replay and network
     // ownership have ended. Keeping the leases here also lets failure cleanup release an owner
     // reference without putting a buffer back in the pool while an in-flight transport slice may
@@ -549,6 +556,9 @@ class StreamingShuffleWriter[K, V](
     private val maxInFlightNetworkBytes = math.max(
       BUFFER_SIZE.toLong, MAX_BUFFER_BYTES / math.max(1, numPartitions))
     private var inFlightNetworkBytes = 0L
+    private var lastCreditProgressSignature = Long.MinValue
+    private var lastCreditProgressNanos = System.nanoTime()
+    private var lastCreditDiagnosticNanos = 0L
     /** Return the replay suffix after a client's last enqueued sequence number. */
     private def replayAfter(
         lastEnqueued: Long,
@@ -681,11 +691,75 @@ class StreamingShuffleWriter[K, V](
     }
 
     /** Wake a blocked route when its reader returns receive-window credit. */
-    private[streaming] def creditAvailable(): Unit = synchronized {
+    private[streaming] def creditAvailable(connected: TransportClient): Unit = {
+      val scheduleTerminalRepair = synchronized {
+        replayHistory.lastOption.exists { terminal =>
+          !terminal.isData &&
+            !terminationAckedClients.contains(connected) &&
+            terminalWriteCompletedClients.contains(connected) &&
+            !replayPendingClients.contains(connected) &&
+            lastEnqueuedByClient.getOrElse(connected, -1L) >= terminal.sequenceNum &&
+            terminalRepairScheduledClients.add(connected)
+        }
+      }
+      if (scheduleTerminalRepair) {
+        // A cumulative ACK is an explicit liveness probe for this exact physical route. Repair on
+        // the bounded dispatcher rather than the Netty control event loop: cross-route admission
+        // can wait for in-flight byte permits. Duplicate terminal frames are idempotently ACKed.
+        sendCompletionExecutor.execute(() => {
+          try retryUnackedTermination(Some(connected))
+          finally synchronized { terminalRepairScheduledClients -= connected }
+        })
+      }
+      synchronized {
+      val terminalSequence = replayHistory.lastOption.filter(!_.isData).map(_.sequenceNum)
+      val connectedClients = client.left.toSeq ++ transportServerHandler.clientsFor(id)
+      if (terminalSequence.isDefined &&
+          connectedClients.exists(client => !terminationAckedClients.contains(client))) {
+        val now = System.nanoTime()
+        val (actionHead, headSequence) = outboundActions.headOption.map {
+          case DataAction(entries) =>
+            val first = entries.headOption.map(_.sequenceNum).getOrElse(-1L)
+            val last = entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
+            (s"data($first-$last)", first)
+          case ControlAction(sequenceNum, _) => (s"control($sequenceNum)", sequenceNum)
+          case ReplayAction(_, maxSequenceNum) => (s"replay($maxSequenceNum)", maxSequenceNum)
+        }.getOrElse(("empty", -1L))
+        val enqueuedProgress = connectedClients.distinct.foldLeft(1L) { (value, target) =>
+          value * 31L + lastEnqueuedByClient.getOrElse(target, -1L)
+        }
+        val progressSignature = ((outboundActions.size.toLong * 31L + headSequence) * 31L +
+          enqueuedProgress) * 31L + inFlightNetworkBytes
+        if (progressSignature != lastCreditProgressSignature) {
+          lastCreditProgressSignature = progressSignature
+          lastCreditProgressNanos = now
+        } else if (now - lastCreditProgressNanos >= TimeUnit.SECONDS.toNanos(10L) &&
+            now - lastCreditDiagnosticNanos >= TimeUnit.SECONDS.toNanos(10L)) {
+          lastCreditDiagnosticNanos = now
+          val routeStates = connectedClients.distinct.map { target =>
+            s"${System.identityHashCode(target)}:" +
+              s"enqueued=${lastEnqueuedByClient.getOrElse(target, -1L)}:" +
+              s"credit=${transportServerHandler.availableDataCredit(id, target)}:" +
+              s"replayPending=${replayPendingClients.contains(target)}:" +
+              s"terminalWritten=${terminalWriteCompletedClients.contains(target)}:" +
+              s"terminalAcked=${terminationAckedClients.contains(target)}"
+          }
+          logWarning(
+            s"Streaming shuffle writer route remains unacknowledged: " +
+              s"shuffle=${streamingShuffleHandle.shuffleId} writer=$shuffleWriterId reader=$id " +
+              s"terminal=${terminalSequence.get} lastSent=${lastSentSequenceNum.get()} " +
+              s"actions=${outboundActions.size} head=$actionHead " +
+              s"scheduled=$outboundDrainScheduled " +
+              s"pendingBatch=${pendingBatch.size} inFlightBytes=$inFlightNetworkBytes " +
+              s"clients=${connectedClients.distinct.size} " +
+              s"routes=${routeStates.mkString("[", ",", "]")}")
+        }
+      }
       // Idle readers repeat their cumulative acknowledgement as a liveness probe. Avoid
       // submitting an empty dispatcher runnable for writers that have already drained, while
       // reliably rescheduling an ordered tail that is still waiting for data credit or EOS.
       if (outboundActions.nonEmpty) scheduleDrainTaskLocked()
+      }
     }
 
     private def connectedTargets(connected: TransportClient): Seq[TransportClient] = {
@@ -854,7 +928,24 @@ class StreamingShuffleWriter[K, V](
     private def scheduleDrainTaskLocked(): Unit = {
       if (!outboundDrainScheduled && !outboundClosed) {
         outboundDrainScheduled = true
-        sendCompletionExecutor.execute(() => drainOutbound())
+        sendCompletionExecutor.execute(() => {
+          try {
+            drainOutbound()
+          } catch {
+            case error: Throwable =>
+              // An admission-time exception happens before drainOutbound removes the head action.
+              // Never leave the scheduled bit latched after the runnable exits: an idle reader's
+              // repair probe must be able to submit the retained ordered tail again.
+              synchronized {
+                outboundDrainScheduled = false
+              }
+              logError(
+                s"Streaming shuffle outbound drain failed for writer $shuffleWriterId, " +
+                  s"reader $id; the retained tail can be retried by the next route probe",
+                error)
+              errorNotifier.markError(error)
+          }
+        })
       }
     }
 
@@ -1351,10 +1442,11 @@ class StreamingShuffleWriter[K, V](
     }
 
     /** Retransmit only an already-enqueued terminal to routes whose application ACK is missing. */
-    private[streaming] def retryUnackedTermination(): Int = {
+    private def retryUnackedTermination(only: Option[TransportClient]): Int = {
       val retry = synchronized {
         replayHistory.lastOption.filter(entry => !entry.isData).toSeq.flatMap { terminal =>
-          transportServerHandler.clientsFor(id).filter { target =>
+          val targets = only.map(Seq(_)).getOrElse(transportServerHandler.clientsFor(id))
+          targets.filter { target =>
             !terminationAckedClients.contains(target) &&
               terminalWriteCompletedClients.contains(target) &&
               !replayPendingClients.contains(target) &&
@@ -1382,6 +1474,8 @@ class StreamingShuffleWriter[K, V](
       }
       retry.size
     }
+
+    private[streaming] def retryUnackedTermination(): Int = retryUnackedTermination(None)
 
     def markTerminationAck(client: TransportClient): Unit = synchronized {
       terminationAckedClients += client
@@ -1513,7 +1607,16 @@ class StreamingShuffleWriter[K, V](
       val releaseRawAfterSend: () => Unit = uncompressedLease match {
         case Some(_) => () => ()
         case None => () => {
-          if (rawReleased.compareAndSet(false, true)) releaseRawBuffer(rawBuffer)
+          // The compressed path calls this eagerly after encoding and PendingSend invokes the
+          // same input-release callback when its envelope retires. Keep both the raw buffer and
+          // its semaphore permit behind one ownership CAS; guarding only the buffer while adding
+          // the permit twice eventually overflows Semaphore's Int counter.
+          if (rawReleased.compareAndSet(false, true)) {
+            releaseRawBuffer(rawBuffer)
+            if (WRITER_BACKPRESSURE_ENABLED) {
+              allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+            }
+          }
           ()
         }
       }
@@ -1537,12 +1640,7 @@ class StreamingShuffleWriter[K, V](
       val releaseInputResources: () => Unit = if (uncompressedLease.isDefined) {
         () => ()
       } else {
-        () => {
-          releaseRawAfterSend()
-          if (WRITER_BACKPRESSURE_ENABLED) {
-            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
-          }
-        }
+        releaseRawAfterSend
       }
       send(dataMessage, () => {
         // Completion is accounted separately from input-buffer ownership.

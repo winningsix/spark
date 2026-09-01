@@ -6723,6 +6723,67 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("pipelined shuffle: a shared producer prepares one route in each consumer stage") {
+    // One shuffle fans out into two DIFFERENT downstream stages. Its query-wide producer
+    // contract has multiplicity two, but each consumer TaskSet owns only one of those routes.
+    // Expanding the global multiplicity in both TaskSets creates four clients and lets the writer
+    // retire after the wrong pair of ACKs.
+    val source = new MyRDD(sc, 2, Nil)
+    val shared = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    val left = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
+    val right = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
+    val leftOutput = new PipelinedShuffleDependency(left, new HashPartitioner(2))
+    val rightOutput = new PipelinedShuffleDependency(right, new HashPartitioner(2))
+    val result = new MyRDD(sc, 2, List(leftOutput, rightOutput), tracker = mapOutputTracker)
+
+    submit(result, Array(0, 1))
+    assert(taskSets.size === 4)
+    assert(shared.readerRouteMultiplicity === 2)
+    Seq(left, right).foreach { consumer =>
+      val taskSet = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq consumer).get
+      assert(taskSet.pipelinedReaderShuffleIds === Seq(shared.shuffleId))
+    }
+
+    completeShuffleMapStageSuccessfully(
+      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq source).get.stageId, 0, 2)
+    Seq(left, right).foreach { consumer =>
+      completeShuffleMapStageSuccessfully(
+        taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq consumer).get.stageId, 0, 2)
+    }
+    complete(
+      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq result).get,
+      Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
+
+  test("pipelined shuffle: shared RDD paths prepare independent routes in one stage") {
+    // ReusedExchangeExec can collapse two operator inputs onto one ShuffledRowRDD object. The
+    // stage still invokes that iterator twice, so a distinct-RDD traversal would undercount it.
+    // Walking dependency paths preserves the two logical consumers.
+    val source = new MyRDD(sc, 2, Nil)
+    val shared = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    shared.setReaderRouteMultiplicity(2)
+    val consumer = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
+    val result = new MyRDD(
+      sc,
+      2,
+      List(new OneToOneDependency(consumer), new OneToOneDependency(consumer)),
+      tracker = mapOutputTracker)
+
+    submit(result, Array(0, 1))
+    assert(taskSets.size === 2)
+    val readerTaskSet = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq result).get
+    assert(readerTaskSet.pipelinedReaderShuffleIds ===
+      Seq(shared.shuffleId, shared.shuffleId))
+
+    completeShuffleMapStageSuccessfully(
+      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq source).get.stageId, 0, 2)
+    complete(readerTaskSet, Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
+
   test("pipelined shuffle: an explicit job cancellation cleans up a buffered consumer deferral") {
     // A buffered deferral is the only mutable state this feature adds; it must never outlive its
     // job. Job cancellation goes through failJobAndIndependentStages ->
