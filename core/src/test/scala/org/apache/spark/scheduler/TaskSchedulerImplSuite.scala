@@ -2892,4 +2892,56 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "the producer must not launch another task while its two-task window is full")
   }
 
+  test("prepared receive mode expands only a sole pure producer") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS.key -> "4")
+
+    def producer(stageId: Int): TaskSet = new TaskSet(
+      Array.tabulate[Task[_]](6)(i => new FakeTask(stageId, i)),
+      stageId = stageId,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(stageId + 1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+
+    taskScheduler.submitTasks(producer(stageId = 0))
+    val offers = (0 until 8).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    assert(taskScheduler.resourceOffers(offers).flatten.length === 4,
+      "the only pure producer should expand from its base window to the sole-stage window")
+  }
+
+  test("prepared receive mode keeps sibling pure producers at their base windows") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS.key -> "4")
+
+    def producer(stageId: Int): TaskSet = new TaskSet(
+      Array.tabulate[Task[_]](6)(i => new FakeTask(stageId, i)),
+      stageId = stageId,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(stageId + 1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+
+    taskScheduler.submitTasks(producer(stageId = 0))
+    taskScheduler.submitTasks(producer(stageId = 1))
+    val offers = (0 until 8).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    assert(taskScheduler.resourceOffers(offers).flatten.length === 4)
+    assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 2)
+    assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 2)
+  }
+
 }

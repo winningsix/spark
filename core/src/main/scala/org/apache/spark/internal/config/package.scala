@@ -2242,6 +2242,21 @@ package object config {
       .checkValue(_ >= 1, "must be at least one")
       .createOptional
 
+  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS =
+    ConfigBuilder("spark.shuffle.streaming.elasticProducers.soleStageMaxTasks")
+      .doc("Maximum running tasks for a pure producer stage after it becomes the only active " +
+        "pure producer in its pipelined group. This can be higher than maxTasksPerStage so the " +
+        "last scan or compute producer fills otherwise idle CPU slots. Ready prepared-reader " +
+        "tasks remain ahead of producers in offer order. When unset, maxTasksPerStage remains " +
+        "the limit throughout the stage lifetime. The prepared receive queue remains the " +
+        "memory/spill boundary while this larger tail wave drains.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "must be at least one")
+      .createOptional
+
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")
       .doc("Number of threads used by one pipelined shuffle reader to create its writer clients. " +

@@ -229,6 +229,8 @@ private[spark] class TaskSchedulerImpl(
     conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
   private val elasticProducerMaxTasksPerStage =
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
+  private val elasticProducerSoleStageMaxTasks =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
   private val inboxReadyRevivePending = new AtomicBoolean(false)
 
   private lazy val streamingTrackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
@@ -340,11 +342,24 @@ private[spark] class TaskSchedulerImpl(
     taskSet.taskSet.isPipelinedShuffleReader && preTaskReaderTaskSetReady(taskSet)
   }
 
-  private def elasticProducerLaunchAllowed(taskSet: TaskSetManager): Boolean = {
+  private def isActivePurePipelinedProducer(taskSet: TaskSetManager): Boolean = {
+    !taskSet.isZombie && taskSet.tasksSuccessful < taskSet.numTasks &&
+      taskSet.taskSet.isPipelinedShuffleProducer &&
+      !taskSet.taskSet.isPipelinedShuffleReader
+  }
+
+  private def elasticProducerLaunchAllowed(
+      taskSet: TaskSetManager,
+      soleActivePureProducer: Boolean): Boolean = {
     val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
+    val taskLimit = if (soleActivePureProducer) {
+      elasticProducerSoleStageMaxTasks.orElse(elasticProducerMaxTasksPerStage)
+    } else {
+      elasticProducerMaxTasksPerStage
+    }
     !executorReceiveServiceEnabled || !pureProducer ||
-      elasticProducerMaxTasksPerStage.forall(taskSet.runningTasks < _)
+      taskLimit.forall(taskSet.runningTasks < _)
   }
 
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
@@ -582,7 +597,8 @@ private[spark] class TaskSchedulerImpl(
       shuffledOffers: Seq[WorkerOffer],
       availableCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
-      tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
+      tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
+      soleActivePureProducer: Boolean)
     : (Boolean, Option[TaskLocality]) = {
     if (!preTaskReaderTaskSetReady(taskSet)) return (true, None)
     var noDelayScheduleRejects = true
@@ -600,7 +616,7 @@ private[spark] class TaskSchedulerImpl(
       val taskSetRpID = taskSet.taskSet.resourceProfileId
 
       // check whether the task can be scheduled to the executor base on resource profile.
-      if (elasticProducerLaunchAllowed(taskSet) && sc.resourceProfileManager
+      if (elasticProducerLaunchAllowed(taskSet, soleActivePureProducer) && sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
           availableCpus(i), availableResources(i))
@@ -751,6 +767,12 @@ private[spark] class TaskSchedulerImpl(
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    val activePureProducerTaskSets = sortedTaskSets.filter(isActivePurePipelinedProducer)
+    val solePureProducer = if (activePureProducerTaskSets.size == 1) {
+      activePureProducerTaskSets.headOption
+    } else {
+      None
+    }
     preparePipelinedReaderInboxes(sortedTaskSets)
     rebuildOfferReadyPreTaskReaderIndices(sortedTaskSets)
     // Once an executor-owned inbox receives its first payload (or EOS), launch its attached
@@ -798,7 +820,7 @@ private[spark] class TaskSchedulerImpl(
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks)
+              availableResources, tasks, solePureProducer.contains(taskSet))
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
