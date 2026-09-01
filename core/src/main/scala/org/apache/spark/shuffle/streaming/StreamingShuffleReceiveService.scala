@@ -392,12 +392,14 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
         routeRegistrationTasks.incrementAndGet()
         try {
           CompletableFuture.runAsync(
-            () => endpointRequests.foreach { request =>
-              try {
-                request.registration()
-                request.result.complete(null)
-              } catch {
-                case error: Throwable => request.result.completeExceptionally(error)
+            () => {
+              val failures = StreamingShuffleExecutorClient.runBatchedRouteRegistrations(
+                endpointRequests.map(request => request.result -> request.registration))
+              endpointRequests.foreach { request =>
+                failures.get(request.result) match {
+                  case Some(error) => request.result.completeExceptionally(error)
+                  case None => request.result.complete(null)
+                }
               }
             },
             executor)

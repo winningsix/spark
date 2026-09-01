@@ -40,7 +40,7 @@ import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
   TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 
 class StreamingShuffleManagerSuite
   extends SparkFunSuite
@@ -301,6 +301,52 @@ class StreamingShuffleManagerSuite
       sessions.foreach(_.close())
       discovery.close()
       clientCreationExecutor.shutdownNow()
+    }
+  }
+
+  test("prepared routes coalesce initial credits across inboxes on one physical lane") {
+    withSpark(new SparkContext("local", "prepared-initial-credit-batch", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val handlers = (0 until 9).map { readerId =>
+        readerId -> new StreamingShuffleClientHandler(
+          3,
+          readerId,
+          new LinkedBlockingQueue[StreamingShuffleMessage](),
+          7,
+          1L << 20,
+          null,
+          new ErrorNotifier())
+      }
+      val failedRequest = new Object()
+      val successfulRequests = handlers.map { case (readerId, handler) =>
+        val request = new Object()
+        request -> (() => {
+          client.registerBatch(
+            7, readerId, "127.0.0.1", server.port, Seq(3 -> handler))
+          // Model an inbox that closes after route installation but before this worker flushes
+          // the shared initial-credit body. Its pending frame must be canceled.
+          if (readerId == 8) client.unregister(7, 3, readerId, handler)
+          ()
+        })
+      }
+      try {
+        val expectedFailure = new RuntimeException("isolated route failure")
+        val failures = StreamingShuffleExecutorClient.runBatchedRouteRegistrations(
+          successfulRequests :+ (failedRequest -> (() => throw expectedFailure)))
+
+        failures shouldBe Map(failedRequest -> expectedFailure)
+        client.initialCreditBatchStats shouldBe (handlers.size.toLong, 1L)
+        eventually(Timeout(10.seconds)) {
+          server.controlBodyStats shouldBe (1L, handlers.size.toLong - 1L)
+        }
+      } finally {
+        handlers.foreach { case (readerId, handler) =>
+          client.unregister(7, 3, readerId, handler)
+        }
+        client.close()
+        server.close()
+      }
     }
   }
 
