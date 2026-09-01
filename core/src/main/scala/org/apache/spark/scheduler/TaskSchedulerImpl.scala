@@ -268,13 +268,17 @@ private[spark] class TaskSchedulerImpl(
             if (!preTaskReaderAssignments.contains(key)) {
               val executorId = receiveExecutors(taskIndex % receiveExecutors.size)
               val partitionId = taskSet.tasks(taskIndex).partitionId
-              val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.distinct.map { shuffleId =>
+              val nextOrdinalByShuffle = new HashMap[Int, Int]
+              val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
+                val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
+                nextOrdinalByShuffle.update(shuffleId, readerOrdinal + 1)
                 StreamingShuffleReceiveInboxId(
                   shuffleId,
                   taskSet.stageId,
                   taskSet.taskSet.stageAttemptId,
                   partitionId,
-                  -1L)
+                  -1L,
+                  readerOrdinal)
               }
               if (inboxes.forall(tracker.prepareReceiveInbox(executorId, _))) {
                 preTaskReaderAssignments.put(

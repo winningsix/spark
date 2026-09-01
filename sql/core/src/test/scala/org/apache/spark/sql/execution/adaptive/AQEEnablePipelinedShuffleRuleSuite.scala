@@ -23,7 +23,9 @@ import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.{SparkPlan, TakeOrderedAndProjectExec, UnionExec}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec,
+  ShuffleExchangeExec}
+import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
 import org.apache.spark.sql.execution.joins.SortMergeJoinExec
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -122,6 +124,44 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       val rewritten = AQEEnablePipelinedShuffle().apply(join)
       assert(rewritten.isInstanceOf[SortMergeJoinExec])
       assert(exchangesWithPipelined(rewritten) === Seq(true, true))
+    }
+  }
+
+  test("a reused broadcast exchange does not block a pipelined shuffle") {
+    withSQLConf(
+        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+      import testImplicits._
+      val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val shuffle = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+      val broadcast = BroadcastExchangeExec(
+        HashedRelationBroadcastMode(leaf.output), leaf)
+      val reusedBroadcast = ReusedExchangeExec(broadcast.output, broadcast)
+      val plan = UnionExec(Seq(shuffle, reusedBroadcast))
+
+      val rewritten = AQEEnablePipelinedShuffle().apply(plan)
+      assert(exchangesWithPipelined(rewritten) === Seq(true))
+      assert(rewritten.collect { case _: ReusedExchangeExec => true }.size === 1)
+    }
+  }
+
+  test("a reused shuffle is rewired to one shared pipelined exchange") {
+    withSQLConf(
+        "spark.sql.pipelinedShuffle.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+      import testImplicits._
+      val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val shuffle = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+      val reused = ReusedExchangeExec(shuffle.output, shuffle)
+      val plan = UnionExec(Seq(shuffle, reused))
+
+      val rewritten = AQEEnablePipelinedShuffle().apply(plan).asInstanceOf[UnionExec]
+      val rewrittenShuffle = rewritten.children.head.asInstanceOf[ShuffleExchangeExec]
+      val rewrittenReuse = rewritten.children(1).asInstanceOf[ReusedExchangeExec]
+      assert(rewrittenShuffle.pipelined)
+      assert(rewrittenReuse.child.asInstanceOf[ShuffleExchangeExec].pipelined)
+      assert(rewrittenReuse.child eq rewrittenShuffle,
+        "the original and reused branches must share one pipelined exchange instance")
     }
   }
 

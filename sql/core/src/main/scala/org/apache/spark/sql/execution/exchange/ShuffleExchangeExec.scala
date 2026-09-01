@@ -206,8 +206,16 @@ case class ShuffleExchangeExec(
 
   override def nodeName: String = "Exchange"
 
-  // The default arg string is positional, so printing `pipelined` unconditionally would add a bare
-  // `false` to every shuffle in every plan. Show it only when set, and name it when shown.
+  // The transport changes how rows move, not the exchange's relational semantics. Ignoring the
+  // flag here lets ReuseExchangeAndSubquery preserve the same exchange-reuse shape when a
+  // separately prepared subquery has already been switched to the pipelined transport.
+  override protected def doCanonicalize(): SparkPlan = {
+    super.doCanonicalize().asInstanceOf[ShuffleExchangeExec].copy(pipelined = false)
+  }
+
+  // `pipelined` is only meaningful for a Real-Time Mode plan, and the default arg string is
+  // positional, so printing it unconditionally would add a bare `false` to every shuffle in every
+  // plan. Show it only when set, and name it when shown.
   override def stringArgs: Iterator[Any] = {
     // `pipelined` is the last field, so drop it positionally rather than by value; argString drops
     // the child on its own. Exchange's `[plan_id=...]` suffix is re-appended here.
@@ -220,6 +228,30 @@ case class ShuffleExchangeExec(
     new UnsafeRowSerializer(child.output.size, longMetric("dataSize"))
 
   @transient lazy val inputRDD: RDD[InternalRow] = child.execute()
+
+  // ReusedExchangeExec is a SparkPlan leaf that invokes this same exchange RDD again. The
+  // distributed pipelined transport therefore needs one independently replayed reader route per
+  // plan occurrence, even though the RDD dependency graph contains only one shared reader RDD.
+  @transient private var pipelinedReaderRouteMultiplicity: Int = 1
+  @transient private var pipelinedExchangeReuseKey: Int = id
+  @transient private var pipelinedSequentialReplayRequired: Boolean = false
+
+  private[exchange] def pipelinedReuseKey: Int = pipelinedExchangeReuseKey
+
+  private[exchange] def setPipelinedReaderRouteMultiplicity(multiplicity: Int): Unit = {
+    require(multiplicity > 0, s"Reader route multiplicity must be positive: $multiplicity")
+    pipelinedReaderRouteMultiplicity = multiplicity
+  }
+
+  private[exchange] def markPipelinedSequentialReplayRequired(): Unit = {
+    pipelinedSequentialReplayRequired = true
+  }
+
+  private[exchange] def copyPipelinedTransportStateFrom(other: ShuffleExchangeExec): Unit = {
+    pipelinedReaderRouteMultiplicity = other.pipelinedReaderRouteMultiplicity
+    pipelinedExchangeReuseKey = other.pipelinedExchangeReuseKey
+    pipelinedSequentialReplayRequired = other.pipelinedSequentialReplayRequired
+  }
 
   // 'mapOutputStatisticsFuture' is only needed when enable AQE.
   @transient
@@ -265,6 +297,14 @@ case class ShuffleExchangeExec(
         serializer,
         writeMetrics,
         pipelined)
+      dep match {
+        case pipelinedDep: PipelinedShuffleDependency[_, _, _] =>
+          pipelinedDep.setReaderRouteMultiplicity(pipelinedReaderRouteMultiplicity)
+          if (pipelinedSequentialReplayRequired) {
+            pipelinedDep.markReplayLeaseAvailable()
+          }
+        case _ =>
+      }
       metrics("numPartitions").set(dep.partitioner.numPartitions)
       val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
       SQLMetrics.postDriverMetricUpdates(
@@ -279,8 +319,11 @@ case class ShuffleExchangeExec(
     new ShuffledRowRDD(shuffleDependency, readMetrics)
   }
 
-  override protected def withNewChildInternal(newChild: SparkPlan): ShuffleExchangeExec =
-    copy(child = newChild)
+  override protected def withNewChildInternal(newChild: SparkPlan): ShuffleExchangeExec = {
+    val copied = copy(child = newChild)
+    copied.copyPipelinedTransportStateFrom(this)
+    copied
+  }
 }
 
 object ShuffleExchangeExec {

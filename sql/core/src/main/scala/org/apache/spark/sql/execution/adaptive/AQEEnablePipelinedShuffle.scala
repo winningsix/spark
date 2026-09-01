@@ -24,6 +24,7 @@ import org.apache.spark.sql.execution.{BinaryExecNode, CoalesceExec, CollectLimi
 import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle,
   PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ShuffledJoin
+import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 
 /**
  * Opt-in (SPARK-57399). Flips eligible [[ShuffleExchangeExec]]
@@ -66,9 +67,13 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
     if (!PipelinedShuffleEligibility.enabled(plan, conf)) return plan
 
     if (conf.pipelinedShuffleFullPlanAQEEnabled) {
-      // Reuse the non-AQE all-visible-exchanges rewrite and its fan-out/consumer safety gates.
-      // This changes only shuffle transport flags; join algorithms and build sides are untouched.
-      EnablePipelinedShuffle().apply(plan)
+      // AQE normally discovers equivalent exchanges when it creates materialized query stages.
+      // Pipelined exchanges deliberately do not become query stages, so waiting for that cache
+      // would duplicate their producers. Preserve the same exchange-reuse decision first, then
+      // let the distributed transport attach every logical consumer to the shared producer.
+      // This changes only exchange wrappers and transport flags; join algorithms and build sides
+      // are untouched.
+      EnablePipelinedShuffle().apply(ReuseExchangeAndSubquery(plan))
     } else {
       flipEligibleExchanges(plan)
     }
@@ -199,16 +204,10 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
    * Canonicalized forms of shuffle exchanges occurring more than once across the plan,
    * materialized stages, and subquery plans -- flipping one of these loses stage reuse.
    *
-   * Note: `ShuffleExchangeExec.pipelined` is a plain case-class field with no doCanonicalize
-   * override, so it PARTICIPATES in the canonical form. An already-flipped (pipelined = true)
-   * exchange and a structurally identical unflipped twin therefore canonicalize DIFFERENTLY and
-   * would not be paired here. The counts are taken over the CURRENT plan on each replanning
-   * round (and this rule does re-run in later rounds on a plan that may already contain an
-   * earlier round's flip -- it is NOT a before-any-flip pass). That is still safe: a flipped and
-   * an unflipped structural twin cannot coexist as a real duplicate, because reuse collapses
-   * twins (ReuseExchangeAndSubquery / ShuffleQueryStageExec) before this rule runs, and if one
-   * somehow slipped through, the DAGScheduler's fan-out check rejects a multi-consumer pipelined
-   * producer rather than producing wrong results. So missing such a pair here is fail-safe.
+   * `ShuffleExchangeExec.pipelined` is deliberately excluded from canonicalization because it is
+   * transport metadata, so regular and pipelined structural twins are counted as duplicates here.
+   * This keeps AQE's targeted flip conservative while full-plan mode delegates reuse handling to
+   * EnablePipelinedShuffle and the configured manager capabilities.
    */
   private def duplicatedShuffleForms(plan: SparkPlan): Set[Any] = {
     val counts = mutable.HashMap.empty[Any, Int]

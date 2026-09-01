@@ -42,7 +42,8 @@ private[spark] case class StreamingShuffleReceiveInboxId(
     stageId: Int,
     stageAttemptNumber: Int,
     partitionId: Int,
-    taskAttemptId: Long)
+    taskAttemptId: Long,
+    readerOrdinal: Int = 0)
 
 private[spark] case class PrepareStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
@@ -61,10 +62,10 @@ private[streaming] object StreamingShuffleReceiveService {
 /**
  * Executor-scoped owner for streaming-shuffle receive queues.
  *
- * The first version deliberately keys an inbox by task attempt, preserving the existing retry and
- * speculation semantics while moving resource ownership out of `StreamingShuffleReader`. A later
- * prepare protocol can create an inbox before its compute task and transfer it through a lease
- * without moving queue cleanup back into the task.
+ * An attached inbox is keyed by task attempt and reader ordinal, preserving retry/speculation
+ * semantics while allowing one task to read a reused shuffle more than once. The prepare protocol
+ * creates those ordinal inboxes before compute and transfers each through a lease without moving
+ * queue cleanup back into the task.
  */
 private[streaming] class StreamingShuffleReceiveService(
     conf: SparkConf,
@@ -72,16 +73,36 @@ private[streaming] class StreamingShuffleReceiveService(
     onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
   private val inboxes =
     new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
+  private case class TaskShuffleKey(
+      shuffleId: Int,
+      stageId: Int,
+      stageAttemptNumber: Int,
+      partitionId: Int,
+      taskAttemptId: Long)
+  private val nextReaderOrdinal = new ConcurrentHashMap[TaskShuffleKey, AtomicInteger]()
 
   def acquire(
       shuffleId: Int,
       context: TaskContext): StreamingShuffleReceiveInboxLease = {
+    val taskShuffleKey = TaskShuffleKey(
+      shuffleId,
+      context.stageId(),
+      context.stageAttemptNumber(),
+      context.partitionId(),
+      context.taskAttemptId())
+    val ordinalCounter = nextReaderOrdinal.computeIfAbsent(
+      taskShuffleKey, _ => new AtomicInteger(0))
+    val readerOrdinal = ordinalCounter.getAndIncrement()
+    context.addTaskCompletionListener[Unit] { _ =>
+      nextReaderOrdinal.remove(taskShuffleKey, ordinalCounter)
+    }
     val preparedId = StreamingShuffleReceiveInboxId(
       shuffleId,
       context.stageId(),
       context.stageAttemptNumber(),
       context.partitionId(),
-      -1L)
+      -1L,
+      readerOrdinal)
     val prepared = inboxes.get(preparedId)
     if (prepared != null && prepared.attach(context.taskAttemptId())) {
       return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))

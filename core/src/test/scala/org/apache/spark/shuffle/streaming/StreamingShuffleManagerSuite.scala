@@ -103,10 +103,16 @@ class StreamingShuffleManagerSuite
       val first = service.acquire(10, TaskContext.empty())
       service.activeInboxCount shouldBe 1
 
+      val duplicate = service.acquire(10, TaskContext.empty())
+      service.activeInboxCount shouldBe 2
+      first.id.readerOrdinal shouldBe 0
+      duplicate.id.readerOrdinal shouldBe 1
+
       service.unregisterShuffle(11)
-      service.activeInboxCount shouldBe 1
+      service.activeInboxCount shouldBe 2
 
       first.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
+      duplicate.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
       service.activeInboxCount shouldBe 0
       first.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
 
@@ -132,6 +138,7 @@ class StreamingShuffleManagerSuite
           requiresWholeGroup
         SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
           receiveServiceEnabled
+        SparkEnv.get.pipelinedShuffleManager.supportsFanOut shouldBe true
       }
     }
   }
