@@ -265,6 +265,7 @@ class StreamingShuffleSuite
       .set("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
       .set("spark.shuffle.streaming.sharedConnections.enabled", "true")
       .set("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
+      .set("spark.shuffle.streaming.writer.waitForTerminationAcks", "false")
       .set("spark.speculation", "false")
       .set("spark.ui.enabled", "false")
     val sc = new SparkContext(conf)

@@ -2199,7 +2199,11 @@ class StreamingShuffleWriter[K, V](
       if (WAIT_FOR_TERMINATION_ACKS) {
         while (!shards.forall(_.allRegisteredClientsAcked)) {
           throwErrorIfExists()
-          Thread.`yield`()
+          // Waiting writers still occupy Spark task slots, but they must not also burn an
+          // executor CPU while the downstream readers are doing the useful work needed to
+          // produce these acknowledgements. Keep the wait interruptible so task cancellation
+          // and failures retain their existing prompt escape path.
+          Thread.sleep(10L)
         }
         logDebug(log"Received all termination acks for shuffle writer ${MDC(
           LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Closing server channel.")
