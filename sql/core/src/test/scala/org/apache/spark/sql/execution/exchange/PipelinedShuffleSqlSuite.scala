@@ -199,6 +199,36 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("distributed range replay uses one sampling pass for skewed hash input") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      import org.apache.spark.sql.functions.{hash, lit, pmod}
+
+      // Keep only keys assigned to one of four hash reducers. With 100k distinct groups this
+      // makes RangePartitioner's ordinary sampling path classify that reducer as imbalanced and
+      // launch a second sampling job. A pipelined input instead uses its first-pass reservoir so
+      // the stream has a fixed two-consumer contract: range sampling, then the range exchange.
+      val df = spark.range(0, 100000, 1, 4)
+        .withColumn("k", $"id" % 100000)
+        .filter(pmod(hash($"k"), lit(4)) === 0)
+        .groupBy($"k").count()
+        .orderBy($"k")
+
+      val rows = df.as[(Long, Long)].collect().toSeq
+      val exchanges = collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined),
+        s"expected pipelined hash and range exchanges; plan:\n${df.queryExecution.executedPlan}")
+      assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows.nonEmpty)
+      assert(rows.map(_._1) === rows.map(_._1).sorted)
+      assert(rows.forall(_._2 == 1L))
+    }
+  }
+
   test("distributed prepared receive multicasts a reused shuffle") {
     withDistributedPipelinedSession() { spark =>
       import spark.implicits._

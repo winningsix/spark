@@ -234,7 +234,7 @@ case class ShuffleExchangeExec(
   // plan occurrence, even though the RDD dependency graph contains only one shared reader RDD.
   @transient private var pipelinedReaderRouteMultiplicity: Int = 1
   @transient private var pipelinedExchangeReuseKey: Int = id
-  @transient private var pipelinedSequentialReplayRequired: Boolean = false
+  @transient private var pipelinedSequentialReplayCount: Int = 0
 
   private[exchange] def pipelinedReuseKey: Int = pipelinedExchangeReuseKey
 
@@ -243,14 +243,15 @@ case class ShuffleExchangeExec(
     pipelinedReaderRouteMultiplicity = multiplicity
   }
 
-  private[exchange] def markPipelinedSequentialReplayRequired(): Unit = {
-    pipelinedSequentialReplayRequired = true
+  private[exchange] def addPipelinedSequentialReplays(count: Int): Unit = {
+    require(count > 0, s"Sequential replay count must be positive: $count")
+    pipelinedSequentialReplayCount += count
   }
 
   private[exchange] def copyPipelinedTransportStateFrom(other: ShuffleExchangeExec): Unit = {
     pipelinedReaderRouteMultiplicity = other.pipelinedReaderRouteMultiplicity
     pipelinedExchangeReuseKey = other.pipelinedExchangeReuseKey
-    pipelinedSequentialReplayRequired = other.pipelinedSequentialReplayRequired
+    pipelinedSequentialReplayCount = other.pipelinedSequentialReplayCount
   }
 
   // 'mapOutputStatisticsFuture' is only needed when enable AQE.
@@ -300,8 +301,8 @@ case class ShuffleExchangeExec(
       dep match {
         case pipelinedDep: PipelinedShuffleDependency[_, _, _] =>
           pipelinedDep.setReaderRouteMultiplicity(pipelinedReaderRouteMultiplicity)
-          if (pipelinedSequentialReplayRequired) {
-            pipelinedDep.markReplayLeaseAvailable()
+          if (pipelinedSequentialReplayCount > 0) {
+            pipelinedDep.addReplayLeases(pipelinedSequentialReplayCount)
           }
         case _ =>
       }
@@ -422,9 +423,14 @@ object ShuffleExchangeExec {
         // RangePartitioner runs a sampling job before the exchange's real job. A pipelined
         // dependency in the input therefore has two sequential consumers and must retain one
         // bounded replay generation rather than being treated as an ordinary single-use stream.
-        if (SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay) {
-          markPipelinedDependenciesReplayable(rdd)
-        }
+        // The ordinary RangePartitioner may run a third, data-dependent job to re-sample skewed
+        // partitions. A live stream cannot know before its producer starts which reducer shards
+        // will need that optional route. Use the already-uniform per-partition reservoir sample
+        // (weighted by the partition row count) for pipelined inputs, making the contract exactly
+        // sampling + final consumption. Regular shuffle inputs keep the standard re-sampling path.
+        val hasReplayablePipelinedInput =
+          SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay &&
+            markPipelinedDependenciesReplayable(rdd)
         // Extract only fields used for sorting to avoid collecting large fields that does not
         // affect sorting result when deciding partition bounds in RangePartitioner
         val rddForSampling = rdd.mapPartitionsInternal { iter =>
@@ -444,7 +450,8 @@ object ShuffleExchangeExec {
           numPartitions,
           rddForSampling,
           ascending = true,
-          samplePointsPerPartitionHint = SQLConf.get.rangeExchangeSampleSizePerPartition)
+          samplePointsPerPartitionHint = SQLConf.get.rangeExchangeSampleSizePerPartition,
+          resampleImbalancedPartitions = !hasReplayablePipelinedInput)
       case SinglePartition => new ConstantPartitioner
       case k: KeyedPartitioning =>
         val keyGroupedPartitioning = k.toGrouped
@@ -643,20 +650,23 @@ object ShuffleExchangeExec {
     dependency
   }
 
-  private def markPipelinedDependenciesReplayable(rdd: RDD[_]): Unit = {
+  private def markPipelinedDependenciesReplayable(rdd: RDD[_]): Boolean = {
     val visited = mutable.HashSet.empty[RDD[_]]
     val pending = mutable.ArrayDeque[RDD[_]](rdd)
+    var found = false
     while (pending.nonEmpty) {
       val current = pending.removeHead()
       if (visited.add(current)) {
         current.dependencies.foreach {
           case dependency: PipelinedShuffleDependency[_, _, _] =>
             dependency.markReplayLeaseAvailable()
+            found = true
           case dependency =>
             pending.append(dependency.rdd)
         }
       }
     }
+    found
   }
 
   /**

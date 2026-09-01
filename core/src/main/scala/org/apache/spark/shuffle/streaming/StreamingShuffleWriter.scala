@@ -157,10 +157,11 @@ class StreamingShuffleWriter[K, V](
   private val expectedReaderRoutes = streamingShuffleHandle.dependency match {
     case dependency: PipelinedShuffleDependency[_, _, _] =>
       val routes = dependency.expectedReaderRoutes
-      // RangePartitioner sampling is an internal reader created after the normal stage graph
-      // snapshot. It consumes every reducer once in addition to the visible range-exchange
-      // reader, so reserve one replay route for that bounded internal consumer.
-      if (REPLAYABLE_FOR_INTERNAL_CONSUMER) routes.map(_ + 1) else routes
+      // Internal preparation and cross-scope exchange reuse create readers after the normal stage
+      // graph snapshot. Reserve every bounded replay route carried by the dependency rather than
+      // assuming there can be only one late consumer.
+      val replayRoutes = dependency.replayReaderRouteCount
+      if (replayRoutes > 0) routes.map(_ + replayRoutes) else routes
     case _ => Array.fill(numPartitions)(1)
   }
   // Use the same map identity that is registered in StreamingShuffleOutputTracker and handed to

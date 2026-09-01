@@ -7844,14 +7844,14 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: an internal replay job attaches only the retained direct stage") {
+  test("pipelined shuffle: counted replay jobs attach only the retained direct stage") {
     val source = new MyRDD(sc, 2, Nil)
     val lowerDep = new PipelinedShuffleDependency(source, new HashPartitioner(2))
     val middle = new MyRDD(sc, 2, List(lowerDep), tracker = mapOutputTracker)
     val directDep = new PipelinedShuffleDependency(middle, new HashPartitioner(2))
     val firstConsumer = new MyRDD(sc, 2, List(directDep), tracker = mapOutputTracker)
     lowerDep.markReplayLeaseAvailable()
-    directDep.markReplayLeaseAvailable()
+    directDep.addReplayLeases(2)
 
     submit(firstConsumer, Array(0, 1))
     val lowerStage = scheduler.shuffleIdToMapStage(lowerDep.shuffleId)
@@ -7867,6 +7867,19 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(lowerStage.jobIds === Set(0))
     assert(scheduler.jobIdToStageIds(1).contains(directStage.id))
     assert(!scheduler.jobIdToStageIds(1).contains(lowerStage.id))
+
+    val replayResultStage = taskSets.find { taskSet =>
+      scheduler.stageIdToStage(taskSet.stageId).rdd eq replayConsumer
+    }.get
+    complete(replayResultStage, Seq((Success, 42), (Success, 43)))
+
+    val secondReplayConsumer = new MyRDD(sc, 2, List(directDep), tracker = mapOutputTracker)
+    submit(secondReplayConsumer, Array(0, 1))
+    // Completed replay job 1 has been removed; the original job and the second replay remain.
+    assert(directStage.jobIds === Set(0, 2))
+    assert(lowerStage.jobIds === Set(0))
+    assert(scheduler.jobIdToStageIds(2).contains(directStage.id))
+    assert(!scheduler.jobIdToStageIds(2).contains(lowerStage.id))
   }
 
   test("pipelined shuffle: sequential re-run of the same producer is sound (fresh stage per job)") {

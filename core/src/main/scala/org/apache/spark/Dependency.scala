@@ -334,7 +334,8 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
    * bounded replay lease instead of being treated as an ordinary once-through shuffle.
    */
   private[spark] var replayableForInternalConsumer = false
-  @transient private var replayLeaseAvailable = false
+  private var configuredReplayReaderRoutes = 0
+  @transient private var replayLeasesAvailable = 0
 
   // The route contract travels with the shuffle task to executors. Result stages may consume only
   // a prefix of the reduce partitions, while sibling consumers may require more than one route.
@@ -366,17 +367,27 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   }
 
   private[spark] def markReplayLeaseAvailable(): Unit = synchronized {
+    addReplayLeases(1)
+  }
+
+  private[spark] def addReplayLeases(count: Int): Unit = synchronized {
+    require(count > 0, s"Replay lease count must be positive: $count")
     replayableForInternalConsumer = true
-    replayLeaseAvailable = true
+    configuredReplayReaderRoutes += count
+    replayLeasesAvailable += count
+  }
+
+  private[spark] def replayReaderRouteCount: Int = synchronized {
+    configuredReplayReaderRoutes
   }
 
   private[spark] def isReplayLeaseAvailable: Boolean = synchronized {
-    replayLeaseAvailable
+    replayLeasesAvailable > 0
   }
 
   private[spark] def consumeReplayLease(): Boolean = synchronized {
-    if (replayLeaseAvailable) {
-      replayLeaseAvailable = false
+    if (replayLeasesAvailable > 0) {
+      replayLeasesAvailable -= 1
       true
     } else {
       false
