@@ -34,7 +34,8 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
@@ -195,7 +196,7 @@ class StreamingShuffleWriterSuite
   // send directly to this mock instead of over the network.
   private def bindMockClient(
       writer: StreamingShuffleWriter[Int, Int],
-      shardId: Int)(onSend: ByteBuf => Unit): Unit = {
+      shardId: Int)(onSend: ByteBuf => Unit): TransportClient = {
     val client = mock[TransportClient]
     val channel = mock[Channel]
     val channelConfig = mock[ChannelConfig]
@@ -219,6 +220,34 @@ class StreamingShuffleWriterSuite
       succeededFuture
     }
     writer.transportServerHandler.futureClients(shardId).complete(client)
+    client
+  }
+
+  test("an idle route probe immediately retransmits an unacknowledged terminal") {
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
+        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+
+        writer.shards(0).send(new TerminationControlMessage(0, 0))
+        eventually(Timeout(10.seconds)) {
+          sends.get() shouldBe 1
+        }
+
+        // The transport write completed, but no TerminationAckMessage was returned. A duplicate
+        // cumulative credit frame for this physical route must actively repair the terminal
+        // instead of merely waking an already-empty outbound action queue.
+        writer.shards(0).creditAvailable(client)
+        eventually(Timeout(10.seconds)) {
+          sends.get() shouldBe 2
+        }
+        writer.errorNotifier.getError() shouldBe empty
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
   }
 
   test("a synchronous transport failure is surfaced through the ErrorNotifier") {
@@ -306,6 +335,36 @@ class StreamingShuffleWriterSuite
       buf.refCnt() should be(0)
       // The task-completion listener will call cleanupResources again (a no-op now).
       context.markTaskCompleted(None)
+    }
+  }
+
+  test("compressed input releases its writer buffer permit exactly once") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 128 << 10)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+      .set(SHUFFLE_COMPRESS, true)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        bindMockClient(writer, 0)(_ => ())
+        val (_, permitLimit) = writer.writerBufferPermitStats
+
+        // A run of identical Java-serialized values produces an independent compressed wire
+        // buffer. The producer returns its raw input immediately, then the dispatcher invokes
+        // PendingSend.releaseInput() for the same envelope. Both callbacks must share one permit
+        // ownership fence.
+        writer.write(Iterator.fill(5000)((0, 0)))
+
+        eventually(Timeout(10.seconds)) {
+          val (rawBytes, wireBytes, messages) = writer.transferStats
+          messages should be > 0L
+          wireBytes should be < rawBytes
+          writer.writerBufferPermitStats shouldBe (permitLimit, permitLimit)
+        }
+      } finally {
+        context.markTaskCompleted(None)
+      }
     }
   }
 

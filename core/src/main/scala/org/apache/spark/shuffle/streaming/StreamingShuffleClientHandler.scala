@@ -78,6 +78,11 @@ class StreamingShuffleClientHandler(
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
   private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
   @volatile private var perStreamAutoReadEnabled = true
+  // A shared executor lane must not emit one Spark transport write for every released data
+  // frame. The cumulative watermark is idempotent, so the executor client can retain only the
+  // newest watermark for this logical route and publish many routes in one control body.
+  @volatile private var multiplexedCreditSender:
+      (TransportClient, StreamingShuffleClientHandler) => Unit = _
 
   setShuffleIdForLogging(shuffleId)
 
@@ -103,6 +108,15 @@ class StreamingShuffleClientHandler(
   /** A multiplexed channel cannot safely toggle autoRead for one logical stream. */
   private[streaming] def useMultiplexedChannel(): Unit = {
     perStreamAutoReadEnabled = false
+  }
+
+  private[streaming] def setMultiplexedCreditSender(
+      sender: (TransportClient, StreamingShuffleClientHandler) => Unit): Unit = {
+    multiplexedCreditSender = sender
+  }
+
+  private[streaming] def clearMultiplexedCreditSender(): Unit = {
+    multiplexedCreditSender = null
   }
 
   /**
@@ -176,6 +190,40 @@ class StreamingShuffleClientHandler(
     }
   }
 
+  /** Build one repair frame so an executor lane can batch many logical-route probes. */
+  private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
+    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
+    val message = if (lastSeqNum < 0) {
+      val available = availableReceiveBytes
+      val advertised = math.min(available, Int.MaxValue.toLong).toInt
+      if (advertised <= 0) return None
+      new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, -advertised)
+    } else {
+      val cumulative = new CreditControlMessage(
+        shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      cumulative.setSeqNum(cumulativeReleasedBytes.get())
+      cumulative
+    }
+    Some(message)
+  }
+
+  /** Surface a failed batched repair through the logical route's normal error path. */
+  private[streaming] def creditRepairBatchSendFailed(
+      client: TransportClient,
+      cause: Throwable): Unit = {
+    if (!terminationAckFailureIsExpected(cause, client)) {
+      val error = new RuntimeException(
+        s"Error sending batched credit repair to shuffle writer $shuffleWriterId", cause)
+      logError(log"Streaming shuffle batched credit repair failed", error)
+      errorNotifier.markError(error)
+    }
+  }
+
+  /** Snapshot one logical route without mutating its liveness protocol. */
+  private[streaming] def routeProgressForDiagnostics: (Long, Boolean, Long) = {
+    (lastSeqNum, terminationReceived, cumulativeReleasedBytes.get())
+  }
+
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
   private def updateQuota(bytes: Long): Long = synchronized {
@@ -213,7 +261,15 @@ class StreamingShuffleClientHandler(
   protected def sendCumulativeCreditAck(
       client: TransportClient,
       releasedBytes: Long): Unit = {
-    sendCreditControlMessage(client, shuffleWriterId, 0, releasedBytes)
+    val sender = multiplexedCreditSender
+    if (!perStreamAutoReadEnabled && sender != null) {
+      // releasedBytes has already been committed to cumulativeReleasedBytes. The batcher reads
+      // that atomic watermark immediately before encoding, so several releases collapse to the
+      // newest value without losing credit.
+      sender(client, this)
+    } else {
+      sendCreditControlMessage(client, shuffleWriterId, 0, releasedBytes)
+    }
   }
 
   protected def sendCreditControlMessage(

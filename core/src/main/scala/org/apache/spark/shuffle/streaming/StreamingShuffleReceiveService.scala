@@ -141,8 +141,17 @@ private[streaming] class StreamingShuffleReceiveService(
       -1L,
       readerOrdinal)
     val prepared = inboxes.get(preparedId)
-    if (prepared != null && prepared.attach(context.taskAttemptId())) {
-      return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))
+    if (prepared != null) {
+      if (prepared.attach(context.taskAttemptId())) {
+        return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))
+      }
+      logWarning(
+        s"Prepared streaming shuffle inbox $preparedId was already attached; " +
+          s"task ${context.taskAttemptId()} is falling back to a task-owned route")
+    } else {
+      logWarning(
+        s"Prepared streaming shuffle inbox $preparedId was absent when task " +
+          s"${context.taskAttemptId()} attempted to attach; falling back to a task-owned route")
     }
     val id = preparedId.copy(taskAttemptId = context.taskAttemptId())
     val inbox = new StreamingShuffleReceiveInbox(id, createQueue())
@@ -247,6 +256,8 @@ private[streaming] class StreamingShuffleReceiveInbox(
   @volatile private var preparedSession: StreamingShufflePreparedReceiveSession = _
 
   def attach(taskAttemptId: Long): Boolean = attached.compareAndSet(false, true)
+
+  private[streaming] def isAttached: Boolean = attached.get()
 
   def startPreparedSession(session: StreamingShufflePreparedReceiveSession): Unit = synchronized {
     require(preparedSession == null, s"Prepared session already exists for $id")
@@ -534,6 +545,7 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
   private val clientFutures = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
   private val clientFutureStartedNanos =
     new ConcurrentHashMap[CompletableFuture[Void], Long]()
+  private val lastIdleDiagnosticNanos = new AtomicLong(0L)
   private val mapIndexes = mutable.HashSet.empty[Int]
   private val routeLifecycleLock = new Object
   private val routeRegistrationTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(
@@ -568,9 +580,29 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
 
   /** Re-advertise bounded route windows for writers that have not terminated yet. */
   def repairIdleCreditWindows(): Unit = {
-    handlers.forEach { (writerId, handler) =>
-      val client = clients.get(writerId)
-      if (client != null) handler.repairCreditWindow(client)
+    val repairs = handlers.entrySet().asScala.flatMap { entry =>
+      Option(clients.get(entry.getKey)).map(_ -> entry.getValue)
+    }.toSeq
+    sharedClient.repairCreditWindows(repairs)
+    val now = System.nanoTime()
+    val previous = lastIdleDiagnosticNanos.get()
+    if (now - previous >= TimeUnit.SECONDS.toNanos(10L) &&
+        lastIdleDiagnosticNanos.compareAndSet(previous, now)) {
+      val routeProgress = handlers.entrySet().asScala.map { entry =>
+        entry.getKey -> entry.getValue.routeProgressForDiagnostics
+      }.toSeq
+      val missingTerminals = routeProgress.collect {
+        case (writerId, (lastSequence, false, releasedBytes)) =>
+          s"$writerId:lastSeq=$lastSequence:released=$releasedBytes"
+      }.sorted.take(12)
+      logWarning(
+        s"Prepared streaming shuffle inbox ${inbox.id} remained idle: " +
+          s"attached=${inbox.isAttached} " +
+          s"expectedWriters=${totalNumShuffleWriters.get()} " +
+          s"advertisedRoutes=${clientFutures.size()} registeredRoutes=${handlers.size()} " +
+          s"terminationAcks=${terminationAckControlMessageSet.size()} " +
+          s"discoveryComplete=${discoveryComplete.get()} " +
+          s"missingTerminalRoutes=${missingTerminals.mkString("[", ",", "]")}")
     }
   }
 

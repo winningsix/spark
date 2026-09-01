@@ -20,12 +20,15 @@ package org.apache.spark.sql.execution
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.util.{HashMap, Properties}
 
+import io.netty.buffer.{ByteBuf, Unpooled}
+
 import org.apache.spark._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests.TEST_MEMORY
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
+import org.apache.spark.shuffle.streaming.StreamingShuffleSerializerInstance
 import org.apache.spark.sql.{LocalSparkSession, Row, SparkSession}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
@@ -87,6 +90,40 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     }
     assert(!deserializerIter.hasNext)
     assert(input.closed)
+  }
+
+  test("streaming ByteBuf format matches UnsafeRow serialization stream") {
+    val rows = Seq(Row("Hello", 1), Row("World", 2))
+    val unsafeRows = rows.map(row => toUnsafeRow(row, Array(StringType, IntegerType)))
+    val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
+    val streamingSerializer = serializer.asInstanceOf[StreamingShuffleSerializerInstance]
+
+    val expected = new ByteArrayOutputStream()
+    val stream = serializer.serializeStream(expected)
+    unsafeRows.foreach(row => stream.writeValue(row))
+    stream.close()
+
+    def verify(buffer: ByteBuf): Unit = try {
+      unsafeRows.foreach(row => streamingSerializer.writeValueToByteBuf(row, buffer))
+      val actual = new Array[Byte](buffer.readableBytes())
+      buffer.getBytes(buffer.readerIndex(), actual)
+      assert(actual === expected.toByteArray)
+
+      val iterator = streamingSerializer.keyValueIteratorFromByteBuf(buffer)
+      unsafeRows.foreach { expectedRow =>
+        assert(iterator.hasNext)
+        val actualRow = iterator.next()._2.asInstanceOf[UnsafeRow]
+        assert(actualRow.getSizeInBytes === expectedRow.getSizeInBytes)
+        assert(actualRow.getUTF8String(0) === expectedRow.getUTF8String(0))
+        assert(actualRow.getInt(1) === expectedRow.getInt(1))
+      }
+      assert(!iterator.hasNext)
+    } finally {
+      buffer.release()
+    }
+
+    verify(Unpooled.buffer())
+    verify(Unpooled.directBuffer())
   }
 
   test("close empty input stream") {

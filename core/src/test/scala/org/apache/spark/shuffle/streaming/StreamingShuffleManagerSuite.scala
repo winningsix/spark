@@ -22,6 +22,8 @@ import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CountDownLatc
   LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
+import scala.collection.mutable
+
 import io.netty.buffer.Unpooled
 import org.mockito.ArgumentMatchers.{any, eq => eqTo}
 import org.mockito.Mockito.{verify, when}
@@ -34,6 +36,7 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
@@ -563,6 +566,126 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared routes coalesce idle credit repairs on one physical lane") {
+    withSpark(new SparkContext("local", "prepared-credit-repair-batch", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val readerHandlers = (0 until 9).map { writerId =>
+        writerId -> new StreamingShuffleClientHandler(
+          writerId,
+          0,
+          new LinkedBlockingQueue[StreamingShuffleMessage](),
+          7,
+          1L << 20,
+          null,
+          new ErrorNotifier())
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => (),
+          shuffleId = 7,
+          numReaders = 1,
+          context = mock[TaskContext],
+          errorNotifier = new ErrorNotifier())
+      }
+      try {
+        val routeClients = client.registerBatch(
+          7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          server.controlBodyStats shouldBe (1L, readerHandlers.size.toLong)
+          writerHandlers.foreach { case (_, handler) =>
+            handler.clientsFor(0).size shouldBe 1
+          }
+        }
+
+        client.repairCreditWindows(readerHandlers.map { case (writerId, handler) =>
+          routeClients(writerId) -> handler
+        })
+        eventually(Timeout(10.seconds)) {
+          server.controlBodyStats shouldBe (2L, readerHandlers.size.toLong * 2L)
+        }
+        client.creditRepairBatchWriteCount shouldBe 1L
+      } finally {
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
+        client.close()
+        server.close()
+      }
+    }
+  }
+
+  test("prepared routes coalesce hot cumulative credits on one physical lane") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS, 100L)
+    withSpark(new SparkContext("local", "prepared-cumulative-credit-batch", conf)) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val queues = (0 until 9).map { writerId =>
+        writerId -> new LinkedBlockingQueue[StreamingShuffleMessage]()
+      }.toMap
+      val readerHandlers = queues.toSeq.sortBy(_._1).map { case (writerId, queue) =>
+        writerId -> new StreamingShuffleClientHandler(
+          writerId, 0, queue, 7, 1L << 20, null, new ErrorNotifier())
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => (), 7, 1, mock[TaskContext], new ErrorNotifier())
+      }
+      val queued = new mutable.ArrayBuffer[StreamingShuffleMessage]()
+      try {
+        val routeClients = client.registerBatch(
+          7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          server.controlBodyStats shouldBe (1L, readerHandlers.size.toLong)
+        }
+
+        readerHandlers.foreach { case (writerId, handler) =>
+          val encoded = ByteBuffer.allocate(40)
+          encoded.putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id())
+          encoded.putLong(0L)
+          encoded.putInt(7)
+          encoded.putInt(writerId)
+          encoded.putInt(0)
+          encoded.putInt(0)
+          encoded.putInt(0)
+          encoded.putLong(0L)
+          encoded.flip()
+          handler.receive(routeClients(writerId), encoded, null)
+          queued += queues(writerId).poll(10, TimeUnit.SECONDS)
+        }
+        queued.foreach(_.release())
+        queued.clear()
+
+        eventually(Timeout(10.seconds)) {
+          client.cumulativeCreditBatchStats shouldBe
+            (readerHandlers.size.toLong, 1L, readerHandlers.size.toLong)
+          server.controlBodyStats shouldBe
+            (2L, readerHandlers.size.toLong * 2L)
+        }
+      } finally {
+        queued.filter(_ != null).foreach(_.release())
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
+        client.close()
+        server.close()
+      }
+    }
+  }
+
   test("shared writer endpoint replays prepared credit that arrives before writer registration") {
     withSpark(new SparkContext("local", "prepared-credit-before-writer", new SparkConf())) { _ =>
       val server = new StreamingShuffleExecutorServer()
@@ -675,10 +798,11 @@ class StreamingShuffleManagerSuite
         suppressedAck.get() shouldBe true
         writerHandler.availableDataCredit(0, writerRouteClient) shouldBe 0L
 
-        readerHandler.repairCreditWindow(routeClient)
+        client.repairCreditWindows(Seq(routeClient -> readerHandler))
         eventually(Timeout(10.seconds)) {
           writerHandler.availableDataCredit(0, writerRouteClient) shouldBe byteLimit
         }
+        client.creditRepairBatchWriteCount shouldBe 1L
       } finally {
         if (queuedData != null) queuedData.release()
         server.unregister(7, 3, writerHandler)
