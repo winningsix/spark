@@ -39,6 +39,7 @@ import org.apache.spark.resource.{CpuAmount, ExecutorResourceRequests, ResourceA
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
+import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
@@ -2890,6 +2891,42 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.length === 2)
     assert(taskScheduler.resourceOffers(offers).flatten.isEmpty,
       "the producer must not launch another task while its two-task window is full")
+  }
+
+  test("prepared receive mode waits only for declared startup shuffle inboxes") {
+    val taskScheduler = setupScheduler()
+    val inboxes = Seq(
+      StreamingShuffleReceiveInboxId(1, 2, 0, 0, -1L, 0),
+      StreamingShuffleReceiveInboxId(2, 2, 0, 0, -1L, 0),
+      StreamingShuffleReceiveInboxId(2, 2, 0, 0, -1L, 1))
+    val taskSet = new TaskSet(
+      Array(new FakeTask(2, 0)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(1, 2, 2),
+      pipelinedReaderStartupShuffleIds = Set(2))
+
+    assert(taskScheduler.requiredPreTaskReaderInboxes(taskSet, inboxes) === inboxes.tail)
+
+    val unresolvedStartup = new TaskSet(
+      taskSet.tasks,
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(1, 2, 2),
+      pipelinedReaderStartupShuffleIds = Set(99))
+    assert(taskScheduler.requiredPreTaskReaderInboxes(unresolvedStartup, inboxes) === inboxes)
   }
 
   test("prepared receive mode does not expand a sole producer before its reader is submitted") {

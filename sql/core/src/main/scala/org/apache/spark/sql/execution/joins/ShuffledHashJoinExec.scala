@@ -121,9 +121,14 @@ case class ShuffledHashJoinExec private (
     relation
   }
 
+  /** The input that must be drained before this join can consume its streamed side. */
+  private[sql] def pipelinedBuildInputRDD(): RDD[InternalRow] = buildPlan.execute()
+
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
-    streamedPlan.execute().zipPartitions(buildPlan.execute()) { (streamIter, buildIter) =>
+    val streamedRDD = streamedPlan.execute()
+    val buildRDD = pipelinedBuildInputRDD()
+    streamedRDD.zipPartitions(buildRDD) { (streamIter, buildIter) =>
       val hashed = buildHashedRelation(buildIter)
       joinType match {
         case FullOuter => buildSideOrFullOuterJoin(streamIter, hashed, numOutputRows,
@@ -134,7 +139,7 @@ case class ShuffledHashJoinExec private (
           buildSideOrFullOuterJoin(streamIter, hashed, numOutputRows, isFullOuterJoin = false)
         case _ => join(streamIter, hashed, numOutputRows)
       }
-    }
+    }.setPipelinedStartupInputs(Seq(buildRDD))
   }
 
   private def buildSideOrFullOuterJoin(

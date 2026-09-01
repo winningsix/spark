@@ -46,7 +46,11 @@ private[spark] class TaskSet(
     val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty,
     // True when this stage writes a pipelined shuffle. A reader that also writes one is a combined
     // stage; only a pure producer is governed by the elastic producer launch window.
-    val isPipelinedShuffleProducer: Boolean = false) {
+    val isPipelinedShuffleProducer: Boolean = false,
+    // Shuffle inputs that must be ready before this stage can make useful progress. Empty means
+    // all reader inputs are required, preserving the conservative default for operators such as
+    // SortMergeJoin. ShuffledHashJoin identifies only its build-side shuffle(s).
+    val pipelinedReaderStartupShuffleIds: Set[Int] = Set.empty) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

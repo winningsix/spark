@@ -19,9 +19,13 @@ package org.apache.spark.sql.execution.exchange
 
 import java.util.concurrent.{Executors, TimeUnit}
 
-import org.apache.spark.SparkFunSuite
+import scala.collection.mutable
+
+import org.apache.spark.{PipelinedShuffleDependency, SparkFunSuite}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
 
 /**
  * End-to-end SQL coverage of the pipelined channel path: a batch query whose hash
@@ -314,6 +318,47 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       val r = (0L until 120L).map(i => (i % 6, i))
       val expected = (for ((lk, lv) <- l; (rk, rv) <- r if lk == rk) yield (lk, lv, rv)).toSet
       assert(rows.toSet === expected)
+    }
+  }
+
+  test("shuffled hash join marks only its build input as startup-critical") {
+    withDistributedPipelinedSession(adaptive = false) { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      // This testing-only config chooses SHJ without adding a SQL hint, matching the production
+      // requirement that BSP and RTM use the same unmodified SQL text and operator plan.
+      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+      val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
+      val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
+      val joined = left.join(right, $"leftKey" === $"rightKey")
+      val plan = joined.queryExecution.executedPlan
+      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
+      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+      assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined),
+        s"both shuffled hash join inputs must be pipelined; plan:\n$plan")
+
+      val executionRDD = joined.queryExecution.toRdd
+      val visited = mutable.HashSet.empty[Int]
+      val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
+      val startupInputs = mutable.ArrayBuffer.empty[RDD[_]]
+      while (pending.nonEmpty) {
+        val current = pending.removeHead()
+        if (visited.add(current.id)) {
+          startupInputs ++= current.pipelinedStartupInputs
+          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
+        }
+      }
+      assert(startupInputs.nonEmpty,
+        s"whole-stage output did not retain shuffled hash join startup metadata; plan:\n$plan")
+      val buildInputRDD = hashJoins.head.pipelinedBuildInputRDD()
+      assert(startupInputs.forall(_ eq buildInputRDD),
+        "the shuffled hash join build input must be the only startup-critical RDD")
+      assert(startupInputs.exists(_.dependencies.exists(
+        _.isInstanceOf[PipelinedShuffleDependency[_, _, _]])),
+        "the shuffled hash join build input must resolve to a pipelined shuffle")
+
+      assert(executionRDD.collect().length === 5)
     }
   }
 
