@@ -57,6 +57,8 @@ private[spark] case class PrepareStreamingShuffleReceiveInboxes(
 private[spark] case class ReleaseStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
 
+private[spark] case class StreamingShuffleWriterLocationsAvailable(shuffleIds: Seq[Int])
+
 private[streaming] case class StreamingShuffleReceiveInboxStats(
     spilledBytes: Long,
     spilledMessages: Long)
@@ -194,6 +196,13 @@ private[streaming] class StreamingShuffleReceiveService(
     }
   }
 
+  def writerLocationsAvailable(shuffleIds: Seq[Int]): Unit = {
+    SparkEnv.get.streamingShuffleOutputTracker.foreach(
+      _.invalidateAvailableShuffleWriterTaskLocations(shuffleIds))
+    val resources = preparedResources
+    if (resources != null) resources.discovery.writerLocationsAvailable()
+  }
+
   def close(): Unit = synchronized {
     inboxes.entrySet().asScala.foreach { entry =>
       if (inboxes.remove(entry.getKey, entry.getValue)) {
@@ -290,6 +299,8 @@ private[streaming] class StreamingShuffleReceiveServiceEndpoint(
     service: StreamingShuffleReceiveService) extends RpcEndpoint {
   override def receive: PartialFunction[Any, Unit] = {
     case ReleaseStreamingShuffleReceiveInbox(id) => service.releasePrepared(id)
+    case StreamingShuffleWriterLocationsAvailable(shuffleIds) =>
+      service.writerLocationsAvailable(shuffleIds)
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
@@ -373,6 +384,8 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
       }
     }
   }
+
+  def writerLocationsAvailable(): Unit = requestImmediatePoll()
 
   def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
     val shuffleSessions = sessions.get(session.shuffleId)
