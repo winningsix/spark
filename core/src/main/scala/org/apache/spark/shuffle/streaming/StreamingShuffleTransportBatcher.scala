@@ -270,7 +270,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     if (!closed && !admissionDrainScheduled && !admissionReadyClients.isEmpty) {
       admissionDrainScheduled = true
       flushExecutor.execute(new Runnable {
-        override def run(): Unit = synchronized {
+        override def run(): Unit = StreamingShuffleTransportBatcher.this.synchronized {
           admissionDrainScheduled = false
           drainAdmissionsLocked()
         }
