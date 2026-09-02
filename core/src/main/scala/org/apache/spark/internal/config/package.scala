@@ -2329,6 +2329,32 @@ package object config {
       .checkValue(_ >= 1, "must be at least one")
       .createOptional
 
+  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE =
+    ConfigBuilder("spark.shuffle.streaming.elasticProducers.expandedMaxTasksPerStage")
+      .doc("Maximum running tasks for each pure producer stage while the number of active pure " +
+        "producer stages reaches expandedMinActiveStages and the producer's direct reader " +
+        "frontier has started. This topology-sensitive window can fill CPU for wide streaming " +
+        "graphs without applying the same fan-out to narrower graphs. When unset, " +
+        "maxTasksPerStage remains the limit until only one pure producer remains.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "must be at least one")
+      .createOptional
+
+  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MIN_ACTIVE_STAGES =
+    ConfigBuilder("spark.shuffle.streaming.elasticProducers.expandedMinActiveStages")
+      .doc("Minimum number of simultaneously active pure producer stages required to use " +
+        "expandedMaxTasksPerStage. A value of zero disables topology-sensitive producer " +
+        "expansion.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 0, "must be non-negative")
+      .createWithDefault(0)
+
   private[spark] val STREAMING_SHUFFLE_READER_TASK_CPUS =
     ConfigBuilder("spark.shuffle.streaming.reader.taskCpus")
       .doc("Optional CPU amount charged to a task that only consumes pipelined shuffles. This " +

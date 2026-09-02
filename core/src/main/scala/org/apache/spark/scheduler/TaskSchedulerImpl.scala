@@ -459,7 +459,8 @@ private[spark] class TaskSchedulerImpl(
       availableCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
-      soleActivePureProducer: Boolean,
+      activePureProducerStages: Int,
+      readerFrontierStarted: Boolean,
       activeTaskSets: Iterable[TaskSetManager])
     : (Boolean, Option[TaskLocality]) = {
     if (!pipelinedShuffleTaskCoordinator.taskSetReady(taskSet)) return (true, None)
@@ -480,7 +481,7 @@ private[spark] class TaskSchedulerImpl(
 
       // check whether the task can be scheduled to the executor base on resource profile.
       if (pipelinedShuffleTaskCoordinator.producerLaunchAllowed(
-          taskSet, soleActivePureProducer) &&
+          taskSet, activePureProducerStages, readerFrontierStarted) &&
           pipelinedShuffleTaskCoordinator.readerLaunchAllowed(
             taskSet, execId, activeTaskSets) && sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
@@ -655,11 +656,13 @@ private[spark] class TaskSchedulerImpl(
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
     val activePureProducerTaskSets =
       sortedTaskSets.filter(pipelinedShuffleTaskCoordinator.isActivePureProducer)
-    val solePureProducer = if (activePureProducerTaskSets.size == 1) {
-      activePureProducerTaskSets.headOption
-    } else {
-      None
+    def pipelinedRunEpoch(taskSet: TaskSetManager): Option[String] = {
+      Option(taskSet.taskSet.properties).flatMap { properties =>
+        Option(properties.getProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH))
+      }
     }
+    val activePureProducerStagesByRunEpoch =
+      activePureProducerTaskSets.groupBy(pipelinedRunEpoch).view.mapValues(_.size).toMap
     // CoarseGrainedSchedulerBackend stops offering a decommissioning executor, but TaskScheduler
     // retains it until executorLost so its running tasks can finish. Do not prepare a reader inbox
     // there: the assignment would never receive an offer and could strand an otherwise runnable
@@ -714,14 +717,17 @@ private[spark] class TaskSchedulerImpl(
         var globalMinLocality: Option[TaskLocality] = None
         // Compute this once per task set and offer pass. Ready readers were moved ahead of their
         // producers above, so their freshly-launched runningTasks are already visible here.
-        val useSoleProducerWindow = solePureProducer.contains(taskSet) &&
+        val producerReaderFrontierStarted =
           pipelinedShuffleTaskCoordinator.readerFrontierStarted(taskSet, sortedTaskSets)
+        val activePureProducerStages =
+          activePureProducerStagesByRunEpoch.getOrElse(pipelinedRunEpoch(taskSet), 0)
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks, useSoleProducerWindow, sortedTaskSets)
+              availableResources, tasks, activePureProducerStages,
+              producerReaderFrontierStarted, sortedTaskSets)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
