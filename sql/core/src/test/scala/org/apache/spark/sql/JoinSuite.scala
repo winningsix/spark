@@ -1607,6 +1607,10 @@ class JoinSuite extends SharedSparkSession with AdaptiveSparkPlanHelper
       withSQLConf(SQLConf.SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "1MB") {
         assertJoin(query, classOf[ShuffledHashJoinExec])
       }
+      withSQLConf(
+          SQLConf.SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> Long.MaxValue.toString) {
+        assertJoin(query, classOf[ShuffledHashJoinExec])
+      }
     }
   }
 
