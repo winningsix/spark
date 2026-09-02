@@ -2001,6 +2001,54 @@ package object config {
       .checkValue(_ >= 0, "prepared inbox ready bytes must be non-negative")
       .createWithDefaultString("0b")
 
+  private[spark] val STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.maxTotalTasksPerExecutor")
+      .doc("Maximum number of attached streaming-shuffle reader compute tasks from all active " +
+        "stages on one executor. Prepared receive inboxes do not count toward this limit, so " +
+        "network readiness and producer routing remain independent from the memory-sensitive " +
+        "compute attach window. A value of zero disables the cap.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 0, "prepared reader total task cap must be non-negative")
+      .createWithDefault(0)
+
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.initialMaxTasksPerExecutor")
+      .doc("Initial per-executor compute attach cap for a streaming-shuffle reader. After enough " +
+        "successful lightweight samples the cap is lifted; stages with high peak execution " +
+        "memory or spill retain it. A value of zero disables sampled attach admission.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 0, "prepared reader initial task cap must be non-negative")
+      .createWithDefault(0)
+
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.memorySampleTasks")
+      .doc("Number of successful streaming-reader tasks required before lifting the initial " +
+        "per-executor attach cap for a lightweight stage.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "prepared reader memory sample count must be positive")
+      .createWithDefault(4)
+
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.heavyTaskPeakExecutionMemory")
+      .doc("Peak execution-memory threshold that keeps a streaming reader at its initial " +
+        "per-executor compute attach cap. This limits concurrent operator hash maps without " +
+        "reducing prepared inbox or producer-route concurrency.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "prepared reader heavy-task memory threshold must be positive")
+      .createWithDefaultString("4g")
+
   private[spark] val STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.clientCreationThreads")
       .doc("Maximum executor-scoped threads used to install prepared reader routes and create " +

@@ -45,7 +45,7 @@ import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.storage.BlockManagerId
-import org.apache.spark.util.{AccumulatorV2, Clock, ManualClock, SystemClock}
+import org.apache.spark.util.{AccumulatorV2, Clock, LongAccumulator, ManualClock, SystemClock}
 import org.apache.spark.util.ArrayImplicits._
 
 class FakeDAGScheduler(sc: SparkContext, taskScheduler: FakeTaskScheduler)
@@ -1858,6 +1858,52 @@ class TaskSetManagerSuite
       metricPeaks: Array[Long] = Array.empty): DirectTaskResult[Int] = {
     val valueSer = SparkEnv.get.serializer.newInstance()
     new DirectTaskResult[Int](valueSer.serialize(id), accumUpdates, metricPeaks)
+  }
+
+  test("prepared reader attach cap expands only after lightweight memory samples") {
+    val testConf = new SparkConf()
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 4)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY, 4L << 30)
+    sc = new SparkContext("local", "test", testConf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    def peakMemory(value: Long): LongAccumulator = {
+      val accumulator = new LongAccumulator()
+      accumulator.register(sc, Some(InternalAccumulator.PEAK_EXECUTION_MEMORY))
+      accumulator.add(value)
+      accumulator
+    }
+
+    def completeTasks(manager: TaskSetManager, peakBytes: Long, spillBytes: Long = 0L): Unit = {
+      for (taskIndex <- 0 until 4) {
+        val task = manager.resourceOffer("exec1", "host1", ANY)._1.get
+        val updates = ArrayBuffer[AccumulatorV2[_, _]](peakMemory(peakBytes))
+        if (spillBytes > 0L) {
+          val spill = new LongAccumulator()
+          spill.register(sc, Some(InternalAccumulator.MEMORY_BYTES_SPILLED))
+          spill.add(spillBytes)
+          updates += spill
+        }
+        manager.handleSuccessfulTask(task.taskId, createTaskResult(taskIndex, updates.toSeq))
+      }
+    }
+
+    val lightweight = new TaskSetManager(
+      sched, FakeTask.createTaskSet(6, stageId = 0, stageAttemptId = 0), MAX_TASK_FAILURES)
+    assert(lightweight.preparedReaderMaxTasksPerExecutor === 1)
+    completeTasks(lightweight, 32L << 20)
+    assert(lightweight.preparedReaderMaxTasksPerExecutor === 0)
+
+    val heavyweight = new TaskSetManager(
+      sched, FakeTask.createTaskSet(6, stageId = 1, stageAttemptId = 0), MAX_TASK_FAILURES)
+    completeTasks(heavyweight, 5L << 30)
+    assert(heavyweight.preparedReaderMaxTasksPerExecutor === 1)
+
+    val spilling = new TaskSetManager(
+      sched, FakeTask.createTaskSet(6, stageId = 2, stageAttemptId = 0), MAX_TASK_FAILURES)
+    completeTasks(spilling, 32L << 20, 1L << 20)
+    assert(spilling.preparedReaderMaxTasksPerExecutor === 1)
   }
 
   test("SPARK-13343 speculative tasks that didn't commit shouldn't be marked as success") {

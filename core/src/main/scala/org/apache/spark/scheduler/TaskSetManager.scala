@@ -142,6 +142,27 @@ private[spark] class TaskSetManager(
 
   val taskAttempts = Array.fill[List[TaskInfo]](numTasks)(Nil)
   private[scheduler] var tasksSuccessful = 0
+  private var successfulPeakExecutionMemorySamples = 0
+  private var maximumSuccessfulPeakExecutionMemory = 0L
+  private var observedMemorySpill = false
+  private val preparedReaderInitialMaxTasksPerExecutor =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR)
+  private val preparedReaderMemorySampleTasks =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS)
+  private val preparedReaderHeavyTaskPeakMemory =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY)
+
+  private[scheduler] def preparedReaderMaxTasksPerExecutor: Int = synchronized {
+    if (preparedReaderInitialMaxTasksPerExecutor <= 0) {
+      0
+    } else if (successfulPeakExecutionMemorySamples < preparedReaderMemorySampleTasks ||
+        maximumSuccessfulPeakExecutionMemory >= preparedReaderHeavyTaskPeakMemory ||
+        observedMemorySpill) {
+      preparedReaderInitialMaxTasksPerExecutor
+    } else {
+      0
+    }
+  }
 
   val weight = 1
   val minShare = 0
@@ -171,6 +192,18 @@ private[spark] class TaskSetManager(
   private[scheduler] val runningTasksSet = new HashSet[Long]
 
   override def runningTasks: Int = runningTasksSet.size
+
+  private[scheduler] def runningTasksOnExecutor(executorId: String): Int = {
+    var count = 0
+    val taskIds = executorIdToTaskIds.getOrElse(executorId, TaskSetManager.EMPTY_LONG_SET)
+    val iterator = taskIds.iterator
+    while (iterator.hasNext) {
+      if (taskInfos.get(iterator.next()).exists(_.running)) {
+        count += 1
+      }
+    }
+    count
+  }
 
   def someAttemptSucceeded(tid: Long): Boolean = {
     successful(taskInfos(tid).index)
@@ -906,6 +939,20 @@ private[spark] class TaskSetManager(
         reason = "another attempt succeeded")
     }
     if (!successful(index)) {
+      var peakExecutionMemory = 0L
+      result.accumUpdates.foreach { accumulator =>
+        accumulator.name match {
+          case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
+            peakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+          case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
+              if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
+            observedMemorySpill = true
+          case _ =>
+        }
+      }
+      successfulPeakExecutionMemorySamples += 1
+      maximumSuccessfulPeakExecutionMemory =
+        math.max(maximumSuccessfulPeakExecutionMemory, peakExecutionMemory)
       tasksSuccessful += 1
       logInfo(log"Finished ${MDC(TASK_NAME, taskName(info.taskId))} in " +
         log"${MDC(DURATION, info.duration)} ms on ${MDC(HOST, info.host)} " +
