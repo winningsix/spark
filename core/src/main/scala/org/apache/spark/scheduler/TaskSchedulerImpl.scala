@@ -564,8 +564,9 @@ private[spark] class TaskSchedulerImpl(
 
   private def pipelinedReaderPlacementCandidates(
       taskSet: TaskSetManager,
-      taskIndex: Int): Seq[String] = {
-    executorIdToRunningTaskIds.keysIterator.filter { executorId =>
+      taskIndex: Int,
+      activeExecutors: Set[String]): Seq[String] = {
+    activeExecutors.iterator.filter { executorId =>
       (for {
         host <- executorIdToHost.get(executorId)
         executorResourceProfileId <- executorIdToResourceProfileId.get(executorId)
@@ -656,10 +657,18 @@ private[spark] class TaskSchedulerImpl(
     } else {
       None
     }
+    // CoarseGrainedSchedulerBackend stops offering a decommissioning executor, but TaskScheduler
+    // retains it until executorLost so its running tasks can finish. Do not prepare a reader inbox
+    // there: the assignment would never receive an offer and could strand an otherwise runnable
+    // pipelined stage while healthy executors sit idle.
+    val activePipelinedExecutors = executorIdToRunningTaskIds.keysIterator
+      .filterNot(isExecutorDecommissioned)
+      .toSet
     pipelinedShuffleTaskCoordinator.prepareForOffers(
       sortedTaskSets,
-      executorIdToRunningTaskIds.keySet.toSet,
-      pipelinedReaderPlacementCandidates)
+      activePipelinedExecutors,
+      (taskSet, taskIndex) =>
+        pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
     // Once an executor-owned inbox receives its first payload (or EOS), launch its attached
     // reader before more producers. This closes the backpressure loop without reserving idle task
     // slots for every reader in the group. The original pool order remains the stable tie-breaker.

@@ -3265,6 +3265,87 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.head.executorId === "executor1")
   }
 
+  test("decommissioning a receive executor reparents its prepared reader") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true")
+    val firstPrepared = new AtomicReference[StreamingShuffleReceiveInboxId]()
+    val firstReleaseCount = new AtomicInteger(0)
+    val replacementPrepared = new AtomicReference[StreamingShuffleReceiveInboxId]()
+
+    def endpoint(
+        name: String,
+        prepared: AtomicReference[StreamingShuffleReceiveInboxId],
+        onRelease: () => Unit): RpcEndpointRef = {
+      sc.env.rpcEnv.setupEndpoint(
+        s"$name-${System.nanoTime()}",
+        new RpcEndpoint {
+          override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+          override def receive: PartialFunction[Any, Unit] = {
+            case ReleaseStreamingShuffleReceiveInbox(_) => onRelease()
+          }
+
+          override def receiveAndReply(
+              context: RpcCallContext): PartialFunction[Any, Unit] = {
+            case PrepareStreamingShuffleReceiveInboxes(ids) =>
+              assert(ids.size === 1)
+              prepared.set(ids.head)
+              context.reply(true)
+          }
+        })
+    }
+
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(
+      "executor0",
+      endpoint("prepared-decommission-first", firstPrepared,
+        () => firstReleaseCount.incrementAndGet())))
+    assert(tracker.registerReceiveEndpoint(
+      "executor1",
+      endpoint("prepared-decommission-replacement", replacementPrepared, () => ())))
+
+    val reader = new TaskSet(
+      Array(new FakeTask(2, 0)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(7),
+      pipelinedReaderStartupShuffleIds = Set(7))
+    taskScheduler.submitTasks(reader)
+
+    val offers = IndexedSeq(
+      WorkerOffer("executor0", "host0", 1),
+      WorkerOffer("executor1", "host1", 1))
+    assert(taskScheduler.resourceOffers(offers).flatten.isEmpty)
+    val oldInbox = firstPrepared.get()
+    assert(oldInbox != null)
+    assert(replacementPrepared.get() == null)
+
+    taskScheduler.executorDecommission(
+      "executor0", ExecutorDecommissionInfo("planned decommission", None))
+    assert(taskScheduler.resourceOffers(offers).flatten.isEmpty)
+    eventually(timeout(10.seconds)) {
+      assert(firstReleaseCount.get() === 1)
+    }
+    val newInbox = replacementPrepared.get()
+    assert(newInbox != null)
+    assert(newInbox !== oldInbox)
+    assert(newInbox.taskAttemptId < oldInbox.taskAttemptId)
+
+    tracker.markInboxDrainReady("executor0", oldInbox)
+    assert(taskScheduler.resourceOffers(offers).flatten.isEmpty)
+    tracker.markInboxDrainReady("executor1", newInbox)
+    val launched = taskScheduler.resourceOffers(offers).flatten
+    assert(launched.size === 1)
+    assert(launched.head.executorId === "executor1")
+  }
+
   test("prepared receive mode does not expand a sole producer before its reader is submitted") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
