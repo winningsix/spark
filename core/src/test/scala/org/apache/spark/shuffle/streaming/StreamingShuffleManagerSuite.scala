@@ -143,6 +143,17 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared receive mode never falls back to a task-owned inbox") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+    val service = new StreamingShuffleReceiveService(conf)
+    val error = intercept[IllegalStateException] {
+      service.acquire(10, TaskContext.empty())
+    }
+    error.getMessage should include("must not fall back to a task-owned route")
+    service.activeInboxCount shouldBe 0
+  }
+
   test("prepared receive service enables elastic group admission") {
     Seq(false -> true, true -> false).foreach { case (receiveServiceEnabled, requiresWholeGroup) =>
       val conf = new SparkConf()
