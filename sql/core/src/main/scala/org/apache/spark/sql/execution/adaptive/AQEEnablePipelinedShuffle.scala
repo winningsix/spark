@@ -58,7 +58,7 @@ import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
  * them would trade AQE's stage reuse for duplicate recomputation, and a pipelined producer
  * cannot be consumed twice.
  */
-case class AQEEnablePipelinedShuffle() extends Rule[SparkPlan] {
+object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
     // Shared environment gate (opt-in flag and manager-specific deployment requirements),

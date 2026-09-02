@@ -799,7 +799,7 @@ object QueryExecution {
       // Opt-in (SPARK-57399): runs last so it observes the final reuse decision and can preserve
       // it when the configured transport supports fan-out or sequential replay.
       // No-op unless spark.sql.shuffle.localPipelined.enabled=true and AQE is off.
-      Seq(EnablePipelinedShuffle())
+      Seq(EnablePipelinedShuffle)
   }
 
   /**

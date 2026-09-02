@@ -72,7 +72,7 @@ import org.apache.spark.sql.execution.joins.{CartesianProductExec, ShuffledHashJ
  *         on a limit takes `executeTake` and never hits `doExecute`; `.write` / `.toLocalIterator`
  *         / a non-root position do.)
  */
-case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
+object EnablePipelinedShuffle extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
     // Shared environment gate (opt-in flag and manager-specific deployment requirements),

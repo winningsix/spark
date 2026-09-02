@@ -66,6 +66,12 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
    * therefore run in cluster mode without weakening the in-process channel's safety check.
    */
   def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
+    // Batch only. IncrementalExecution inherits QueryExecution's preparation rules, while
+    // streaming marks its own safe boundaries for Real-Time Mode.
+    if (plan.exists(_.logicalLink.exists(_.isStreaming))) {
+      logDebug("Pipelined shuffle: leaving a streaming plan to Real-Time Mode boundary marking.")
+      return false
+    }
     enabled(conf, plan.session != null && plan.session.sparkContext.isLocal)
   }
 
