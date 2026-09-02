@@ -284,6 +284,37 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       !taskSet.taskSet.isPipelinedShuffleReader
   }
 
+  /** Topological reader depth inside one pipelined run epoch. */
+  def readerDepths(taskSets: Iterable[TaskSetManager]): Map[TaskSetManager, Int] = {
+    val active = taskSets.iterator.filter { taskSet =>
+      !taskSet.isZombie && taskSet.taskSet.isPipelined
+    }.toSeq
+    val producerByShuffleId = active.flatMap { taskSet =>
+      taskSet.taskSet.shuffleId.map(_ -> taskSet)
+    }.toMap
+    val depths = new HashMap[TaskSetManager, Int]
+    val visiting = new HashSet[TaskSetManager]
+
+    def depth(taskSet: TaskSetManager): Int = {
+      depths.getOrElseUpdate(taskSet, {
+        // Pipelined task graphs are acyclic. Keep this guard defensive so malformed metadata
+        // cannot recurse forever in the task scheduler's resource-offer path.
+        if (!visiting.add(taskSet)) {
+          0
+        } else {
+          val parents = taskSet.taskSet.pipelinedReaderShuffleIds.distinct.flatMap(
+            producerByShuffleId.get)
+          val result = if (parents.isEmpty) 0 else 1 + parents.map(depth).max
+          visiting -= taskSet
+          result
+        }
+      })
+    }
+
+    active.foreach(depth)
+    depths.toMap
+  }
+
   def readerFrontierStarted(
       producer: TaskSetManager,
       taskSets: Iterable[TaskSetManager]): Boolean = {
