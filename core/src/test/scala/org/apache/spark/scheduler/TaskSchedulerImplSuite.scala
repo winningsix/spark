@@ -3692,6 +3692,89 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "the deeper reader must not strand the stage that produces its remaining input")
   }
 
+  test("prepared reader attach reserves capacity across a readiness race") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1")
+    val executorId = "executor0"
+    val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"reader-frontier-reservation-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            prepared.synchronized(prepared ++= ids)
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+    val groupProperties = new Properties()
+    groupProperties.setProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH, "reader-race-group")
+
+    val sourceProducer = new TaskSet(
+      Array(new FakeTask(3, 0)),
+      stageId = 3,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = groupProperties,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    val upstreamReaderProducer = new TaskSet(
+      Array(new FakeTask(2, 0)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = groupProperties,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(2),
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(1),
+      pipelinedReaderStartupShuffleIds = Set(1),
+      isPipelinedShuffleProducer = true)
+    val deepReader = new TaskSet(
+      Array(new FakeTask(1, 0)),
+      stageId = 1,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = groupProperties,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(2),
+      pipelinedReaderStartupShuffleIds = Set(2))
+    taskScheduler.submitTasks(sourceProducer)
+    taskScheduler.submitTasks(deepReader)
+    taskScheduler.submitTasks(upstreamReaderProducer)
+
+    val offer = IndexedSeq(WorkerOffer(executorId, "host0", 1))
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 1)
+    eventually(timeout(10.seconds)) {
+      assert(prepared.synchronized(prepared.size) === 2)
+    }
+    val deepInbox = prepared.synchronized(prepared.find(_.shuffleId == 2).get)
+    tracker.markInboxDrainReady(executorId, deepInbox)
+
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
+      "the ready deeper reader must reserve the attachment for its unstarted dependency")
+    assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 0)
+
+    val upstreamInbox = prepared.synchronized(prepared.find(_.shuffleId == 1).get)
+    tracker.markInboxDrainReady(executorId, upstreamInbox)
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 1)
+    assert(taskScheduler.taskSetManagerForAttempt(2, 0).get.runningTasks === 1,
+      "the upstream reader-producer must attach when it becomes ready")
+    assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 0)
+  }
+
   test("wide producer expansion counts stages only within one pipelined run epoch") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
