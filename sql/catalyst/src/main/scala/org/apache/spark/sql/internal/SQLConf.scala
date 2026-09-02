@@ -1145,6 +1145,19 @@ object SQLConf {
     .bytesConf(ByteUnit.BYTE)
     .createWithDefaultString("10MB")
 
+  val SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD =
+    buildConf("spark.sql.shuffledHashJoin.localMapThreshold")
+      .doc("Configures the maximum estimated size in bytes per shuffle partition for the build " +
+        "side of a statically planned shuffled hash join. Spark estimates this by comparing the " +
+        "build side's total logical-plan size with this threshold multiplied by " +
+        "`spark.sql.shuffle.partitions`. This setting is independent of " +
+        s"`${AUTO_BROADCASTJOIN_THRESHOLD.key}`, so broadcast joins can be disabled without " +
+        "also disabling shuffled hash join selection. A negative value disables size-based " +
+        "static shuffled hash join selection. When unset, it falls back to " +
+        s"`${AUTO_BROADCASTJOIN_THRESHOLD.key}` to preserve the existing behavior.")
+      .version("4.3.0")
+      .fallbackConf(AUTO_BROADCASTJOIN_THRESHOLD)
+
   val SHUFFLE_HASH_JOIN_FACTOR =
     buildConfFromConfigFile[Int]("spark.sql.shuffledHashJoinFactor")
       .checkValue(_ >= 1, "The shuffle hash join factor must be at least 1.")
@@ -8959,6 +8972,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
     getConf(SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED)
 
   def autoBroadcastJoinThreshold: Long = getConf(AUTO_BROADCASTJOIN_THRESHOLD)
+
+  def shuffledHashJoinLocalMapThreshold: Long =
+    getConf(SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD)
 
   def limitInitialNumPartitions: Int = getConf(LIMIT_INITIAL_NUM_PARTITIONS)
 
