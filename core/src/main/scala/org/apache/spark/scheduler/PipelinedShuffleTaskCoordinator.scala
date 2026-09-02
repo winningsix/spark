@@ -53,6 +53,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
   private val readerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
   private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
+  private val maxTotalReaderTasksPerExecutor =
+    conf.get(STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
   private val revivePending = new AtomicBoolean(false)
   // A prepared inbox is reusable only until its attached task completes. Give every replacement a
   // distinct negative token so a delayed ready ACK from the previous lease cannot satisfy the new
@@ -191,6 +193,36 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     } else {
       readyTaskIndices.get((taskSet.stageId, taskSet.taskSet.stageAttemptId, executorId))
         .exists(_.contains(taskIndex))
+    }
+  }
+
+  /**
+   * Admit reader compute independently from executor-owned inbox preparation.
+   *
+   * A fully streaming query can have several downstream hash joins alive at once. Preparing all
+   * inboxes is required to keep producer routes non-blocking, but attaching all of their compute
+   * tasks to the same executor can overcommit execution memory. The per-stage sampled cap protects
+   * the first heavy tasks; the executor-wide cap bounds overlapping reader stages.
+   */
+  def readerLaunchAllowed(
+      taskSet: TaskSetManager,
+      executorId: String,
+      activeTaskSets: Iterable[TaskSetManager]): Boolean = {
+    if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      val stageCap = taskSet.preparedReaderMaxTasksPerExecutor
+      val belowStageCap = stageCap <= 0 || taskSet.runningTasksOnExecutor(executorId) < stageCap
+      val totalReaders = if (maxTotalReaderTasksPerExecutor > 0) {
+        activeTaskSets.iterator
+          .filter(manager => !manager.isZombie && manager.taskSet.isPipelinedShuffleReader)
+          .map(_.runningTasksOnExecutor(executorId))
+          .sum
+      } else {
+        0
+      }
+      belowStageCap &&
+        (maxTotalReaderTasksPerExecutor <= 0 || totalReaders < maxTotalReaderTasksPerExecutor)
     }
   }
 

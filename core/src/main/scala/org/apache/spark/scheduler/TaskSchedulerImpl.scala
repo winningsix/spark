@@ -459,7 +459,8 @@ private[spark] class TaskSchedulerImpl(
       availableCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
-      soleActivePureProducer: Boolean)
+      soleActivePureProducer: Boolean,
+      activeTaskSets: Iterable[TaskSetManager])
     : (Boolean, Option[TaskLocality]) = {
     if (!pipelinedShuffleTaskCoordinator.taskSetReady(taskSet)) return (true, None)
     var noDelayScheduleRejects = true
@@ -479,7 +480,9 @@ private[spark] class TaskSchedulerImpl(
 
       // check whether the task can be scheduled to the executor base on resource profile.
       if (pipelinedShuffleTaskCoordinator.producerLaunchAllowed(
-          taskSet, soleActivePureProducer) && sc.resourceProfileManager
+          taskSet, soleActivePureProducer) &&
+          pipelinedShuffleTaskCoordinator.readerLaunchAllowed(
+            taskSet, execId, activeTaskSets) && sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
           availableCpus(i), availableResources(i))
@@ -718,7 +721,7 @@ private[spark] class TaskSchedulerImpl(
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks, useSoleProducerWindow)
+              availableResources, tasks, useSoleProducerWindow, sortedTaskSets)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject

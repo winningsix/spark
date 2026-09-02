@@ -2944,6 +2944,58 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     launched.foreach(task => assert(task.cpus === BigDecimal("0.25")))
   }
 
+  test("prepared reader compute attach is capped without reducing inbox preparation") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
+    val executorId = "executor0"
+    val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"prepared-attach-cap-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInbox(id) =>
+            prepared.synchronized(prepared += id)
+            context.reply(true)
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            prepared.synchronized(prepared ++= ids)
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](3)(i => new FakeTask(2, i)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(7),
+      pipelinedReaderStartupShuffleIds = Set(7))
+    taskScheduler.submitTasks(reader)
+    val offer = IndexedSeq(WorkerOffer(executorId, "host0", 15))
+
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
+    eventually(timeout(10.seconds)) {
+      assert(prepared.synchronized(prepared.size) === 3,
+        "all network inboxes must be prepared even though compute attach is capped")
+    }
+    prepared.synchronized(prepared.toSeq).foreach(tracker.markInboxDrainReady(executorId, _))
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 1)
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
+      "the remaining ready inboxes must wait for the running compute attachment")
+  }
+
   test("prepared receive mode waits only for declared startup shuffle inboxes") {
     val taskScheduler = setupScheduler()
     val inboxes = Seq(
