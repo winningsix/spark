@@ -202,6 +202,8 @@ private[spark] class TaskSchedulerImpl(
 
   protected val executorIdToHost = new HashMap[String, String]
 
+  private val executorIdToResourceProfileId = new HashMap[String, Int]
+
   private val abortTimer = ThreadUtils.newDaemonSingleThreadScheduledExecutor("task-abort-timer")
   // Exposed for testing
   val unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, Long]
@@ -560,6 +562,24 @@ private[spark] class TaskSchedulerImpl(
     availWorkerResources.assignAddressesCustomResources(taskSetProf)
   }
 
+  private def pipelinedReaderPlacementCandidates(
+      taskSet: TaskSetManager,
+      taskIndex: Int): Seq[String] = {
+    executorIdToRunningTaskIds.keysIterator.filter { executorId =>
+      (for {
+        host <- executorIdToHost.get(executorId)
+        executorResourceProfileId <- executorIdToResourceProfileId.get(executorId)
+      } yield {
+        val applicationAllows = healthTrackerOpt.forall { healthTracker =>
+          !healthTracker.isNodeExcluded(host) && !healthTracker.isExecutorExcluded(executorId)
+        }
+        applicationAllows && sc.resourceProfileManager.canBeScheduled(
+          taskSet.taskSet.resourceProfileId, executorResourceProfileId) &&
+          taskSet.isExecutorAllowedForTask(taskIndex, executorId, host)
+      }).contains(true)
+    }.toSeq.sorted
+  }
+
   private def minTaskLocality(
       l1: Option[TaskLocality],
       l2: Option[TaskLocality]) : Option[TaskLocality] = {
@@ -586,6 +606,7 @@ private[spark] class TaskSchedulerImpl(
     // Also track if new executor is added
     var newExecAvail = false
     for (o <- offers) {
+      executorIdToResourceProfileId(o.executorId) = o.resourceProfileId
       if (!hostToExecutors.contains(o.host)) {
         hostToExecutors(o.host) = new HashSet[String]()
       }
@@ -636,7 +657,9 @@ private[spark] class TaskSchedulerImpl(
       None
     }
     pipelinedShuffleTaskCoordinator.prepareForOffers(
-      sortedTaskSets, executorIdToRunningTaskIds.keySet.toSet)
+      sortedTaskSets,
+      executorIdToRunningTaskIds.keySet.toSet,
+      pipelinedReaderPlacementCandidates)
     // Once an executor-owned inbox receives its first payload (or EOS), launch its attached
     // reader before more producers. This closes the backpressure loop without reserving idle task
     // slots for every reader in the group. The original pool order remains the stable tie-breaker.
@@ -1192,6 +1215,7 @@ private[spark] class TaskSchedulerImpl(
       // happen below in the rootPool.executorLost() call.
       taskIds.foreach(cleanupTaskState)
     }
+    executorIdToResourceProfileId -= executorId
 
     val host = executorIdToHost(executorId)
     val execs = hostToExecutors.getOrElse(host, new HashSet)
