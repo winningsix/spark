@@ -997,8 +997,10 @@ private[spark] class TaskSchedulerImpl(
       tid: Long,
       taskState: TaskState,
       reason: TaskFailedReason): Unit = synchronized {
+    val taskIndex = taskSetManager.taskInfos(tid).index
     taskSetManager.handleFailedTask(tid, taskState, reason)
     if (!taskSetManager.isZombie && !taskSetManager.someAttemptSucceeded(tid)) {
+      pipelinedShuffleTaskCoordinator.taskFailed(taskSetManager, taskIndex)
       // Need to revive offers again now that the task set manager state has been updated to
       // reflect failed tasks that need to be re-run.
       backend.reviveOffers()
