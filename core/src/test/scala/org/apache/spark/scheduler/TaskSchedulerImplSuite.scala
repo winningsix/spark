@@ -3495,4 +3495,99 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 2)
   }
 
+  test("prepared receive mode expands a wide producer frontier after its readers start") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE.key -> "4",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MIN_ACTIVE_STAGES.key -> "4")
+
+    val groupProperties = new Properties()
+    groupProperties.setProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH, "wide-group")
+    def producer(stageId: Int): TaskSet = new TaskSet(
+      Array.tabulate[Task[_]](6)(i => new FakeTask(stageId, i)),
+      stageId = stageId,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = groupProperties,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(stageId + 1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+
+    (0 until 4).foreach(stageId => taskScheduler.submitTasks(producer(stageId)))
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](4)(i => new FakeTask(4, i)),
+      stageId = 4,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = groupProperties,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = 1 to 4)
+    taskScheduler.submitTasks(reader)
+    taskScheduler.taskSetManagerForAttempt(4, 0).get.runningTasksSet += Long.MaxValue
+
+    val offers = (0 until 16).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    assert(taskScheduler.resourceOffers(offers).flatten.length === 16)
+    (0 until 4).foreach { stageId =>
+      assert(taskScheduler.taskSetManagerForAttempt(stageId, 0).get.runningTasks === 4)
+    }
+  }
+
+  test("wide producer expansion counts stages only within one pipelined run epoch") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE.key -> "4",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MIN_ACTIVE_STAGES.key -> "4")
+
+    def properties(epoch: String): Properties = {
+      val result = new Properties()
+      result.setProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH, epoch)
+      result
+    }
+    def producer(stageId: Int, epoch: String): TaskSet = new TaskSet(
+      Array.tabulate[Task[_]](6)(i => new FakeTask(stageId, i)),
+      stageId = stageId,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = properties(epoch),
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(stageId + 1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+
+    (0 until 4).foreach { stageId =>
+      taskScheduler.submitTasks(producer(stageId, s"group-${stageId / 2}"))
+    }
+    (0 until 2).foreach { groupId =>
+      val readerStageId = 4 + groupId
+      taskScheduler.submitTasks(new TaskSet(
+        Array.tabulate[Task[_]](2)(i => new FakeTask(readerStageId, i)),
+        stageId = readerStageId,
+        stageAttemptId = 0,
+        priority = 0,
+        properties = properties(s"group-$groupId"),
+        resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+        shuffleId = None,
+        isPipelined = true,
+        isPipelinedShuffleReader = true,
+        pipelinedReaderShuffleIds = Seq(1 + 2 * groupId, 2 + 2 * groupId)))
+      taskScheduler.taskSetManagerForAttempt(readerStageId, 0).get.runningTasksSet +=
+        Long.MaxValue - groupId
+    }
+    val offers = (0 until 16).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    assert(taskScheduler.resourceOffers(offers).flatten.length === 8)
+    (0 until 4).foreach { stageId =>
+      assert(taskScheduler.taskSetManagerForAttempt(stageId, 0).get.runningTasks === 2)
+    }
+  }
+
 }

@@ -51,6 +51,16 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
   private val soleProducerMaxTasks =
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
+  private val expandedProducerMaxTasks =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE)
+  private val expandedProducerMinActiveStages =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MIN_ACTIVE_STAGES)
+  require(
+    (expandedProducerMinActiveStages == 0) == expandedProducerMaxTasks.isEmpty,
+    "expanded producer task limit and active-stage threshold must be configured together")
+  require(
+    expandedProducerMaxTasks.forall(expanded => producerMaxTasks.exists(expanded >= _)),
+    "expanded producer task limit must be at least the base producer task limit")
   private val readerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
   private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
   private val maxTotalReaderTasksPerExecutor =
@@ -292,11 +302,15 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
 
   def producerLaunchAllowed(
       taskSet: TaskSetManager,
-      soleActivePureProducer: Boolean): Boolean = {
+      activePureProducerStages: Int,
+      readerFrontierStarted: Boolean): Boolean = {
     val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
-    val taskLimit = if (soleActivePureProducer) {
+    val taskLimit = if (activePureProducerStages == 1 && readerFrontierStarted) {
       soleProducerMaxTasks.orElse(producerMaxTasks)
+    } else if (readerFrontierStarted && expandedProducerMinActiveStages > 0 &&
+        activePureProducerStages >= expandedProducerMinActiveStages) {
+      expandedProducerMaxTasks.orElse(producerMaxTasks)
     } else {
       producerMaxTasks
     }
