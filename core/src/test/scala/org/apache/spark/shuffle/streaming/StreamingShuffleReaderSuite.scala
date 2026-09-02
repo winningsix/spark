@@ -214,4 +214,66 @@ class StreamingShuffleReaderSuite
       }
     }
   }
+
+  test("prepared reader reports inbox queue spill in task metrics") {
+    withTempDir { spillDir =>
+      withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+        val context = createTaskContext(sc.conf, 0)
+        val session = mock[StreamingShufflePreparedReceiveSession]
+        when(session.errorNotifier).thenReturn(new ErrorNotifier())
+        when(session.totalNumShuffleWriters).thenReturn(new AtomicInteger(0))
+        when(session.terminationAckControlMessageSet)
+          .thenReturn(ConcurrentHashMap.newKeySet[Long]())
+        when(session.allTermAcksSentNotice).thenReturn(new Semaphore(0))
+        val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
+        val inbox = new StreamingShuffleReceiveInbox(
+          StreamingShuffleReceiveInboxId(0, 0, 0, 0, -1L), queue)
+        inbox.startPreparedSession(session)
+        val lease = new StreamingShuffleReceiveInboxLease(inbox, () => inbox.close())
+        val bytes = Array.fill[Byte](128)(1)
+        val buffer = Unpooled.wrappedBuffer(bytes)
+        queue.put(new DataMessage(0, 0, bytes.length, buffer, 0L))
+        buffer.release()
+
+        val reader = new StreamingShuffleReader[Int, Int](
+          new StreamingShuffleHandle(0, dep),
+          context,
+          sharedExecutorClient = Some(mock[StreamingShuffleExecutorClient]),
+          receiveInbox = Some(lease))
+        context.markTaskCompleted(None)
+
+        context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
+        reader.cleanupResources()
+        context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
+      }
+    }
+  }
+
+  test("spilled inbox data releases payload ownership but defers producer credit") {
+    withTempDir { spillDir =>
+      val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
+      val payloadReleases = new AtomicInteger(0)
+      val creditReleases = new AtomicInteger(0)
+      val bytes = Array.fill[Byte](128)(1)
+      val buffer = Unpooled.wrappedBuffer(bytes)
+      val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+      buffer.release()
+      data.setResourceReleaseCallback(() => payloadReleases.incrementAndGet())
+      data.setReleaseCallback(() => creditReleases.incrementAndGet())
+
+      queue.put(data)
+
+      queue.spilledBytesCount shouldBe bytes.length.toLong
+      payloadReleases.get() shouldBe 1
+      creditReleases.get() shouldBe 0
+
+      val materialized = queue.take()
+      creditReleases.get() shouldBe 0
+      materialized.release()
+      creditReleases.get() shouldBe 1
+      queue.close()
+    }
+  }
 }

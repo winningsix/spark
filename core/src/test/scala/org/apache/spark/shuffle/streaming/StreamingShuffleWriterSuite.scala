@@ -35,6 +35,7 @@ import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
@@ -116,6 +117,30 @@ class StreamingShuffleWriterSuite
         new StreamingShuffleWriter[Int, Int](handle, 0, context)
       }
       assert(e.getMessage.contains("memory budget"))
+    }
+  }
+
+  test("writer reports replay spill exactly once in task metrics") {
+    val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val bytes = Array.fill[Byte](128)(1)
+        val buffer = Unpooled.wrappedBuffer(bytes)
+        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+        buffer.release()
+
+        writer.shards(0).send(data)
+        writer.stop(success = true)
+        val firstReportedBytes = context.taskMetrics.diskBytesSpilled
+        firstReportedBytes should be > bytes.length.toLong
+
+        writer.stop(success = true)
+        context.taskMetrics.diskBytesSpilled shouldBe firstReportedBytes
+      } finally {
+        context.markTaskCompleted(None)
+      }
     }
   }
 

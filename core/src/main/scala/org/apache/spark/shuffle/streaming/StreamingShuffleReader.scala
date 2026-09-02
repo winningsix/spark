@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.File
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -231,6 +231,7 @@ class StreamingShuffleReader[K, C](
 
   private var currentDataMessage: StreamingShuffleMessage = _
   private var queueWaitNanosRemainder = 0L
+  private val reportedInboxSpilledBytes = new AtomicLong(0L)
 
   private def recordQueueWaitNanos(waitNanos: Long): Unit = {
     val totalNanos = queueWaitNanosRemainder + waitNanos
@@ -313,6 +314,12 @@ class StreamingShuffleReader[K, C](
         case _ =>
           StreamingShuffleReceiveInboxStats(0L, 0L)
       }
+    }
+    // Reader-queue spill is part of this task's disk footprint. Report it through TaskMetrics so
+    // event logs do not describe an executor-local RTM spill file as a spill-free shuffle.
+    val previouslyReported = reportedInboxSpilledBytes.getAndSet(inboxStats.spilledBytes)
+    if (inboxStats.spilledBytes > previouslyReported) {
+      context.taskMetrics().incDiskBytesSpilled(inboxStats.spilledBytes - previouslyReported)
     }
     logDebug(
       log"Streaming reader queue spilled ${MDC(LogKeys.NUM_BYTES, inboxStats.spilledBytes)} " +
