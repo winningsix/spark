@@ -84,6 +84,14 @@ private[streaming] class StreamingShuffleReceiveService(
     onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
   private val inboxes =
     new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
+  private case class PreparedInboxKey(
+      shuffleId: Int,
+      stageId: Int,
+      stageAttemptNumber: Int,
+      partitionId: Int,
+      readerOrdinal: Int)
+  private val preparedInboxes =
+    new ConcurrentHashMap[PreparedInboxKey, StreamingShuffleReceiveInbox]()
   private case class TaskShuffleKey(
       shuffleId: Int,
       stageId: Int,
@@ -91,6 +99,15 @@ private[streaming] class StreamingShuffleReceiveService(
       partitionId: Int,
       taskAttemptId: Long)
   private val nextReaderOrdinal = new ConcurrentHashMap[TaskShuffleKey, AtomicInteger]()
+
+  private def preparedInboxKey(id: StreamingShuffleReceiveInboxId): PreparedInboxKey = {
+    PreparedInboxKey(
+      id.shuffleId,
+      id.stageId,
+      id.stageAttemptNumber,
+      id.partitionId,
+      id.readerOrdinal)
+  }
   private case class PreparedResources(
       discovery: StreamingShufflePreparedReceiveDiscovery,
       clientCreationExecutor: ExecutorService) {
@@ -134,14 +151,15 @@ private[streaming] class StreamingShuffleReceiveService(
     context.addTaskCompletionListener[Unit] { _ =>
       nextReaderOrdinal.remove(taskShuffleKey, ordinalCounter)
     }
-    val preparedId = StreamingShuffleReceiveInboxId(
+    val logicalPreparedId = StreamingShuffleReceiveInboxId(
       shuffleId,
       context.stageId(),
       context.stageAttemptNumber(),
       context.partitionId(),
       -1L,
       readerOrdinal)
-    val prepared = inboxes.get(preparedId)
+    val prepared = preparedInboxes.get(preparedInboxKey(logicalPreparedId))
+    val preparedId = if (prepared == null) logicalPreparedId else prepared.id
     if (prepared != null) {
       if (prepared.attach(context.taskAttemptId())) {
         return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))
@@ -166,31 +184,46 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def prepare(id: StreamingShuffleReceiveInboxId): Boolean = synchronized {
-    require(id.taskAttemptId == -1L, s"Prepared inbox must use taskAttemptId=-1: $id")
+    require(id.taskAttemptId < 0L, s"Prepared inbox must use a negative generation token: $id")
+    val key = preparedInboxKey(id)
+    val logicalExisting = preparedInboxes.get(key)
+    if (logicalExisting != null) {
+      return logicalExisting.id == id && logicalExisting.session.isDefined
+    }
     val inbox = new StreamingShuffleReceiveInbox(id, createQueue())
     val existing = inboxes.putIfAbsent(id, inbox)
-    val selected = if (existing == null) inbox else existing
-    if (existing == null) {
-      try {
-        val executorClient = sharedClient().getOrElse(throw new IllegalStateException(
-          "Prepared receive inbox requires the shared executor client"))
-        val resources = getPreparedResources
-        selected.startPreparedSession(new StreamingShufflePreparedReceiveSession(
-          selected,
-          executorClient,
-          conf,
-          resources.discovery,
-          resources.clientCreationExecutor,
-          () => onDrainReady(id)))
-        logDebug(s"Prepared streaming shuffle receive inbox $id")
-      } catch {
-        case t: Throwable =>
-          inboxes.remove(id, selected)
-          selected.close()
-          throw t
-      }
+    if (existing != null) {
+      inbox.close()
+      val logicalRace = preparedInboxes.putIfAbsent(key, existing)
+      val current = if (logicalRace == null) existing else logicalRace
+      return current.id == id && current.session.isDefined
     }
-    selected.session.isDefined
+    val logicalRace = preparedInboxes.putIfAbsent(key, inbox)
+    if (logicalRace != null) {
+      inboxes.remove(id, inbox)
+      inbox.close()
+      return logicalRace.id == id && logicalRace.session.isDefined
+    }
+    try {
+      val executorClient = sharedClient().getOrElse(throw new IllegalStateException(
+        "Prepared receive inbox requires the shared executor client"))
+      val resources = getPreparedResources
+      inbox.startPreparedSession(new StreamingShufflePreparedReceiveSession(
+        inbox,
+        executorClient,
+        conf,
+        resources.discovery,
+        resources.clientCreationExecutor,
+        () => onDrainReady(id)))
+      logDebug(s"Prepared streaming shuffle receive inbox $id")
+    } catch {
+      case t: Throwable =>
+        preparedInboxes.remove(key, inbox)
+        inboxes.remove(id, inbox)
+        inbox.close()
+        throw t
+    }
+    inbox.session.isDefined
   }
 
   def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
@@ -200,6 +233,7 @@ private[streaming] class StreamingShuffleReceiveService(
   def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = {
     val inbox = inboxes.get(id)
     inbox != null && inboxes.remove(id, inbox) && {
+      preparedInboxes.remove(preparedInboxKey(id), inbox)
       inbox.close()
       true
     }
@@ -208,6 +242,7 @@ private[streaming] class StreamingShuffleReceiveService(
   def unregisterShuffle(shuffleId: Int): Unit = {
     inboxes.entrySet().asScala.foreach { entry =>
       if (entry.getKey.shuffleId == shuffleId && inboxes.remove(entry.getKey, entry.getValue)) {
+        preparedInboxes.remove(preparedInboxKey(entry.getKey), entry.getValue)
         entry.getValue.close()
       }
     }
@@ -223,6 +258,7 @@ private[streaming] class StreamingShuffleReceiveService(
   def close(): Unit = synchronized {
     inboxes.entrySet().asScala.foreach { entry =>
       if (inboxes.remove(entry.getKey, entry.getValue)) {
+        preparedInboxes.remove(preparedInboxKey(entry.getKey), entry.getValue)
         entry.getValue.close()
       }
     }
@@ -238,6 +274,9 @@ private[streaming] class StreamingShuffleReceiveService(
   private def releaseLease(
       inbox: StreamingShuffleReceiveInbox): StreamingShuffleReceiveInboxStats = {
     inboxes.remove(inbox.id, inbox)
+    if (inbox.id.taskAttemptId < 0L) {
+      preparedInboxes.remove(preparedInboxKey(inbox.id), inbox)
+    }
     inbox.close()
   }
 

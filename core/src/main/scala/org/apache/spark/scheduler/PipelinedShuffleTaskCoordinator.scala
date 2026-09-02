@@ -18,7 +18,7 @@
 package org.apache.spark.scheduler
 
 import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 
@@ -54,6 +54,10 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   private val readerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
   private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
   private val revivePending = new AtomicBoolean(false)
+  // A prepared inbox is reusable only until its attached task completes. Give every replacement a
+  // distinct negative token so a delayed ready ACK from the previous lease cannot satisfy the new
+  // assignment (the task attempt id itself is not known until the scheduler launches the task).
+  private val nextPreparedInboxGeneration = new AtomicLong(-1L)
 
   private lazy val trackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
     SparkEnv.get.streamingShuffleOutputTracker.collect {
@@ -108,7 +112,7 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
                   taskSet.stageId,
                   taskSet.taskSet.stageAttemptId,
                   partitionId,
-                  -1L,
+                  nextPreparedInboxGeneration.getAndDecrement(),
                   readerOrdinal)
               }
               pending += key -> ReaderAssignment(executorId, inboxes)

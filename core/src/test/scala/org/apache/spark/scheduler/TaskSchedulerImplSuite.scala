@@ -3049,7 +3049,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
     assert(prepareCount.get() === 2)
     val retryInbox = latestPrepared.get()
-    assert(retryInbox === firstInbox)
+    assert(retryInbox !== firstInbox)
+    assert(retryInbox.taskAttemptId < firstInbox.taskAttemptId)
+    // A delayed ACK for the consumed generation must not satisfy the replacement assignment.
+    tracker.markInboxDrainReady(executorId, firstInbox)
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
     tracker.markInboxDrainReady(executorId, retryInbox)
     val retryAttempt = taskScheduler.resourceOffers(offer).flatten
     assert(retryAttempt.size === 1)
