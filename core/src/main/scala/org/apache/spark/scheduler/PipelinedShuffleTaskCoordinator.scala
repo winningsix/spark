@@ -218,7 +218,7 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       taskSet: TaskSetManager,
       executorId: String,
       activeTaskSets: Iterable[TaskSetManager],
-      upstreamReaderProducersStarted: Boolean): Boolean = {
+      upstreamReaderProducers: Seq[TaskSetManager]): Boolean = {
     if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
       true
     } else {
@@ -232,36 +232,50 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       } else {
         0
       }
-      belowStageCap && upstreamReaderProducersStarted &&
+      belowStageCap && !upstreamReaderAttachmentReserved(
+        executorId, upstreamReaderProducers) &&
         (maxTotalReaderTasksPerExecutor <= 0 || totalReaders < maxTotalReaderTasksPerExecutor)
     }
   }
 
   /**
-   * Keep a deeper reader from consuming compute attachments before the reader-producers that feed
-   * it have started.
+   * Return the direct reader-producers that feed a reader.
    *
    * Inbox readiness is input-local: a downstream shuffled hash join can become ready from its
    * build input while a streamed input is still produced by an upstream join. If that downstream
-   * stage attaches first, it can fill the executor-wide reader cap and strand the upstream join
-   * whose output it is waiting for. Requiring only the direct reader-producer dependencies to have
-   * started reserves the frontier without serializing pure producers or waiting for an upstream
-   * stage to finish.
+   * stage attaches first, it can fill the executor-wide reader cap and strand that upstream join.
    */
-  def upstreamReaderProducersStarted(
+  def upstreamReaderProducers(
       reader: TaskSetManager,
-      taskSets: Iterable[TaskSetManager]): Boolean = {
+      taskSets: Iterable[TaskSetManager]): Seq[TaskSetManager] = {
     if (!enabled || !reader.taskSet.isPipelinedShuffleReader) {
-      true
+      Seq.empty
     } else {
-      val producerByShuffleId = taskSets.iterator
-        .filterNot(_.isZombie)
-        .flatMap(taskSet => taskSet.taskSet.shuffleId.map(_ -> taskSet))
-        .toMap
-      reader.taskSet.pipelinedReaderShuffleIds.distinct.forall { shuffleId =>
-        producerByShuffleId.get(shuffleId).forall { producer =>
-          !producer.taskSet.isPipelinedShuffleReader ||
-            producer.runningTasks > 0 || producer.tasksSuccessful > 0
+      val inputShuffleIds = reader.taskSet.pipelinedReaderShuffleIds.toSet
+      taskSets.iterator.filter { producer =>
+        !producer.isZombie && producer.taskSet.isPipelinedShuffleReader &&
+          producer.taskSet.shuffleId.exists(inputShuffleIds.contains)
+      }.toSeq
+    }
+  }
+
+  /**
+   * Reserve only the executor slots needed by pending tasks of a direct reader-producer.
+   *
+   * Once an upstream task attaches (or completes), its reservation disappears immediately. This
+   * lets independent executors and later stages overlap while preventing a readiness race from
+   * leaving a few critical upstream partitions queued behind their own consumers.
+   */
+  private def upstreamReaderAttachmentReserved(
+      executorId: String,
+      upstreamReaderProducers: Seq[TaskSetManager]): Boolean = {
+    upstreamReaderProducers.exists { producer =>
+      producer.tasks.indices.exists { taskIndex =>
+        producer.isTaskPendingForOffer(taskIndex) && {
+          val key = ReaderKey(producer.stageId, producer.taskSet.stageAttemptId, taskIndex)
+          // Missing preparation is conservatively reserved on every executor until a placement
+          // exists; prepareForOffers normally resolves it before this admission check.
+          assignments.get(key).forall(_.executorId == executorId)
         }
       }
     }
