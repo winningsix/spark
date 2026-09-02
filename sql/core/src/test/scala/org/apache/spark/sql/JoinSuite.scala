@@ -1597,6 +1597,19 @@ class JoinSuite extends SharedSparkSession with AdaptiveSparkPlanHelper
     }
   }
 
+  test("static shuffled hash join threshold is independent of broadcast threshold") {
+    val query =
+      "SELECT * FROM range(0, 100000) large JOIN range(0, 10) small ON large.id = small.id"
+    withSQLConf(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false") {
+      assertJoin(query, classOf[SortMergeJoinExec])
+      withSQLConf(SQLConf.SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "1MB") {
+        assertJoin(query, classOf[ShuffledHashJoinExec])
+      }
+    }
+  }
+
   test("SPARK-36794: Ignore duplicated key when building relation for semi/anti hash join") {
     withTable("t1", "t2") {
       spark.range(10).map(i => (i.toString, i + 1)).toDF("c1", "c2").write.saveAsTable("t1")
