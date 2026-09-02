@@ -294,6 +294,7 @@ class StreamingShuffleWriter[K, V](
   private[streaming] def transferStats: (Long, Long, Long) =
     (rawBytesSent.get(), wireBytesSent.get(), dataMessagesSent.get())
   private val replaySpilledBytes = new AtomicLong(0L)
+  private val reportedReplaySpilledBytes = new AtomicLong(0L)
   // Counts messages whose TransportClient write callback has not completed. In the relaxed
   // pipelined lifecycle this is the second half of the delivery barrier, after every shard's
   // reader-registration/send chain has completed. It preserves all network writes without
@@ -1942,6 +1943,12 @@ class StreamingShuffleWriter[K, V](
     // has no standard block-fetch fallback path. This MapStatus is therefore only a placeholder
     // to satisfy the ShuffleWriter contract and the DAGScheduler / MapOutputTracker bookkeeping;
     // its all-zero partition lengths are never read by any reducer.
+    val currentReplaySpilledBytes = replaySpilledBytes.get()
+    val previouslyReported = reportedReplaySpilledBytes.getAndSet(currentReplaySpilledBytes)
+    if (currentReplaySpilledBytes > previouslyReported) {
+      context.taskMetrics().incDiskBytesSpilled(
+        currentReplaySpilledBytes - previouslyReported)
+    }
     Some(MapStatus(
       SparkEnv.get.blockManager.shuffleServerId,
       Array.fill(numPartitions)(0L),

@@ -174,6 +174,31 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
+  public void testPayloadAndConsumerReleaseAreIndependentAndIdempotent() {
+    byte[] payload = "hi".getBytes();
+    ByteBuf payloadBuf = Unpooled.wrappedBuffer(payload);
+    DataMessage msg = new DataMessage(0, 0, payload.length, payloadBuf, 0L);
+    java.util.concurrent.atomic.AtomicInteger resourceReleases =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    java.util.concurrent.atomic.AtomicInteger consumerReleases =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    msg.setResourceReleaseCallback(resourceReleases::incrementAndGet);
+    msg.setReleaseCallback(consumerReleases::incrementAndGet);
+
+    Runnable consumerRelease = msg.takeReleaseCallback();
+    msg.releaseOwnedResources();
+    msg.releaseOwnedResources();
+    assertEquals(1, payloadBuf.refCnt());
+    assertEquals(1, resourceReleases.get());
+    assertEquals(0, consumerReleases.get());
+
+    consumerRelease.run();
+    msg.release();
+    assertEquals(1, consumerReleases.get());
+    payloadBuf.release();
+  }
+
+  @Test
   public void testDataMessageRejectsDataSizeLargerThanReadableBytes() {
     byte[] payload = "hello".getBytes();
     ByteBuf payloadBuf = Unpooled.wrappedBuffer(payload);

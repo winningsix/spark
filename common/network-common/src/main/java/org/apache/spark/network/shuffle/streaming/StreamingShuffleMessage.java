@@ -51,6 +51,7 @@ import io.netty.buffer.CompositeByteBuf;
 public abstract sealed class StreamingShuffleMessage
   permits CreditControlMessage, DataMessage, TerminationAckMessage, TerminationControlMessage {
   protected ByteBuf ownedBuf = null;
+  private Runnable resourceReleaseCallback = null;
   private Runnable releaseCallback = null;
 
   // To prevent any duplicate/out of order/missing messages, each writer will track the current
@@ -108,19 +109,62 @@ public abstract sealed class StreamingShuffleMessage
   }
 
   /**
+   * Registers cleanup that belongs to the encoded payload rather than to consumer admission.
+   *
+   * <p>A spillable receiver may copy the payload to disk and release its Netty ownership before
+   * the downstream operator consumes the message. That early resource cleanup must not also run
+   * the ordinary release callback: streaming shuffle uses that callback to return receive credit,
+   * and returning credit at spill time would let a blocked producer turn a bounded queue into an
+   * unbounded disk writer.</p>
+   */
+  public void setResourceReleaseCallback(Runnable resourceReleaseCallback) {
+    this.resourceReleaseCallback = resourceReleaseCallback;
+  }
+
+  /**
+   * Transfers the consumer-release callback to another owner.
+   *
+   * <p>The caller becomes responsible for invoking or reattaching the returned callback exactly
+   * once. Payload resources remain owned by this message until {@link #releaseOwnedResources()} or
+   * {@link #release()} is called.</p>
+   */
+  public Runnable takeReleaseCallback() {
+    Runnable callback = releaseCallback;
+    releaseCallback = null;
+    return callback;
+  }
+
+  /** Releases only payload resources, without signalling downstream consumption. */
+  public void releaseOwnedResources() {
+    try {
+      if (ownedBuf != null) {
+        ownedBuf.release();
+        ownedBuf = null;
+      }
+    } finally {
+      if (resourceReleaseCallback != null) {
+        Runnable callback = resourceReleaseCallback;
+        resourceReleaseCallback = null;
+        callback.run();
+      }
+    }
+  }
+
+  /**
    * Releases any resources associated with this message.
    * In VERY RARE cases when the task fails unexpectedly, this method may be called twice.
    * This method is idempotent — a second call on the same thread is a no-op — but it is
    * NOT thread-safe.
    */
   public void release() {
-    if (ownedBuf != null) {
-      ownedBuf.release();
-      ownedBuf = null;
-    }
-    if (releaseCallback != null) {
-      releaseCallback.run();
-      releaseCallback = null;
+    try {
+      releaseOwnedResources();
+    } finally {
+      if (releaseCallback != null) {
+        Runnable callback = releaseCallback;
+        releaseCallback = null;
+        callback.run();
+      }
     }
   }
 

@@ -505,27 +505,27 @@ class StreamingShuffleClientHandler(
           case dataMessage: DataMessage =>
             updateQuota(messageSize)
             val retainedBody = managedBody.map(_.retain())
+            // Transport-body ownership is independent of receive-window ownership. A spillable
+            // inbox may release the copied payload immediately, but credit must remain outstanding
+            // until the downstream task consumes or cancels the spilled entry.
+            dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
-              try {
-                val available = updateQuota(-messageSize)
-                if (backpressureEnabled && !terminationReceived) {
-                  if (perStreamAutoReadEnabled) {
-                    // Dedicated channels retain the original additive-credit protocol; their
-                    // channel-level autoRead is the primary admission boundary.
-                    sendCreditControlMessage(
-                      client,
-                      shuffleWriterId,
-                      math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
-                  } else {
-                    // Carry an absolute released-byte watermark. Repeating it after an idle
-                    // interval repairs a delayed final wake-up without adding the same credit
-                    // twice or advertising receive capacity that may still be in flight.
-                    val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
-                    sendCumulativeCreditAck(client, released)
-                  }
+              updateQuota(-messageSize)
+              if (backpressureEnabled && !terminationReceived) {
+                if (perStreamAutoReadEnabled) {
+                  // Dedicated channels retain the original additive-credit protocol; their
+                  // channel-level autoRead is the primary admission boundary.
+                  sendCreditControlMessage(
+                    client,
+                    shuffleWriterId,
+                    math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                } else {
+                  // Carry an absolute released-byte watermark. Repeating it after an idle
+                  // interval repairs a delayed final wake-up without adding the same credit
+                  // twice or advertising receive capacity that may still be in flight.
+                  val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                  sendCumulativeCreditAck(client, released)
                 }
-              } finally {
-                retainedBody.foreach(_.release())
               }
             })
             // We can only release the frame after all rows in the buffer have been decoded. The
