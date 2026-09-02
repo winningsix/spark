@@ -670,6 +670,13 @@ private[spark] class TaskSchedulerImpl(
     }
     val activePureProducerStagesByRunEpoch =
       activePureProducerTaskSets.groupBy(pipelinedRunEpoch).view.mapValues(_.size).toMap
+    val indexedTaskSets = sortedTaskSets.zipWithIndex
+    val firstTaskSetIndexByRunEpoch = indexedTaskSets.groupMapReduce {
+      case (taskSet, _) => pipelinedRunEpoch(taskSet)
+    }(_._2)(math.min)
+    val readerDepthByTaskSet = sortedTaskSets.groupBy(pipelinedRunEpoch).valuesIterator.flatMap {
+      sameEpochTaskSets => pipelinedShuffleTaskCoordinator.readerDepths(sameEpochTaskSets)
+    }.toMap
     // CoarseGrainedSchedulerBackend stops offering a decommissioning executor, but TaskScheduler
     // retains it until executorLost so its running tasks can finish. Do not prepare a reader inbox
     // there: the assignment would never receive an offer and could strand an otherwise runnable
@@ -682,11 +689,18 @@ private[spark] class TaskSchedulerImpl(
       activePipelinedExecutors,
       (taskSet, taskIndex) =>
         pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
-    // Once an executor-owned inbox receives its first payload (or EOS), launch its attached
-    // reader before more producers. This closes the backpressure loop without reserving idle task
-    // slots for every reader in the group. The original pool order remains the stable tie-breaker.
-    val offerTaskSets = sortedTaskSets.zipWithIndex.sortBy { case (taskSet, index) =>
-      (if (pipelinedShuffleTaskCoordinator.isReadyReader(taskSet)) 0 else 1, index)
+    // Once an executor-owned startup inbox receives its first payload (or EOS), launch its
+    // attached reader before more producers. Within one run epoch, attach upstream readers before
+    // deeper consumers: otherwise a downstream join that is ready on only one input can consume
+    // the executor-wide reader cap and strand the join that produces its other input. Preserve the
+    // pool's run-epoch order and use its original position as the stable tie-breaker.
+    val offerTaskSets = indexedTaskSets.sortBy { case (taskSet, index) =>
+      if (pipelinedShuffleTaskCoordinator.isReadyReader(taskSet)) {
+        (0, firstTaskSetIndexByRunEpoch(pipelinedRunEpoch(taskSet)),
+          readerDepthByTaskSet.getOrElse(taskSet, 0), index)
+      } else {
+        (1, index, 0, index)
+      }
     }.map(_._1)
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
