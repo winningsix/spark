@@ -31,6 +31,7 @@ import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, Streaming
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
+  STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
@@ -145,14 +146,17 @@ private[streaming] class StreamingShuffleReceiveService(
       if (prepared.attach(context.taskAttemptId())) {
         return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))
       }
-      logWarning(
-        s"Prepared streaming shuffle inbox $preparedId was already attached; " +
-          s"task ${context.taskAttemptId()} is falling back to a task-owned route")
-    } else {
-      logWarning(
-        s"Prepared streaming shuffle inbox $preparedId was absent when task " +
-          s"${context.taskAttemptId()} attempted to attach; falling back to a task-owned route")
     }
+    if (conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)) {
+      val state = if (prepared == null) "was not prepared" else "was already attached"
+      throw new IllegalStateException(
+        s"Streaming shuffle receive inbox $preparedId $state when task " +
+          s"${context.taskAttemptId()} attempted to attach. Prepared receive mode must not " +
+          "fall back to a task-owned route because that bypasses the ready acknowledgement.")
+    }
+    // Compatibility mode for direct users of the executor-scoped queue service. Production
+    // prepared receive mode takes the strict branch above and therefore always attaches the
+    // scheduler-owned inbox that was routed before task launch.
     val id = preparedId.copy(taskAttemptId = context.taskAttemptId())
     val inbox = new StreamingShuffleReceiveInbox(id, createQueue())
     require(inbox.attach(context.taskAttemptId()), s"Could not attach receive inbox $id")
