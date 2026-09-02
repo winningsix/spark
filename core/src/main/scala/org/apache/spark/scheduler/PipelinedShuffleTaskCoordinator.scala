@@ -32,7 +32,7 @@ import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
  * The ordinary scheduler remains responsible for locality, resource profiles, exclusions, and
  * task serialization. This coordinator contributes only the transport-specific decisions:
  * prepare an inbox before assigning its task, prioritize an inbox that has begun draining, and
- * bound pure producers until their direct reader frontier has started.
+ * bound pure producers until their direct reader frontier is routable or has started.
  */
 private[scheduler] final class PipelinedShuffleTaskCoordinator(
     conf: SparkConf,
@@ -300,15 +300,54 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     }
   }
 
+  /**
+   * Whether every partition of a producer's submitted direct-reader frontier has a live route.
+   *
+   * A reader task may intentionally defer its compute attachment while another join input is
+   * still being built. That must not hold an otherwise wide producer frontier at its conservative
+   * startup window: executor-owned inbox preparation and the drain-ready ACK already make the
+   * producer route safe, independently of when reader compute attaches. Tasks that have already
+   * launched or completed also have a route by construction. A pending retry, executor loss, or
+   * incomplete ACK makes the frontier non-routable again until a fresh assignment is ready.
+   */
+  def readerFrontierRoutable(
+      producer: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): Boolean = {
+    producer.taskSet.shuffleId.exists { shuffleId =>
+      val directReaders = taskSets.iterator.filter { taskSet =>
+        !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+          taskSet.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
+      }.toSeq
+      directReaders.nonEmpty && trackerMaster.exists { tracker =>
+        directReaders.forall { reader =>
+          reader.tasks.indices.forall { taskIndex =>
+            if (!reader.isTaskPendingForOffer(taskIndex)) {
+              true
+            } else {
+              val key = ReaderKey(reader.stageId, reader.taskSet.stageAttemptId, taskIndex)
+              assignments.get(key).exists { assignment =>
+                val directInboxes = assignment.inboxes.filter(_.shuffleId == shuffleId)
+                directInboxes.nonEmpty && directInboxes.forall { inbox =>
+                  tracker.isReceiveInboxDrainReady(assignment.executorId, inbox)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   def producerLaunchAllowed(
       taskSet: TaskSetManager,
       activePureProducerStages: Int,
+      readerFrontierRoutable: Boolean,
       readerFrontierStarted: Boolean): Boolean = {
     val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
     val taskLimit = if (activePureProducerStages == 1 && readerFrontierStarted) {
       soleProducerMaxTasks.orElse(producerMaxTasks)
-    } else if (readerFrontierStarted && expandedProducerMinActiveStages > 0 &&
+    } else if (readerFrontierRoutable && expandedProducerMinActiveStages > 0 &&
         activePureProducerStages >= expandedProducerMinActiveStages) {
       expandedProducerMaxTasks.orElse(producerMaxTasks)
     } else {
