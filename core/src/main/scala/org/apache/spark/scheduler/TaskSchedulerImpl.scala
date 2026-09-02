@@ -228,6 +228,12 @@ private[spark] class TaskSchedulerImpl(
     pipelinedShuffleTaskCoordinator.requiredReaderInboxes(taskSet, inboxes)
   }
 
+  private[scheduler] def producerReaderFrontierRoutable(
+      taskSet: TaskSetManager): Boolean = {
+    pipelinedShuffleTaskCoordinator.readerFrontierRoutable(
+      taskSet, rootPool.getSortedTaskSetQueue)
+  }
+
   private[scheduler] def taskCpusForTaskSet(
       taskSet: TaskSet,
       profileTaskCpus: BigDecimal): BigDecimal = {
@@ -460,6 +466,7 @@ private[spark] class TaskSchedulerImpl(
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
       activePureProducerStages: Int,
+      readerFrontierRoutable: Boolean,
       readerFrontierStarted: Boolean,
       activeTaskSets: Iterable[TaskSetManager])
     : (Boolean, Option[TaskLocality]) = {
@@ -481,7 +488,7 @@ private[spark] class TaskSchedulerImpl(
 
       // check whether the task can be scheduled to the executor base on resource profile.
       if (pipelinedShuffleTaskCoordinator.producerLaunchAllowed(
-          taskSet, activePureProducerStages, readerFrontierStarted) &&
+          taskSet, activePureProducerStages, readerFrontierRoutable, readerFrontierStarted) &&
           pipelinedShuffleTaskCoordinator.readerLaunchAllowed(
             taskSet, execId, activeTaskSets) && sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
@@ -717,6 +724,8 @@ private[spark] class TaskSchedulerImpl(
         var globalMinLocality: Option[TaskLocality] = None
         // Compute this once per task set and offer pass. Ready readers were moved ahead of their
         // producers above, so their freshly-launched runningTasks are already visible here.
+        val producerReaderFrontierRoutable =
+          pipelinedShuffleTaskCoordinator.readerFrontierRoutable(taskSet, sortedTaskSets)
         val producerReaderFrontierStarted =
           pipelinedShuffleTaskCoordinator.readerFrontierStarted(taskSet, sortedTaskSets)
         val activePureProducerStages =
@@ -727,6 +736,7 @@ private[spark] class TaskSchedulerImpl(
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
               availableResources, tasks, activePureProducerStages,
+              producerReaderFrontierRoutable,
               producerReaderFrontierStarted, sortedTaskSets)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality

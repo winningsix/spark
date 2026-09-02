@@ -2332,10 +2332,11 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE =
     ConfigBuilder("spark.shuffle.streaming.elasticProducers.expandedMaxTasksPerStage")
       .doc("Maximum running tasks for each pure producer stage while the number of active pure " +
-        "producer stages reaches expandedMinActiveStages and the producer's direct reader " +
-        "frontier has started. This topology-sensitive window can fill CPU for wide streaming " +
-        "graphs without applying the same fan-out to narrower graphs. When unset, " +
-        "maxTasksPerStage remains the limit until only one pure producer remains.")
+        "producer stages reaches expandedMinActiveStages and every partition of the producer's " +
+        "direct reader frontier has acknowledged its executor-owned inbox. This route-ready " +
+        "gate is independent from reader compute attachment, so a join waiting for another " +
+        "input does not strand producer CPU. When unset, maxTasksPerStage remains the limit " +
+        "until only one pure producer remains.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
