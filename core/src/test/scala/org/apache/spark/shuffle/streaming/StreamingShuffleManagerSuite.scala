@@ -177,6 +177,36 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("failed prepared inbox batch rolls back the executor-side prefix") {
+    withSpark(new SparkContext("local", "prepared-inbox-batch-rollback", new SparkConf())) { _ =>
+      val conf = SparkEnv.get.conf.clone()
+        .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+      val first = StreamingShuffleReceiveInboxId(7, 9, 0, 3, -17L)
+      val second = StreamingShuffleReceiveInboxId(7, 9, 0, 4, -18L)
+      val service = new StreamingShuffleReceiveService(
+        conf, () => Some(mock[StreamingShuffleExecutorClient])) {
+        override def prepare(id: StreamingShuffleReceiveInboxId): Boolean = {
+          if (id == second) throw new IllegalStateException("injected prepare failure")
+          super.prepare(id)
+        }
+      }
+      try {
+        val error = intercept[IllegalStateException] {
+          service.prepareAll(Seq(first, second))
+        }
+        error.getMessage should include("injected prepare failure")
+        service.activeInboxCount shouldBe 0
+
+        // The failed batch must not leave the logical partition owned by its old generation.
+        val replacement = first.copy(taskAttemptId = -19L)
+        service.prepare(replacement) shouldBe true
+        service.activeInboxCount shouldBe 1
+      } finally {
+        service.close()
+      }
+    }
+  }
+
   test("prepared receive service enables elastic group admission") {
     Seq(false -> true, true -> false).foreach { case (receiveServiceEnabled, requiresWholeGroup) =>
       val conf = new SparkConf()

@@ -227,7 +227,24 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
-    ids.forall(prepare)
+    val newlyPrepared = mutable.ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
+    def rollback(): Unit = newlyPrepared.reverseIterator.foreach(releasePrepared)
+    try {
+      val remaining = ids.distinct.iterator
+      var prepared = true
+      while (remaining.hasNext && prepared) {
+        val id = remaining.next()
+        val alreadyPrepared = inboxes.containsKey(id)
+        prepared = prepare(id)
+        if (prepared && !alreadyPrepared) newlyPrepared += id
+      }
+      if (!prepared) rollback()
+      prepared
+    } catch {
+      case t: Throwable =>
+        rollback()
+        throw t
+    }
   }
 
   def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = {
