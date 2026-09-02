@@ -1067,6 +1067,16 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val FORCE_APPLY_SHUFFLED_HASH_JOIN =
+    buildConf("spark.sql.join.forceApplyShuffledHashJoin")
+      .internal()
+      .doc("When true, prefer a shuffled hash join whenever the join type has a valid hash " +
+        "build side, without applying the normal size-based cost checks. This is intended for " +
+        "controlled plan-shape experiments and is disabled by default.")
+      .version("4.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val SPLIT_STREAMED_SIDE_JOIN_CONDITION =
     buildConf("spark.sql.join.splitStreamedSideJoinCondition")
       .internal()
