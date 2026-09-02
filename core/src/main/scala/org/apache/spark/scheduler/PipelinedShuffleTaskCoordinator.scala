@@ -185,6 +185,27 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     }
   }
 
+  /**
+   * Forget the consumed inbox assignment for a reader task that must be retried.
+   *
+   * An executor-owned inbox is a single-attempt lease: task completion closes it after the
+   * attached iterator either drains or fails. Keeping the driver assignment after a failed task
+   * would therefore let the retry pass the stale drain-ready gate and fall back to a task-owned
+   * route. Remove both sides of the old preparation here so the next offer pass prepares a fresh
+   * inbox and waits for a new ready acknowledgement before launching the retry.
+   */
+  def taskFailed(taskSet: TaskSetManager, taskIndex: Int): Unit = {
+    if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader || taskIndex < 0) return
+    val key = ReaderKey(taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
+    assignments.remove(key).foreach { assignment =>
+      readyTaskIndices.get((key.stageId, key.stageAttemptId, assignment.executorId))
+        .foreach(_ -= taskIndex)
+      trackerMaster.foreach { tracker =>
+        assignment.inboxes.foreach(tracker.releaseReceiveInbox(assignment.executorId, _))
+      }
+    }
+  }
+
   def taskSetReady(taskSet: TaskSetManager): Boolean = {
     if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
       true

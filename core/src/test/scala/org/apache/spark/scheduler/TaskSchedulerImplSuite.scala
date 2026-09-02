@@ -20,7 +20,7 @@ package org.apache.spark.scheduler
 import java.nio.ByteBuffer
 import java.util.Properties
 import java.util.concurrent.{CountDownLatch, ExecutorService, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap}
@@ -39,7 +39,10 @@ import org.apache.spark.resource.{CpuAmount, ExecutorResourceRequests, ResourceA
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
-import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
+import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
+  PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
+  StreamingShuffleReceiveInboxId}
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
@@ -2975,6 +2978,83 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       pipelinedReaderShuffleIds = Seq(1, 2, 2),
       pipelinedReaderStartupShuffleIds = Set(99))
     assert(taskScheduler.requiredPreTaskReaderInboxes(unresolvedStartup, inboxes) === inboxes)
+  }
+
+  test("failed pipelined reader retries through a freshly prepared inbox") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true")
+    val executorId = "executor0"
+    val prepareCount = new AtomicInteger(0)
+    val releaseCount = new AtomicInteger(0)
+    val latestPrepared = new AtomicReference[StreamingShuffleReceiveInboxId]()
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"prepared-retry-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receive: PartialFunction[Any, Unit] = {
+          case ReleaseStreamingShuffleReceiveInbox(_) => releaseCount.incrementAndGet()
+        }
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInbox(id) =>
+            latestPrepared.set(id)
+            prepareCount.incrementAndGet()
+            context.reply(true)
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            ids.foreach(latestPrepared.set)
+            prepareCount.incrementAndGet()
+            context.reply(true)
+          case ReleaseStreamingShuffleReceiveInbox(_) =>
+            releaseCount.incrementAndGet()
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+
+    val reader = new TaskSet(
+      Array(new FakeTask(2, 0)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(7),
+      pipelinedReaderStartupShuffleIds = Set(7))
+    taskScheduler.submitTasks(reader)
+    val offer = IndexedSeq(WorkerOffer(executorId, "host0", 1))
+
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
+    assert(prepareCount.get() === 1)
+    val firstInbox = latestPrepared.get()
+    assert(firstInbox != null)
+    tracker.markInboxDrainReady(executorId, firstInbox)
+    val firstAttempt = taskScheduler.resourceOffers(offer).flatten
+    assert(firstAttempt.size === 1)
+
+    val manager = taskScheduler.taskSetManagerForAttempt(2, 0).get
+    failTask(firstAttempt.head.taskId, TaskState.KILLED, TaskKilled("retry"), manager)
+    eventually(timeout(10.seconds)) {
+      assert(releaseCount.get() === 1)
+    }
+
+    // The old ready bit must not launch the retry. The first offer prepares a new lease and waits
+    // for the executor to acknowledge that this replacement inbox has begun draining.
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
+    assert(prepareCount.get() === 2)
+    val retryInbox = latestPrepared.get()
+    assert(retryInbox === firstInbox)
+    tracker.markInboxDrainReady(executorId, retryInbox)
+    val retryAttempt = taskScheduler.resourceOffers(offer).flatten
+    assert(retryAttempt.size === 1)
+    assert(retryAttempt.head.index === firstAttempt.head.index)
+    assert(retryAttempt.head.taskId !== firstAttempt.head.taskId)
   }
 
   test("prepared receive mode does not expand a sole producer before its reader is submitted") {
