@@ -154,6 +154,29 @@ class StreamingShuffleManagerSuite
     service.activeInboxCount shouldBe 0
   }
 
+  test("task attachment resolves the current prepared inbox generation") {
+    withSpark(new SparkContext("local", "prepared-inbox-generation", new SparkConf())) { _ =>
+      val conf = SparkEnv.get.conf.clone()
+        .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+      val service = new StreamingShuffleReceiveService(
+        conf, () => Some(mock[StreamingShuffleExecutorClient]))
+      val context = mock[TaskContext]
+      when(context.stageId()).thenReturn(9)
+      when(context.stageAttemptNumber()).thenReturn(0)
+      when(context.partitionId()).thenReturn(3)
+      when(context.taskAttemptId()).thenReturn(41L)
+      val generatedId = StreamingShuffleReceiveInboxId(7, 9, 0, 3, -17L)
+      try {
+        service.prepare(generatedId) shouldBe true
+        val lease = service.acquire(7, context)
+        lease.id shouldBe generatedId
+        lease.close() shouldBe StreamingShuffleReceiveInboxStats(0L, 0L)
+      } finally {
+        service.close()
+      }
+    }
+  }
+
   test("prepared receive service enables elastic group admission") {
     Seq(false -> true, true -> false).foreach { case (receiveServiceEnabled, requiresWholeGroup) =>
       val conf = new SparkConf()
