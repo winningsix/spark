@@ -217,7 +217,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   def readerLaunchAllowed(
       taskSet: TaskSetManager,
       executorId: String,
-      activeTaskSets: Iterable[TaskSetManager]): Boolean = {
+      activeTaskSets: Iterable[TaskSetManager],
+      upstreamReaderProducersStarted: Boolean): Boolean = {
     if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
       true
     } else {
@@ -231,8 +232,38 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       } else {
         0
       }
-      belowStageCap &&
+      belowStageCap && upstreamReaderProducersStarted &&
         (maxTotalReaderTasksPerExecutor <= 0 || totalReaders < maxTotalReaderTasksPerExecutor)
+    }
+  }
+
+  /**
+   * Keep a deeper reader from consuming compute attachments before the reader-producers that feed
+   * it have started.
+   *
+   * Inbox readiness is input-local: a downstream shuffled hash join can become ready from its
+   * build input while a streamed input is still produced by an upstream join. If that downstream
+   * stage attaches first, it can fill the executor-wide reader cap and strand the upstream join
+   * whose output it is waiting for. Requiring only the direct reader-producer dependencies to have
+   * started reserves the frontier without serializing pure producers or waiting for an upstream
+   * stage to finish.
+   */
+  def upstreamReaderProducersStarted(
+      reader: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): Boolean = {
+    if (!enabled || !reader.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      val producerByShuffleId = taskSets.iterator
+        .filterNot(_.isZombie)
+        .flatMap(taskSet => taskSet.taskSet.shuffleId.map(_ -> taskSet))
+        .toMap
+      reader.taskSet.pipelinedReaderShuffleIds.distinct.forall { shuffleId =>
+        producerByShuffleId.get(shuffleId).forall { producer =>
+          !producer.taskSet.isPipelinedShuffleReader ||
+            producer.runningTasks > 0 || producer.tasksSuccessful > 0
+        }
+      }
     }
   }
 
