@@ -88,7 +88,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   /** Prepare missing reader inboxes, then rebuild the ready-task view for this offer pass. */
   def prepareForOffers(
       taskSets: Iterable[TaskSetManager],
-      activeExecutors: Set[String]): Unit = {
+      activeExecutors: Set[String],
+      placementCandidates: (TaskSetManager, Int) => Seq[String]): Unit = {
     if (!enabled) return
     trackerMaster.foreach { tracker =>
       val receiveExecutors = tracker.receiveExecutorIds.filter(activeExecutors.contains).sorted
@@ -100,22 +101,33 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
         }.foreach { taskSet =>
           taskSet.tasks.indices.foreach { taskIndex =>
             val key = ReaderKey(taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
-            if (!assignments.contains(key)) {
-              val executorId = receiveExecutors(taskIndex % receiveExecutors.size)
-              val partitionId = taskSet.tasks(taskIndex).partitionId
-              val nextOrdinalByShuffle = new HashMap[Int, Int]
-              val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
-                val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
-                nextOrdinalByShuffle.update(shuffleId, readerOrdinal + 1)
-                StreamingShuffleReceiveInboxId(
-                  shuffleId,
-                  taskSet.stageId,
-                  taskSet.taskSet.stageAttemptId,
-                  partitionId,
-                  nextPreparedInboxGeneration.getAndDecrement(),
-                  readerOrdinal)
+            if (taskSet.isTaskPendingForOffer(taskIndex)) {
+              val candidates = placementCandidates(taskSet, taskIndex)
+                .filter(receiveExecutors.contains).distinct.sorted
+              assignments.get(key).filterNot(a => candidates.contains(a.executorId)).foreach {
+                stale =>
+                  assignments.remove(key)
+                  readyTaskIndices.get((key.stageId, key.stageAttemptId, stale.executorId))
+                    .foreach(_ -= taskIndex)
+                  stale.inboxes.foreach(tracker.releaseReceiveInbox(stale.executorId, _))
               }
-              pending += key -> ReaderAssignment(executorId, inboxes)
+              if (!assignments.contains(key) && candidates.nonEmpty) {
+                val executorId = candidates(taskIndex % candidates.size)
+                val partitionId = taskSet.tasks(taskIndex).partitionId
+                val nextOrdinalByShuffle = new HashMap[Int, Int]
+                val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
+                  val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
+                  nextOrdinalByShuffle.update(shuffleId, readerOrdinal + 1)
+                  StreamingShuffleReceiveInboxId(
+                    shuffleId,
+                    taskSet.stageId,
+                    taskSet.taskSet.stageAttemptId,
+                    partitionId,
+                    nextPreparedInboxGeneration.getAndDecrement(),
+                    readerOrdinal)
+                }
+                pending += key -> ReaderAssignment(executorId, inboxes)
+              }
             }
           }
         }

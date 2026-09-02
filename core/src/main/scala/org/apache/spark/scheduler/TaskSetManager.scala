@@ -376,6 +376,18 @@ private[spark] class TaskSetManager(
     }
   }
 
+  private[scheduler] def isExecutorAllowedForTask(
+      index: Int,
+      execId: String,
+      host: String): Boolean = {
+    !taskSetExcludelistHelperOpt.exists { excludeList =>
+      excludeList.isNodeExcludedForTaskSet(host) ||
+        excludeList.isExecutorExcludedForTaskSet(execId) ||
+        excludeList.isNodeExcludedForTask(host, index) ||
+        excludeList.isExecutorExcludedForTask(execId, index)
+    }
+  }
+
   /**
    * Dequeue a pending task for a given node and return its index and locality level.
    * Only search for tasks matching the given locality constraint.
