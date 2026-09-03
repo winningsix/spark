@@ -2181,6 +2181,21 @@ package object config {
         "spark.shuffle.streaming.rawBufferPoolMaxMemory must be positive.")
       .createWithDefault(4L << 30) // 4 GB
 
+  private[spark] val STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.wireBufferMaxMemory")
+      .doc("Maximum executor-wide direct bytes reserved for compressed streaming-shuffle wire " +
+        "payloads. When the budget is full, writers remain work-conserving by using a heap wire " +
+        "buffer that is still governed by the normal replay spill lifecycle. This prevents " +
+        "per-task replay limits and Netty arena chunks from multiplying to the executor direct " +
+        "memory limit without turning a fixed writer-task count into the primary flow control.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0,
+        "spark.shuffle.streaming.wireBufferMaxMemory must be positive.")
+      .createWithDefault(4L << 30) // 4 GB
+
   private[spark] val STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.readerMessageBatching.enabled")
       .doc("Whether a streaming shuffle reader enqueues all decoded messages from one transport " +

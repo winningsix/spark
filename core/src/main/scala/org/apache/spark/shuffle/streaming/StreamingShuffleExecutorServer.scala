@@ -33,7 +33,7 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
   STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
-  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS}
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS, STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.netty.SparkTransportConf
@@ -228,6 +228,13 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE),
     conf.get(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY))
 
+  // Compression destinations used to come from Netty's pooled allocator independently in every
+  // writer. Under a wide pipelined stage, requested 128 KiB buffers materialized and retained 4 MiB
+  // arena chunks until the JVM hit MaxDirectMemorySize. Reserve exact unpooled direct payloads at
+  // executor scope; callers fall back to heap when this work-conserving budget is full.
+  private[streaming] val wireBufferBudget = new StreamingShuffleDirectBufferBudget(
+    conf.get(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY))
+
   val port: Int = server.getPort
 
   private[streaming] def controlBodyStats: (Long, Long) =
@@ -263,6 +270,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
     val (bodies, frames) = controlBodyStats
+    val (wireUsed, wirePeak, wireLimit, wireHeapFallbacks, wireHeapFallbackBytes) =
+      wireBufferBudget.stats
     val (batchBodies, batchWrites, transportedBodies, peakBodiesPerWrite) =
       crossRouteBatcher.transportBatchStats
     logInfo(
@@ -271,10 +280,14 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
         s"controlBodies=$bodies controlFrames=$frames " +
         s"crossRouteSubmittedBodies=$batchBodies crossRouteTransportWrites=$batchWrites " +
         s"crossRouteTransportedBodies=$transportedBodies " +
-        s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite")
+        s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite " +
+        s"wireDirectUsedBytes=$wireUsed wireDirectPeakBytes=$wirePeak " +
+        s"wireDirectLimitBytes=$wireLimit wireHeapFallbacks=$wireHeapFallbacks " +
+        s"wireHeapFallbackBytes=$wireHeapFallbackBytes")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()
+    wireBufferBudget.close()
     pendingCredits.clear()
     retiredRoutes.clear()
     server.close()
@@ -283,6 +296,48 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   private[streaming] def pendingCreditCount: Int =
     pendingCredits.values().toArray(new Array[ArrayDeque[PendingCredit]](0))
       .iterator.map(_.size()).sum
+}
+
+/** Executor-wide accounting for exact, unpooled direct wire payloads. */
+private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes: Long) {
+  require(maxMemoryBytes > 0L, "direct buffer budget must be positive")
+
+  private val usedBytes = new AtomicLong(0L)
+  private val peakBytes = new AtomicLong(0L)
+  private val heapFallbacks = new AtomicLong(0L)
+  private val heapFallbackBytes = new AtomicLong(0L)
+  @volatile private var closed = false
+
+  def tryAcquire(bytes: Int): Boolean = {
+    require(bytes > 0, "direct buffer reservation must be positive")
+    val requested = bytes.toLong
+    var acquired = false
+    while (!acquired && !closed) {
+      val current = usedBytes.get()
+      if (current + requested > maxMemoryBytes) return false
+      acquired = usedBytes.compareAndSet(current, current + requested)
+      if (acquired) peakBytes.accumulateAndGet(current + requested, Math.max)
+    }
+    acquired
+  }
+
+  def release(bytes: Int): Unit = {
+    require(bytes > 0, "direct buffer release must be positive")
+    val remaining = usedBytes.addAndGet(-bytes.toLong)
+    require(remaining >= 0L, "direct buffer budget released more bytes than it acquired")
+  }
+
+  def recordHeapFallback(bytes: Int): Unit = {
+    require(bytes > 0, "heap fallback size must be positive")
+    heapFallbacks.incrementAndGet()
+    heapFallbackBytes.addAndGet(bytes.toLong)
+  }
+
+  private[streaming] def stats: (Long, Long, Long, Long, Long) =
+    (usedBytes.get(), peakBytes.get(), maxMemoryBytes,
+      heapFallbacks.get(), heapFallbackBytes.get())
+
+  def close(): Unit = closed = true
 }
 
 /** Executor-wide reusable direct buffers for relaxed streaming writers. */

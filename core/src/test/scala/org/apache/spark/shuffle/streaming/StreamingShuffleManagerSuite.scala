@@ -65,6 +65,21 @@ class StreamingShuffleManagerSuite
     new SparkConf().get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT) shouldBe 100L
   }
 
+  test("executor direct wire budget is exact and work conserving") {
+    val budget = new StreamingShuffleDirectBufferBudget(1024L)
+    budget.tryAcquire(768) shouldBe true
+    budget.tryAcquire(300) shouldBe false
+    budget.recordHeapFallback(300)
+    budget.stats shouldBe (768L, 768L, 1024L, 1L, 300L)
+
+    budget.release(768)
+    budget.tryAcquire(1024) shouldBe true
+    budget.stats shouldBe (1024L, 1024L, 1024L, 1L, 300L)
+    budget.release(1024)
+    budget.close()
+    budget.tryAcquire(1) shouldBe false
+  }
+
   // ---- getWriterId ----
 
   test("getWriterId returns the writer id for a data message") {

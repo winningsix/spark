@@ -332,6 +332,35 @@ class StreamingShuffleWriter[K, V](
   // path uses heap raw buffers so an executor-global Netty direct-memory limit remains reserved
   // for the bounded compressed envelopes and transport bodies.
   private[streaming] val bufferPool = new LinkedBlockingDeque[ByteBuf]()
+
+  /**
+   * Allocate a compression destination without letting Netty arena chunks become an untracked
+   * executor-wide cache. A full direct budget must not park all producer tasks: use a heap buffer
+   * and let the existing replay cap/spill lifecycle retire it in normal sequence order.
+   *
+   * The returned byte count is the exact direct reservation owned by the returned buffer.
+   */
+  private def allocateWireBuffer(maxSize: Int): (ByteBuf, Int) = {
+    sharedExecutorServer match {
+      case Some(shared) if shared.wireBufferBudget.tryAcquire(maxSize) =>
+        try (Unpooled.directBuffer(maxSize, maxSize), maxSize)
+        catch {
+          case error: Throwable =>
+            shared.wireBufferBudget.release(maxSize)
+            throw error
+        }
+      case Some(shared) =>
+        shared.wireBufferBudget.recordHeapFallback(maxSize)
+        (Unpooled.buffer(maxSize, maxSize), 0)
+      case None =>
+        // Low-level tests and the legacy dedicated-server path do not share executor state.
+        (server.getPooledByteBufAllocator.directBuffer(maxSize, maxSize), 0)
+    }
+  }
+
+  private def releaseWireReservation(bytes: Int): Unit = {
+    if (bytes > 0) sharedExecutorServer.foreach(_.wireBufferBudget.release(bytes))
+  }
   // A relaxed pipelined writer can return from write() long before every downstream reader has
   // drained and acknowledged its replay stream.  The raw input buffers are only a writer-side
   // allocation cache; retaining that cache until the reader ACK barrier multiplies its peak by
@@ -1570,13 +1599,14 @@ class StreamingShuffleWriter[K, V](
       val dataSize = rawBuffer.writerIndex()
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
+      var wireDirectReservation = 0
       val wireBuffer = compressionCodec match {
         case Some(compressor) =>
           // Compress directly between NIO views of the Netty buffers. If compression is not
           // beneficial, discard the destination and send the original buffer.
           val maxCompressedSize = compressor.maxCompressedLength(dataSize)
-          val compressed = server.getPooledByteBufAllocator
-            .directBuffer(maxCompressedSize, maxCompressedSize)
+          val (compressed, reservedDirectBytes) = allocateWireBuffer(maxCompressedSize)
+          wireDirectReservation = reservedDirectBytes
           try {
             val source = rawBuffer.nioBuffer(rawBuffer.readerIndex(), dataSize)
             val destination = compressed.nioBuffer(0, maxCompressedSize)
@@ -1586,11 +1616,15 @@ class StreamingShuffleWriter[K, V](
             compressed.writerIndex(compressedSize)
             if (compressedSize < dataSize) compressed else {
               compressed.release()
+              releaseWireReservation(wireDirectReservation)
+              wireDirectReservation = 0
               rawBuffer
             }
           } catch {
             case t: Throwable =>
               compressed.release()
+              releaseWireReservation(wireDirectReservation)
+              wireDirectReservation = 0
               throw t
           }
         case None => rawBuffer
@@ -1634,7 +1668,10 @@ class StreamingShuffleWriter[K, V](
       }
       val releaseReplayResources: () => Unit = () => {
         if (wireBuffer ne rawBuffer) {
-          if (wireReleased.compareAndSet(false, true)) wireBuffer.release()
+          if (wireReleased.compareAndSet(false, true)) {
+            wireBuffer.release()
+            releaseWireReservation(wireDirectReservation)
+          }
         } else {
           uncompressedLease.foreach(_.markReplayComplete())
         }
