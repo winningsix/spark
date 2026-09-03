@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
-import io.netty.buffer.{ByteBuf, UnpooledByteBufAllocator}
+import io.netty.buffer.{ByteBuf, CompositeByteBuf, UnpooledByteBufAllocator}
 import io.netty.channel.ChannelFuture
 import io.netty.util.concurrent.GenericFutureListener
 import org.mockito.ArgumentMatchers.any
@@ -43,6 +43,62 @@ class StreamingShuffleTransportBatcherSuite
   extends SparkFunSuite
   with Matchers
   with MockitoSugar {
+
+  test("flattened transport batches do not consolidate framed body components") {
+    val bodyCount = 20
+    val batcher = new StreamingShuffleTransportBatcher(
+      UnpooledByteBufAllocator.DEFAULT,
+      maxBytes = bodyCount * 2,
+      maxWaitTimeMs = 0,
+      maxInFlightBytes = bodyCount * 2,
+      new ErrorNotifier())
+    val client = mock[TransportClient]
+    val future = mock[ChannelFuture]
+    val listener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val outbound = new AtomicReference[ByteBuf]()
+
+    when(future.isSuccess).thenReturn(true)
+    when(future.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        listener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        future
+      }
+    when(client.send(any[ByteBuf])).thenAnswer { invocation =>
+      outbound.set(invocation.getArgument[ByteBuf](0))
+      future
+    }
+
+    try {
+      (0 until bodyCount).foreach { value =>
+        val framed = UnpooledByteBufAllocator.DEFAULT.compositeBuffer(2)
+        framed.addComponent(true,
+          UnpooledByteBufAllocator.DEFAULT.buffer(1).writeByte(value))
+        framed.addComponent(true,
+          UnpooledByteBufAllocator.DEFAULT.buffer(1).writeByte(255 - value))
+        batcher.submit(client, framed, () => ())
+      }
+
+      eventually(Timeout(Span(5, Seconds))) {
+        listener.get() should not be null
+      }
+      val sent = outbound.get().asInstanceOf[CompositeByteBuf]
+      // The old body-count limit consolidated the 40 input components into a small number of
+      // copied buffers. Keeping every component proves that no addComponent call crossed the
+      // composite's maxNumComponents threshold and allocated a hidden direct copy.
+      sent.numComponents() shouldBe bodyCount * 2
+      sent.readableBytes() shouldBe bodyCount * 2
+      (0 until bodyCount).foreach { value =>
+        sent.getUnsignedByte(value * 2) shouldBe value
+        sent.getUnsignedByte(value * 2 + 1) shouldBe 255 - value
+      }
+
+      outbound.getAndSet(null).release()
+      listener.get().operationComplete(future)
+    } finally {
+      Option(outbound.getAndSet(null)).foreach(_.release())
+      batcher.discard()
+    }
+  }
 
   test("a full transport window does not block an unrelated connection") {
     implicit val executionContext: ExecutionContext = ExecutionContext.global

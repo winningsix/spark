@@ -321,7 +321,21 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
-        val composite = allocator.compositeBuffer(batch.bodies.length)
+        // A framed body is commonly itself a header + payload CompositeByteBuf. Using only the
+        // body count as maxNumComponents makes Netty consolidate as soon as the flattened batch
+        // crosses that smaller limit (or the allocator default of 16). Consolidation defeats the
+        // zero-copy design and allocates a pooled direct chunk -- 4 MiB with the production arena
+        // -- while the executor is already carrying the original components. Under a wide RTM
+        // producer frontier those hidden copies can exhaust MaxDirectMemorySize even though the
+        // transport byte window is bounded. Size the component table for the exact flattened
+        // shape so addComponent never triggers an implicit payload copy.
+        val flattenedComponents = batch.bodies.iterator.map { pending =>
+          pending.body match {
+            case body: CompositeByteBuf => body.numComponents()
+            case _ => 1
+          }
+        }.sum
+        val composite = allocator.compositeBuffer(math.max(1, flattenedComponents))
         outbound = composite
         batch.bodies.foreach { body =>
           addBodyComponents(composite, body.body)
