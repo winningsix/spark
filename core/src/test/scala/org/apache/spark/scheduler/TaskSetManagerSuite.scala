@@ -1930,30 +1930,26 @@ class TaskSetManagerSuite
       isPipelinedShuffleReader = true)
     val manager = new TaskSetManager(sched, readerTaskSet, MAX_TASK_FAILURES)
 
-    def heartbeat(peakBytes: Long, runTimeMs: Long): Seq[AccumulatorV2[_, _]] = {
+    def heartbeat(peakBytes: Long): Seq[AccumulatorV2[_, _]] = {
       def metric(name: String, value: Long): LongAccumulator = {
         val accumulator = new LongAccumulator()
         accumulator.register(sc, Some(name))
         accumulator.add(value)
         accumulator
       }
-      Seq(
-        metric(InternalAccumulator.PEAK_EXECUTION_MEMORY, peakBytes),
-        metric(InternalAccumulator.EXECUTOR_RUN_TIME, runTimeMs))
+      Seq(metric(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY, peakBytes))
     }
 
     assert(!manager.updatePreparedReaderRunningMemorySample(
-      11L, heartbeat(32L << 20, 500L)), "launch-race heartbeat must not count")
+      11L, heartbeat(32L << 20)), "the first heartbeat is not stable yet")
     assert(!manager.updatePreparedReaderRunningMemorySample(
-      11L, heartbeat(32L << 20, 2000L)), "first usable heartbeat is not stable yet")
+      11L, heartbeat(32L << 20)), "one stable task is below the sample count")
     assert(!manager.updatePreparedReaderRunningMemorySample(
-      11L, heartbeat(32L << 20, 12000L)), "one stable task is below the sample count")
+      12L, heartbeat(32L << 20)), "second task still needs a stable heartbeat")
     assert(!manager.updatePreparedReaderRunningMemorySample(
-      12L, heartbeat(32L << 20, 3000L)), "second task still needs a stable heartbeat")
-    assert(!manager.updatePreparedReaderRunningMemorySample(
-      12L, heartbeat(64L << 20, 13000L)), "a growing peak resets stability")
+      12L, heartbeat(64L << 20)), "a growing peak resets stability")
     assert(manager.updatePreparedReaderRunningMemorySample(
-      12L, heartbeat(64L << 20, 23000L)), "two stable running tasks should expand")
+      12L, heartbeat(64L << 20)), "two stable running tasks should expand")
     assert(manager.preparedReaderMaxTasksPerExecutor === 0)
     assert(manager.preparedReaderCanExpand)
   }
