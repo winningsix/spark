@@ -468,7 +468,7 @@ private[spark] class TaskSchedulerImpl(
       activePureProducerStages: Int,
       readerFrontierRoutable: Boolean,
       readerFrontierStarted: Boolean,
-      startupFairProducerTaskLimit: Option[Int],
+      fairProducerTaskLimit: Option[Int],
       upstreamReaderProducers: Seq[TaskSetManager],
       activeTaskSets: Iterable[TaskSetManager],
       readerCpuReservations: Map[(Option[String], String), BigDecimal])
@@ -492,7 +492,7 @@ private[spark] class TaskSchedulerImpl(
       // check whether the task can be scheduled to the executor base on resource profile.
       if (pipelinedShuffleTaskCoordinator.producerLaunchAllowed(
           taskSet, activePureProducerStages, readerFrontierRoutable, readerFrontierStarted,
-          startupFairProducerTaskLimit) &&
+          fairProducerTaskLimit) &&
           pipelinedShuffleTaskCoordinator.readerLaunchAllowed(
             taskSet, execId, activeTaskSets, upstreamReaderProducers) &&
           sc.resourceProfileManager.canBeScheduled(
@@ -708,9 +708,9 @@ private[spark] class TaskSchedulerImpl(
         pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
     val readerCpuReservations =
       pipelinedShuffleTaskCoordinator.readerCpuReservations(sortedTaskSets)
-    // Until a reader compute task actually starts, distribute pure-producer slots across every
-    // active input stage in its run epoch. Filling the first routable stage to its expanded cap
-    // can exhaust bounded transport buffers before the reader's startup-input producer launches.
+    // Distribute pure-producer slots across every active input stage in its run epoch. Filling the
+    // first stage to its expanded cap can exhaust bounded transport buffers while sibling inputs
+    // are still needed by the reader, even after reader compute has started.
     // Add already-running producers to the currently free offer capacity so this fair share stays
     // stable across subsequent reviveOffers passes.
     val freeCpuSlots = shuffledOffers.iterator.map(_.cores).sum.toInt
@@ -718,7 +718,7 @@ private[spark] class TaskSchedulerImpl(
       activePureProducerTaskSets.groupBy(pipelinedRunEpoch).view.mapValues { taskSets =>
         taskSets.iterator.map(_.runningTasks).sum
       }.toMap
-    val startupFairProducerTaskLimitByRunEpoch =
+    val fairProducerTaskLimitByRunEpoch =
       activePureProducerStagesByRunEpoch.collect { case (runEpoch, activeStages)
           if activeStages > 1 =>
         val reservedExecutors = readerCpuReservations.keysIterator.count(_._1 == runEpoch)
@@ -787,8 +787,8 @@ private[spark] class TaskSchedulerImpl(
           pipelinedShuffleTaskCoordinator.upstreamReaderProducers(taskSet, sortedTaskSets)
         val activePureProducerStages =
           activePureProducerStagesByRunEpoch.getOrElse(pipelinedRunEpoch(taskSet), 0)
-        val startupFairProducerTaskLimit =
-          startupFairProducerTaskLimitByRunEpoch.get(pipelinedRunEpoch(taskSet))
+        val fairProducerTaskLimit =
+          fairProducerTaskLimitByRunEpoch.get(pipelinedRunEpoch(taskSet))
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
@@ -796,7 +796,7 @@ private[spark] class TaskSchedulerImpl(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
               availableResources, tasks, activePureProducerStages,
               producerReaderFrontierRoutable,
-              producerReaderFrontierStarted, startupFairProducerTaskLimit,
+              producerReaderFrontierStarted, fairProducerTaskLimit,
               upstreamReaderProducers, sortedTaskSets,
               readerCpuReservations)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
