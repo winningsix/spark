@@ -720,6 +720,23 @@ private[spark] class Executor(
     /** How much the JVM process has spent in GC when the task starts to run. */
     @volatile var startGCTime: Long = _
 
+    /** Start of Task.run(), published for live heartbeat metrics. */
+    @volatile private var taskStartTimeNs: Long = 0L
+
+    private[executor] def updateTaskMetricsForHeartbeat(curGCTime: Long): Unit = {
+      val currentTask = task
+      val startNs = taskStartTimeNs
+      if (currentTask != null && startNs > 0L && !isFinished) {
+        currentTask.metrics.setExecutorRunTime(math.max(0L, TimeUnit.NANOSECONDS.toMillis(
+          Executor.cpuWeightedNanos(
+            (System.nanoTime() - startNs) - currentTask.executorDeserializeTimeNs,
+            taskDescription.cpus))))
+        currentTask.updatePeakExecutionMemoryMetrics()
+        currentTask.metrics.mergeShuffleReadMetrics()
+        currentTask.metrics.setJvmGCTime(curGCTime - startGCTime)
+      }
+    }
+
     /**
      * The task to run. This will be set in run() by deserializing the task binary coming
      * from the driver. Once it is set, it will never be changed.
@@ -837,7 +854,6 @@ private[spark] class Executor(
       val ser = env.closureSerializer.newInstance()
       logInfo(log"Running ${MDC(TASK_NAME, taskName)}")
       execBackend.statusUpdate(taskId, TaskState.RUNNING, EMPTY_BYTE_BUFFER)
-      var taskStartTimeNs: Long = 0
       var taskStartCpu: Long = 0
       startGCTime = computeTotalGcTime()
       var taskStarted: Boolean = false
@@ -1545,9 +1561,7 @@ private[spark] class Executor(
 
     for (taskRunner <- runningTasks.values().asScala) {
       if (taskRunner.task != null) {
-        taskRunner.task.updatePeakExecutionMemoryMetrics()
-        taskRunner.task.metrics.mergeShuffleReadMetrics()
-        taskRunner.task.metrics.setJvmGCTime(curGCTime - taskRunner.startGCTime)
+        taskRunner.updateTaskMetricsForHeartbeat(curGCTime)
         val accumulatorsToReport = {
           if (HEARTBEAT_DROP_ZEROES) {
             taskRunner.task.metrics.accumulators().filterNot(_.isZero)

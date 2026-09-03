@@ -1954,6 +1954,48 @@ class TaskSetManagerSuite
     assert(manager.preparedReaderCanExpand)
   }
 
+  test("prepared reader does not classify fetch-waiting zero-memory tasks as lightweight") {
+    val testConf = new SparkConf()
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 2)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY, 4L << 30)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MIN_ACTIVE_EXECUTION_TIME, 2000L)
+    sc = new SparkContext("local", "test", testConf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+    val readerTaskSet = new TaskSet(
+      Array.tabulate[Task[_]](4)(index => new FakeTask(0, index)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true)
+    val manager = new TaskSetManager(sched, readerTaskSet, MAX_TASK_FAILURES)
+
+    def heartbeat(runMillis: Long, fetchWaitMillis: Long): Seq[AccumulatorV2[_, _]] = {
+      def metric(name: String, value: Long): LongAccumulator = {
+        val accumulator = new LongAccumulator()
+        accumulator.register(sc, Some(name))
+        accumulator.add(value)
+        accumulator
+      }
+      Seq(
+        metric(InternalAccumulator.EXECUTOR_RUN_TIME, runMillis),
+        metric(InternalAccumulator.shuffleRead.FETCH_WAIT_TIME, fetchWaitMillis))
+    }
+
+    assert(!manager.updatePreparedReaderRunningMemorySample(11L, heartbeat(5000L, 4800L)))
+    assert(!manager.updatePreparedReaderRunningMemorySample(12L, heartbeat(5000L, 4800L)))
+    assert(!manager.preparedReaderCanExpand,
+      "wall time spent waiting for input must not count as a lightweight sample")
+    assert(!manager.updatePreparedReaderRunningMemorySample(11L, heartbeat(5000L, 1000L)))
+    assert(manager.updatePreparedReaderRunningMemorySample(12L, heartbeat(5000L, 1000L)))
+    assert(manager.preparedReaderCanExpand,
+      "zero-memory tasks with useful execution progress should expand")
+  }
+
   test("SPARK-13343 speculative tasks that didn't commit shouldn't be marked as success") {
     sc = new SparkContext("local", "test")
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))

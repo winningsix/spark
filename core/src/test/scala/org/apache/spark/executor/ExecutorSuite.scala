@@ -356,11 +356,10 @@ class ExecutorSuite extends SparkFunSuite
       when(mockTask.metrics).thenReturn(metrics)
       when(mockTaskRunner.taskId).thenReturn(6)
       when(mockTaskRunner.task).thenReturn(mockTask)
-      when(mockTaskRunner.startGCTime).thenReturn(1)
       tasksMap.put(6, mockTaskRunner)
 
       executor.invokePrivate(reportHeartbeat())
-      verify(mockTask).updatePeakExecutionMemoryMetrics()
+      verify(mockTaskRunner).updateTaskMetricsForHeartbeat(any[Long])
       assert(heartbeats.length == 2)
       val updates = heartbeats(1).accumUpdates
       assert(updates.length == 1 && updates(0)._1 == 6,

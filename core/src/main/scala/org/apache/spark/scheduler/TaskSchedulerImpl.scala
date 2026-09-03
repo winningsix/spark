@@ -1067,7 +1067,11 @@ private[spark] class TaskSchedulerImpl(
       taskSetManager: TaskSetManager,
       tid: Long,
       taskResult: DirectTaskResult[_]): Unit = synchronized {
+    val expandableBefore = taskSetManager.preparedReaderCanExpand
     taskSetManager.handleSuccessfulTask(tid, taskResult)
+    if (!expandableBefore && taskSetManager.preparedReaderCanExpand) {
+      backend.reviveOffers()
+    }
   }
 
   def handleFailedTask(
