@@ -487,17 +487,23 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       taskSet: TaskSetManager,
       activePureProducerStages: Int,
       readerFrontierRoutable: Boolean,
-      readerFrontierStarted: Boolean): Boolean = {
+      readerFrontierStarted: Boolean,
+      startupFairTaskLimit: Option[Int]): Boolean = {
     val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
+    val startupTaskLimit = startupFairTaskLimit match {
+      case Some(fairLimit) => Some(producerMaxTasks.fold(fairLimit)(math.min(_, fairLimit)))
+      case None => producerMaxTasks
+    }
     val taskLimit = if (activePureProducerStages == 1 &&
         (readerFrontierRoutable || readerFrontierStarted)) {
       soleProducerMaxTasks.orElse(producerMaxTasks)
-    } else if (readerFrontierRoutable && expandedProducerMinActiveStages > 0 &&
+    } else if (readerFrontierRoutable && readerFrontierStarted &&
+        expandedProducerMinActiveStages > 0 &&
         activePureProducerStages >= expandedProducerMinActiveStages) {
       expandedProducerMaxTasks.orElse(producerMaxTasks)
     } else {
-      producerMaxTasks
+      startupTaskLimit
     }
     !enabled || !pureProducer || taskLimit.forall(taskSet.runningTasks < _)
   }
