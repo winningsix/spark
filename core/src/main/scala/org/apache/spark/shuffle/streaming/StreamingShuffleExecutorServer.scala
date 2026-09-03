@@ -231,7 +231,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   // Compression destinations used to come from Netty's pooled allocator independently in every
   // writer. Under a wide pipelined stage, requested 128 KiB buffers materialized and retained 4 MiB
   // arena chunks until the JVM hit MaxDirectMemorySize. Reserve exact unpooled direct payloads at
-  // executor scope; callers fall back to heap when this work-conserving budget is full.
+  // executor scope. When the budget is full, callers keep the already-accounted raw input buffer
+  // as the wire payload; allocating an unbounded heap fallback would bypass writer backpressure.
   private[streaming] val wireBufferBudget = new StreamingShuffleDirectBufferBudget(
     conf.get(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY))
 
@@ -270,7 +271,7 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
     val (bodies, frames) = controlBodyStats
-    val (wireUsed, wirePeak, wireLimit, wireHeapFallbacks, wireHeapFallbackBytes) =
+    val (wireUsed, wirePeak, wireLimit, wireRawFallbacks, wireRawFallbackBytes) =
       wireBufferBudget.stats
     val (batchBodies, batchWrites, transportedBodies, peakBodiesPerWrite) =
       crossRouteBatcher.transportBatchStats
@@ -282,8 +283,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
         s"crossRouteTransportedBodies=$transportedBodies " +
         s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite " +
         s"wireDirectUsedBytes=$wireUsed wireDirectPeakBytes=$wirePeak " +
-        s"wireDirectLimitBytes=$wireLimit wireHeapFallbacks=$wireHeapFallbacks " +
-        s"wireHeapFallbackBytes=$wireHeapFallbackBytes")
+        s"wireDirectLimitBytes=$wireLimit wireRawFallbacks=$wireRawFallbacks " +
+        s"wireRawFallbackBytes=$wireRawFallbackBytes")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()
@@ -304,8 +305,8 @@ private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes
 
   private val usedBytes = new AtomicLong(0L)
   private val peakBytes = new AtomicLong(0L)
-  private val heapFallbacks = new AtomicLong(0L)
-  private val heapFallbackBytes = new AtomicLong(0L)
+  private val rawFallbacks = new AtomicLong(0L)
+  private val rawFallbackBytes = new AtomicLong(0L)
   @volatile private var closed = false
 
   def tryAcquire(bytes: Int): Boolean = {
@@ -327,15 +328,15 @@ private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes
     require(remaining >= 0L, "direct buffer budget released more bytes than it acquired")
   }
 
-  def recordHeapFallback(bytes: Int): Unit = {
-    require(bytes > 0, "heap fallback size must be positive")
-    heapFallbacks.incrementAndGet()
-    heapFallbackBytes.addAndGet(bytes.toLong)
+  def recordRawFallback(bytes: Int): Unit = {
+    require(bytes > 0, "raw fallback size must be positive")
+    rawFallbacks.incrementAndGet()
+    rawFallbackBytes.addAndGet(bytes.toLong)
   }
 
   private[streaming] def stats: (Long, Long, Long, Long, Long) =
     (usedBytes.get(), peakBytes.get(), maxMemoryBytes,
-      heapFallbacks.get(), heapFallbackBytes.get())
+      rawFallbacks.get(), rawFallbackBytes.get())
 
   def close(): Unit = closed = true
 }
