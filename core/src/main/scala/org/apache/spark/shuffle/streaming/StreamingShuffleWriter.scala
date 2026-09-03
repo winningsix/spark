@@ -43,7 +43,6 @@ import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
   STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
-  STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
@@ -121,8 +120,6 @@ class StreamingShuffleWriter[K, V](
     conf.get(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS)
   private val WRITER_BACKPRESSURE_ENABLED =
     conf.get(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED)
-  private val EXECUTOR_RECEIVE_SERVICE_ENABLED =
-    conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
   private val REPLAY_MAX_MEMORY =
     conf.get(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY).toLong
 
@@ -1442,22 +1439,22 @@ class StreamingShuffleWriter[K, V](
 
     /** Release replay entries already enqueued for all currently connected clients. */
     private def trimReplayHistory(): Unit = synchronized {
-      // A relaxed writer normally retains replay history until asynchronous cleanup because an
-      // elastic reader may register after the producer task has returned. Once every expected
-      // reader route has registered, that late-reader window is closed only for task-owned
-      // readers. An executor-owned prepared inbox can detach and attach a replacement transport
-      // route after the first route satisfied expectedReaderRoutes. That replacement starts at
-      // sequence zero, so trimming the prefix here makes it observe only the retained terminal
-      // frame. Keep the bounded/spillable replay lease until group cleanup in executor receive
-      // service mode. Internal consumers need the same treatment because RangePartitioner (and
-      // similar preparation passes) can also register a second logical consumer.
+      // A relaxed writer retains replay history while an elastic reader can still register after
+      // the producer task has returned. Once every expected physical route has registered, the
+      // late-reader window is closed and data already enqueued for every route can be retired.
+      // This is also the correct lifecycle for executor-owned prepared inboxes: pipelined task
+      // sets are fail-fast and never retry a failed task in place, so keeping a full producer-side
+      // replay copy for a hypothetical replacement inbox only duplicates a blocking shuffle on
+      // the normal path. A lost route fails the transient group and its caller reruns the group
+      // from scratch. Internal consumers are different because RangePartitioner (and similar
+      // preparation passes) can intentionally register another logical consumer in the same run.
       val allReadersConnected = transportServerHandler.allExpectedReadersConnectedFuture.isDone &&
         !transportServerHandler.allExpectedReadersConnectedFuture.isCompletedExceptionally
       val canTrim = if (WAIT_FOR_TERMINATION_ACKS) {
         LINGER_AFTER_TERMINATION_MS == 0 && allReadersConnected
       } else {
-        !REPLAYABLE_FOR_INTERNAL_CONSUMER && !EXECUTOR_RECEIVE_SERVICE_ENABLED &&
-          LINGER_AFTER_TERMINATION_MS == 0 && allReadersConnected
+        !REPLAYABLE_FOR_INTERNAL_CONSUMER && LINGER_AFTER_TERMINATION_MS == 0 &&
+          allReadersConnected
       }
       if (!canTrim) return
       val clients = transportServerHandler.clientsFor(id)
@@ -1763,6 +1760,12 @@ class StreamingShuffleWriter[K, V](
     }
 
     private def spillReplayHistoryIfNeeded(): Unit = {
+      // First retire frames that every expected route has already accepted. In particular, do
+      // this before considering a just-created frame for spill: the replay entry and its
+      // PendingSend share the same payload, and the executor-wide raw/wire budgets already bound
+      // that live transport data. Spilling the entry while its send is still queued copies every
+      // normal-path frame to NVMe before the outbound drain gets a chance to deliver it.
+      trimReplayHistory()
       if (REPLAY_MAX_MEMORY_PER_SHARD <= 0 ||
           inMemoryReplayBytes <= REPLAY_MAX_MEMORY_PER_SHARD) {
         return
@@ -1770,7 +1773,15 @@ class StreamingShuffleWriter[K, V](
       val entries = replayHistory.iterator
       while (inMemoryReplayBytes > REPLAY_MAX_MEMORY_PER_SHARD && entries.hasNext) {
         val entry = entries.next()
-        if (entry.buffer != null) spillReplayEntry(entry)
+        val queuedForDelivery = entry.isData && (pendingBatch.exists(
+          _.sequenceNum == entry.sequenceNum) || outboundActions.exists {
+          case DataAction(pending) => pending.exists(_.sequenceNum == entry.sequenceNum)
+          case _ => false
+        })
+        // A queued envelope is live transport state, not dormant replay state. Backpressure owns
+        // its memory bound; spill only history retained after delivery or while waiting for a
+        // reader that has not registered yet.
+        if (entry.buffer != null && !queuedForDelivery) spillReplayEntry(entry)
       }
     }
 

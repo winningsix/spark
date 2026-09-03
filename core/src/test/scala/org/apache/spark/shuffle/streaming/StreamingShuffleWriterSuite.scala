@@ -35,6 +35,7 @@ import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
@@ -120,7 +121,7 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("writer reports replay spill exactly once in task metrics") {
+  test("writer does not spill a live transport frame before its reader connects") {
     val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
       val context = createTaskContext(sc.conf, 0)
@@ -134,10 +135,36 @@ class StreamingShuffleWriterSuite
         writer.shards(0).send(data)
         writer.stop(success = true)
         val firstReportedBytes = context.taskMetrics.diskBytesSpilled
-        firstReportedBytes should be > bytes.length.toLong
+        firstReportedBytes shouldBe 0L
 
         writer.stop(success = true)
         context.taskMetrics.diskBytesSpilled shouldBe firstReportedBytes
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("prepared inbox delivery retires replay without spilling") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        bindMockClient(writer, 0)(_ => ())
+        val bytes = Array.fill[Byte](128)(1)
+        val buffer = Unpooled.wrappedBuffer(bytes)
+        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+        buffer.release()
+
+        writer.shards(0).send(data)
+        writer.stop(success = true)
+
+        context.taskMetrics.diskBytesSpilled shouldBe 0L
+        writer.errorNotifier.getError() shouldBe empty
       } finally {
         context.markTaskCompleted(None)
       }
