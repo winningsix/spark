@@ -2996,6 +2996,63 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.forall(_.executorId === executorId))
   }
 
+  test("pure producer slots are shared fairly before a prepared reader starts") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "32",
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    (0 until 8).foreach { i =>
+      val endpoint = sc.env.rpcEnv.setupEndpoint(
+        s"fair-producer-frontier-$i-${System.nanoTime()}",
+        new RpcEndpoint {
+          override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+          override def receiveAndReply(
+              context: RpcCallContext): PartialFunction[Any, Unit] = {
+            case PrepareStreamingShuffleReceiveInbox(_) => context.reply(true)
+            case PrepareStreamingShuffleReceiveInboxes(_) => context.reply(true)
+          }
+        })
+      assert(tracker.registerReceiveEndpoint(s"executor$i", endpoint))
+    }
+
+    def producer(stageId: Int): TaskSet = new TaskSet(
+      Array.tabulate[Task[_]](64)(i => new FakeTask(stageId, i)),
+      stageId = stageId,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(stageId + 1),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    (0 until 3).foreach(stageId => taskScheduler.submitTasks(producer(stageId)))
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](8)(i => new FakeTask(3, i)),
+      stageId = 3,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(1, 2, 3),
+      pipelinedReaderStartupShuffleIds = Set(3))
+    taskScheduler.submitTasks(reader)
+
+    val offers = (0 until 8).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 7)
+    }
+    assert(taskScheduler.resourceOffers(offers).flatten.size === 48)
+    (0 until 3).foreach { stageId =>
+      assert(taskScheduler.taskSetManagerForAttempt(stageId, 0).get.runningTasks === 16)
+    }
+    assert(taskScheduler.taskSetManagerForAttempt(3, 0).get.runningTasks === 0)
+  }
+
   test("prepared reader compute attach expands after lightweight sampling") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
@@ -3688,6 +3745,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     eventually(timeout(10.seconds)) {
       assert(prepared.synchronized(prepared.size) === 16)
     }
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
+      "a routable inbox must not expand one producer before reader compute starts")
 
     val firstProducer = taskScheduler.taskSetManagerForAttempt(0, 0).get
     assert(taskScheduler.taskSetManagerForAttempt(4, 0).get.runningTasks === 0,
