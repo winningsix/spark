@@ -29,6 +29,33 @@ import io.netty.buffer.Unpooled
 import org.apache.spark.network.shuffle.streaming.DataMessage
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
 
+/** Executor-scoped memory reservation shared by all prepared streaming-shuffle inboxes. */
+private[streaming] final class StreamingShuffleReaderMemoryBudget(val maxBytes: Long) {
+  require(maxBytes > 0, "maxBytes must be positive")
+
+  private val usedBytes = new AtomicLong(0L)
+
+  def tryAcquire(bytes: Long): Boolean = {
+    if (bytes <= 0) return true
+    var current = usedBytes.get()
+    var reserved = false
+    while (!reserved && current <= maxBytes - bytes) {
+      reserved = usedBytes.compareAndSet(current, current + bytes)
+      if (!reserved) current = usedBytes.get()
+    }
+    reserved
+  }
+
+  def release(bytes: Long): Unit = {
+    if (bytes > 0) {
+      val remaining = usedBytes.addAndGet(-bytes)
+      require(remaining >= 0, s"Released $bytes bytes from a $remaining-byte reservation")
+    }
+  }
+
+  private[streaming] def usedBytesCount: Long = usedBytes.get()
+}
+
 /**
  * A reader queue that preserves message order while amortizing queue operations over one
  * transport body. The network handler decodes all frames in a body and enqueues them with
@@ -39,7 +66,9 @@ import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
  * each writer connection can have its own Netty event loop.
  */
 private[streaming] final class StreamingShuffleMessageQueue
-    (maxInMemoryBytes: Long = 0L, spillDirectory: Option[File] = None)
+    (maxInMemoryBytes: Long = 0L,
+     spillDirectory: Option[File] = None,
+     sharedMemoryBudget: Option[StreamingShuffleReaderMemoryBudget] = None)
     extends AbstractQueue[StreamingShuffleMessage] with BlockingQueue[StreamingShuffleMessage] {
 
   require(maxInMemoryBytes >= 0, "maxInMemoryBytes must be non-negative")
@@ -135,7 +164,19 @@ private[streaming] final class StreamingShuffleMessageQueue
         reserved = queuedMemoryBytes.compareAndSet(currentBytes, currentBytes + bytes)
         if (!reserved) currentBytes = queuedMemoryBytes.get()
       }
-      reserved
+      if (reserved && !sharedMemoryBudget.forall(_.tryAcquire(bytes))) {
+        queuedMemoryBytes.addAndGet(-bytes)
+        false
+      } else {
+        reserved
+      }
+    }
+  }
+
+  private def releaseInMemory(bytes: Long): Unit = {
+    if (bytes > 0) {
+      queuedMemoryBytes.addAndGet(-bytes)
+      sharedMemoryBudget.foreach(_.release(bytes))
     }
   }
 
@@ -207,7 +248,7 @@ private[streaming] final class StreamingShuffleMessageQueue
 
   private def consumeEntry(entry: QueueEntry): StreamingShuffleMessage = {
     val memoryBytes = entry.inMemoryBytes
-    if (memoryBytes > 0) queuedMemoryBytes.addAndGet(-memoryBytes)
+    releaseInMemory(memoryBytes)
     messageCount.decrementAndGet()
     entry.materialize()
   }
@@ -231,7 +272,10 @@ private[streaming] final class StreamingShuffleMessageQueue
           if (converted > 0) {
             var i = 0
             while (i < converted) {
-              if (entries(i) != null) entries(i).release()
+              if (entries(i) != null) {
+                releaseInMemory(entries(i).inMemoryBytes)
+                entries(i).release()
+              }
               i += 1
             }
           }
