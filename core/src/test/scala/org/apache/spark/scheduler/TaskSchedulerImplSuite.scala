@@ -2996,7 +2996,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.forall(_.executorId === executorId))
   }
 
-  test("pure producer slots are shared fairly before a prepared reader starts") {
+  test("pure producer slots stay shared fairly across prepared reader startup") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "32",
@@ -3051,6 +3051,17 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       assert(taskScheduler.taskSetManagerForAttempt(stageId, 0).get.runningTasks === 16)
     }
     assert(taskScheduler.taskSetManagerForAttempt(3, 0).get.runningTasks === 0)
+
+    val firstProducer = taskScheduler.taskSetManagerForAttempt(0, 0).get
+    eventually(timeout(10.seconds)) {
+      assert(taskScheduler.producerReaderFrontierRoutable(firstProducer))
+    }
+    taskScheduler.taskSetManagerForAttempt(3, 0).get.runningTasksSet += Long.MaxValue
+    val progressSlotOffers = (0 until 8).map { i =>
+      new WorkerOffer(s"executor$i", s"host$i", 1)
+    }
+    assert(taskScheduler.resourceOffers(progressSlotOffers).flatten.isEmpty,
+      "reader startup must not let one producer consume its sibling inputs' progress slots")
   }
 
   test("prepared reader compute attach expands after lightweight sampling") {
