@@ -1545,6 +1545,7 @@ private[spark] class Executor(
 
     for (taskRunner <- runningTasks.values().asScala) {
       if (taskRunner.task != null) {
+        taskRunner.task.updatePeakExecutionMemoryMetrics()
         taskRunner.task.metrics.mergeShuffleReadMetrics()
         taskRunner.task.metrics.setJvmGCTime(curGCTime - taskRunner.startGCTime)
         val accumulatorsToReport = {

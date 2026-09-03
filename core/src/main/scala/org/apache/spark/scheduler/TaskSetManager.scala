@@ -204,31 +204,28 @@ private[spark] class TaskSetManager(
       return false
     }
     val expandableBefore = preparedReaderCanExpandNow
-    var peakExecutionMemory = 0L
-    var executorRunTime = 0L
+    var peakOnHeapExecutionMemory = 0L
+    var peakOffHeapExecutionMemory = 0L
     updates.foreach { accumulator =>
       accumulator.name match {
-        case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
-          peakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.EXECUTOR_RUN_TIME) =>
-          executorRunTime = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
+          peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
+          peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
             if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
           observedMemorySpill = true
         case _ =>
       }
     }
-    // Ignore a launch-race heartbeat. After one second, even a zero-memory reader is a useful
-    // observation; the second unchanged heartbeat makes it a stable lightweight sample.
-    if (executorRunTime >= 1000L) {
-      val next = runningReaderMemorySamples.get(taskId) match {
-        case Some(previous) if previous.peakBytes == peakExecutionMemory =>
-          RunningReaderMemorySample(
-            peakExecutionMemory, math.min(Int.MaxValue, previous.stableHeartbeats + 1))
-        case _ => RunningReaderMemorySample(peakExecutionMemory, 0)
-      }
-      runningReaderMemorySamples.update(taskId, next)
+    val peakExecutionMemory = peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
+    val next = runningReaderMemorySamples.get(taskId) match {
+      case Some(previous) if previous.peakBytes == peakExecutionMemory =>
+        RunningReaderMemorySample(
+          peakExecutionMemory, math.min(Int.MaxValue, previous.stableHeartbeats + 1))
+      case _ => RunningReaderMemorySample(peakExecutionMemory, 0)
     }
+    runningReaderMemorySamples.update(taskId, next)
     !expandableBefore && preparedReaderCanExpandNow
   }
 

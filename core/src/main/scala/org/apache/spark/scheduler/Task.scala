@@ -169,10 +169,18 @@ private[spark] abstract class Task[T](
     }
   }
 
-  private var taskMemoryManager: TaskMemoryManager = _
+  @volatile private var taskMemoryManager: TaskMemoryManager = _
 
   def setTaskMemoryManager(taskMemoryManager: TaskMemoryManager): Unit = {
     this.taskMemoryManager = taskMemoryManager
+  }
+
+  /** Refresh live task-memory peaks before executor heartbeat metrics are collected. */
+  private[spark] def updatePeakExecutionMemoryMetrics(): Unit = {
+    if (taskMemoryManager != null) {
+      metrics.setPeakOnHeapExecutionMemory(taskMemoryManager.getPeakOnHeapExecutionMemory)
+      metrics.setPeakOffHeapExecutionMemory(taskMemoryManager.getPeakOffHeapExecutionMemory)
+    }
   }
 
   def runTask(context: TaskContext): T
