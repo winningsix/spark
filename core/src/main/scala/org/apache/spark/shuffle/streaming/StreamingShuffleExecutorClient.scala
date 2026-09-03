@@ -20,7 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList, RejectedExecutionException,
   ScheduledExecutorService, TimeoutException, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -150,7 +150,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private case class ConnectionLane(
       shuffleId: Int,
       remoteHost: String,
-      remotePort: Int)
+      remotePort: Int,
+      consumerGeneration: Int)
   private case class Registration(
       handler: StreamingShuffleClientHandler,
       client: TransportClient,
@@ -175,16 +176,17 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   // of zero.
   private val registrations =
     new ConcurrentHashMap[Route, CopyOnWriteArrayList[Registration]]()
-  // A pooled TransportClient can outlive one logical reader route and be handed back to a later
-  // task after the earlier handler unregisters. The writer keys replay cursors by physical
-  // client, so reusing that client for a new logical consumer would make the new reader appear to
-  // have already consumed the old stream. Keep a route tombstone and use a fresh unmanaged
-  // connection on every subsequent registration; only the first consumer gets pooled sharing.
-  private val usedRoutes = ConcurrentHashMap.newKeySet[Route]()
-  // Pool one physical connection per (remote executor, shuffle), rather than per remote executor.
-  // A large sibling shuffle can otherwise fill the shared channel's FIFO and hold an earlier
-  // stage's last data/termination frames behind seconds of unrelated traffic. The shuffle lane
-  // keeps cross-route batching within one exchange while avoiding a connection per task/inbox.
+  // A TransportClient is also the writer's replay-cursor identity. Reusing the same client for a
+  // later lifetime of one route would make the new consumer appear to have already consumed the
+  // stream. Assign successive registrations of each route to successive connection generations.
+  // Routes in the same consumer wave normally have the same generation and can still share one
+  // physical lane; this avoids opening one unmanaged connection per writer x reader route.
+  private val routeConsumerGenerations =
+    new ConcurrentHashMap[Route, AtomicInteger]()
+  // Pool one physical connection per (remote executor, shuffle, consumer generation), rather
+  // than per logical route. The generation preserves replay isolation for repeated consumers,
+  // while the shuffle dimension prevents a large sibling exchange from blocking an earlier
+  // stage's terminal frames behind unrelated traffic.
   private val laneClients = new ConcurrentHashMap[ConnectionLane, TransportClient]()
   private val initialCreditRegistrations = new AtomicLong(0L)
   private val initialCreditWrites = new AtomicLong(0L)
@@ -431,29 +433,24 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       remotePort: Int,
       handler: StreamingShuffleClientHandler): InstalledRegistration = {
     val route = Route(shuffleId, writerId, readerId)
-    // A second consumer of the same shuffle partition cannot share the pooled connection: the
-    // writer may have already sent a prefix to the first consumer, while this consumer needs a
-    // fresh sequence starting at zero. Give only duplicate routes an unmanaged connection; the
-    // common one-consumer case keeps the pooled connection and its lower connection count.
-    // usedRoutes atomically grants the pooled lane to exactly one lifetime consumer of this
-    // route. ConnectionLane.computeIfAbsent then serializes creation only for that physical lane;
-    // do not hold an executor-wide lock while opening TCP connections to unrelated shuffles or
-    // remote executors, since prepared inbox registration deliberately runs those in parallel.
-    val firstLifetimeRegistration = usedRoutes.add(route)
-    if (!firstLifetimeRegistration) {
+    // The writer keys replay state by TransportClient, so every lifetime of the same route needs
+    // a distinct client. Pool that client with other routes at the same lifetime generation
+    // instead of creating one unmanaged connection for each route. Atomic generation assignment
+    // also permits prepared inbox registrations to run in parallel without an executor-wide lock.
+    val consumerGeneration = routeConsumerGenerations
+      .computeIfAbsent(route, _ => new AtomicInteger(0))
+      .getAndIncrement()
+    if (consumerGeneration > 0) {
       val active = Option(registrations.get(route)).map(_.size()).getOrElse(0)
-      logWarning(
-        s"Registering another lifetime consumer for streaming shuffle route $route: " +
-          s"activeRegistrations=$active")
+      logDebug(
+        s"Registering consumer generation $consumerGeneration for streaming shuffle route " +
+          s"$route: activeRegistrations=$active")
     }
-    val (client, laneShared) = if (firstLifetimeRegistration) {
-      val lane = ConnectionLane(shuffleId, remoteHost, remotePort)
-      (laneClients.computeIfAbsent(
-        lane,
-        _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler)), true)
-    } else {
-      (clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler), false)
-    }
+    val lane = ConnectionLane(shuffleId, remoteHost, remotePort, consumerGeneration)
+    val client = laneClients.computeIfAbsent(
+      lane,
+      _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler))
+    val laneShared = true
     val registration = Registration(handler, client, laneShared, new AtomicBoolean(true))
     handler.setMultiplexedCreditSender(scheduleCumulativeCredit)
     handler.setMultiplexedTerminationAckSender(scheduleTerminationAck)
@@ -829,7 +826,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         entry.getValue.close()
       }
     }
-    usedRoutes.removeIf(_.shuffleId == shuffleId)
+    routeConsumerGenerations.keySet().removeIf(_.shuffleId == shuffleId)
   }
 
   private[streaming] def initialCreditBatchStats: (Long, Long) =

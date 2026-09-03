@@ -736,6 +736,48 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("successive consumer generations pool routes on replay-isolated lanes") {
+    withSpark(new SparkContext("local", "prepared-consumer-generation-lanes", new SparkConf())) {
+      _ =>
+        val server = new StreamingShuffleExecutorServer()
+        val client = new StreamingShuffleExecutorClient()
+        def handlers(): Seq[(Int, StreamingShuffleClientHandler)] = (3 to 11).map { writerId =>
+          writerId -> new StreamingShuffleClientHandler(
+            writerId,
+            0,
+            new LinkedBlockingQueue[StreamingShuffleMessage](),
+            7,
+            1L << 20,
+            null,
+            new ErrorNotifier())
+        }
+        val firstHandlers = handlers()
+        val secondHandlers = handlers()
+        try {
+          val first = client.registerBatch(
+            7, 0, "127.0.0.1", server.port, firstHandlers)
+          first.values.toSet.size shouldBe 1
+          firstHandlers.foreach { case (writerId, handler) =>
+            client.unregister(7, writerId, 0, handler)
+          }
+
+          val second = client.registerBatch(
+            7, 0, "127.0.0.1", server.port, secondHandlers)
+          second.values.toSet.size shouldBe 1
+          (second.values.head eq first.values.head) shouldBe false
+        } finally {
+          firstHandlers.foreach { case (writerId, handler) =>
+            client.unregister(7, writerId, 0, handler)
+          }
+          secondHandlers.foreach { case (writerId, handler) =>
+            client.unregister(7, writerId, 0, handler)
+          }
+          client.close()
+          server.close()
+        }
+    }
+  }
+
   test("prepared routes coalesce idle credit repairs on one physical lane") {
     val socketBufferSize = 128 << 10
     val conf = new SparkConf().set(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE, socketBufferSize)
