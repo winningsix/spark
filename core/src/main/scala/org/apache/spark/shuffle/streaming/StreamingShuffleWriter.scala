@@ -332,8 +332,10 @@ class StreamingShuffleWriter[K, V](
 
   /**
    * Allocate a compression destination without letting Netty arena chunks become an untracked
-   * executor-wide cache. A full direct budget must not park all producer tasks: use a heap buffer
-   * and let the existing replay cap/spill lifecycle retire it in normal sequence order.
+   * executor-wide cache. A full direct budget must not turn into an unbounded heap allocation:
+   * return no destination so the caller keeps its already-accounted raw input as the wire frame.
+   * That raw frame retains the writer permit until network completion, so the producer stops at
+   * the executor raw-buffer boundary instead of computing ahead into heap or replay spill.
    *
    * The returned byte count is the exact direct reservation owned by the returned buffer.
    */
@@ -347,8 +349,8 @@ class StreamingShuffleWriter[K, V](
             throw error
         }
       case Some(shared) =>
-        shared.wireBufferBudget.recordHeapFallback(maxSize)
-        (Unpooled.buffer(maxSize, maxSize), 0)
+        shared.wireBufferBudget.recordRawFallback(maxSize)
+        (null, 0)
       case None =>
         // Low-level tests and the legacy dedicated-server path do not share executor state.
         (server.getPooledByteBufAllocator.directBuffer(maxSize, maxSize), 0)
@@ -1613,7 +1615,9 @@ class StreamingShuffleWriter[K, V](
           val maxCompressedSize = compressor.maxCompressedLength(dataSize)
           val (compressed, reservedDirectBytes) = allocateWireBuffer(maxCompressedSize)
           wireDirectReservation = reservedDirectBytes
-          try {
+          if (compressed == null) {
+            rawBuffer
+          } else try {
             val source = rawBuffer.nioBuffer(rawBuffer.readerIndex(), dataSize)
             val destination = compressed.nioBuffer(0, maxCompressedSize)
             val compressedSize = compressor.compress(

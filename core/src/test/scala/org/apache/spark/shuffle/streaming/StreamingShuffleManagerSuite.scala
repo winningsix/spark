@@ -69,7 +69,7 @@ class StreamingShuffleManagerSuite
     val budget = new StreamingShuffleDirectBufferBudget(1024L)
     budget.tryAcquire(768) shouldBe true
     budget.tryAcquire(300) shouldBe false
-    budget.recordHeapFallback(300)
+    budget.recordRawFallback(300)
     budget.stats shouldBe (768L, 768L, 1024L, 1L, 300L)
 
     budget.release(768)
