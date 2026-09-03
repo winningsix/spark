@@ -65,6 +65,13 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
   private val maxTotalReaderTasksPerExecutor =
     conf.get(STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
+  private val expandedMaxTotalReaderTasksPerExecutor =
+    conf.get(STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
+  require(
+    expandedMaxTotalReaderTasksPerExecutor == 0 ||
+      (maxTotalReaderTasksPerExecutor > 0 &&
+        expandedMaxTotalReaderTasksPerExecutor >= maxTotalReaderTasksPerExecutor),
+    "expanded prepared reader cap requires a positive, no-larger initial total cap")
   private val revivePending = new AtomicBoolean(false)
   // A prepared inbox is reusable only until its attached task completes. Give every replacement a
   // distinct negative token so a delayed ready ACK from the previous lease cannot satisfy the new
@@ -224,7 +231,13 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     } else {
       val stageCap = taskSet.preparedReaderMaxTasksPerExecutor
       val belowStageCap = stageCap <= 0 || taskSet.runningTasksOnExecutor(executorId) < stageCap
-      val totalReaders = if (maxTotalReaderTasksPerExecutor > 0) {
+      val effectiveTotalReaderCap =
+        if (expandedMaxTotalReaderTasksPerExecutor > 0 && taskSet.preparedReaderCanExpand) {
+          expandedMaxTotalReaderTasksPerExecutor
+        } else {
+          maxTotalReaderTasksPerExecutor
+        }
+      val totalReaders = if (effectiveTotalReaderCap > 0) {
         activeTaskSets.iterator
           .filter(manager => !manager.isZombie && manager.taskSet.isPipelinedShuffleReader)
           .map(_.runningTasksOnExecutor(executorId))
@@ -234,7 +247,7 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       }
       belowStageCap && !upstreamReaderAttachmentReserved(
         executorId, upstreamReaderProducers) &&
-        (maxTotalReaderTasksPerExecutor <= 0 || totalReaders < maxTotalReaderTasksPerExecutor)
+        (effectiveTotalReaderCap <= 0 || totalReaders < effectiveTotalReaderCap)
     }
   }
 

@@ -2042,6 +2042,20 @@ package object config {
       .checkValue(_ >= 0, "prepared reader total task cap must be non-negative")
       .createWithDefault(0)
 
+  private[spark] val STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.expandedMaxTotalTasksPerExecutor")
+      .doc("Executor-wide streaming-reader compute attach cap after the candidate stage has " +
+        "completed enough lightweight execution-memory samples. Unsampled, memory-heavy, or " +
+        "memory-spilling stages retain maxTotalTasksPerExecutor. Zero disables expansion. This " +
+        "is a safety ceiling; prepared inbox readiness and the executor byte budgets remain the " +
+        "primary work-conserving flow-control signals.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 0, "expanded prepared reader total task cap must be non-negative")
+      .createWithDefault(0)
+
   private[spark] val STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.initialMaxTasksPerExecutor")
       .doc("Initial per-executor compute attach cap for a streaming-shuffle reader. After enough " +
