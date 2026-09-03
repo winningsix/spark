@@ -54,7 +54,9 @@ class StreamingShuffleClientHandler(
     byteLimit: Long,
     val context: TaskContext,
     errorNotifier: ErrorNotifier,
-    onMessageAvailable: () => Unit = () => ()) extends RpcHandler with TaskContextAwareLogging {
+    onMessageAvailable: () => Unit = () => (),
+    onReceiveWindowExhausted: () => Unit = () => ())
+  extends RpcHandler with TaskContextAwareLogging {
   private val RECVBUF_SIZE: Integer = Option(SparkEnv.get)
     .map(env => Integer.valueOf(env.conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)))
     .getOrElse(Integer.valueOf(32 << 10))
@@ -479,6 +481,7 @@ class StreamingShuffleClientHandler(
     val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
     val pendingTerminationAcks = new ArrayBuffer[Int]()
     var publishedMessage = false
+    var receiveWindowExhausted = false
     try {
       // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
       // DataMessage processing is asynchronous, so retain that buffer and release it with the
@@ -503,7 +506,7 @@ class StreamingShuffleClientHandler(
         }
         shuffleMessage match {
           case dataMessage: DataMessage =>
-            updateQuota(messageSize)
+            receiveWindowExhausted |= updateQuota(messageSize) == 0L
             val retainedBody = managedBody.map(_.retain())
             // Transport-body ownership is independent of receive-window ownership. A spillable
             // inbox may release the copied payload immediately, but credit must remain outstanding
@@ -586,6 +589,11 @@ class StreamingShuffleClientHandler(
       }
       if (publishedMessage) {
         onMessageAvailable()
+        // A credit-controlled writer cannot publish another data frame after its receive window
+        // reaches zero. Wake a prepared reader even when its configured byte threshold is higher
+        // than the initial credit reachable by the currently admitted producer wave; otherwise
+        // both sides wait forever and the writer's queued terminal can never reach this inbox.
+        if (receiveWindowExhausted) onReceiveWindowExhausted()
       }
       // Queue publication is the end-to-end delivery point for a prepared inbox. Duplicate
       // terminals are not republished, but are ACKed again here so a lost ACK remains repairable.
