@@ -89,7 +89,7 @@ case class CollectLimitExec(limit: Int = -1, child: SparkPlan, offset: Int = 0) 
             serializer,
             writeMetrics,
             pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
-              SQLConf.get, sparkContext.isLocal)),
+              this, SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       if (limit >= 0) {
@@ -150,7 +150,7 @@ case class CollectTailExec(limit: Int, child: SparkPlan) extends LimitExec {
             serializer,
             writeMetrics,
             pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
-              SQLConf.get, sparkContext.isLocal)),
+              this, SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       singlePartitionRDD.mapPartitionsInternal(takeRight)
@@ -375,7 +375,7 @@ case class TakeOrderedAndProjectExec(
             serializer,
             writeMetrics,
             pipelined = PipelinedShuffleEligibility.hiddenShuffleEnabled(
-              SQLConf.get, sparkContext.isLocal)),
+              this, SQLConf.get, sparkContext.isLocal)),
           readMetrics)
       }
       singlePartitionRDD.mapPartitionsWithIndexInternal { (idx, iter) =>

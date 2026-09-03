@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.exchange
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
 
@@ -32,6 +33,9 @@ import org.apache.spark.sql.internal.SQLConf
  * its own plan-shape logic.
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
+
+  private val HIDDEN_SHUFFLE_DISABLED =
+    TreeNodeTag[Boolean]("pipelined_shuffle_hidden_shuffle_disabled")
 
   def supportsMemoryRetainingConsumer: Boolean = {
     val manager = SparkEnv.get.pipelinedShuffleManager
@@ -71,8 +75,22 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
    * prepared-receive transport: it can admit the hidden producer/consumer boundary elastically,
    * while the local channel still relies on conservative whole-plan shape checks.
    */
-  def hiddenShuffleEnabled(conf: SQLConf, isLocal: Boolean): Boolean = {
-    enabled(conf, isLocal) &&
+  def hiddenShuffleEnabled(
+      plan: SparkPlan,
+      conf: SQLConf,
+      isLocal: Boolean): Boolean = {
+    !plan.getTagValue(HIDDEN_SHUFFLE_DISABLED).contains(true) &&
+      enabled(conf, isLocal) &&
       SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
+  }
+
+  /**
+   * Propagate a whole-plan regular-shuffle fallback to dependencies built later inside
+   * `doExecute`. Those hidden dependencies are absent when [[EnablePipelinedShuffle]] runs, so
+   * rewriting visible exchanges alone would leave a regular plan with a pipelined limit/TopN
+   * boundary and DAGScheduler would reject the resulting mixed job.
+   */
+  def disableHiddenShuffles(plan: SparkPlan): Unit = {
+    plan.foreachWithSubqueries(_.setTagValue(HIDDEN_SHUFFLE_DISABLED, true))
   }
 }
