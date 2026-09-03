@@ -244,7 +244,10 @@ class StreamingShuffleServerHandler(
         // addIfAbsent also makes repeated credit messages on the same connection idempotent.
         val encodedCredit = creditControlMessage.numMessages.toLong
         val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
-        val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
+        val zeroWindowDiscovery =
+          creditControlMessage.numMessages == StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT
+        val credit = if (zeroWindowDiscovery) 0L
+          else if (encodedCredit < 0) -encodedCredit else encodedCredit
         val state = if (enablesCreditFlow) {
           enableCreditControl(readerId, client)
         } else {

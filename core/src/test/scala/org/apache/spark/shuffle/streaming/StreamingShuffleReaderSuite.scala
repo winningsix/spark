@@ -323,4 +323,37 @@ class StreamingShuffleReaderSuite
     StreamingShuffleReceiveService.routeByteLimit(1024L, 1900) shouldBe 1L
     StreamingShuffleReceiveService.routeByteLimit(1024L, 0) shouldBe 1024L
   }
+
+  test("executor receive credit leases are bounded and work conserving") {
+    val budget = new StreamingShuffleReceiveCreditBudget(100L)
+    val grants = new AtomicInteger(0)
+    val first = budget.acquire(60L, () => grants.incrementAndGet())
+    val second = budget.acquire(40L, () => grants.incrementAndGet())
+    val blockedLarge = budget.acquire(70L, () => grants.addAndGet(10))
+    val blockedSmall = budget.acquire(30L, () => grants.incrementAndGet())
+
+    first.isGranted shouldBe true
+    second.isGranted shouldBe true
+    blockedLarge.isGranted shouldBe false
+    blockedSmall.isGranted shouldBe false
+    budget.usedBytesCount shouldBe 100L
+    budget.pendingLeaseCount shouldBe 2
+
+    // Releasing forty bytes cannot fit the oldest 70-byte request, but must not strand the
+    // 30-byte request behind it.
+    second.close()
+    blockedLarge.isGranted shouldBe false
+    blockedSmall.isGranted shouldBe true
+    grants.get() shouldBe 1
+    budget.usedBytesCount shouldBe 90L
+
+    first.close()
+    blockedLarge.isGranted shouldBe true
+    grants.get() shouldBe 11
+    budget.usedBytesCount shouldBe 100L
+
+    Seq(first, second, blockedLarge, blockedSmall).foreach(_.close())
+    budget.usedBytesCount shouldBe 0L
+    budget.pendingLeaseCount shouldBe 0
+  }
 }

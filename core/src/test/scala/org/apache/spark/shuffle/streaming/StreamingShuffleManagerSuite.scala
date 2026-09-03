@@ -736,6 +736,68 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("prepared routes discover at zero window until executor credit is available") {
+    withSpark(new SparkContext("local", "prepared-global-credit-budget", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val budget = new StreamingShuffleReceiveCreditBudget(64L)
+      val readerHandlers = (3 to 4).map { writerId =>
+        val handler = new StreamingShuffleClientHandler(
+          writerId,
+          0,
+          new LinkedBlockingQueue[StreamingShuffleMessage](),
+          7,
+          64L,
+          null,
+          new ErrorNotifier())
+        handler.useExecutorReceiveCreditBudget(budget, 64L)
+        writerId -> handler
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => (),
+          shuffleId = 7,
+          numReaders = 1,
+          context = mock[TaskContext],
+          errorNotifier = new ErrorNotifier())
+      }
+      try {
+        client.registerBatch(7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          budget.usedBytesCount shouldBe 64L
+          budget.pendingLeaseCount shouldBe 1
+          writerHandlers.head._2.availableDataCredit(
+            0, writerHandlers.head._2.clientsFor(0).head) shouldBe 64L
+          writerHandlers(1)._2.availableDataCredit(
+            0, writerHandlers(1)._2.clientsFor(0).head) shouldBe 0L
+          readerHandlers(1)._2.prepareMultiplexedCreditRepair() shouldBe empty
+        }
+
+        // Retiring the active route transfers the executor lease to the already-discovered route.
+        readerHandlers.head._2.closeReceiveCreditLease()
+        eventually(Timeout(10.seconds)) {
+          writerHandlers(1)._2.availableDataCredit(
+            0, writerHandlers(1)._2.clientsFor(0).head) shouldBe 64L
+          budget.usedBytesCount shouldBe 64L
+          budget.pendingLeaseCount shouldBe 0
+        }
+      } finally {
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
+        client.close()
+        server.close()
+      }
+      budget.usedBytesCount shouldBe 0L
+    }
+  }
+
   test("successive consumer generations pool routes on replay-isolated lanes") {
     withSpark(new SparkContext("local", "prepared-consumer-generation-lanes", new SparkConf())) {
       _ =>

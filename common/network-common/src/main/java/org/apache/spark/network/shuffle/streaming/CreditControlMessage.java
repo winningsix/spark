@@ -25,8 +25,9 @@ import io.netty.buffer.CompositeByteBuf;
  *
  * Besides connection establishment, distributed multiplexed routes use this message for
  * byte-based flow control. A negative {@link #numMessages} advertises the initial absolute byte
- * window. Zero means that {@link #getSeqNum()} carries the cumulative number of encoded data bytes
- * released by the reader on this connection. Positive values retain the legacy additive grant.
+ * window; {@link Integer#MIN_VALUE} discovers a bounded route with a zero-byte window. Zero means
+ * that {@link #getSeqNum()} carries the cumulative number of encoded data bytes released by the
+ * reader on this connection. Positive values retain the legacy additive grant.
  */
 public final class CreditControlMessage extends StreamingShuffleMessage {
   public final int shuffleId;
@@ -34,8 +35,9 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
   public final int shuffleReaderId;
 
   /**
-   * Negative values establish an absolute byte window, zero selects a cumulative release
-   * acknowledgement in the inherited sequence field, and positive values are additive grants.
+   * Negative values establish an absolute byte window, {@link Integer#MIN_VALUE} establishes a
+   * zero-byte window, zero selects a cumulative release acknowledgement in the inherited sequence
+   * field, and positive values are additive grants.
    */
   public final int numMessages;
 

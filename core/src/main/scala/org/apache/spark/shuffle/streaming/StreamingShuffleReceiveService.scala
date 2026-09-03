@@ -18,6 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.io.File
+import java.util.{LinkedHashSet, TreeMap}
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
   CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, RejectedExecutionException,
   ScheduledExecutorService, Semaphore, TimeoutException, TimeUnit}
@@ -36,7 +37,8 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
-  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
+  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY,
+  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
@@ -75,6 +77,130 @@ private[streaming] object StreamingShuffleReceiveService {
 }
 
 /**
+ * Executor-wide admission for logical receive windows.
+ *
+ * Route discovery must cover every lifetime writer, but granting every discovered route an
+ * independent receive window lets the aggregate window exceed the executor queue budget. A lease
+ * separates those two states: a route without a lease is discoverable with a zero-byte window,
+ * and becomes data-active only when capacity is available. Deferred grants are work-conserving so
+ * a large request at the head cannot strand capacity usable by a smaller route.
+ */
+private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes: Long) {
+  require(maxBytes > 0L, "maxBytes must be positive")
+
+  private val pending = new TreeMap[Long, LinkedHashSet[StreamingShuffleReceiveCreditLease]]()
+  private var usedBytes = 0L
+  private var pendingLeases = 0
+  private var peakUsedBytes = 0L
+  private var peakPendingLeases = 0
+  private var deferredGrants = 0L
+  private var closed = false
+
+  def acquire(bytes: Long, onGranted: () => Unit): StreamingShuffleReceiveCreditLease = {
+    val requested = math.max(1L, math.min(bytes, maxBytes))
+    val lease = new StreamingShuffleReceiveCreditLease(this, requested, onGranted)
+    synchronized {
+      if (closed) {
+        lease.markClosed()
+      } else if (requested <= maxBytes - usedBytes) {
+        usedBytes += requested
+        peakUsedBytes = math.max(peakUsedBytes, usedBytes)
+        lease.markGranted()
+      } else {
+        pending.computeIfAbsent(
+          requested, _ => new LinkedHashSet[StreamingShuffleReceiveCreditLease]()).add(lease)
+        pendingLeases += 1
+        peakPendingLeases = math.max(peakPendingLeases, pendingLeases)
+      }
+    }
+    lease
+  }
+
+  private[streaming] def release(lease: StreamingShuffleReceiveCreditLease): Unit = {
+    val callbacks = synchronized {
+      if (!lease.markClosed()) {
+        Seq.empty
+      } else {
+        if (lease.isGranted) {
+          usedBytes -= lease.bytes
+          require(usedBytes >= 0L, s"Receive credit budget underflow: $usedBytes")
+        } else {
+          val sameSize = pending.get(lease.bytes)
+          if (sameSize != null && sameSize.remove(lease)) {
+            pendingLeases -= 1
+            if (sameSize.isEmpty) pending.remove(lease.bytes)
+          }
+        }
+        val ready = new mutable.ArrayBuffer[() => Unit]()
+        var next = if (closed) null else pending.firstEntry()
+        while (next != null && next.getKey <= maxBytes - usedBytes) {
+          val candidates = next.getValue
+          val iterator = candidates.iterator()
+          val candidate = iterator.next()
+          iterator.remove()
+          pendingLeases -= 1
+          if (candidates.isEmpty) pending.remove(next.getKey)
+          if (!candidate.isClosed) {
+            usedBytes += candidate.bytes
+            peakUsedBytes = math.max(peakUsedBytes, usedBytes)
+            deferredGrants += 1L
+            candidate.markGranted()
+            ready += candidate.onGranted
+          }
+          next = pending.firstEntry()
+        }
+        ready.toSeq
+      }
+    }
+    callbacks.foreach(callback => callback())
+  }
+
+  private[streaming] def usedBytesCount: Long = synchronized { usedBytes }
+  private[streaming] def pendingLeaseCount: Int = synchronized { pendingLeases }
+
+  private[streaming] def stats: (Long, Long, Int, Long) = synchronized {
+    (usedBytes, peakUsedBytes, peakPendingLeases, deferredGrants)
+  }
+
+  def close(): Unit = synchronized {
+    if (!closed) {
+      closed = true
+      val pendingIterator = pending.values().iterator()
+      while (pendingIterator.hasNext) {
+        val leases = pendingIterator.next().iterator()
+        while (leases.hasNext) leases.next().markClosed()
+      }
+      pending.clear()
+      pendingLeases = 0
+    }
+  }
+}
+
+private[streaming] final class StreamingShuffleReceiveCreditLease(
+    budget: StreamingShuffleReceiveCreditBudget,
+    val bytes: Long,
+    private[streaming] val onGranted: () => Unit) {
+  @volatile private var granted = false
+  @volatile private var closed = false
+
+  private[streaming] def markGranted(): Unit = {
+    require(!closed, "Cannot grant a closed receive credit lease")
+    granted = true
+  }
+
+  private[streaming] def markClosed(): Boolean = {
+    if (closed) false else {
+      closed = true
+      true
+    }
+  }
+
+  private[streaming] def isGranted: Boolean = granted
+  private[streaming] def isClosed: Boolean = closed
+  def close(): Unit = budget.release(this)
+}
+
+/**
  * Executor-scoped owner for streaming-shuffle receive queues.
  *
  * An attached inbox is keyed by task attempt and reader ordinal, preserving retry/speculation
@@ -88,6 +214,11 @@ private[streaming] class StreamingShuffleReceiveService(
     onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
   private val readerMemoryBudget = new StreamingShuffleReaderMemoryBudget(
     conf.get(STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY))
+  private val readerCreditBudget = Option.when(
+    conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)) {
+    new StreamingShuffleReceiveCreditBudget(
+      conf.get(STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY))
+  }
   private val inboxes =
     new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
   private case class PreparedInboxKey(
@@ -220,7 +351,8 @@ private[streaming] class StreamingShuffleReceiveService(
         conf,
         resources.discovery,
         resources.clientCreationExecutor,
-        () => onDrainReady(id)))
+        () => onDrainReady(id),
+        readerCreditBudget))
       logDebug(s"Prepared streaming shuffle receive inbox $id")
     } catch {
       case t: Throwable =>
@@ -279,6 +411,7 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def close(): Unit = synchronized {
+    readerCreditBudget.foreach(_.close())
     inboxes.entrySet().asScala.foreach { entry =>
       if (inboxes.remove(entry.getKey, entry.getValue)) {
         preparedInboxes.remove(preparedInboxKey(entry.getKey), entry.getValue)
@@ -289,6 +422,14 @@ private[streaming] class StreamingShuffleReceiveService(
     if (resources != null) {
       resources.close()
       preparedResources = null
+    }
+    readerCreditBudget.foreach { budget =>
+      val (creditUsed, creditPeak, creditPeakPending, creditDeferredGrants) = budget.stats
+      logInfo(
+        s"Closed streaming shuffle receive service: receiveCreditUsedBytes=$creditUsed " +
+        s"receiveCreditPeakBytes=$creditPeak receiveCreditLimitBytes=${budget.maxBytes} " +
+        s"receiveCreditPeakPending=$creditPeakPending " +
+        s"receiveCreditDeferredGrants=$creditDeferredGrants")
     }
   }
 
@@ -620,7 +761,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     conf: SparkConf,
     discovery: StreamingShufflePreparedReceiveDiscovery,
     clientCreationExecutor: ExecutorService,
-    signalDrainReady: () => Unit) extends Logging {
+    signalDrainReady: () => Unit,
+    receiveCreditBudget: Option[StreamingShuffleReceiveCreditBudget] = None) extends Logging {
   private val closed = new AtomicBoolean(false)
   private val discoveryComplete = new AtomicBoolean(false)
   private val drainReady = new AtomicBoolean(false)
@@ -738,6 +880,12 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     // lifetime writer, not only for the writers that happen to run concurrently.
     val perWriterByteLimit = StreamingShuffleReceiveService.routeByteLimit(
       conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY), numWriters)
+    // A controlled writer admits one complete frame whenever a route has positive credit, even
+    // when the fair-share window is smaller than the frame. Reserve for that largest normal frame
+    // so the sum of active logical windows remains within the executor budget.
+    val routeReservationBytes = math.max(
+      perWriterByteLimit,
+      conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE).toLong + 40L)
     val newlyPublished = locations.filter { case (mapId, location) =>
       val duplicate = location.mapIndex >= 0 && mapIndexes.contains(location.mapIndex)
       if (!duplicate && !clientFutures.containsKey(mapId)) {
@@ -753,7 +901,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
       (location.host, location.port)
     }.foreach { case ((host, port), routeLocations) =>
       val future = discovery.submitRouteRegistration(host, port, clientCreationExecutor)(() =>
-        registerRoutes(host, port, routeLocations.toSeq, perWriterByteLimit))
+        registerRoutes(
+          host, port, routeLocations.toSeq, perWriterByteLimit, routeReservationBytes))
       clientFutureStartedNanos.putIfAbsent(future, System.nanoTime())
       future.whenComplete { (_, error) =>
         clientFutureStartedNanos.remove(future)
@@ -802,7 +951,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
       host: String,
       port: Int,
       routeLocations: Seq[(Long, StreamingShuffleTaskLocation)],
-      perWriterByteLimit: Long): Unit = {
+      perWriterByteLimit: Long,
+      routeReservationBytes: Long): Unit = {
     val routeHandlers = routeLocations.map { case (mapId, _) =>
       val handler = new StreamingShuffleClientHandler(
         mapId.toInt,
@@ -814,6 +964,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
         errorNotifier,
         () => onMessageAvailable(),
         () => onReceiveWindowExhausted())
+      receiveCreditBudget.foreach(
+        handler.useExecutorReceiveCreditBudget(_, routeReservationBytes))
       handler.setOnTermAckResponseHandler { writerId =>
         terminationAckControlMessageSet.add(writerId.toLong)
         if (terminationAckControlMessageSet.size() == totalNumShuffleWriters.get()) {
