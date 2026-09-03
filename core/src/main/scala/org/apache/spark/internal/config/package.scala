@@ -2006,14 +2006,28 @@ package object config {
       .doc("Minimum queued data bytes before an executor-prepared shuffle inbox wakes its " +
         "compute task. The executor-owned inbox can receive data without a resident task, so a " +
         "positive threshold avoids spending scheduler CPU capacity on readers that would only " +
-        "wait for producers. An inbox still becomes ready after every writer has terminated, so " +
-        "small and empty partitions cannot hang. Zero restores first-message attachment.")
+        "wait for producers. An inbox still becomes ready after every writer has terminated or " +
+        "after a full receive window stops making progress, so small partitions and bounded " +
+        "producer waves cannot hang. Zero restores first-message attachment.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
       .checkValue(_ >= 0, "prepared inbox ready bytes must be non-negative")
       .createWithDefaultString("1m")
+
+  private[spark] val STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT =
+    ConfigBuilder("spark.shuffle.streaming.preparedInbox.readyIdleTimeout")
+      .doc("Maximum time a prepared shuffle inbox waits after a writer exhausts its bounded " +
+        "receive window without any new message arriving. When this idle timeout expires, the " +
+        "compute task is attached even if readyBytes has not been reached, allowing consumption " +
+        "to return credit and unblock the producer's queued data and terminal frame.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "prepared inbox ready idle timeout must be positive")
+      .createWithDefaultString("100ms")
 
   private[spark] val STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.maxTotalTasksPerExecutor")

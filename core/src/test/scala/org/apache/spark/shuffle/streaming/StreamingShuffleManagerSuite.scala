@@ -20,7 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.nio.ByteBuffer
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CountDownLatch,
   LinkedBlockingQueue, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
 
@@ -42,6 +42,7 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREM
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
+  STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
@@ -61,6 +62,7 @@ class StreamingShuffleManagerSuite
 
   test("prepared inbox defers compute attachment by default") {
     new SparkConf().get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES) shouldBe (1L << 20)
+    new SparkConf().get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT) shouldBe 100L
   }
 
   // ---- getWriterId ----
@@ -304,6 +306,88 @@ class StreamingShuffleManagerSuite
       ready.await(10, TimeUnit.SECONDS) shouldBe true
       discovery.stats._3 shouldBe 1L
     } finally {
+      session.close()
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
+  test("prepared inbox becomes drain-ready when its receive window fills below threshold") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
+      .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES, 32L << 20)
+      .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT, 200L)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(1, "prepared-window-ready-test-client")
+    val sharedClient = mock[StreamingShuffleExecutorClient]
+    val transportClient = mock[TransportClient]
+    val routeHandler = new AtomicReference[StreamingShuffleClientHandler]()
+    val drainReady = new CountDownLatch(1)
+    when(sharedClient.registerBatch(
+      eqTo(7),
+      eqTo(0),
+      eqTo("writer-host"),
+      eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenAnswer { invocation =>
+        val handlers = invocation.getArgument[Seq[(Int, StreamingShuffleClientHandler)]](4)
+        routeHandler.set(handlers.head._2)
+        Map(3 -> transportClient)
+      }
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L), queue)
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox,
+      sharedClient,
+      conf,
+      discovery,
+      clientCreationExecutor,
+      () => drainReady.countDown())
+    val queued = new java.util.ArrayList[StreamingShuffleMessage]()
+
+    def encodedData(sequenceNumber: Long, payloadBytes: Int): ByteBuffer = {
+      val encoded = ByteBuffer.allocate(40 + payloadBytes)
+      encoded.putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id())
+      encoded.putLong(sequenceNumber)
+      encoded.putInt(7)
+      encoded.putInt(3)
+      encoded.putInt(0)
+      encoded.putInt(payloadBytes)
+      encoded.putInt(payloadBytes)
+      encoded.putLong(0L)
+      while (encoded.hasRemaining) encoded.put(0.toByte)
+      encoded.flip()
+      encoded
+    }
+
+    try {
+      session.start()
+      // Four hundred lifetime writers share the 32 MiB reader window, but only a bounded wave is
+      // scheduled at once. The old code waited for the full 32 MiB threshold even after an active
+      // route had exhausted its approximately 82 KiB credit and could publish neither data nor
+      // its terminal frame.
+      session.onWriterSnapshot(ShuffleLocationResponse(
+        Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)),
+        400))
+      eventually(Timeout(10.seconds)) {
+        routeHandler.get() should not be null
+      }
+      val handler = routeHandler.get()
+      handler.useMultiplexedChannel()
+      val routeWindow = StreamingShuffleReceiveService.routeByteLimit(32L << 20, 400).toInt
+
+      handler.receive(null, encodedData(0L, routeWindow / 2), null)
+      drainReady.await(100, TimeUnit.MILLISECONDS) shouldBe false
+
+      handler.receive(null, encodedData(1L, routeWindow / 2), null)
+      drainReady.await(100, TimeUnit.MILLISECONDS) shouldBe false
+      drainReady.await(10, TimeUnit.SECONDS) shouldBe true
+      queue.size() shouldBe 2
+    } finally {
+      queue.drainTo(queued)
+      queued.forEach(_.release())
       session.close()
       discovery.close()
       clientCreationExecutor.shutdownNow()

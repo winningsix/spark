@@ -34,6 +34,7 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
+  STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
   STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY}
@@ -470,6 +471,22 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
 
   def writerLocationsAvailable(): Unit = requestImmediatePoll()
 
+  /** Run a prepared-session liveness check without allocating one timer thread per inbox. */
+  def scheduleSessionCheck(delayNanos: Long)(check: => Unit): Unit = {
+    if (!closed.get()) {
+      try {
+        executor.schedule(
+          new Runnable {
+            override def run(): Unit = check
+          },
+          delayNanos,
+          TimeUnit.NANOSECONDS)
+      } catch {
+        case _: RejectedExecutionException if closed.get() =>
+      }
+    }
+  }
+
   def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
     val shuffleSessions = sessions.get(session.shuffleId)
     if (shuffleSessions != null) {
@@ -608,6 +625,10 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
   private val discoveryComplete = new AtomicBoolean(false)
   private val drainReady = new AtomicBoolean(false)
   private val drainReadyBytes = conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES)
+  private val drainReadyIdleNanos = TimeUnit.MILLISECONDS.toNanos(
+    conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT))
+  private val lastMessageAvailableNanos = new AtomicLong(System.nanoTime())
+  private val idleReadyCheckScheduled = new AtomicBoolean(false)
   private val clients = new ConcurrentHashMap[Long, TransportClient]()
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleClientHandler]()
   private val clientFutures = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
@@ -640,6 +661,35 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     case queue if drainReadyBytes == 0L && !queue.isEmpty =>
       markDrainReady()
     case _ =>
+  }
+
+  private def onMessageAvailable(): Unit = {
+    lastMessageAvailableNanos.set(System.nanoTime())
+    maybeMarkDrainReady()
+  }
+
+  private def scheduleIdleReadyCheck(delayNanos: Long): Unit = {
+    if (!closed.get() && !drainReady.get() &&
+        idleReadyCheckScheduled.compareAndSet(false, true)) {
+      discovery.scheduleSessionCheck(delayNanos) {
+        idleReadyCheckScheduled.set(false)
+        if (!closed.get() && !drainReady.get()) {
+          val idleNanos = System.nanoTime() - lastMessageAvailableNanos.get()
+          if (idleNanos >= drainReadyIdleNanos && !inbox.queue.isEmpty) {
+            // A producer has exhausted this route's initial byte credit and no sibling route has
+            // grown the inbox during the grace period. Attaching compute is now the only state
+            // transition that can consume data, return credit, and deliver the queued terminal.
+            markDrainReady()
+          } else {
+            scheduleIdleReadyCheck(math.max(1L, drainReadyIdleNanos - idleNanos))
+          }
+        }
+      }
+    }
+  }
+
+  private def onReceiveWindowExhausted(): Unit = {
+    scheduleIdleReadyCheck(drainReadyIdleNanos)
   }
 
   def start(): Unit = discovery.register(this)
@@ -762,7 +812,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
         perWriterByteLimit,
         null,
         errorNotifier,
-        () => maybeMarkDrainReady())
+        () => onMessageAvailable(),
+        () => onReceiveWindowExhausted())
       handler.setOnTermAckResponseHandler { writerId =>
         terminationAckControlMessageSet.add(writerId.toLong)
         if (terminationAckControlMessageSet.size() == totalNumShuffleWriters.get()) {
