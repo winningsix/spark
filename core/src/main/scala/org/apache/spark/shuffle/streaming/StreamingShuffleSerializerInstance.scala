@@ -31,6 +31,13 @@ import org.apache.spark.serializer.SerializerInstance
  */
 private[spark] trait StreamingShuffleSerializerInstance { self: SerializerInstance =>
 
+  /**
+   * Exact number of bytes [[writeValueToByteBuf]] will append, when it is knowable without
+   * serializing the value. Writers use this to reserve backpressure and direct-buffer capacity
+   * before an oversized record is copied; serializers without a cheap exact size may return None.
+   */
+  def serializedValueSize(value: Any): Option[Int] = None
+
   def writeValueToByteBuf(value: Any, output: ByteBuf): Unit
 
   def keyValueIteratorFromByteBuf(input: ByteBuf): Iterator[(Any, Any)]

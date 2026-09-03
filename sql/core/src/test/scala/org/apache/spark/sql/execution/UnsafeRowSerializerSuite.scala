@@ -97,6 +97,10 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     val unsafeRows = rows.map(row => toUnsafeRow(row, Array(StringType, IntegerType)))
     val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
     val streamingSerializer = serializer.asInstanceOf[StreamingShuffleSerializerInstance]
+    unsafeRows.foreach { row =>
+      assert(streamingSerializer.serializedValueSize(row).contains(
+        Integer.BYTES + row.getSizeInBytes))
+    }
 
     val expected = new ByteArrayOutputStream()
     val stream = serializer.serializeStream(expected)

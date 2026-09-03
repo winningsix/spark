@@ -73,6 +73,10 @@ private[spark] class PipelinedChannelShuffleManager(conf: SparkConf)
 
   override def requiresSingleExecutor: Boolean = true
 
+  // The local scheduler admits the complete connected stage group, so every reducer is resident
+  // while a build-before-probe consumer retains its first input.
+  override def supportsMemoryRetainingConsumer: Boolean = true
+
   override def usesStreamingShuffleOutputTracker: Boolean = false
 
   // Records cross the channel as object references read by a concurrent consumer thread; the

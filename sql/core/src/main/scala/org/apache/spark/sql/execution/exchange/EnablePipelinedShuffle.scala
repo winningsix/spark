@@ -22,7 +22,7 @@ import scala.collection.mutable
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
-import org.apache.spark.sql.execution.joins.CartesianProductExec
+import org.apache.spark.sql.execution.joins.{CartesianProductExec, ShuffledHashJoinExec}
 
 /**
  * Opt-in (SPARK-57399). Rewrites EVERY [[ShuffleExchangeExec]] in a
@@ -152,6 +152,23 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
           r.copy(child = rewritten(reuseTargetByChildKey.getOrElse(s.pipelinedReuseKey, s)))
         case s: ShuffleExchangeExec => rewritten(s)
       }
+    }
+
+    // A shuffled hash join drains and retains its build input before touching its streamed input.
+    // Prepared receive may admit fewer reduce tasks than the shuffle width to bound those hash
+    // maps. Map writers interleave reducer shards, however, so data for the inactive reducers can
+    // consume every bounded writer/raw permit and prevent the active reducers from ever seeing
+    // EOS. There is no work-conserving in-memory ordering that breaks that cycle: the missing
+    // shards must either be durably staged or all readers must be resident. Keep the whole
+    // non-AQE plan regular unless the transport explicitly supports that contract.
+    val hasMemoryRetainingConsumer = plan.collectWithSubqueries {
+      case _: ShuffledHashJoinExec => true
+    }.nonEmpty
+    if (hasMemoryRetainingConsumer &&
+        !PipelinedShuffleEligibility.supportsMemoryRetainingConsumer) {
+      logDebug("EnablePipelinedShuffle: plan has a shuffled hash join but the configured " +
+        "transport cannot safely admit a memory-retaining consumer; leaving it regular.")
+      return rewriteExchanges(asPipelined = false)
     }
 
     if ((sameScopeReuseCountByExchangeKey.nonEmpty && !supportsFanOut) ||

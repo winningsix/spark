@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{BinaryExecNode, CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle,
   PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
-import org.apache.spark.sql.execution.joins.ShuffledJoin
+import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, ShuffledJoin}
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 
 /**
@@ -141,6 +141,13 @@ case class AQEEnablePipelinedShuffle() extends Rule[SparkPlan] {
       }
 
     case _: QueryStageExec => // already materialized; a leaf here
+
+    case _: ShuffledHashJoinExec
+        if !PipelinedShuffleEligibility.supportsMemoryRetainingConsumer =>
+      // Build-before-probe readers may retain one hash table per admitted task. A prepared
+      // transport that starts only a subset of reducers can then deadlock interleaved producers
+      // behind shards for inactive reducers. Leave this join's inputs materialized; a free
+      // exchange above the join may still form a safe pipelined suffix.
 
     case j: ShuffledJoin if !blocked =>
       // Flip the join's immediate shuffle inputs only as a symmetric pair.

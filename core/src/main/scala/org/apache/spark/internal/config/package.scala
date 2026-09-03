@@ -1952,9 +1952,9 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.writerMaxMemory")
       .doc("Best-effort memory limit in bytes for in-flight data buffers in a streaming " +
         "shuffle writer task. Includes TCP send/receive buffers. The writer back-pressures " +
-        "the upstream iterator when this limit is reached. This is a best-effort bound: " +
-        "back-pressure is accounted per network buffer, so an individual serialized row that " +
-        "exceeds the network buffer size can push actual in-flight memory above this limit.")
+        "the upstream iterator when this limit is reached. Serializers that expose an exact " +
+        "record size reserve oversized buffers by byte capacity before serialization; other " +
+        "serializers cannot grow a buffer beyond the capacity already acquired.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

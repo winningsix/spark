@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
-import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, Semaphore}
+import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque}
 import java.util.concurrent.atomic.AtomicLong
 
 import io.netty.buffer.{ByteBuf, Unpooled}
@@ -349,35 +349,65 @@ private[streaming] final class StreamingShuffleRawBufferPool(
   require(maxMemoryBytes >= bufferSize,
     "raw buffer pool must admit at least one serialization buffer")
 
-  private val maxBuffers = math.min(
-    Int.MaxValue.toLong, math.max(1L, maxMemoryBytes / bufferSize)).toInt
-  // A permit represents an allocation slot not yet materialized. Once allocated, the slot moves
-  // between borrowers and the available deque until the pool closes or rejects an oversized buf.
-  private val unallocated = new Semaphore(maxBuffers)
+  // Account exact allocated capacity, not buffer count. UnsafeRow can contain a value larger than
+  // the configured network buffer (for example a 1 MiB bloom-filter row). Counting such a grown
+  // buffer as one 128 KiB slot understated executor direct memory by 8x and let many writers
+  // bypass the raw in-flight budget simultaneously.
+  private val usedBytes = new AtomicLong(0L)
+  private val peakBytes = new AtomicLong(0L)
   private val available = new LinkedBlockingDeque[ByteBuf]()
   @volatile private var closed = false
 
-  def tryBorrow(): ByteBuf = {
-    val cached = available.pollLast()
-    if (cached != null) {
-      cached.clear()
-      cached
-    } else if (!closed && unallocated.tryAcquire()) {
-      try Unpooled.directBuffer(bufferSize)
-      catch {
-        case error: Throwable =>
-          unallocated.release()
-          throw error
-      }
-    } else {
-      null
+  private def tryReserve(bytes: Int): Boolean = {
+    val requested = bytes.toLong
+    var acquired = false
+    while (!acquired && !closed) {
+      val current = usedBytes.get()
+      if (current + requested > maxMemoryBytes) return false
+      acquired = usedBytes.compareAndSet(current, current + requested)
+      if (acquired) peakBytes.accumulateAndGet(current + requested, Math.max)
+    }
+    acquired
+  }
+
+  private def allocate(capacity: Int): ByteBuf = {
+    if (!tryReserve(capacity)) return null
+    try Unpooled.directBuffer(capacity, capacity)
+    catch {
+      case error: Throwable =>
+        usedBytes.addAndGet(-capacity.toLong)
+        throw error
     }
   }
 
-  def awaitBorrow(waitMillis: Long): ByteBuf = {
-    val cached = available.pollLast(waitMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
-    if (cached != null) cached.clear()
-    cached
+  def tryBorrow(minCapacity: Int = bufferSize): ByteBuf = {
+    val capacity = math.max(bufferSize, minCapacity)
+    val cached = if (capacity == bufferSize) available.pollLast() else null
+    if (cached != null) {
+      cached.clear()
+      cached
+    } else {
+      allocate(capacity)
+    }
+  }
+
+  def awaitBorrow(waitMillis: Long, minCapacity: Int = bufferSize): ByteBuf = {
+    val capacity = math.max(bufferSize, minCapacity)
+    val cached = if (capacity == bufferSize) {
+      available.pollLast(waitMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    } else {
+      // Oversized buffers are not cached. Wait for another oversized borrower to release exact
+      // capacity, then retry the CAS reservation; callers already loop with task-cancellation
+      // checks, so a short timed signal is sufficient and cannot strand a waiter.
+      this.synchronized { wait(waitMillis) }
+      null
+    }
+    if (cached != null) {
+      cached.clear()
+      cached
+    } else {
+      tryBorrow(capacity)
+    }
   }
 
   def recycle(buffer: ByteBuf): Unit = {
@@ -400,13 +430,18 @@ private[streaming] final class StreamingShuffleRawBufferPool(
    * eventually leaving every writer blocked with an empty free list and zero permits.
    */
   def discard(buffer: ByteBuf): Unit = {
-    buffer.release()
-    unallocated.release()
+    destroy(buffer)
   }
 
+  private[streaming] def stats: (Long, Long, Long) =
+    (usedBytes.get(), peakBytes.get(), maxMemoryBytes)
+
   private def destroy(buffer: ByteBuf): Unit = {
+    val capacity = buffer.capacity()
     buffer.release()
-    unallocated.release()
+    val remaining = usedBytes.addAndGet(-capacity.toLong)
+    require(remaining >= 0L, "raw buffer pool released more bytes than it allocated")
+    this.synchronized { notifyAll() }
   }
 
   def close(): Unit = {
@@ -414,5 +449,6 @@ private[streaming] final class StreamingShuffleRawBufferPool(
     val buffers = new java.util.ArrayList[ByteBuf]()
     available.drainTo(buffers)
     buffers.forEach(buffer => { destroy(buffer); () })
+    this.synchronized { notifyAll() }
   }
 }
