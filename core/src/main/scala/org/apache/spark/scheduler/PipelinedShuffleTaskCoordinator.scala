@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 
-import org.apache.spark.{SparkConf, SparkEnv, StreamingShuffleOutputTrackerMaster}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, StreamingShuffleOutputTrackerMaster}
 import org.apache.spark.internal.config._
 import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
 
@@ -340,6 +340,63 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     !taskSet.isZombie && taskSet.tasksSuccessful < taskSet.numTasks &&
       taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
+  }
+
+  /**
+   * Reserve enough CPU on each executor to attach one prepared reader in every active run epoch.
+   *
+   * Pure producers normally consume whole CPUs while prepared readers use a fractional charge.
+   * If producers take the final whole CPU before an inbox becomes drain-ready, bounded transport
+   * backpressure can stop every producer while the reader that would return credit has no
+   * schedulable CPU. The old heap wire fallback hid that cycle by letting producers allocate past
+   * the transport budget. Keep the small reservation only until a reader in that epoch is already
+   * running on the executor; its own CPU charge then preserves the progress path.
+   */
+  def readerCpuReservations(
+      taskSets: Iterable[TaskSetManager]): Map[(Option[String], String), BigDecimal] = {
+    if (!enabled) return Map.empty
+
+    def runEpoch(taskSet: TaskSetManager): Option[String] = {
+      Option(taskSet.taskSet.properties).flatMap { properties =>
+        Option(properties.getProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH))
+      }
+    }
+
+    val activeReaders = taskSets.iterator.filter { taskSet =>
+      !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader
+    }.toSeq
+    val readersByAttempt = activeReaders.map { taskSet =>
+      (taskSet.stageId, taskSet.taskSet.stageAttemptId) -> taskSet
+    }.toMap
+    val result = new HashMap[(Option[String], String), BigDecimal]
+
+    assignments.foreach { case (key, assignment) =>
+      readersByAttempt.get((key.stageId, key.stageAttemptId)).foreach { reader =>
+        val reservationKey = runEpoch(reader) -> assignment.executorId
+        val hasRunningReader = activeReaders.exists { candidate =>
+          runEpoch(candidate) == reservationKey._1 &&
+            candidate.runningTasksOnExecutor(assignment.executorId) > 0
+        }
+        if (!hasRunningReader && reader.isTaskPendingForOffer(key.taskIndex)) {
+          val configuredCpus = if (reader.taskSet.isPipelinedShuffleProducer) {
+            readerProducerTaskCpus
+          } else {
+            readerTaskCpus
+          }
+          // Without an explicit fractional charge there is no CPU amount that can let a reader
+          // overlap a whole-CPU producer (notably on a one-core executor). Preserve ordinary
+          // scheduling in that case; the reservation is specifically the progress guarantee for
+          // fractional prepared-reader execution.
+          configuredCpus.filter(_ < 1).foreach { cpus =>
+            result.updateWith(reservationKey) {
+              case Some(current) => Some(current.max(cpus))
+              case None => Some(cpus)
+            }
+          }
+        }
+      }
+    }
+    result.toMap
   }
 
   /** Topological reader depth inside one pipelined run epoch. */

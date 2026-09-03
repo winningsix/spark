@@ -469,7 +469,8 @@ private[spark] class TaskSchedulerImpl(
       readerFrontierRoutable: Boolean,
       readerFrontierStarted: Boolean,
       upstreamReaderProducers: Seq[TaskSetManager],
-      activeTaskSets: Iterable[TaskSetManager])
+      activeTaskSets: Iterable[TaskSetManager],
+      readerCpuReservations: Map[(Option[String], String), BigDecimal])
     : (Boolean, Option[TaskLocality]) = {
     if (!pipelinedShuffleTaskCoordinator.taskSetReady(taskSet)) return (true, None)
     var noDelayScheduleRejects = true
@@ -494,8 +495,20 @@ private[spark] class TaskSchedulerImpl(
             taskSet, execId, activeTaskSets, upstreamReaderProducers) &&
           sc.resourceProfileManager.canBeScheduled(
             taskSetRpID, shuffledOffers(i).resourceProfileId)) {
+        val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
+          !taskSet.taskSet.isPipelinedShuffleReader
+        val taskSetRunEpoch = Option(taskSet.taskSet.properties).flatMap { properties =>
+          Option(properties.getProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH))
+        }
+        val readerCpuReservation =
+          readerCpuReservations.getOrElse(taskSetRunEpoch -> execId, BigDecimal(0))
+        val cpusAvailableForTask = if (pureProducer) {
+          (availableCpus(i) - readerCpuReservation).max(BigDecimal(0))
+        } else {
+          availableCpus(i)
+        }
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
-          availableCpus(i), availableResources(i))
+          cpusAvailableForTask, availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
           try {
             val (taskDescOption, didReject, index) =
@@ -691,6 +704,8 @@ private[spark] class TaskSchedulerImpl(
       activePipelinedExecutors,
       (taskSet, taskIndex) =>
         pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
+    val readerCpuReservations =
+      pipelinedShuffleTaskCoordinator.readerCpuReservations(sortedTaskSets)
     // Once an executor-owned startup inbox reaches its compute-ready byte threshold (or EOS),
     // launch its attached reader before more producers. Inbox preparation separately opens the
     // producer routing frontier without consuming a compute slot. Within one run epoch, attach
@@ -758,7 +773,8 @@ private[spark] class TaskSchedulerImpl(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
               availableResources, tasks, activePureProducerStages,
               producerReaderFrontierRoutable,
-              producerReaderFrontierStarted, upstreamReaderProducers, sortedTaskSets)
+              producerReaderFrontierStarted, upstreamReaderProducers, sortedTaskSets,
+              readerCpuReservations)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject

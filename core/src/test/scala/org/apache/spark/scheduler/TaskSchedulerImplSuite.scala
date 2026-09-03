@@ -2944,6 +2944,58 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     launched.foreach(task => assert(task.cpus === BigDecimal("0.25")))
   }
 
+  test("pure producers reserve a progress slot for an assigned prepared reader") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
+    val executorId = "executor0"
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"prepared-reader-reservation-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInbox(_) => context.reply(true)
+          case PrepareStreamingShuffleReceiveInboxes(_) => context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+
+    val producer = new TaskSet(
+      Array.tabulate[Task[_]](8)(i => new FakeTask(0, i)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(7),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    val reader = new TaskSet(
+      Array(new FakeTask(1, 0)),
+      stageId = 1,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(7),
+      pipelinedReaderStartupShuffleIds = Set(7))
+    taskScheduler.submitTasks(producer)
+    taskScheduler.submitTasks(reader)
+
+    val launched = taskScheduler.resourceOffers(
+      IndexedSeq(new WorkerOffer(executorId, "host0", 7))).flatten
+    assert(launched.size === 6,
+      "one whole producer slot must remain available for the fractional reader to attach")
+    assert(launched.forall(_.executorId === executorId))
+  }
+
   test("prepared reader compute attach expands after lightweight sampling") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
