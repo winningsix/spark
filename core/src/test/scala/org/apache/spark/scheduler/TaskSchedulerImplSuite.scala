@@ -3423,11 +3423,28 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "a producer-only offer race must stay at the base window until its reader is submitted")
   }
 
-  test("prepared receive mode does not expand a sole producer before its reader starts") {
+  test("prepared receive mode expands a sole producer before reader compute attaches") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
       config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS.key -> "4")
+    val executorId = "executor0"
+    val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"sole-frontier-prepared-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            prepared.synchronized(prepared ++= ids)
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
     val producer = new TaskSet(
       Array.tabulate[Task[_]](6)(i => new FakeTask(0, i)),
       stageId = 0,
@@ -3448,24 +3465,20 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       shuffleId = None,
       isPipelined = true,
       isPipelinedShuffleReader = true,
-      pipelinedReaderShuffleIds = Seq(1))
+      pipelinedReaderShuffleIds = Seq(1),
+      pipelinedReaderStartupShuffleIds = Set(1))
     taskScheduler.submitTasks(producer)
     taskScheduler.submitTasks(reader)
 
-    val offers = (0 until 8).map { i =>
-      new WorkerOffer(s"executor$i", s"host$i", 1)
-    }
+    val offers = IndexedSeq(new WorkerOffer(executorId, "host0", 8))
     val firstWave = taskScheduler.resourceOffers(offers).flatten
-    assert(firstWave.length === 2)
-    assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 2,
-      "the producer must stay at its base window until a direct reader has started")
-
-    // Model the reader frontier after its first ready task has launched. The next offer may now
-    // expand the same producer to the sole-stage window and fill otherwise idle CPU slots.
-    taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasksSet += Long.MaxValue
-    val secondWave = taskScheduler.resourceOffers(offers).flatten
-    assert(secondWave.length === 2)
+    assert(firstWave.length === 4)
     assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 4)
+    assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 0,
+      "inbox preparation must not be confused with reader compute attachment")
+    eventually(timeout(10.seconds)) {
+      assert(prepared.synchronized(prepared.size) === 4)
+    }
   }
 
   test("prepared receive mode keeps sibling pure producers at their base windows") {
@@ -3539,7 +3552,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
   }
 
-  test("wide producer frontier becomes routable after every direct inbox ready ACK") {
+  test("wide producer frontier becomes routable after every direct inbox is prepared") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "2",
@@ -3601,17 +3614,10 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
 
     val firstProducer = taskScheduler.taskSetManagerForAttempt(0, 0).get
-    assert(!taskScheduler.producerReaderFrontierRoutable(firstProducer))
-    val preparedInboxes = prepared.synchronized(prepared.toSeq)
-    val withheld = preparedInboxes.filter(_.shuffleId == 1).last
-    preparedInboxes.filterNot(_ == withheld).foreach(tracker.markInboxDrainReady(executorId, _))
-    assert(!taskScheduler.producerReaderFrontierRoutable(firstProducer),
-      "one missing partition ACK must retain the conservative producer window")
-    tracker.markInboxDrainReady(executorId, withheld)
     assert(taskScheduler.taskSetManagerForAttempt(4, 0).get.runningTasks === 0,
-      "inbox readiness must not be confused with reader compute attachment")
+      "inbox preparation must not be confused with reader compute attachment")
     assert(taskScheduler.producerReaderFrontierRoutable(firstProducer),
-      "every direct partition has a prepared, drain-ready producer route")
+      "every direct partition has a prepared executor-owned inbox")
   }
 
   test("prepared reader attach prioritizes the upstream stage within one run epoch") {

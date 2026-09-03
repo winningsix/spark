@@ -691,11 +691,13 @@ private[spark] class TaskSchedulerImpl(
       activePipelinedExecutors,
       (taskSet, taskIndex) =>
         pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
-    // Once an executor-owned startup inbox receives its first payload (or EOS), launch its
-    // attached reader before more producers. Within one run epoch, attach upstream readers before
-    // deeper consumers: otherwise a downstream join that is ready on only one input can consume
-    // the executor-wide reader cap and strand the join that produces its other input. Preserve the
-    // pool's run-epoch order and use its original position as the stable tie-breaker.
+    // Once an executor-owned startup inbox reaches its compute-ready byte threshold (or EOS),
+    // launch its attached reader before more producers. Inbox preparation separately opens the
+    // producer routing frontier without consuming a compute slot. Within one run epoch, attach
+    // upstream readers before deeper consumers: otherwise a downstream join that is ready on only
+    // one input can consume the executor-wide reader cap and strand the join that produces its
+    // other input. Preserve the pool's run-epoch order and use its original position as the stable
+    // tie-breaker.
     val offerTaskSets = indexedTaskSets.sortBy { case (taskSet, index) =>
       if (pipelinedShuffleTaskCoordinator.isReadyReader(taskSet)) {
         (0, firstTaskSetIndexByRunEpoch(pipelinedRunEpoch(taskSet)),
@@ -738,8 +740,9 @@ private[spark] class TaskSchedulerImpl(
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
-        // Compute this once per task set and offer pass. Ready readers were moved ahead of their
-        // producers above, so their freshly-launched runningTasks are already visible here.
+        // Compute this once per task set and offer pass. Compute-ready readers were moved ahead of
+        // their producers above, so their freshly-launched runningTasks are already visible here;
+        // inbox preparation may independently make a producer's routing frontier safe.
         val producerReaderFrontierRoutable =
           pipelinedShuffleTaskCoordinator.readerFrontierRoutable(taskSet, sortedTaskSets)
         val producerReaderFrontierStarted =

@@ -377,14 +377,17 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   }
 
   /**
-   * Whether every partition of a producer's submitted direct-reader frontier has a live route.
+   * Whether every partition of a producer's submitted direct-reader frontier has a prepared
+   * executor-owned inbox.
    *
    * A reader task may intentionally defer its compute attachment while another join input is
    * still being built. That must not hold an otherwise wide producer frontier at its conservative
-   * startup window: executor-owned inbox preparation and the drain-ready ACK already make the
-   * producer route safe, independently of when reader compute attaches. Tasks that have already
-   * launched or completed also have a route by construction. A pending retry, executor loss, or
-   * incomplete ACK makes the frontier non-routable again until a fresh assignment is ready.
+   * startup window: executor-owned inbox preparation makes the producer route safe independently
+   * of when reader compute attaches. The drain-ready signal intentionally controls only compute
+   * attachment; waiting for it here makes a small shuffle hold producers at their conservative
+   * window until every writer finishes. Tasks that have already launched or completed have a
+   * route by construction. A pending retry or executor loss removes its assignment and makes the
+   * frontier non-routable again until a fresh inbox is prepared.
    */
   def readerFrontierRoutable(
       producer: TaskSetManager,
@@ -394,19 +397,15 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
         !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
           taskSet.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
       }.toSeq
-      directReaders.nonEmpty && trackerMaster.exists { tracker =>
-        directReaders.forall { reader =>
-          reader.tasks.indices.forall { taskIndex =>
-            if (!reader.isTaskPendingForOffer(taskIndex)) {
-              true
-            } else {
-              val key = ReaderKey(reader.stageId, reader.taskSet.stageAttemptId, taskIndex)
-              assignments.get(key).exists { assignment =>
-                val directInboxes = assignment.inboxes.filter(_.shuffleId == shuffleId)
-                directInboxes.nonEmpty && directInboxes.forall { inbox =>
-                  tracker.isReceiveInboxDrainReady(assignment.executorId, inbox)
-                }
-              }
+      directReaders.nonEmpty && trackerMaster.isDefined && directReaders.forall { reader =>
+        reader.tasks.indices.forall { taskIndex =>
+          if (!reader.isTaskPendingForOffer(taskIndex)) {
+            true
+          } else {
+            val key = ReaderKey(reader.stageId, reader.taskSet.stageAttemptId, taskIndex)
+            assignments.get(key).exists { assignment =>
+              val directInboxes = assignment.inboxes.filter(_.shuffleId == shuffleId)
+              directInboxes.nonEmpty
             }
           }
         }
@@ -421,7 +420,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       readerFrontierStarted: Boolean): Boolean = {
     val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
       !taskSet.taskSet.isPipelinedShuffleReader
-    val taskLimit = if (activePureProducerStages == 1 && readerFrontierStarted) {
+    val taskLimit = if (activePureProducerStages == 1 &&
+        (readerFrontierRoutable || readerFrontierStarted)) {
       soleProducerMaxTasks.orElse(producerMaxTasks)
     } else if (readerFrontierRoutable && expandedProducerMinActiveStages > 0 &&
         activePureProducerStages >= expandedProducerMinActiveStages) {

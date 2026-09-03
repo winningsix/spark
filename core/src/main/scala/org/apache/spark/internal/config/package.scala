@@ -2003,17 +2003,17 @@ package object config {
 
   private[spark] val STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.readyBytes")
-      .doc("Optional minimum queued data bytes before an executor-prepared shuffle inbox wakes " +
-        "its compute task. Zero wakes the task after the first data or termination frame, which " +
-        "proves that endpoint preparation and producer routing are operational without imposing " +
-        "a size barrier on small or sparse inputs. Positive values are experimental and an inbox " +
-        "still becomes ready after every writer has terminated so empty partitions cannot hang.")
+      .doc("Minimum queued data bytes before an executor-prepared shuffle inbox wakes its " +
+        "compute task. The executor-owned inbox can receive data without a resident task, so a " +
+        "positive threshold avoids spending scheduler CPU capacity on readers that would only " +
+        "wait for producers. An inbox still becomes ready after every writer has terminated, so " +
+        "small and empty partitions cannot hang. Zero restores first-message attachment.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
       .checkValue(_ >= 0, "prepared inbox ready bytes must be non-negative")
-      .createWithDefaultString("0b")
+      .createWithDefaultString("1m")
 
   private[spark] val STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.maxTotalTasksPerExecutor")
