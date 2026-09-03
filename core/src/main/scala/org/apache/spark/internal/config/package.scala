@@ -2092,18 +2092,6 @@ package object config {
       .checkValue(_ > 0, "prepared reader heavy-task memory threshold must be positive")
       .createWithDefaultString("4g")
 
-  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MIN_ACTIVE_EXECUTION_TIME =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.minActiveExecutionTime")
-      .doc("Useful execution time required to classify a zero-execution-memory streaming reader " +
-        "as lightweight. Fetch wait and GC are excluded so an input-starved hash join cannot " +
-        "expand before its build-side memory demand becomes visible.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .timeConf(TimeUnit.MILLISECONDS)
-      .checkValue(_ > 0L, "prepared reader active execution time must be positive")
-      .createWithDefaultString("2s")
-
   private[spark] val STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.clientCreationThreads")
       .doc("Maximum executor-scoped threads used to install prepared reader routes and create " +
