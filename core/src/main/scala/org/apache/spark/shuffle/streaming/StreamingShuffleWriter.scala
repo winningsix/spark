@@ -1076,9 +1076,10 @@ class StreamingShuffleWriter[K, V](
                 None
               } else if (reservedBytes > 0 && inFlightNetworkBytes > 0 &&
                   inFlightNetworkBytes + reservedBytes > maxInFlightNetworkBytes) {
-                // Keep the action in order. This may move its direct frame to replay storage;
-                // a later network completion will reopen the route window and reschedule drain.
-                spillOnePendingData()
+                // Keep the live action in memory and stop this producer-side drain. A later
+                // network completion reopens the executor wire window and reschedules it. Moving
+                // the frame to replay storage here would let computation run ahead of transport
+                // by using disk as an unbounded extension of the backpressure window.
                 outboundDrainScheduled = false
                 None
               } else {
@@ -2208,10 +2209,10 @@ class StreamingShuffleWriter[K, V](
       if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
         shards.foreach(_.send())
         while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
-          val spilled = shards.iterator.map(_.spillOnePendingData()).exists(identity)
-          if (!spilled) {
-            throwErrorIfExists()
-          }
+          // Backpressure must stop the iterator before it produces another frame. Spilling a
+          // queued live frame here only frees a permit so computation can continue, turning the
+          // local disk into an escape hatch around the configured in-flight bound.
+          throwErrorIfExists()
         }
       }
     }
@@ -2232,9 +2233,11 @@ class StreamingShuffleWriter[K, V](
         case Some(shared) =>
           buffer = shared.rawBufferPool.tryBorrow()
           while (buffer == null) {
-            // Retiring a queued frame may return its raw owner to this writer's local deque.
-            // Prefer that immediately reusable buffer before waiting on a global pool slot.
-            shards.iterator.exists(_.spillOnePendingData())
+            // A relaxed writer may retire a queued frame to break a multi-input scheduling
+            // cycle. A backpressured writer must instead wait before pulling more input.
+            if (!WRITER_BACKPRESSURE_ENABLED) {
+              shards.iterator.exists(_.spillOnePendingData())
+            }
             buffer = bufferPool.pollLast()
             if (buffer == null) buffer = shared.rawBufferPool.tryBorrow()
             if (buffer == null) buffer = shared.rawBufferPool.awaitBorrow(10L)
