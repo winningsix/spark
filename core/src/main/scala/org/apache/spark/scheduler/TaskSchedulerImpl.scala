@@ -1002,10 +1002,14 @@ private[spark] class TaskSchedulerImpl(
       accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
       blockManagerId: BlockManagerId,
       executorUpdates: mutable.Map[(Int, Int), ExecutorMetrics]): Boolean = {
+    var reviveForPreparedReaderExpansion = false
     // (taskId, stageId, stageAttemptId, accumUpdates)
     val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = {
       accumUpdates.flatMap { case (id, updates) =>
         Option(taskIdToTaskSetManager.get(id)).map { taskSetMgr =>
+          if (taskSetMgr.updatePreparedReaderRunningMemorySample(id, updates)) {
+            reviveForPreparedReaderExpansion = true
+          }
           val (accInfos, taskProcessRate) = getTaskAccumulableInfosAndProcessRate(updates)
           if (efficientTaskCalcualtionEnabled && taskProcessRate > 0.0) {
             taskSetMgr.taskProcessRateCalculator.foreach {
@@ -1016,8 +1020,10 @@ private[spark] class TaskSchedulerImpl(
         }
       }
     }
-    dagScheduler.executorHeartbeatReceived(execId, accumUpdatesWithTaskIds, blockManagerId,
-      executorUpdates)
+    val blockManagerAlive = dagScheduler.executorHeartbeatReceived(
+      execId, accumUpdatesWithTaskIds, blockManagerId, executorUpdates)
+    if (reviveForPreparedReaderExpansion) backend.reviveOffers()
+    blockManagerAlive
   }
 
  private def getTaskAccumulableInfosAndProcessRate(
