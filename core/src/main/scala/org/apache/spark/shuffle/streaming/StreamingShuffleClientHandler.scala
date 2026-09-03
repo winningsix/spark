@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.BlockingQueue
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -71,6 +71,11 @@ class StreamingShuffleClientHandler(
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
+  private val receiveCreditLeaseClosed = new AtomicBoolean(false)
+  private val receiveCreditWindowOpened = new AtomicBoolean(true)
+  @volatile private var receiveCreditBudget: Option[StreamingShuffleReceiveCreditBudget] = None
+  @volatile private var routeReservationBytes: Long = 0L
+  @volatile private var receiveCreditLease: StreamingShuffleReceiveCreditLease = _
   // Total encoded data bytes released by the task on this connection. Multiplexed routes send
   // this as an absolute acknowledgement watermark, so an idle retry is idempotent.
   private val cumulativeReleasedBytes = new AtomicLong(0L)
@@ -115,6 +120,17 @@ class StreamingShuffleClientHandler(
   /** A multiplexed channel cannot safely toggle autoRead for one logical stream. */
   private[streaming] def useMultiplexedChannel(): Unit = {
     perStreamAutoReadEnabled = false
+  }
+
+  private[streaming] def useExecutorReceiveCreditBudget(
+      budget: StreamingShuffleReceiveCreditBudget,
+      reservationBytes: Long): Unit = synchronized {
+    require(receiveCreditLease == null, "Receive credit budget was installed after registration")
+    require(receiveCreditBudget.isEmpty, "Receive credit budget was installed more than once")
+    require(reservationBytes > 0L, "Receive credit reservation must be positive")
+    receiveCreditBudget = Some(budget)
+    routeReservationBytes = reservationBytes
+    receiveCreditWindowOpened.set(false)
   }
 
   private[streaming] def setMultiplexedCreditSender(
@@ -184,7 +200,7 @@ class StreamingShuffleClientHandler(
     }
   }
 
-  private def initialCreditAmount: Int = {
+  private def boundedCreditAmount(windowOpened: Boolean): Int = {
     // The first credit both discovers the route and opens its bounded receive window. On a
     // multiplexed channel this is the logical replacement for toggling channel-wide autoRead;
     // each route gets an independent writer-side byte budget even though the physical channel is
@@ -192,7 +208,8 @@ class StreamingShuffleClientHandler(
     if (backpressureEnabled && !perStreamAutoReadEnabled) {
       // A negative first credit opts this logical stream into writer-side byte admission. Positive
       // credits retain the historical connection-discovery-only protocol for dedicated channels.
-      -math.min(byteLimit, Int.MaxValue.toLong).toInt
+      if (windowOpened) -math.min(byteLimit, Int.MaxValue.toLong).toInt
+      else StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT
     } else {
       // Preserve the original connection-discovery marker when reader backpressure is disabled.
       1
@@ -201,7 +218,48 @@ class StreamingShuffleClientHandler(
 
   override def channelActive(client: TransportClient): Unit = {
     bindChannel(client, configureSocket = true)
-    sendCreditControlMessage(client, shuffleWriterId, initialCreditAmount)
+    sendCreditControlMessage(client, shuffleWriterId, boundedCreditAmount(windowOpened = true))
+  }
+
+  private def acquireReceiveCredit(client: TransportClient): Boolean = {
+    if (receiveCreditLeaseClosed.get()) return false
+    receiveCreditBudget match {
+      case None => true
+      case Some(budget) => synchronized {
+        if (receiveCreditLeaseClosed.get()) {
+          false
+        } else {
+          if (receiveCreditLease == null) {
+            val requested = if (routeReservationBytes > 0L) routeReservationBytes else byteLimit
+            receiveCreditLease = budget.acquire(
+              requested, () => openDeferredReceiveWindow(client))
+          }
+          val granted = receiveCreditLease.isGranted
+          if (granted) receiveCreditWindowOpened.set(true)
+          granted
+        }
+      }
+    }
+  }
+
+  private def openDeferredReceiveWindow(client: TransportClient): Unit = {
+    if (!receiveCreditLeaseClosed.get() && receiveCreditWindowOpened.compareAndSet(false, true)) {
+      sendAvailableCreditFloor(client, byteLimit)
+    }
+  }
+
+  private def maybeReleaseReceiveCredit(): Unit = {
+    val releasable = synchronized {
+      terminationReceived && remainingBytesQuota >= byteLimit
+    }
+    if (releasable) closeReceiveCreditLease()
+  }
+
+  private[streaming] def closeReceiveCreditLease(): Unit = {
+    if (receiveCreditLeaseClosed.compareAndSet(false, true)) {
+      val lease = synchronized { receiveCreditLease }
+      if (lease != null) lease.close()
+    }
   }
 
   /** Bind one logical route and return its discovery frame for an executor-level batch send. */
@@ -210,8 +268,9 @@ class StreamingShuffleClientHandler(
       configureSocket: Boolean): CreditControlMessage = {
     useMultiplexedChannel()
     bindChannel(client, configureSocket)
+    val windowOpened = acquireReceiveCredit(client)
     new CreditControlMessage(
-      shuffleId, shuffleWriterId, shuffleReaderId, initialCreditAmount)
+      shuffleId, shuffleWriterId, shuffleReaderId, boundedCreditAmount(windowOpened))
   }
 
   /** Surface a failed executor-level discovery batch through this route's normal error path. */
@@ -288,7 +347,8 @@ class StreamingShuffleClientHandler(
   }
 
   private def clampedAvailableReceiveBytes: Long = {
-    math.max(0L, math.min(byteLimit, remainingBytesQuota))
+    if (receiveCreditBudget.isDefined && !receiveCreditWindowOpened.get()) 0L
+    else math.max(0L, math.min(byteLimit, remainingBytesQuota))
   }
 
   private def availableReceiveBytes: Long = synchronized {
@@ -514,6 +574,7 @@ class StreamingShuffleClientHandler(
             dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
               updateQuota(-messageSize)
+              maybeReleaseReceiveCredit()
               if (backpressureEnabled && !terminationReceived) {
                 if (perStreamAutoReadEnabled) {
                   // Dedicated channels retain the original additive-credit protocol; their
@@ -542,6 +603,7 @@ class StreamingShuffleClientHandler(
             // ownership allowed a relaxed writer to discard its endpoint while the task-visible
             // terminal was still in this callback.
             terminationReceived = true
+            maybeReleaseReceiveCredit()
             pendingTerminationAcks += controlMessage.shuffleWriterId
           case _ =>
             throw new IllegalArgumentException(
@@ -710,4 +772,10 @@ class StreamingShuffleClientHandler(
       hasClosedEndpoint(ex)
     }
   }
+}
+
+private[streaming] object StreamingShuffleClientHandler {
+  // Negative values opt a route into bounded credit mode. Int.MinValue is reserved for discovery
+  // without opening a data window; it cannot collide with a valid positive Int-sized byte grant.
+  val ZERO_WINDOW_CREDIT: Int = Int.MinValue
 }

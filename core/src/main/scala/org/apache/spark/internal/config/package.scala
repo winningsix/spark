@@ -1990,9 +1990,10 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY =
     ConfigBuilder("spark.shuffle.streaming.readerTotalQueueMaxMemory")
       .doc("Maximum aggregate bytes of streaming shuffle data retained by all prepared reader " +
-        "queues in one executor. Once this shared budget is exhausted, individual queues spill " +
-        "new data to executor-local disk even if their per-queue limit has not been reached. " +
-        "This prevents many prepared inboxes from multiplying the per-reader memory limit.")
+        "queues in one executor. The same bound limits aggregate prepared-route receive windows: " +
+        "all routes remain discoverable, but routes without executor budget advertise a zero-byte " +
+        "window until capacity is released. The queue reservation remains a final safety net for " +
+        "oversized frames. This prevents prepared inboxes from multiplying the per-reader limit.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

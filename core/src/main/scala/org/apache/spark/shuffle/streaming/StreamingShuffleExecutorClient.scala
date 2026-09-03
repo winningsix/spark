@@ -466,6 +466,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     discardPendingCumulativeCredit(installed.registration.handler)
     installed.registration.handler.clearMultiplexedCreditSender()
     installed.registration.handler.clearMultiplexedTerminationAckSender()
+    installed.registration.handler.closeReceiveCreditLease()
     installed.routeRegistrations.remove(installed.registration)
     if (installed.routeRegistrations.isEmpty) {
       registrations.remove(installed.route, installed.routeRegistrations)
@@ -797,6 +798,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         discardPendingCumulativeCredit(handler)
         handler.clearMultiplexedCreditSender()
         handler.clearMultiplexedTerminationAckSender()
+        handler.closeReceiveCreditLease()
         routeRegistrations.remove(registration)
         if (!registration.laneShared) registration.client.close()
       }
@@ -816,6 +818,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
           discardPendingCumulativeCredit(registration.handler)
           registration.handler.clearMultiplexedCreditSender()
           registration.handler.clearMultiplexedTerminationAckSender()
+          registration.handler.closeReceiveCreditLease()
         }
         entry.getValue.asScala.filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
         entry.getValue.clear()

@@ -226,6 +226,32 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("zero-window discovery registers a bounded route without admitting data") {
+    withSpark(new SparkContext("local", "zero-window-route", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 0,
+        numReaders = 1,
+        context = context,
+        errorNotifier = new ErrorNotifier())
+      val client = mock[TransportClient]
+      try {
+        handler.handleMessage(client, new CreditControlMessage(
+          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
+        handler.isCreditControlled(0, client) shouldBe true
+        handler.availableDataCredit(0, client) shouldBe 0L
+        handler.hasDataCredit(0, client, 128L) shouldBe false
+
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -64))
+        handler.availableDataCredit(0, client) shouldBe 64L
+        handler.hasDataCredit(0, client, 128L) shouldBe true
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   // Builds a single-partition writer against a freshly registered shuffle. The caller must run
   // this inside a withSpark block and must eventually call context.markTaskCompleted(None) to
   // tear down the Netty server the writer starts in its constructor.
