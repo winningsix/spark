@@ -85,7 +85,8 @@ private[streaming] object StreamingShuffleReceiveService {
  * and becomes data-active only when capacity is available. Deferred grants are work-conserving so
  * a large request at the head cannot strand capacity usable by a smaller route.
  */
-private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes: Long) {
+private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes: Long)
+  extends Logging {
   require(maxBytes > 0L, "maxBytes must be positive")
 
   private val pending = new TreeMap[Long, LinkedHashSet[StreamingShuffleReceiveCreditLease]]()
@@ -111,6 +112,11 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
           requested, _ => new LinkedHashSet[StreamingShuffleReceiveCreditLease]()).add(lease)
         pendingLeases += 1
         peakPendingLeases = math.max(peakPendingLeases, pendingLeases)
+        if (pendingLeases == 1) {
+          logInfo(
+            s"Executor receive-credit budget saturated: usedBytes=$usedBytes " +
+              s"limitBytes=$maxBytes deferredRequestBytes=$requested")
+        }
       }
     }
     lease

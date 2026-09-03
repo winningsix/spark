@@ -321,9 +321,19 @@ class StreamingShuffleReader[K, C](
     if (inboxStats.spilledBytes > previouslyReported) {
       context.taskMetrics().incDiskBytesSpilled(inboxStats.spilledBytes - previouslyReported)
     }
-    logDebug(
-      log"Streaming reader queue spilled ${MDC(LogKeys.NUM_BYTES, inboxStats.spilledBytes)} " +
-        log"bytes in ${MDC(LogKeys.COUNT, inboxStats.spilledMessages)} messages")
+    if (inboxStats.spilledBytes > 0L) {
+      val (queuePeakBytes, maxMessageBytes) = messageQueue match {
+        case queue: StreamingShuffleMessageQueue =>
+          (queue.peakQueuedMemoryBytesCount, queue.maxDataMessageBytesCount)
+        case _ => (0L, 0L)
+      }
+      logInfo(
+        s"Streaming reader queue spilled ${inboxStats.spilledBytes} bytes in " +
+          s"${inboxStats.spilledMessages} messages: " +
+          s"inbox=${receiveInbox.map(_.id)} expectedWriters=${totalNumShuffleWriters.get()} " +
+          s"queuePeakBytes=$queuePeakBytes queueLimitBytes=$READER_QUEUE_MAX_MEMORY " +
+          s"maxMessageBytes=$maxMessageBytes")
+    }
     Utils.tryLogNonFatalError {
       memoryConsumer.freeMemory(memoryConsumer.getUsed())
     }

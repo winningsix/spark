@@ -142,12 +142,21 @@ private[streaming] final class StreamingShuffleMessageQueue
   private val stateLock = new Object
   private val messageCount = new AtomicInteger(0)
   private val queuedMemoryBytes = new AtomicLong(0L)
+  private val peakQueuedMemoryBytes = new AtomicLong(0L)
+  private val maxDataMessageBytes = new AtomicLong(0L)
   private val spillLock = new Object
   private var spillFile: File = _
   private var spillRaf: RandomAccessFile = _
   private var spillChannel: FileChannel = _
   private val spilledBytes = new AtomicLong(0L)
   private val spilledMessages = new AtomicLong(0L)
+
+  private def updateMaximum(maximum: AtomicLong, candidate: Long): Unit = {
+    var current = maximum.get()
+    while (candidate > current && !maximum.compareAndSet(current, candidate)) {
+      current = maximum.get()
+    }
+  }
 
   private def canSpill: Boolean = maxInMemoryBytes > 0 && spillDirectory.exists(_.isDirectory)
 
@@ -168,6 +177,7 @@ private[streaming] final class StreamingShuffleMessageQueue
         queuedMemoryBytes.addAndGet(-bytes)
         false
       } else {
+        if (reserved) updateMaximum(peakQueuedMemoryBytes, queuedMemoryBytes.get())
         reserved
       }
     }
@@ -219,6 +229,7 @@ private[streaming] final class StreamingShuffleMessageQueue
 
   private def toEntry(message: StreamingShuffleMessage): QueueEntry = message match {
     case data: DataMessage if canSpill && !reserveInMemory(data.dataSize.toLong) =>
+      updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
       val bytes = new Array[Byte](data.dataSize)
       data.data.getBytes(data.data.readerIndex(), bytes)
       val offset = writeFully(bytes)
@@ -238,8 +249,10 @@ private[streaming] final class StreamingShuffleMessageQueue
         data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
       entry
     case data: DataMessage if canSpill =>
+      updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
       new InMemoryEntry(data)
     case data: DataMessage =>
+      updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
       reserveInMemory(data.dataSize.toLong)
       new InMemoryEntry(data)
     case other =>
@@ -422,6 +435,10 @@ private[streaming] final class StreamingShuffleMessageQueue
   private[streaming] def numQueuedBatches: Int = batches.size()
 
   private[streaming] def queuedMemoryBytesCount: Long = queuedMemoryBytes.get()
+
+  private[streaming] def peakQueuedMemoryBytesCount: Long = peakQueuedMemoryBytes.get()
+
+  private[streaming] def maxDataMessageBytesCount: Long = maxDataMessageBytes.get()
 
   private[streaming] def spilledBytesCount: Long = spilledBytes.get()
 
