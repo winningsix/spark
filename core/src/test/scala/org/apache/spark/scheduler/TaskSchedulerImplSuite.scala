@@ -44,7 +44,7 @@ import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
   PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
   StreamingShuffleReceiveInboxId}
 import org.apache.spark.status.api.v1.ThreadStackTrace
-import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
+import org.apache.spark.util.{Clock, LongAccumulator, ManualClock, ThreadUtils}
 
 class FakeSchedulerBackend extends SchedulerBackend {
   def start(): Unit = {}
@@ -2944,10 +2944,13 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     launched.foreach(task => assert(task.cpus === BigDecimal("0.25")))
   }
 
-  test("prepared reader compute attach is capped without reducing inbox preparation") {
+  test("prepared reader compute attach expands after lightweight sampling") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS.key -> "1",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "2",
       config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
     val executorId = "executor0"
     val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
@@ -2991,9 +2994,22 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         "all network inboxes must be prepared even though compute attach is capped")
     }
     prepared.synchronized(prepared.toSeq).foreach(tracker.markInboxDrainReady(executorId, _))
-    assert(taskScheduler.resourceOffers(offer).flatten.size === 1)
+    val initial = taskScheduler.resourceOffers(offer).flatten
+    assert(initial.size === 1)
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
       "the remaining ready inboxes must wait for the running compute attachment")
+
+    val peakMemory = new LongAccumulator()
+    peakMemory.register(sc, Some(InternalAccumulator.PEAK_EXECUTION_MEMORY))
+    peakMemory.add(32L << 20)
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val result = new DirectTaskResult[Int](
+      valueSer.serialize(initial.head.index), Seq(peakMemory), Array.emptyLongArray)
+    taskScheduler.taskSetManagerForAttempt(2, 0).get
+      .handleSuccessfulTask(initial.head.taskId, result)
+
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
+      "a lightweight sampled reader must expand to the executor-wide safety ceiling")
   }
 
   test("prepared receive mode waits only for declared startup shuffle inboxes") {

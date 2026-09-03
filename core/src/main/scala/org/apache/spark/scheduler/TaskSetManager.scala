@@ -164,6 +164,13 @@ private[spark] class TaskSetManager(
     }
   }
 
+  private[scheduler] def preparedReaderCanExpand: Boolean = synchronized {
+    preparedReaderInitialMaxTasksPerExecutor > 0 &&
+      successfulPeakExecutionMemorySamples >= preparedReaderMemorySampleTasks &&
+      maximumSuccessfulPeakExecutionMemory < preparedReaderHeavyTaskPeakMemory &&
+      !observedMemorySpill
+  }
+
   val weight = 1
   val minShare = 0
   var priority = taskSet.priority

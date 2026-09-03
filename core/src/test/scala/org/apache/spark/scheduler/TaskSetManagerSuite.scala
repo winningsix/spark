@@ -1892,18 +1892,22 @@ class TaskSetManagerSuite
     val lightweight = new TaskSetManager(
       sched, FakeTask.createTaskSet(6, stageId = 0, stageAttemptId = 0), MAX_TASK_FAILURES)
     assert(lightweight.preparedReaderMaxTasksPerExecutor === 1)
+    assert(!lightweight.preparedReaderCanExpand)
     completeTasks(lightweight, 32L << 20)
     assert(lightweight.preparedReaderMaxTasksPerExecutor === 0)
+    assert(lightweight.preparedReaderCanExpand)
 
     val heavyweight = new TaskSetManager(
       sched, FakeTask.createTaskSet(6, stageId = 1, stageAttemptId = 0), MAX_TASK_FAILURES)
     completeTasks(heavyweight, 5L << 30)
     assert(heavyweight.preparedReaderMaxTasksPerExecutor === 1)
+    assert(!heavyweight.preparedReaderCanExpand)
 
     val spilling = new TaskSetManager(
       sched, FakeTask.createTaskSet(6, stageId = 2, stageAttemptId = 0), MAX_TASK_FAILURES)
     completeTasks(spilling, 32L << 20, 1L << 20)
     assert(spilling.preparedReaderMaxTasksPerExecutor === 1)
+    assert(!spilling.preparedReaderCanExpand)
   }
 
   test("SPARK-13343 speculative tasks that didn't commit shouldn't be marked as success") {
