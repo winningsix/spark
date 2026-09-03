@@ -154,6 +154,12 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       }
     }
 
+    def rewriteAsRegular(): SparkPlan = {
+      val regularPlan = rewriteExchanges(asPipelined = false)
+      PipelinedShuffleEligibility.disableHiddenShuffles(regularPlan)
+      regularPlan
+    }
+
     // A shuffled hash join drains and retains its build input before touching its streamed input.
     // Prepared receive may admit fewer reduce tasks than the shuffle width to bound those hash
     // maps. Map writers interleave reducer shards, however, so data for the inactive reducers can
@@ -168,7 +174,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
         !PipelinedShuffleEligibility.supportsMemoryRetainingConsumer) {
       logDebug("EnablePipelinedShuffle: plan has a shuffled hash join but the configured " +
         "transport cannot safely admit a memory-retaining consumer; leaving it regular.")
-      return rewriteExchanges(asPipelined = false)
+      return rewriteAsRegular()
     }
 
     if ((sameScopeReuseCountByExchangeKey.nonEmpty && !supportsFanOut) ||
@@ -179,7 +185,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       // rather than WARN, which would fire on every reuse-bearing query and read as a fault.
       logDebug("EnablePipelinedShuffle: plan has a reused shuffle exchange but the configured " +
         "manager lacks fan-out or sequential replay; leaving it regular.")
-      return rewriteExchanges(asPipelined = false)
+      return rewriteAsRegular()
     }
 
     // An operator that would read a shuffle in a way the configured transport cannot serve, or that
@@ -191,7 +197,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       logDebug("EnablePipelinedShuffle: a shuffle is read through an operator the configured " +
         "transport cannot serve (coalesce / cartesian product / a limit operator that builds a " +
         "hidden shuffle); leaving the plan regular.")
-      return rewriteExchanges(asPipelined = false)
+      return rewriteAsRegular()
     }
 
     rewriteExchanges(asPipelined = true)

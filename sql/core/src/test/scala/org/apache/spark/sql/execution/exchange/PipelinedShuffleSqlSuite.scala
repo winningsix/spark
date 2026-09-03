@@ -364,22 +364,30 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
-  test("prepared receive leaves shuffled hash join regular") {
+  test("prepared receive keeps a shuffled hash join and its hidden limit shuffle regular") {
     withDistributedPipelinedSession(adaptive = false) { spark =>
       import spark.implicits._
-      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
-      val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
-      val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
-      val joined = left.join(right, $"leftKey" === $"rightKey")
-      val plan = joined.queryExecution.executedPlan
-      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
-      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+      withTempDir { dir =>
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+        val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
+        val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
+        val joined = left.join(right, $"leftKey" === $"rightKey")
+          .orderBy($"leftKey").limit(3)
+        val plan = joined.queryExecution.executedPlan
+        val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
+        val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
 
-      assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
-      assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
-        s"a memory-retaining shuffled hash join must fall back to BSP; plan:\n$plan")
-      assert(joined.collect().length === 5)
+        assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
+        assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
+          s"a memory-retaining shuffled hash join must fall back to BSP; plan:\n$plan")
+
+        // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden shuffle.
+        // It must inherit the whole-plan BSP fallback instead of producing an illegal mixed job.
+        val output = new java.io.File(dir, "shj-limit-output").getAbsolutePath
+        joined.write.parquet(output)
+        assert(spark.read.parquet(output).count() === 3L)
+      }
     }
   }
 
