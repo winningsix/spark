@@ -2952,6 +2952,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
       config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "2",
       config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
+    val countingBackend = new FakeSchedulerBackend {
+      var reviveCount = 0
+      override def reviveOffers(): Unit = reviveCount += 1
+    }
+    taskScheduler.backend = countingBackend
     val executorId = "executor0"
     val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
     val endpoint = sc.env.rpcEnv.setupEndpoint(
@@ -3005,8 +3010,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     val valueSer = SparkEnv.get.serializer.newInstance()
     val result = new DirectTaskResult[Int](
       valueSer.serialize(initial.head.index), Seq(peakMemory), Array.emptyLongArray)
-    taskScheduler.taskSetManagerForAttempt(2, 0).get
-      .handleSuccessfulTask(initial.head.taskId, result)
+    val manager = taskScheduler.taskSetManagerForAttempt(2, 0).get
+    val reviveCountBeforeCompletion = countingBackend.reviveCount
+    taskScheduler.handleSuccessfulTask(manager, initial.head.taskId, result)
+    assert(countingBackend.reviveCount === reviveCountBeforeCompletion + 1,
+      "completion-based expansion must immediately revive all executor offers")
 
     assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
       "a lightweight sampled reader must expand to the executor-wide safety ceiling")

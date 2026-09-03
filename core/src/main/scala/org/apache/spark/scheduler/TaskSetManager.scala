@@ -145,7 +145,10 @@ private[spark] class TaskSetManager(
   private var successfulPeakExecutionMemorySamples = 0
   private var maximumSuccessfulPeakExecutionMemory = 0L
   private var observedMemorySpill = false
-  private case class RunningReaderMemorySample(peakBytes: Long, stableHeartbeats: Int)
+  private case class RunningReaderMemorySample(
+      peakBytes: Long,
+      stableHeartbeats: Int,
+      activeExecutionMillis: Long)
   private val runningReaderMemorySamples = new HashMap[Long, RunningReaderMemorySample]
   private val preparedReaderInitialMaxTasksPerExecutor =
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR)
@@ -153,10 +156,18 @@ private[spark] class TaskSetManager(
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS)
   private val preparedReaderHeavyTaskPeakMemory =
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY)
+  private val preparedReaderMinActiveExecutionTime =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MIN_ACTIVE_EXECUTION_TIME)
+
+  private def isLightweightRunningReaderSample(sample: RunningReaderMemorySample): Boolean = {
+    (sample.peakBytes > 0L && sample.stableHeartbeats >= 1) ||
+      (sample.peakBytes == 0L &&
+        sample.activeExecutionMillis >= preparedReaderMinActiveExecutionTime)
+  }
 
   private def preparedReaderMemorySampleCount: Int = {
     successfulPeakExecutionMemorySamples +
-      runningReaderMemorySamples.valuesIterator.count(_.stableHeartbeats >= 1)
+      runningReaderMemorySamples.valuesIterator.count(isLightweightRunningReaderSample)
   }
 
   private def maximumPreparedReaderPeakExecutionMemory: Long = {
@@ -191,9 +202,10 @@ private[spark] class TaskSetManager(
    *
    * Blocking shuffle consumers often finish as one wave after every producer terminal arrives,
    * so completion-only sampling cannot lift an initial attach cap in time to help that wave. A
-   * running task becomes a sample only after its peak execution-memory value is unchanged across
-   * two heartbeats. This avoids expanding from the first heartbeat while a hash table is still
-   * growing, while allowing lightweight readers to make the attach window work-conserving.
+   * running memory consumer becomes a sample only after its peak execution-memory value is
+   * unchanged across two heartbeats. A zero-memory task instead needs useful execution time after
+   * subtracting fetch wait and GC. This avoids classifying a reader that is merely parked waiting
+   * for input before its hash table starts growing.
    *
    * @return true when this update changes the stage from capped to expandable.
    */
@@ -206,12 +218,21 @@ private[spark] class TaskSetManager(
     val expandableBefore = preparedReaderCanExpandNow
     var peakOnHeapExecutionMemory = 0L
     var peakOffHeapExecutionMemory = 0L
+    var executorRunTime = 0L
+    var fetchWaitTime = 0L
+    var jvmGCTime = 0L
     updates.foreach { accumulator =>
       accumulator.name match {
         case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
           peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
           peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.EXECUTOR_RUN_TIME) =>
+          executorRunTime = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.shuffleRead.FETCH_WAIT_TIME) =>
+          fetchWaitTime = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.JVM_GC_TIME) =>
+          jvmGCTime = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
             if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
           observedMemorySpill = true
@@ -219,11 +240,14 @@ private[spark] class TaskSetManager(
       }
     }
     val peakExecutionMemory = peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
+    val activeExecutionMillis = math.max(0L, executorRunTime - fetchWaitTime - jvmGCTime)
     val next = runningReaderMemorySamples.get(taskId) match {
       case Some(previous) if previous.peakBytes == peakExecutionMemory =>
         RunningReaderMemorySample(
-          peakExecutionMemory, math.min(Int.MaxValue, previous.stableHeartbeats + 1))
-      case _ => RunningReaderMemorySample(peakExecutionMemory, 0)
+          peakExecutionMemory,
+          math.min(Int.MaxValue, previous.stableHeartbeats + 1),
+          activeExecutionMillis)
+      case _ => RunningReaderMemorySample(peakExecutionMemory, 0, activeExecutionMillis)
     }
     runningReaderMemorySamples.update(taskId, next)
     !expandableBefore && preparedReaderCanExpandNow
