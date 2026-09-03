@@ -552,6 +552,10 @@ class StreamingShuffleWriter[K, V](
       extends OutboundAction
     private val pendingBatch = new mutable.ArrayBuffer[PendingSend]()
     private var pendingBatchBytes = 0
+    // Sequence numbers whose producer envelope has not yet been encoded into a transport body.
+    // Replay-cap enforcement runs once per produced frame, so deriving this state by repeatedly
+    // scanning pendingBatch and every DataAction makes a blocked route quadratic in its backlog.
+    private val livePendingSequences = new mutable.HashSet[Long]()
     // State changes (sequence numbers, replay cursors, and the action queue) stay serialized on
     // this shard monitor, while buffer composition and network submission run on the shared
     // completion executor. The old implementation held this monitor through encodeBatch and
@@ -985,6 +989,7 @@ class StreamingShuffleWriter[K, V](
       errorNotifier.markError(error)
       action match {
         case DataAction(entries) =>
+          synchronized { entries.foreach(entry => livePendingSequences -= entry.sequenceNum) }
           entries.foreach(entry => Option(entry.buf).foreach(_.release()))
           entries.foreach(_.buf = null)
           completePendingEntries(entries)
@@ -1299,6 +1304,7 @@ class StreamingShuffleWriter[K, V](
           entry.releaseInput()
           Option(entry.buf).foreach(_.release())
           entry.buf = null
+          synchronized { livePendingSequences -= entry.sequenceNum }
         }
         case _ =>
       }
@@ -1376,8 +1382,10 @@ class StreamingShuffleWriter[K, V](
       inMemoryReplayBytes += replayEntry.length
 
       if (message.isInstanceOf[DataMessage]) {
-        pendingBatch += PendingSend(
+        val pending = PendingSend(
           sequenceNum, buf, done, releaseInputResources, networkComplete)
+        pendingBatch += pending
+        livePendingSequences += sequenceNum
         pendingBatchBytes += replayEntry.length
         // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate is
         // not itself a memory bound if the queued send still owns an encoded duplicate of the
@@ -1726,6 +1734,7 @@ class StreamingShuffleWriter[K, V](
         val batch = pendingBatch.toSeq
         pendingBatch.clear()
         pendingBatchBytes = 0
+        batch.foreach(entry => livePendingSequences -= entry.sequenceNum)
         (actions, batch)
       }
       queuedActions.foreach { action =>
@@ -1750,6 +1759,7 @@ class StreamingShuffleWriter[K, V](
         releaseReplayEntry(entry)
       }
       replayHistory.clear()
+      livePendingSequences.clear()
       lastEnqueuedByClient.clear()
       replayPendingClients.clear()
       terminalWriteCompletedClients.clear()
@@ -1774,15 +1784,16 @@ class StreamingShuffleWriter[K, V](
       val entries = replayHistory.iterator
       while (inMemoryReplayBytes > REPLAY_MAX_MEMORY_PER_SHARD && entries.hasNext) {
         val entry = entries.next()
-        val queuedForDelivery = entry.isData && (pendingBatch.exists(
-          _.sequenceNum == entry.sequenceNum) || outboundActions.exists {
-          case DataAction(pending) => pending.exists(_.sequenceNum == entry.sequenceNum)
-          case _ => false
-        })
+        val queuedForDelivery = entry.isData && livePendingSequences.contains(entry.sequenceNum)
         // A queued envelope is live transport state, not dormant replay state. Backpressure owns
         // its memory bound; spill only history retained after delivery or while waiting for a
         // reader that has not registered yet.
-        if (entry.buffer != null && !queuedForDelivery) spillReplayEntry(entry)
+        if (queuedForDelivery) {
+          // Data actions preserve sequence order, so the first queued data entry begins the live
+          // suffix. No later entry can be dormant history yet.
+          return
+        }
+        if (entry.buffer != null) spillReplayEntry(entry)
       }
     }
 
@@ -1832,6 +1843,7 @@ class StreamingShuffleWriter[K, V](
         }.flatten
       }
       queued.foreach { pending =>
+        livePendingSequences -= sequenceNum
         Option(pending.buf).foreach(_.release())
         pending.buf = null
         // This frame has not been submitted to Netty. Its replay file is now the sole payload
