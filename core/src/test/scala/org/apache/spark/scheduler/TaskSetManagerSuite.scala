@@ -1910,6 +1910,54 @@ class TaskSetManagerSuite
     assert(!spilling.preparedReaderCanExpand)
   }
 
+  test("prepared reader attach cap expands from stable running heartbeat samples") {
+    val testConf = new SparkConf()
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 2)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY, 4L << 30)
+    sc = new SparkContext("local", "test", testConf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+    val readerTasks = Array.tabulate[Task[_]](4)(index => new FakeTask(0, index))
+    val readerTaskSet = new TaskSet(
+      readerTasks,
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true)
+    val manager = new TaskSetManager(sched, readerTaskSet, MAX_TASK_FAILURES)
+
+    def heartbeat(peakBytes: Long, runTimeMs: Long): Seq[AccumulatorV2[_, _]] = {
+      def metric(name: String, value: Long): LongAccumulator = {
+        val accumulator = new LongAccumulator()
+        accumulator.register(sc, Some(name))
+        accumulator.add(value)
+        accumulator
+      }
+      Seq(
+        metric(InternalAccumulator.PEAK_EXECUTION_MEMORY, peakBytes),
+        metric(InternalAccumulator.EXECUTOR_RUN_TIME, runTimeMs))
+    }
+
+    assert(!manager.updatePreparedReaderRunningMemorySample(
+      11L, heartbeat(32L << 20, 500L)), "launch-race heartbeat must not count")
+    assert(!manager.updatePreparedReaderRunningMemorySample(
+      11L, heartbeat(32L << 20, 2000L)), "first usable heartbeat is not stable yet")
+    assert(!manager.updatePreparedReaderRunningMemorySample(
+      11L, heartbeat(32L << 20, 12000L)), "one stable task is below the sample count")
+    assert(!manager.updatePreparedReaderRunningMemorySample(
+      12L, heartbeat(32L << 20, 3000L)), "second task still needs a stable heartbeat")
+    assert(!manager.updatePreparedReaderRunningMemorySample(
+      12L, heartbeat(64L << 20, 13000L)), "a growing peak resets stability")
+    assert(manager.updatePreparedReaderRunningMemorySample(
+      12L, heartbeat(64L << 20, 23000L)), "two stable running tasks should expand")
+    assert(manager.preparedReaderMaxTasksPerExecutor === 0)
+    assert(manager.preparedReaderCanExpand)
+  }
+
   test("SPARK-13343 speculative tasks that didn't commit shouldn't be marked as success") {
     sc = new SparkContext("local", "test")
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
