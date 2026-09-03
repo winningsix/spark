@@ -33,6 +33,11 @@ import org.apache.spark.sql.internal.SQLConf
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
+  def supportsMemoryRetainingConsumer: Boolean = {
+    val manager = SparkEnv.get.pipelinedShuffleManager
+    manager != null && manager.supportsMemoryRetainingConsumer
+  }
+
   private def enabled(conf: SQLConf, isLocal: Boolean): Boolean = {
     if (!conf.localPipelinedShuffleEnabled) {
       return false

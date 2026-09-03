@@ -322,7 +322,9 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
   }
 
   test("shuffled hash join marks only its build input as startup-critical") {
-    withDistributedPipelinedSession(adaptive = false) { spark =>
+    // The in-process channel admits the whole connected group, so it can safely exercise the
+    // build-before-probe metadata path. Prepared distributed receive is covered separately below.
+    withPipelinedSession { spark =>
       import spark.implicits._
       spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
       // This testing-only config chooses SHJ without adding a SQL hint, matching the production
@@ -359,6 +361,25 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
         "the shuffled hash join build input must resolve to a pipelined shuffle")
 
       assert(executionRDD.collect().length === 5)
+    }
+  }
+
+  test("prepared receive leaves shuffled hash join regular") {
+    withDistributedPipelinedSession(adaptive = false) { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+      val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
+      val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
+      val joined = left.join(right, $"leftKey" === $"rightKey")
+      val plan = joined.queryExecution.executedPlan
+      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
+      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+
+      assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
+      assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
+        s"a memory-retaining shuffled hash join must fall back to BSP; plan:\n$plan")
+      assert(joined.collect().length === 5)
     }
   }
 

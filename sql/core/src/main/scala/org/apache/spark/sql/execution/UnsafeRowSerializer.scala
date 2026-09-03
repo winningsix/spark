@@ -57,6 +57,11 @@ private class UnsafeRowSerializerInstance(
 
   private[this] val byteBufWriteBuffer: Array[Byte] = new Array[Byte](4096)
 
+  override def serializedValueSize(value: Any): Option[Int] = {
+    // The streaming representation is one four-byte length followed by the UnsafeRow bytes.
+    Some(Math.addExact(Integer.BYTES, value.asInstanceOf[UnsafeRow].getSizeInBytes))
+  }
+
   private def byteBufBaseObject(buffer: ByteBuf): Object = {
     if (buffer.hasArray) buffer.array() else null
   }

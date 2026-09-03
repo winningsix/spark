@@ -121,6 +121,28 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("executor raw pool accounts oversized buffers by exact capacity") {
+    val pool = new StreamingShuffleRawBufferPool(bufferSize = 128, maxMemoryBytes = 512)
+    val oversized = pool.tryBorrow(minCapacity = 384)
+    try {
+      assert(oversized != null && oversized.capacity() === 384)
+      assert(pool.stats === (384L, 384L, 512L))
+      assert(pool.tryBorrow(minCapacity = 256) == null,
+        "384 allocated bytes must leave only 128 bytes, not another count-based buffer slot")
+    } finally {
+      pool.recycle(oversized)
+    }
+
+    val afterRelease = pool.tryBorrow(minCapacity = 256)
+    try {
+      assert(afterRelease != null && afterRelease.capacity() === 256)
+      assert(pool.stats === (256L, 384L, 512L))
+    } finally {
+      pool.recycle(afterRelease)
+      pool.close()
+    }
+  }
+
   test("writer does not spill a live transport frame before its reader connects") {
     val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>

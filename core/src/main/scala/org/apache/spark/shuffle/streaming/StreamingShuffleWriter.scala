@@ -440,7 +440,9 @@ class StreamingShuffleWriter[K, V](
 
   /** A buffer with metadata. Not thread safe: only supports single-threaded access. */
   @NotThreadSafe
-  private[streaming] case class TimestampedBuffer(buffer: ByteBuf) {
+  private[streaming] case class TimestampedBuffer(
+      buffer: ByteBuf,
+      reservedBytes: Int = BUFFER_SIZE) {
     val serializationStream: Option[SerializationStream] = byteBufSerializer match {
       case Some(_) => None
       case None => Some(serializerInstance.serializeStream(new ByteBufOutputStream(buffer)))
@@ -1604,6 +1606,7 @@ class StreamingShuffleWriter[K, V](
         flushBatch: Boolean): Unit = synchronized {
       timestampedBuffer.serializationStream.foreach(_.close())
       val rawBuffer = timestampedBuffer.buffer
+      val rawReservationBytes = timestampedBuffer.reservedBytes
       val dataSize = rawBuffer.writerIndex()
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
@@ -1670,7 +1673,7 @@ class StreamingShuffleWriter[K, V](
           if (rawReleased.compareAndSet(false, true)) {
             releaseRawBuffer(rawBuffer)
             if (WRITER_BACKPRESSURE_ENABLED) {
-              allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+              allocatedBufferBytesSemaphore.release(rawReservationBytes)
             }
           }
           ()
@@ -1691,7 +1694,7 @@ class StreamingShuffleWriter[K, V](
         case Some(lease) => () => {
           lease.markNetworkComplete()
           if (WRITER_BACKPRESSURE_ENABLED) {
-            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+            allocatedBufferBytesSemaphore.release(rawReservationBytes)
           }
         }
         case None => () => ()
@@ -2216,15 +2219,19 @@ class StreamingShuffleWriter[K, V](
     schedule()
   }
 
-  private def newBuffer(): TimestampedBuffer = {
-    // Back-pressure is accounted per network buffer (BUFFER_SIZE permits each), not by exact
-    // byte size, so this bounds in-flight memory only on a best-effort basis: a single
-    // serialized row larger than BUFFER_SIZE (rows are not split across buffers, see write())
-    // grows its buffer past BUFFER_SIZE and thus exceeds the tracked budget.
+  private def newBuffer(minCapacity: Int = BUFFER_SIZE): TimestampedBuffer = {
+    val reservationBytes = math.max(BUFFER_SIZE, minCapacity)
+    require(reservationBytes <= MAX_BUFFER_BYTES,
+      s"Serialized shuffle row requires $reservationBytes bytes, exceeding the per-writer " +
+        s"buffer budget of $MAX_BUFFER_BYTES bytes")
+    // Reserve the exact raw capacity before allocating or serializing an oversized UnsafeRow.
+    // This prevents one large value from being counted as only one BUFFER_SIZE permit.
     if (WRITER_BACKPRESSURE_ENABLED) {
-      if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
+      if (!allocatedBufferBytesSemaphore.tryAcquire(
+          reservationBytes, 10, TimeUnit.MICROSECONDS)) {
         shards.foreach(_.send())
-        while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
+        while (!allocatedBufferBytesSemaphore.tryAcquire(
+            reservationBytes, 10, TimeUnit.MILLISECONDS)) {
           // Backpressure must stop the iterator before it produces another frame. Spilling a
           // queued live frame here only frees a permit so computation can continue, turning the
           // local disk into an escape hatch around the configured in-flight bound.
@@ -2232,7 +2239,7 @@ class StreamingShuffleWriter[K, V](
         }
       }
     }
-    var buffer = bufferPool.pollLast()
+    var buffer = if (reservationBytes == BUFFER_SIZE) bufferPool.pollLast() else null
     if (buffer == null && !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0) {
       // A blocking multi-input consumer can leave encoded DataActions queued indefinitely.  The
       // relaxed writer must not wait on the normal semaphore (that closes the cross-input cycle),
@@ -2242,28 +2249,30 @@ class StreamingShuffleWriter[K, V](
       // genuinely in flight, the executor-level transport window remains the finite bound and a
       // new allocation is required for progress.
       shards.iterator.exists(_.spillOnePendingData())
-      buffer = bufferPool.pollLast()
+      if (reservationBytes == BUFFER_SIZE) buffer = bufferPool.pollLast()
     }
     if (buffer == null) {
       sharedExecutorServer match {
         case Some(shared) =>
-          buffer = shared.rawBufferPool.tryBorrow()
+          buffer = shared.rawBufferPool.tryBorrow(reservationBytes)
           while (buffer == null) {
             // A relaxed writer may retire a queued frame to break a multi-input scheduling
             // cycle. A backpressured writer must instead wait before pulling more input.
             if (!WRITER_BACKPRESSURE_ENABLED) {
               shards.iterator.exists(_.spillOnePendingData())
             }
-            buffer = bufferPool.pollLast()
-            if (buffer == null) buffer = shared.rawBufferPool.tryBorrow()
-            if (buffer == null) buffer = shared.rawBufferPool.awaitBorrow(10L)
+            buffer = if (reservationBytes == BUFFER_SIZE) bufferPool.pollLast() else null
+            if (buffer == null) buffer = shared.rawBufferPool.tryBorrow(reservationBytes)
+            if (buffer == null) {
+              buffer = shared.rawBufferPool.awaitBorrow(10L, reservationBytes)
+            }
             if (buffer == null) throwErrorIfExists()
           }
-        case None => buffer = Unpooled.directBuffer(BUFFER_SIZE)
+        case None => buffer = Unpooled.directBuffer(reservationBytes, reservationBytes)
       }
     }
     val allocated = buffer
-    TimestampedBuffer(allocated)
+    TimestampedBuffer(allocated, reservationBytes)
   }
 
   /**
@@ -2298,18 +2307,26 @@ class StreamingShuffleWriter[K, V](
       flushThread.foreach(_.start())
       records.foreach { record =>
         val shard = shards(partitioner.getPartition(record._1))
+        val serializedSize = byteBufSerializer.flatMap(_.serializedValueSize(record._2))
         var timestampedBuffer = if (TIME_BASED_FLUSH_ENABLED) {
           shard.takeBuffer()
         } else {
           singleThreadedBuffers(shard.id)
         }
         if (timestampedBuffer == null) {
-          timestampedBuffer = newBuffer()
+          timestampedBuffer = newBuffer(serializedSize.getOrElse(BUFFER_SIZE))
           if (!TIME_BASED_FLUSH_ENABLED) {
             // Publish immediately to the task-owned array so failure cleanup can release it even
             // if serialization throws before this record finishes.
             singleThreadedBuffers(shard.id) = timestampedBuffer
           }
+        } else if (serializedSize.exists(_ > timestampedBuffer.buffer.writableBytes())) {
+          // Flush the current partial frame before a known-size value would grow it. The new
+          // frame reserves enough writer and executor capacity before serialization begins.
+          if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = null
+          shard.enqueue(timestampedBuffer)
+          timestampedBuffer = newBuffer(serializedSize.get)
+          if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = timestampedBuffer
         }
         val dataStartPos = timestampedBuffer.buffer.writerIndex()
         // TODO we are actually not guaranteeing that a buffer used to send data for a
@@ -2329,10 +2346,11 @@ class StreamingShuffleWriter[K, V](
             partitionSerializationStream.flush()
         }
 
-        // A single row is never split across buffers (see the TODO above), so an oversized row
-        // grows its buffer past BUFFER_SIZE and inflates the tracked memory budget. Warn
-        // (throttled) so operators can raise the block size or writer memory instead of overshoot.
-        // When a row trips both thresholds the more severe memory warning takes precedence.
+        // A single row is never split across buffers (see the TODO above). A serializer with an
+        // exact size hint reserves an oversized buffer before writing; a serializer without one
+        // cannot grow beyond the capacity it acquired. Warn (throttled) so operators can raise
+        // the block size or writer memory. When a row trips both thresholds the more severe
+        // memory warning takes precedence.
         val rowSize = timestampedBuffer.buffer.writerIndex() - dataStartPos
         if (rowSize > MAX_BUFFER_BYTES / 4) {
           hugeRowWarningThrottler(
