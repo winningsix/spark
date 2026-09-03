@@ -276,4 +276,51 @@ class StreamingShuffleReaderSuite
       queue.close()
     }
   }
+
+  test("prepared inbox queues share an executor memory budget") {
+    withTempDir { spillDir =>
+      val budget = new StreamingShuffleReaderMemoryBudget(128L)
+      val first = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(budget))
+      val second = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(budget))
+
+      def dataMessage(fill: Byte): DataMessage = {
+        val bytes = Array.fill[Byte](96)(fill)
+        val buffer = Unpooled.wrappedBuffer(bytes)
+        val message = new DataMessage(0, 0, bytes.length, buffer, 0L)
+        buffer.release()
+        message
+      }
+
+      try {
+        first.put(dataMessage(1))
+        second.put(dataMessage(2))
+
+        first.queuedMemoryBytesCount shouldBe 96L
+        second.queuedMemoryBytesCount shouldBe 0L
+        second.spilledBytesCount shouldBe 96L
+        budget.usedBytesCount shouldBe 96L
+
+        first.take().release()
+        budget.usedBytesCount shouldBe 0L
+
+        second.put(dataMessage(3))
+        second.queuedMemoryBytesCount shouldBe 96L
+        budget.usedBytesCount shouldBe 96L
+      } finally {
+        Seq(first, second).foreach { queue =>
+          val messages = new java.util.ArrayList[StreamingShuffleMessage]()
+          queue.drainTo(messages)
+          messages.forEach(_.release())
+          queue.close()
+        }
+      }
+      budget.usedBytesCount shouldBe 0L
+    }
+  }
+
+  test("prepared route credit is divided across all lifetime writers") {
+    StreamingShuffleReceiveService.routeByteLimit(1024L, 32) shouldBe 32L
+    StreamingShuffleReceiveService.routeByteLimit(1024L, 1900) shouldBe 1L
+    StreamingShuffleReceiveService.routeByteLimit(1024L, 0) shouldBe 1024L
+  }
 }

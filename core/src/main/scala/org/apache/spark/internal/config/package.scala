@@ -1987,6 +1987,20 @@ package object config {
         "spark.shuffle.streaming.readerQueueMaxMemory must be non-negative.")
       .createWithDefault(0L)
 
+  private[spark] val STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.readerTotalQueueMaxMemory")
+      .doc("Maximum aggregate bytes of streaming shuffle data retained by all prepared reader " +
+        "queues in one executor. Once this shared budget is exhausted, individual queues spill " +
+        "new data to executor-local disk even if their per-queue limit has not been reached. " +
+        "This prevents many prepared inboxes from multiplying the per-reader memory limit.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0,
+        "spark.shuffle.streaming.readerTotalQueueMaxMemory must be positive.")
+      .createWithDefaultString("4g")
+
   private[spark] val STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.readyBytes")
       .doc("Optional minimum queued data bytes before an executor-prepared shuffle inbox wakes " +

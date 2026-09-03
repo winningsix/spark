@@ -30,14 +30,13 @@ import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, Streaming
   TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES,
-  STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
   STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
-  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY}
+  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
@@ -68,6 +67,10 @@ private[streaming] case class StreamingShuffleReceiveInboxStats(
 
 private[streaming] object StreamingShuffleReceiveService {
   val ENDPOINT_NAME = "StreamingShuffleReceiveService"
+
+  private[streaming] def routeByteLimit(readerMaxMemory: Long, numWriters: Int): Long = {
+    math.max(readerMaxMemory / math.max(1, numWriters), 1L)
+  }
 }
 
 /**
@@ -82,6 +85,8 @@ private[streaming] class StreamingShuffleReceiveService(
     conf: SparkConf,
     sharedClient: () => Option[StreamingShuffleExecutorClient] = () => None,
     onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
+  private val readerMemoryBudget = new StreamingShuffleReaderMemoryBudget(
+    conf.get(STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY))
   private val inboxes =
     new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
   private case class PreparedInboxKey(
@@ -288,6 +293,8 @@ private[streaming] class StreamingShuffleReceiveService(
 
   private[streaming] def activeInboxCount: Int = inboxes.size()
 
+  private[streaming] def queuedMemoryBytesCount: Long = readerMemoryBudget.usedBytesCount
+
   private def releaseLease(
       inbox: StreamingShuffleReceiveInbox): StreamingShuffleReceiveInboxStats = {
     inboxes.remove(inbox.id, inbox)
@@ -301,7 +308,8 @@ private[streaming] class StreamingShuffleReceiveService(
     if (conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)) {
       new StreamingShuffleMessageQueue(
         conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
-        Some(new File(Utils.getLocalDir(conf))))
+        Some(new File(Utils.getLocalDir(conf))),
+        Some(readerMemoryBudget))
     } else {
       new LinkedBlockingQueue[StreamingShuffleMessage]()
     }
@@ -675,15 +683,11 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     // With no map partitions there can be no data or termination frame to trigger the normal
     // ready path. Discovery itself proves that the inbox can be attached and drained empty.
     if (numWriters == 0) markDrainReady()
-    // Only the configured elastic producer window can publish concurrently for this shuffle.
-    // Size the route window from that frontier instead of every lifetime map task.
-    val liveWriterWindow = conf
-      .get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
-      .map(math.min(numWriters, _))
-      .getOrElse(numWriters)
-    val perWriterByteLimit = math.max(
-      conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY) /
-        math.max(1, liveWriterWindow), 1L)
+    // A route keeps its initial credit until its downstream data is consumed or cancelled. Map
+    // tasks rotate through the producer window, so credit can remain outstanding for every
+    // lifetime writer, not only for the writers that happen to run concurrently.
+    val perWriterByteLimit = StreamingShuffleReceiveService.routeByteLimit(
+      conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY), numWriters)
     val newlyPublished = locations.filter { case (mapId, location) =>
       val duplicate = location.mapIndex >= 0 && mapIndexes.contains(location.mapIndex)
       if (!duplicate && !clientFutures.containsKey(mapId)) {
