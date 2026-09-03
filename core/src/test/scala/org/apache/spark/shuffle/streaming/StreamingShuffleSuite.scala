@@ -42,7 +42,8 @@ import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
-  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
+  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY,
+  STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
@@ -850,6 +851,9 @@ class StreamingShuffleSuite
         // Keep the producer buffer as the network-send owner so this test isolates the writer
         // semaphore backpressure path. Compressed envelopes use replay spill as their bound.
         .set(SHUFFLE_COMPRESS, false)
+        // A one-byte replay cap would expose any attempt to bypass writer backpressure by moving
+        // a live frame to disk while the reader is deliberately not consuming.
+        .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
         .set(STREAMING_SHUFFLE_READER_MAX_MEMORY, 1))) { sc =>
       val g = new ShuffleGroup[Int](sc, 1, 1)
 
@@ -876,6 +880,7 @@ class StreamingShuffleSuite
         writeFinished.isCompleted shouldBe false
         it.isBlocking shouldBe true
       }
+      g.writers(0).context.taskMetrics().diskBytesSpilled shouldBe 0L
 
       // We are allowed to buffer 128KB on the writer including TCP buffers, 32KB in the reader TCP
       // buffer, and one block in the reader queue, for at least 3 messages of 64KB each to be sent.
