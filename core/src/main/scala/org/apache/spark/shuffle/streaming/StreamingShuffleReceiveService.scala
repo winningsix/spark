@@ -457,7 +457,8 @@ private[streaming] class StreamingShuffleReceiveService(
       new StreamingShuffleMessageQueue(
         conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
         Some(new File(Utils.getLocalDir(conf))),
-        Some(readerMemoryBudget))
+        Some(readerMemoryBudget),
+        stageDataBeforeConsumerAttach = true)
     } else {
       new LinkedBlockingQueue[StreamingShuffleMessage]()
     }
@@ -471,7 +472,16 @@ private[streaming] class StreamingShuffleReceiveInbox(
   private val attached = new AtomicBoolean(false)
   @volatile private var preparedSession: StreamingShufflePreparedReceiveSession = _
 
-  def attach(taskAttemptId: Long): Boolean = attached.compareAndSet(false, true)
+  def attach(taskAttemptId: Long): Boolean = {
+    val didAttach = attached.compareAndSet(false, true)
+    if (didAttach) {
+      queue match {
+        case staged: StreamingShuffleMessageQueue => staged.markConsumerAttached()
+        case _ =>
+      }
+    }
+    didAttach
+  }
 
   private[streaming] def isAttached: Boolean = attached.get()
 
@@ -804,7 +814,7 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
 
   private def maybeMarkDrainReady(): Unit = inbox.queue match {
     case queue: StreamingShuffleMessageQueue
-        if drainReadyBytes == 0L || queue.queuedMemoryBytesCount >= drainReadyBytes =>
+        if drainReadyBytes == 0L || queue.receivedDataBytesCount >= drainReadyBytes =>
       markDrainReady()
     case queue if drainReadyBytes == 0L && !queue.isEmpty =>
       markDrainReady()

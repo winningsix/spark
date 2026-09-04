@@ -277,6 +277,55 @@ class StreamingShuffleReaderSuite
     }
   }
 
+  test("unattached prepared inbox stages data and returns producer credit") {
+    withTempDir { spillDir =>
+      val queue = new StreamingShuffleMessageQueue(
+        1024L,
+        Some(spillDir),
+        stageDataBeforeConsumerAttach = true)
+      val payloadReleases = new AtomicInteger(0)
+      val creditReleases = new AtomicInteger(0)
+
+      def dataMessage(fill: Byte): DataMessage = {
+        val bytes = Array.fill[Byte](128)(fill)
+        val buffer = Unpooled.wrappedBuffer(bytes)
+        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+        buffer.release()
+        data.setResourceReleaseCallback(() => payloadReleases.incrementAndGet())
+        data.setReleaseCallback(() => creditReleases.incrementAndGet())
+        data
+      }
+
+      try {
+        queue.put(dataMessage(1))
+        queue.queuedMemoryBytesCount shouldBe 0L
+        queue.receivedDataBytesCount shouldBe 128L
+        queue.spilledBytesCount shouldBe 128L
+        payloadReleases.get() shouldBe 1
+        creditReleases.get() shouldBe 1
+
+        val staged = queue.take()
+        staged.release()
+        creditReleases.get() shouldBe 1
+
+        queue.markConsumerAttached()
+        queue.put(dataMessage(2))
+        queue.queuedMemoryBytesCount shouldBe 128L
+        queue.spilledBytesCount shouldBe 128L
+        payloadReleases.get() shouldBe 1
+        creditReleases.get() shouldBe 1
+        queue.take().release()
+        payloadReleases.get() shouldBe 2
+        creditReleases.get() shouldBe 2
+      } finally {
+        val messages = new java.util.ArrayList[StreamingShuffleMessage]()
+        queue.drainTo(messages)
+        messages.forEach(_.release())
+        queue.close()
+      }
+    }
+  }
+
   test("prepared inbox queues share an executor memory budget") {
     withTempDir { spillDir =>
       val budget = new StreamingShuffleReaderMemoryBudget(128L)
