@@ -109,14 +109,6 @@ private[spark] class StreamingShuffleManager
     preparedReceiveServiceConfigured
   }
 
-  // A memory-retaining reader (for example a shuffled hash join build) may start before every
-  // reduce task can be admitted only when inactive routes have executor-owned inboxes. Those
-  // inboxes durably stage pre-attachment data and return its receive credit, so interleaved map
-  // output for a late reader cannot strand all producer permits behind an inactive task.
-  override def supportsMemoryRetainingConsumer: Boolean = {
-    preparedReceiveServiceConfigured
-  }
-
   override def supportsSequentialReplay: Boolean = true
 
   override def supportsFanOut: Boolean = true
