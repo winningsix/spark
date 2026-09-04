@@ -67,6 +67,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     conf.get(STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
   private val expandedMaxTotalReaderTasksPerExecutor =
     conf.get(STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
+  private val maxRetainedReaderExecutionMemory =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY)
   require(
     expandedMaxTotalReaderTasksPerExecutor == 0 ||
       (maxTotalReaderTasksPerExecutor > 0 &&
@@ -245,9 +247,31 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       } else {
         0
       }
+      val withinRetainedMemoryBudget = if (maxRetainedReaderExecutionMemory > 0L) {
+        val runningRetainedBytes = activeTaskSets.iterator
+          .filter(manager => !manager.isZombie && manager.taskSet.isPipelinedShuffleReader)
+          .foldLeft(0L) { (total, manager) =>
+            val perTaskBytes = manager.preparedReaderEstimatedPeakExecutionMemory
+              .getOrElse(maxRetainedReaderExecutionMemory)
+            val runningTasks = manager.runningTasksOnExecutor(executorId).toLong
+            val stageBytes = if (runningTasks > 0L &&
+                perTaskBytes > Long.MaxValue / runningTasks) {
+              Long.MaxValue
+            } else {
+              perTaskBytes * runningTasks
+            }
+            if (Long.MaxValue - total < stageBytes) Long.MaxValue else total + stageBytes
+          }
+        val candidateBytes = taskSet.preparedReaderEstimatedPeakExecutionMemory
+          .getOrElse(maxRetainedReaderExecutionMemory)
+        runningRetainedBytes <= maxRetainedReaderExecutionMemory - candidateBytes
+      } else {
+        true
+      }
       belowStageCap && !upstreamReaderAttachmentReserved(
         executorId, upstreamReaderProducers) &&
-        (effectiveTotalReaderCap <= 0 || totalReaders < effectiveTotalReaderCap)
+        (effectiveTotalReaderCap <= 0 || totalReaders < effectiveTotalReaderCap) &&
+        withinRetainedMemoryBudget
     }
   }
 
