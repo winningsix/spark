@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.{AbstractQueue, ArrayList, Collection, Iterator => JIterator}
 import java.util.concurrent.{BlockingQueue, LinkedBlockingQueue, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import io.netty.buffer.Unpooled
 
@@ -68,7 +68,8 @@ private[streaming] final class StreamingShuffleReaderMemoryBudget(val maxBytes: 
 private[streaming] final class StreamingShuffleMessageQueue
     (maxInMemoryBytes: Long = 0L,
      spillDirectory: Option[File] = None,
-     sharedMemoryBudget: Option[StreamingShuffleReaderMemoryBudget] = None)
+     sharedMemoryBudget: Option[StreamingShuffleReaderMemoryBudget] = None,
+     stageDataBeforeConsumerAttach: Boolean = false)
     extends AbstractQueue[StreamingShuffleMessage] with BlockingQueue[StreamingShuffleMessage] {
 
   require(maxInMemoryBytes >= 0, "maxInMemoryBytes must be non-negative")
@@ -150,6 +151,7 @@ private[streaming] final class StreamingShuffleMessageQueue
   private var spillChannel: FileChannel = _
   private val spilledBytes = new AtomicLong(0L)
   private val spilledMessages = new AtomicLong(0L)
+  private val consumerAttached = new AtomicBoolean(false)
 
   private def updateMaximum(maximum: AtomicLong, candidate: Long): Unit = {
     var current = maximum.get()
@@ -227,27 +229,43 @@ private[streaming] final class StreamingShuffleMessageQueue
     }
   }
 
+  private def spillData(data: DataMessage, releaseCreditNow: Boolean): QueueEntry = {
+    updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
+    val bytes = new Array[Byte](data.dataSize)
+    data.data.getBytes(data.data.readerIndex(), bytes)
+    val offset = writeFully(bytes)
+    // Payload ownership can end as soon as its durable copy exists. For an unattached prepared
+    // inbox, return receive credit at that same durability boundary: no compute task exists that
+    // could consume the entry, and retaining one window per inactive route eventually strands
+    // every executor credit lease. Once the task attaches, keep the normal consume-time credit
+    // lifecycle so a slow live reader still backpressures its producers.
+    var consumerReleaseCallback = data.takeReleaseCallback()
+    try {
+      data.releaseOwnedResources()
+      if (releaseCreditNow && consumerReleaseCallback != null) {
+        val callback = consumerReleaseCallback
+        consumerReleaseCallback = null
+        callback.run()
+      }
+    } catch {
+      case t: Throwable =>
+        if (consumerReleaseCallback != null) consumerReleaseCallback.run()
+        throw t
+    }
+    new SpilledDataEntry(
+      data.shuffleId, data.shuffleWriterId, data.shuffleReaderId, data.dataSize,
+      data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
+  }
+
   private def toEntry(message: StreamingShuffleMessage): QueueEntry = message match {
+    case data: DataMessage
+        if canSpill && stageDataBeforeConsumerAttach && !consumerAttached.get() =>
+      spillData(data, releaseCreditNow = true)
     case data: DataMessage if canSpill && !reserveInMemory(data.dataSize.toLong) =>
-      updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
-      val bytes = new Array[Byte](data.dataSize)
-      data.data.getBytes(data.data.readerIndex(), bytes)
-      val offset = writeFully(bytes)
       // Free the copied payload now, but keep receive credit outstanding until the downstream
       // task consumes or cancels this entry. Returning credit at spill time turns a bounded inbox
       // into an unbounded disk sink because its producer immediately refills every spilled frame.
-      val consumerReleaseCallback = data.takeReleaseCallback()
-      try {
-        data.releaseOwnedResources()
-      } catch {
-        case t: Throwable =>
-          if (consumerReleaseCallback != null) consumerReleaseCallback.run()
-          throw t
-      }
-      val entry = new SpilledDataEntry(
-        data.shuffleId, data.shuffleWriterId, data.shuffleReaderId, data.dataSize,
-        data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
-      entry
+      spillData(data, releaseCreditNow = false)
     case data: DataMessage if canSpill =>
       updateMaximum(maxDataMessageBytes, data.dataSize.toLong)
       new InMemoryEntry(data)
@@ -436,6 +454,12 @@ private[streaming] final class StreamingShuffleMessageQueue
 
   private[streaming] def queuedMemoryBytesCount: Long = queuedMemoryBytes.get()
 
+  // Before a prepared reader attaches, every received data byte is either still resident or has
+  // been durably staged. This monotonic value lets the scheduler launch a ready reader even when
+  // its initial data was intentionally staged rather than counted as queue memory.
+  private[streaming] def receivedDataBytesCount: Long =
+    queuedMemoryBytes.get() + spilledBytes.get()
+
   private[streaming] def peakQueuedMemoryBytesCount: Long = peakQueuedMemoryBytes.get()
 
   private[streaming] def maxDataMessageBytesCount: Long = maxDataMessageBytes.get()
@@ -443,6 +467,8 @@ private[streaming] final class StreamingShuffleMessageQueue
   private[streaming] def spilledBytesCount: Long = spilledBytes.get()
 
   private[streaming] def spilledMessagesCount: Long = spilledMessages.get()
+
+  private[streaming] def markConsumerAttached(): Unit = consumerAttached.set(true)
 
   private[streaming] def close(): Unit = spillLock.synchronized {
     if (spillChannel != null) {
