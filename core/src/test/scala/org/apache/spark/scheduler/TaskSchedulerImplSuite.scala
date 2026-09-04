@@ -3155,6 +3155,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
       config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "4",
       config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY.key -> "64m")
+    val countingBackend = new FakeSchedulerBackend {
+      var reviveCount = 0
+      override def reviveOffers(): Unit = reviveCount += 1
+    }
+    taskScheduler.backend = countingBackend
     val taskSet = new TaskSet(
       Array.tabulate[Task[_]](4)(i => new FakeTask(4, i)),
       stageId = 4,
@@ -3180,12 +3185,76 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     val result = new DirectTaskResult[Int](
       valueSer.serialize(initial.head.index), Seq(peakMemory), Array.emptyLongArray)
     val manager = taskScheduler.taskSetManagerForAttempt(4, 0).get
+    val reviveCountBeforeCompletion = countingBackend.reviveCount
     taskScheduler.handleSuccessfulTask(manager, initial.head.taskId, result)
+    assert(countingBackend.reviveCount === reviveCountBeforeCompletion + 1,
+      "a larger heavy-task byte-budget cap must immediately revive idle executor offers")
 
     assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
       "a sampled heavy stage must use its 64 MiB byte budget, not the initial total count cap")
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
       "the sampled byte cap must prevent a third retained relation on the executor")
+  }
+
+  test("completed heavy-task samples revive offers when the byte-budget cap increases") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "false",
+      config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS.key -> "1",
+      config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY.key -> "4g",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "4",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY.key -> "24g")
+    val countingBackend = new FakeSchedulerBackend {
+      var reviveCount = 0
+      override def reviveOffers(): Unit = reviveCount += 1
+    }
+    taskScheduler.backend = countingBackend
+    val taskSet = new TaskSet(
+      Array.tabulate[Task[_]](4)(i => new FakeTask(5, i)),
+      stageId = 5,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      pipelinedReaderMemoryMayGrow = false,
+      retainsExecutionMemory = true,
+      retainedMemoryBuildCount = 1)
+    taskScheduler.submitTasks(taskSet)
+    val offer = IndexedSeq(WorkerOffer("executor0", "host0", 7))
+
+    val initial = taskScheduler.resourceOffers(offer).flatten
+    assert(initial.size === 1)
+    val manager = taskScheduler.taskSetManagerForAttempt(5, 0).get
+    val livePeak = new LongAccumulator()
+    livePeak.register(sc, Some(InternalAccumulator.PEAK_EXECUTION_MEMORY))
+    livePeak.add(12L << 30)
+    val completedBuilds = new LongAccumulator()
+    completedBuilds.register(sc, Some(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED))
+    completedBuilds.add(1L)
+    val liveUpdates = Seq(livePeak, completedBuilds)
+    assert(!manager.updatePreparedReaderRunningMemorySample(initial.head.taskId, liveUpdates))
+    assert(manager.updatePreparedReaderRunningMemorySample(initial.head.taskId, liveUpdates))
+    assert(manager.preparedReaderEstimatedPeakExecutionMemory.contains(12L << 30))
+    assert(manager.preparedReaderMaxTasksPerExecutor === 2)
+    assert(!manager.preparedReaderCanExpand)
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 1)
+
+    val finalPeak = new LongAccumulator()
+    finalPeak.register(sc, Some(InternalAccumulator.PEAK_EXECUTION_MEMORY))
+    finalPeak.add(8L << 30)
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val result = new DirectTaskResult[Int](
+      valueSer.serialize(initial.head.index), Seq(finalPeak), Array.emptyLongArray)
+    val reviveCountBeforeCompletion = countingBackend.reviveCount
+    taskScheduler.handleSuccessfulTask(manager, initial.head.taskId, result)
+
+    assert(manager.preparedReaderEstimatedPeakExecutionMemory.contains(8L << 30))
+    assert(manager.preparedReaderMaxTasksPerExecutor === 3)
+    assert(!manager.preparedReaderCanExpand)
+    assert(countingBackend.reviveCount === reviveCountBeforeCompletion + 1,
+      "a heavy-task byte cap increase from two to three must revive idle offers")
   }
 
   test("nested shuffled-hash readers stage only genuinely late unattached partitions") {
