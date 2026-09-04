@@ -243,8 +243,10 @@ class StreamingShuffleManagerSuite
           requiresWholeGroup
         SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
           receiveServiceEnabled
-        SparkEnv.get.pipelinedShuffleManager.supportsMemoryRetainingConsumer shouldBe
-          receiveServiceEnabled
+        // Prepared receive can stage inactive partitions, but doing so merely moves the whole
+        // memory-retaining boundary to disk. It must not advertise the no-spill contract needed
+        // to pipeline a shuffled hash join with only a subset of reducers attached.
+        SparkEnv.get.pipelinedShuffleManager.supportsMemoryRetainingConsumer shouldBe false
         SparkEnv.get.pipelinedShuffleManager.supportsFanOut shouldBe true
       }
     }
