@@ -243,6 +243,8 @@ class StreamingShuffleManagerSuite
           requiresWholeGroup
         SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
           receiveServiceEnabled
+        SparkEnv.get.pipelinedShuffleManager.supportsMemoryRetainingConsumer shouldBe
+          receiveServiceEnabled
         SparkEnv.get.pipelinedShuffleManager.supportsFanOut shouldBe true
       }
     }
