@@ -405,7 +405,7 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
     }
   }
 
-  test("prepared receive keeps a shuffled hash join and its hidden limit shuffle regular") {
+  test("prepared receive pipelines a shuffled hash join and its hidden limit shuffle") {
     withDistributedPipelinedSession(adaptive = false) { spark =>
       import spark.implicits._
       withTempDir { dir =>
@@ -420,11 +420,13 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
         val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
 
         assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
-        assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
-          s"a memory-retaining shuffled hash join must fall back to BSP; plan:\n$plan")
+        assert(exchanges.size >= 2 && exchanges.forall(_.pipelined),
+          s"prepared late-reader staging must safely pipeline shuffled hash join inputs; " +
+            s"plan:\n$plan")
 
         // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden shuffle.
-        // It must inherit the whole-plan BSP fallback instead of producing an illegal mixed job.
+        // Prepared receive must serve that late-created boundary as well as the visible join
+        // inputs; completing the write verifies the full distributed producer/consumer chain.
         val output = new java.io.File(dir, "shj-limit-output").getAbsolutePath
         joined.write.parquet(output)
         assert(spark.read.parquet(output).count() === 3L)
