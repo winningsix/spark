@@ -964,7 +964,7 @@ case class AdaptiveSparkPlanExec(
     // leaf still wraps its pre-codegen instance. Re-run the full-plan transport rule after those
     // final copies so reuse is rewired to one producer before DAGScheduler sees the RDD graph.
     val optimizedRootPlan = if (conf.pipelinedShuffleFullPlanAQEEnabled) {
-      AQEEnablePipelinedShuffle().apply(postProcessedRootPlan)
+      AQEEnablePipelinedShuffle.apply(postProcessedRootPlan)
     } else {
       postProcessedRootPlan
     }

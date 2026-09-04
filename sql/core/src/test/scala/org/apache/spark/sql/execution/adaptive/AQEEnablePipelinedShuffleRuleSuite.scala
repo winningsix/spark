@@ -121,7 +121,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       val join = SortMergeJoinExec(
         left.output, right.output, Inner, None, leftExchange, rightExchange)
 
-      val rewritten = AQEEnablePipelinedShuffle().apply(join)
+      val rewritten = AQEEnablePipelinedShuffle.apply(join)
       assert(rewritten.isInstanceOf[SortMergeJoinExec])
       assert(exchangesWithPipelined(rewritten) === Seq(true, true))
     }
@@ -139,7 +139,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       val reusedBroadcast = ReusedExchangeExec(broadcast.output, broadcast)
       val plan = UnionExec(Seq(shuffle, reusedBroadcast))
 
-      val rewritten = AQEEnablePipelinedShuffle().apply(plan)
+      val rewritten = AQEEnablePipelinedShuffle.apply(plan)
       assert(exchangesWithPipelined(rewritten) === Seq(true))
       assert(rewritten.collect { case _: ReusedExchangeExec => true }.size === 1)
     }
@@ -155,7 +155,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       val reused = ReusedExchangeExec(shuffle.output, shuffle)
       val plan = UnionExec(Seq(shuffle, reused))
 
-      val rewritten = AQEEnablePipelinedShuffle().apply(plan).asInstanceOf[UnionExec]
+      val rewritten = AQEEnablePipelinedShuffle.apply(plan).asInstanceOf[UnionExec]
       val rewrittenShuffle = rewritten.children.head.asInstanceOf[ShuffleExchangeExec]
       val rewrittenReuse = rewritten.children(1).asInstanceOf[ReusedExchangeExec]
       assert(rewrittenShuffle.pipelined)
@@ -189,7 +189,7 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
         val exchange = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
         val limit = TakeOrderedAndProjectExec(1, Nil, exchange.output, exchange)
 
-        val rewritten = AQEEnablePipelinedShuffle().apply(limit)
+        val rewritten = AQEEnablePipelinedShuffle.apply(limit)
         assert(rewritten.isInstanceOf[TakeOrderedAndProjectExec])
         assert(exchangesWithPipelined(rewritten) === Seq(true))
       }
