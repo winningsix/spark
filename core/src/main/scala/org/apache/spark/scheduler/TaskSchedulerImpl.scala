@@ -1107,9 +1107,15 @@ private[spark] class TaskSchedulerImpl(
       taskSetManager: TaskSetManager,
       tid: Long,
       taskResult: DirectTaskResult[_]): Unit = synchronized {
-    val expandableBefore = taskSetManager.preparedReaderCanExpand
+    val readerCapBefore = taskSetManager.preparedReaderMaxTasksPerExecutor
     taskSetManager.handleSuccessfulTask(tid, taskResult)
-    if (!expandableBefore && taskSetManager.preparedReaderCanExpand) {
+    val readerCapAfter = taskSetManager.preparedReaderMaxTasksPerExecutor
+    // A completed retained-memory task can replace a conservative live heartbeat estimate with
+    // its final peak.  Heavy SHJ stages never satisfy preparedReaderCanExpand, but their sampled
+    // byte-budget cap can still increase (for example, from two to three tasks per executor).
+    // Revive all outstanding offers whenever completion relaxes that cap so idle executor slots
+    // do not remain stranded until another task happens to finish.
+    if (readerCapBefore > 0 && (readerCapAfter == 0 || readerCapAfter > readerCapBefore)) {
       backend.reviveOffers()
     }
   }
