@@ -63,7 +63,7 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
       val rtmPlan = withSQLConf(
           SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "true",
           SQLConf.PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED.key -> "true") {
-        AQEEnablePipelinedShuffle().apply(bspPlan)
+        AQEEnablePipelinedShuffle.apply(bspPlan)
       }
       val directShuffles = rtmPlan.collectWithSubqueries {
         case exchange: ShuffleExchangeExec => exchange
