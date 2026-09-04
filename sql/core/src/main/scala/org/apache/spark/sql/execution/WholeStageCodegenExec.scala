@@ -800,9 +800,16 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
         }
       }
     }
-    val retainedMemoryBuildCount = child.collect {
-      case _: ShuffledHashJoinExec => true
-    }.size
+    // Count only builds emitted by this codegen stage. TreeNode.collect descends through an
+    // InputAdapter into a nested WholeStageCodegenExec, whose output RDD carries its own count;
+    // counting that subtree here as well makes DAGScheduler wait for duplicate build fences.
+    def retainedMemoryBuildsInThisStage(plan: SparkPlan): Int = plan match {
+      case _: InputAdapter => 0
+      case _: ShuffledHashJoinExec =>
+        1 + plan.children.map(retainedMemoryBuildsInThisStage).sum
+      case _ => plan.children.map(retainedMemoryBuildsInThisStage).sum
+    }
+    val retainedMemoryBuildCount = retainedMemoryBuildsInThisStage(child)
     val pipelinedMemoryMayGrow = child.exists {
       // ShuffledHashJoin has an explicit build-complete heartbeat fence. Operators in this
       // category do not, so their memory remains unsafe to sample until task completion.

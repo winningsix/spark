@@ -240,11 +240,14 @@ private[spark] class TaskSetManager(
       return false
     }
     val capBefore = preparedReaderMaxTasksPerExecutor
+    var reportedPeakExecutionMemory = 0L
     var peakOnHeapExecutionMemory = 0L
     var peakOffHeapExecutionMemory = 0L
     var retainedMemoryBuildsCompleted = 0L
     updates.foreach { accumulator =>
       accumulator.name match {
+        case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
+          reportedPeakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
           peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
@@ -264,7 +267,17 @@ private[spark] class TaskSetManager(
       runningReaderMemorySamples.remove(taskId)
       return false
     }
-    val peakExecutionMemory = peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
+    // Retained operators such as ShuffledHashJoin explicitly add their relation sizes to the
+    // legacy peak metric once each build is complete. Those allocations are not necessarily
+    // visible through TaskMemoryManager's on/off-heap counters. Use the larger observation,
+    // rather than adding them, because both metrics may describe the same allocation.
+    val taskMemoryManagerPeak = if (
+        Long.MaxValue - peakOnHeapExecutionMemory < peakOffHeapExecutionMemory) {
+      Long.MaxValue
+    } else {
+      peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
+    }
+    val peakExecutionMemory = math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
     val next = runningReaderMemorySamples.get(taskId) match {
       case Some(previous) if previous.peakBytes == peakExecutionMemory =>
         RunningReaderMemorySample(
