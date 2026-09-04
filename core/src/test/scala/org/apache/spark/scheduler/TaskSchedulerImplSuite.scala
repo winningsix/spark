@@ -3151,8 +3151,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
       config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS.key -> "1",
       config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY.key -> "16m",
-      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "4",
-      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "8",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "4",
       config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY.key -> "64m")
     val taskSet = new TaskSet(
       Array.tabulate[Task[_]](4)(i => new FakeTask(4, i)),
@@ -3182,7 +3182,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     taskScheduler.handleSuccessfulTask(manager, initial.head.taskId, result)
 
     assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
-      "the regular stage cap must derive from the sampled 32 MiB task and 64 MiB budget")
+      "a sampled heavy stage must use its 64 MiB byte budget, not the initial total count cap")
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
       "the sampled byte cap must prevent a third retained relation on the executor")
   }
