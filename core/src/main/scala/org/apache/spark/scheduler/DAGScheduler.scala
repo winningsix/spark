@@ -1469,6 +1469,11 @@ private[spark] class DAGScheduler(
     !traverseParentRDDsWithinStage(rdd, current => !current.pipelinedMemoryMayGrow)
   }
 
+  /** Whether this stage contains a build-before-probe consumer such as ShuffledHashJoin. */
+  private def retainsExecutionMemoryUntilTaskCompletion(rdd: RDD[_]): Boolean = {
+    !traverseParentRDDsWithinStage(rdd, current => current.pipelinedStartupInputs.isEmpty)
+  }
+
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
   private def eagerlyComputePartitionsForRddAndAncestors(rdd: RDD[_]): Unit = {
     val startTime = System.nanoTime
@@ -3180,7 +3185,9 @@ private[spark] class DAGScheduler(
       } else {
         Set.empty[Int]
       }
-      val readerMemoryMayGrow = pipelinedReaderShuffleIds.nonEmpty &&
+      val retainsExecutionMemory = retainsExecutionMemoryUntilTaskCompletion(stage.rdd)
+      val readerMemoryMayGrow =
+        (pipelinedReaderShuffleIds.nonEmpty || retainsExecutionMemory) &&
         pipelinedReaderMemoryMayGrow(stage.rdd)
       val isPipelinedShuffleProducer = isPipelinedProducer(stage)
       taskScheduler.submitTasks(new TaskSet(
@@ -3190,7 +3197,8 @@ private[spark] class DAGScheduler(
         pipelinedReaderShuffleIds = pipelinedReaderShuffleIds,
         pipelinedReaderStartupShuffleIds = pipelinedReaderStartupShuffleIds,
         isPipelinedShuffleProducer = isPipelinedShuffleProducer,
-        pipelinedReaderMemoryMayGrow = readerMemoryMayGrow))
+        pipelinedReaderMemoryMayGrow = readerMemoryMayGrow,
+        retainsExecutionMemory = retainsExecutionMemory))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run

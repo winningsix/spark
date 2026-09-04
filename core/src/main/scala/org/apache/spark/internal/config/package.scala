@@ -2059,9 +2059,10 @@ package object config {
 
   private[spark] val STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.initialMaxTasksPerExecutor")
-      .doc("Initial per-executor compute attach cap for a streaming-shuffle reader. After enough " +
-        "stable lightweight samples the cap is lifted; stages with high peak execution " +
-        "memory or spill retain it. A value of zero disables sampled attach admission.")
+      .doc("Initial per-executor compute attach cap for a streaming-shuffle reader or a " +
+        "memory-retaining consumer behind a regular-shuffle fallback. After enough stable " +
+        "lightweight samples the cap is lifted; stages with high peak execution memory or spill " +
+        "retain it. A value of zero disables sampled attach admission.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
@@ -2096,10 +2097,11 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.maxRetainedExecutionMemoryPerExecutor")
       .doc("Executor-wide budget for execution memory retained by attached streaming-shuffle " +
-        "readers. After a stage has enough completed task samples, its per-executor attach cap " +
-        "is derived from the largest observed task peak and this budget. The scheduler also " +
-        "accounts running readers from every active stage against the same budget. An unsampled " +
-        "reader conservatively reserves the full budget. Zero disables byte-based admission.")
+        "readers and regular-shuffle memory-retaining consumers. After a stage has enough " +
+        "completed task samples, its per-executor attach cap is derived from the largest observed " +
+        "task peak and this budget. The scheduler accounts all such active stages against the same " +
+        "budget. An unsampled consumer conservatively reserves the full budget. Zero disables " +
+        "byte-based admission.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

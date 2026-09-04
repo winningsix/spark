@@ -53,7 +53,11 @@ private[spark] class TaskSet(
     val pipelinedReaderStartupShuffleIds: Set[Int] = Set.empty,
     // True when an operator in this reader stage can keep growing execution memory as streamed
     // input arrives. Its early heartbeat samples cannot safely lift reader admission limits.
-    val pipelinedReaderMemoryMayGrow: Boolean = false) {
+    val pipelinedReaderMemoryMayGrow: Boolean = false,
+    // True when tasks in this stage retain substantial execution memory until task completion.
+    // This is independent of shuffle transport: a shuffled hash join needs the same sampled,
+    // executor-wide admission after its inputs fall back to regular materialized exchanges.
+    val retainsExecutionMemory: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

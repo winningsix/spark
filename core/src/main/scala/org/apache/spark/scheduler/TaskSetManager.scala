@@ -224,7 +224,8 @@ private[spark] class TaskSetManager(
   private[scheduler] def updatePreparedReaderRunningMemorySample(
       taskId: Long,
       updates: Seq[AccumulatorV2[_, _]]): Boolean = synchronized {
-    if (!taskSet.isPipelinedShuffleReader || taskSet.pipelinedReaderMemoryMayGrow ||
+    if ((!taskSet.isPipelinedShuffleReader && !taskSet.retainsExecutionMemory) ||
+        taskSet.pipelinedReaderMemoryMayGrow ||
         preparedReaderInitialMaxTasksPerExecutor <= 0) {
       return false
     }
