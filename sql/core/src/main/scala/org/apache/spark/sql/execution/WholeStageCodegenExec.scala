@@ -800,7 +800,9 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
         }
       }
     }
-    outputRDD.setPipelinedStartupInputs(pipelinedStartupRDDs)
+    outputRDD
+      .setPipelinedStartupInputs(pipelinedStartupRDDs)
+      .setPipelinedMemoryMayGrow(child.exists(_.isInstanceOf[BlockingOperatorWithCodegen]))
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {

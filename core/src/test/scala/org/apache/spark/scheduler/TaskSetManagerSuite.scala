@@ -1910,7 +1910,7 @@ class TaskSetManagerSuite
     assert(!spilling.preparedReaderCanExpand)
   }
 
-  test("prepared reader attach cap expands from stable running heartbeat samples") {
+  test("prepared reader cap uses running samples only when memory cannot grow with input") {
     val testConf = new SparkConf()
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 2)
@@ -1952,6 +1952,29 @@ class TaskSetManagerSuite
       12L, heartbeat(64L << 20)), "two stable running tasks should expand")
     assert(manager.preparedReaderMaxTasksPerExecutor === 0)
     assert(manager.preparedReaderCanExpand)
+
+    val growingReaderTaskSet = new TaskSet(
+      Array.tabulate[Task[_]](4)(index => new FakeTask(1, index)),
+      stageId = 1,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderMemoryMayGrow = true)
+    val growingManager = new TaskSetManager(sched, growingReaderTaskSet, MAX_TASK_FAILURES)
+
+    Seq(21L, 22L).foreach { taskId =>
+      assert(!growingManager.updatePreparedReaderRunningMemorySample(
+        taskId, heartbeat(32L << 20)))
+      assert(!growingManager.updatePreparedReaderRunningMemorySample(
+        taskId, heartbeat(32L << 20)))
+    }
+    assert(growingManager.preparedReaderMaxTasksPerExecutor === 1)
+    assert(!growingManager.preparedReaderCanExpand,
+      "an external sort's early stable peak must not release every reader")
   }
 
   test("prepared reader does not classify running zero-memory tasks as lightweight") {

@@ -157,12 +157,25 @@ abstract class RDD[T: ClassTag](
   // task serialization; the field is transient so it never changes executor-side RDD behavior.
   @transient private var _pipelinedStartupInputs: Seq[RDD[_]] = Seq.empty
 
+  // Driver-only marker for a pipelined consumer whose execution memory may grow for as long as
+  // input keeps arriving (for example an external sort or hash aggregate). A temporarily stable
+  // heartbeat is not evidence that such a task is lightweight; DAGScheduler carries this marker
+  // to TaskSet so reader admission waits for completed memory samples instead.
+  @transient private var _pipelinedMemoryMayGrow = false
+
   private[spark] def setPipelinedStartupInputs(inputs: Seq[RDD[_]]): this.type = {
     _pipelinedStartupInputs = inputs
     this
   }
 
   private[spark] def pipelinedStartupInputs: Seq[RDD[_]] = _pipelinedStartupInputs
+
+  private[spark] def setPipelinedMemoryMayGrow(value: Boolean = true): this.type = {
+    _pipelinedMemoryMayGrow = value
+    this
+  }
+
+  private[spark] def pipelinedMemoryMayGrow: Boolean = _pipelinedMemoryMayGrow
 
   /** Assign a name to this RDD */
   def setName(_name: String): this.type = {

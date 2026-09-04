@@ -313,6 +313,19 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       assert(exchanges.length >= 2 && exchanges.forall(_.pipelined),
         s"both join inputs should be pipelined; plan:\n${joined.queryExecution.executedPlan}")
 
+      val pending = mutable.ArrayDeque[RDD[_]](joined.queryExecution.toRdd)
+      val visited = mutable.HashSet.empty[Int]
+      var markedMemoryGrowing = false
+      while (pending.nonEmpty && !markedMemoryGrowing) {
+        val current = pending.removeHead()
+        if (visited.add(current.id)) {
+          markedMemoryGrowing = current.pipelinedMemoryMayGrow
+          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
+        }
+      }
+      assert(markedMemoryGrowing,
+        "sort-merge join stages must require completed memory samples before reader expansion")
+
       // Ground truth: an equi-join on k over the two relations.
       val l = (0L until 200L).map(i => (i % 10, i))
       val r = (0L until 120L).map(i => (i % 6, i))

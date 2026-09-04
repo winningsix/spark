@@ -122,7 +122,7 @@ case class SortExec(
       SortExec.recordSortMetrics(sorter, metrics, spillSizeBefore, sortTime, peakMemory, spillSize)
 
       sortedIterator
-    }
+    }.setPipelinedMemoryMayGrow()
   }
 
   override def usedInputs: AttributeSet = AttributeSet(Seq.empty)
