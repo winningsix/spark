@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.metric
 
 import java.io.File
 
+import scala.collection.mutable.ArrayBuffer
 import scala.reflect.{classTag, ClassTag}
 import scala.util.Random
 
@@ -26,6 +27,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
 
 import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Final, Partial}
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
@@ -490,6 +492,38 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
               "records read" -> 10L)))),
             enableWholeStage
           )
+      }
+    }
+  }
+
+  test("ShuffledHashJoin reports retained hash relation as peak execution memory") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "40",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "2",
+      SQLConf.PREFER_SORTMERGEJOIN.key -> "false") {
+      val resultTaskPeaks = ArrayBuffer.empty[Long]
+      val listener = new SparkListener {
+        override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = {
+          if (taskEnd.taskType == "ResultTask") {
+            resultTaskPeaks.synchronized {
+              resultTaskPeaks += taskEnd.taskMetrics.peakExecutionMemory
+            }
+          }
+        }
+      }
+      spark.sparkContext.addSparkListener(listener)
+      try {
+        val build = Seq((1, "1"), (2, "2")).toDF("key", "value")
+        val streamed = (1 to 10).map(i => (i, i.toString)).toDF("key", "value")
+        val joined = streamed.join(build.hint("shuffle_hash"), "key")
+        assert(joined.queryExecution.executedPlan.collect {
+          case join: ShuffledHashJoinExec => join
+        }.nonEmpty)
+
+        joined.collect()
+        spark.sparkContext.listenerBus.waitUntilEmpty()
+        assert(resultTaskPeaks.synchronized(resultTaskPeaks.exists(_ > 0L)))
+      } finally {
+        spark.sparkContext.removeSparkListener(listener)
       }
     }
   }

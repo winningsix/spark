@@ -116,6 +116,12 @@ case class ShuffledHashJoinExec private (
       ignoresDuplicatedKey = ignoreDuplicatedKey)
     buildTime += NANOSECONDS.toMillis(System.nanoTime() - start)
     buildDataSize += relation.estimatedSize
+    // HashedRelation owns execution memory until the task completes. Report its retained size so
+    // task admission and the UI do not treat a memory-retaining shuffled hash join as memory-free.
+    // This also matches the accounting performed for BroadcastHashJoinExec's per-task read-only
+    // relation. Multiple hash relations in the same task are additive because they coexist until
+    // the task-completion listeners close them.
+    context.taskMetrics().incPeakExecutionMemory(relation.estimatedSize)
     // This relation is usually used until the end of task.
     context.addTaskCompletionListener[Unit](_ => relation.close())
     relation
