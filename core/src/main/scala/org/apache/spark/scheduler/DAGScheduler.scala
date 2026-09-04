@@ -1157,9 +1157,8 @@ private[spark] class DAGScheduler(
    *    materialize the prefix stages, and the final job runs the pipelined tail.
    *
    * An UNMATERIALIZED regular boundary in a pipelined job is rejected by transports that require
-   * whole-group admission: its stage would have to run while gang-admitted producers already hold
-   * slots (blocked on transport backpressure waiting for consumers), and admission does not
-   * account for the prefix's slots -- the prefix could be starved and deadlock the group.
+   * whole-group admission. A prepared-receive transport may materialize a regular frontier first,
+   * then start the pipelined suffix; this is used by asymmetric shuffled hash join execution.
    * A pipelined shuffle BELOW a regular boundary is supported only when the manager owns prepared
    * executor inboxes and declares that capability; otherwise it would run outside the regime the
    * group machinery covers.
@@ -1507,6 +1506,16 @@ private[spark] class DAGScheduler(
   /** Whether this stage contains a build-before-probe consumer such as ShuffledHashJoin. */
   private def retainsExecutionMemoryUntilTaskCompletion(rdd: RDD[_]): Boolean = {
     !traverseParentRDDsWithinStage(rdd, current => current.pipelinedStartupInputs.isEmpty)
+  }
+
+  /** Number of build-before-probe memory fences expected from each task in this stage. */
+  private def retainedMemoryBuildCount(rdd: RDD[_]): Int = {
+    var count = 0
+    traverseParentRDDsWithinStage(rdd, { current =>
+      count += current.retainedMemoryBuildCount
+      true
+    })
+    count
   }
 
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
@@ -2432,7 +2441,14 @@ private[spark] class DAGScheduler(
       SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
     val supportedPipelinedBelowRegular = supportsUnmaterializedRegularBoundary &&
       shape.hasPipelinedBelowRegular && !shape.hasPipelined
-    if (shape.isUnsupportedMix && !supportedPipelinedBelowRegular) {
+    // Prepared receive can also materialize a regular frontier before starting the pipelined
+    // suffix. This is the asymmetric SHJ shape: regular build-side shuffles and a pipelined
+    // streamed side, with no pipelined dependency hidden below a regular boundary.
+    val supportedUnmaterializedRegularFrontier = supportsUnmaterializedRegularBoundary &&
+      shape.hasPipelined && shape.hasUnmaterializedRegularBoundary &&
+      !shape.hasPipelinedBelowRegular
+    if (shape.isUnsupportedMix && !supportedPipelinedBelowRegular &&
+        !supportedUnmaterializedRegularFrontier) {
       logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
         log"a regular shuffle is only supported when every regular shuffle is a materialized " +
         log"prefix below the pipelined shuffles")
@@ -2655,7 +2671,19 @@ private[spark] class DAGScheduler(
             // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
             submitWaitingPipelinedChildStages(stage)
           } else {
-            for (parent <- missing) {
+            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
+            // In a prepared-receive mixed stage, materialize every regular frontier before any
+            // pipelined parent starts. Otherwise a probe producer can occupy transport/CPU while
+            // the SHJ reader is still waiting for its durable build input. Completion of the
+            // regular parent resubmits this waiting stage, at which point the pipelined group is
+            // started normally.
+            val parentsToSubmit = if (pipelinedMissing.nonEmpty && regularMissing.nonEmpty &&
+                SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary) {
+              regularMissing
+            } else {
+              missing
+            }
+            for (parent <- parentsToSubmit) {
               submitStage(parent)
             }
 
@@ -2678,7 +2706,6 @@ private[spark] class DAGScheduler(
             // stages (from getMissingParentStages), so classify them by their shuffle dependency
             // type -- no extra graph walk. For a job with no pipelined dependency, pipelinedMissing
             // is empty and this stage simply parks in waitingStages, exactly as before.
-            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
             // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
             // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
             // has its own regular missing parent); running this stage against a not-yet-running
@@ -3248,6 +3275,7 @@ private[spark] class DAGScheduler(
         Set.empty[Int]
       }
       val retainsExecutionMemory = retainsExecutionMemoryUntilTaskCompletion(stage.rdd)
+      val retainedBuildCount = retainedMemoryBuildCount(stage.rdd)
       val readerMemoryMayGrow =
         (pipelinedReaderShuffleIds.nonEmpty || retainsExecutionMemory) &&
         pipelinedReaderMemoryMayGrow(stage.rdd)
@@ -3260,7 +3288,8 @@ private[spark] class DAGScheduler(
         pipelinedReaderStartupShuffleIds = pipelinedReaderStartupShuffleIds,
         isPipelinedShuffleProducer = isPipelinedShuffleProducer,
         pipelinedReaderMemoryMayGrow = readerMemoryMayGrow,
-        retainsExecutionMemory = retainsExecutionMemory))
+        retainsExecutionMemory = retainsExecutionMemory,
+        retainedMemoryBuildCount = retainedBuildCount))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run

@@ -51,7 +51,11 @@ private[spark] case class StreamingShuffleReceiveInboxId(
     stageAttemptNumber: Int,
     partitionId: Int,
     taskAttemptId: Long,
-    readerOrdinal: Int = 0)
+    readerOrdinal: Int = 0,
+    // True only when producer progress fundamentally requires durable late-reader staging.
+    // Asymmetric SHJ readers build from a regular input, so their unattached probe routes must
+    // retain credit and backpressure the producer instead.
+    stageDataBeforeConsumerAttach: Boolean = true)
 
 private[spark] case class PrepareStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
@@ -319,7 +323,7 @@ private[streaming] class StreamingShuffleReceiveService(
     // prepared receive mode takes the strict branch above and therefore always attaches the
     // scheduler-owned inbox that was routed before task launch.
     val id = preparedId.copy(taskAttemptId = context.taskAttemptId())
-    val inbox = new StreamingShuffleReceiveInbox(id, createQueue())
+    val inbox = new StreamingShuffleReceiveInbox(id, createQueue(id))
     require(inbox.attach(context.taskAttemptId()), s"Could not attach receive inbox $id")
     val existing = inboxes.putIfAbsent(id, inbox)
     require(existing == null, s"Streaming shuffle receive inbox $id is already active")
@@ -333,7 +337,7 @@ private[streaming] class StreamingShuffleReceiveService(
     if (logicalExisting != null) {
       return logicalExisting.id == id && logicalExisting.session.isDefined
     }
-    val inbox = new StreamingShuffleReceiveInbox(id, createQueue())
+    val inbox = new StreamingShuffleReceiveInbox(id, createQueue(id))
     val existing = inboxes.putIfAbsent(id, inbox)
     if (existing != null) {
       inbox.close()
@@ -452,13 +456,14 @@ private[streaming] class StreamingShuffleReceiveService(
     inbox.close()
   }
 
-  private def createQueue(): BlockingQueue[StreamingShuffleMessage] = {
+  private def createQueue(
+      id: StreamingShuffleReceiveInboxId): BlockingQueue[StreamingShuffleMessage] = {
     if (conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)) {
       new StreamingShuffleMessageQueue(
         conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
         Some(new File(Utils.getLocalDir(conf))),
         Some(readerMemoryBudget),
-        stageDataBeforeConsumerAttach = true)
+        stageDataBeforeConsumerAttach = id.stageDataBeforeConsumerAttach)
     } else {
       new LinkedBlockingQueue[StreamingShuffleMessage]()
     }

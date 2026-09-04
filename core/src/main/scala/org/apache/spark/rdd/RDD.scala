@@ -163,6 +163,11 @@ abstract class RDD[T: ClassTag](
   // to TaskSet so reader admission waits for completed memory samples instead.
   @transient private var _pipelinedMemoryMayGrow = false
 
+  // Number of build-before-probe operators in this RDD wrapper. Executors report the matching
+  // completed count after each retained build finishes, allowing admission to use a live memory
+  // sample without waiting for the whole probe task to complete.
+  @transient private var _retainedMemoryBuildCount = 0
+
   private[spark] def setPipelinedStartupInputs(inputs: Seq[RDD[_]]): this.type = {
     _pipelinedStartupInputs = inputs
     this
@@ -176,6 +181,13 @@ abstract class RDD[T: ClassTag](
   }
 
   private[spark] def pipelinedMemoryMayGrow: Boolean = _pipelinedMemoryMayGrow
+
+  private[spark] def setRetainedMemoryBuildCount(value: Int): this.type = {
+    _retainedMemoryBuildCount = value
+    this
+  }
+
+  private[spark] def retainedMemoryBuildCount: Int = _retainedMemoryBuildCount
 
   /** Assign a name to this RDD */
   def setName(_name: String): this.type = {

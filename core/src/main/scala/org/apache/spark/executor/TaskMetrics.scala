@@ -58,6 +58,7 @@ class TaskMetrics private[spark] () extends Serializable {
   private val _peakExecutionMemory = new LongAccumulator
   private val _peakOnHeapExecutionMemory = new LongAccumulator
   private val _peakOffHeapExecutionMemory = new LongAccumulator
+  private val _retainedMemoryBuildsCompleted = new LongAccumulator
   private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)]
 
   /**
@@ -127,6 +128,10 @@ class TaskMetrics private[spark] () extends Serializable {
    */
   def peakOffHeapExecutionMemory: Long = _peakOffHeapExecutionMemory.sum
 
+  /** Number of memory-retaining build operators whose state is fully constructed. */
+  private[spark] def retainedMemoryBuildsCompleted: Long =
+    _retainedMemoryBuildsCompleted.sum
+
   /**
    * Storage statuses of any blocks that have been updated as a result of this task.
    *
@@ -161,6 +166,8 @@ class TaskMetrics private[spark] () extends Serializable {
   private[spark] def incMemoryBytesSpilled(v: Long): Unit = _memoryBytesSpilled.add(v)
   private[spark] def incDiskBytesSpilled(v: Long): Unit = _diskBytesSpilled.add(v)
   private[spark] def incPeakExecutionMemory(v: Long): Unit = _peakExecutionMemory.add(v)
+  private[spark] def incRetainedMemoryBuildsCompleted(v: Long = 1L): Unit =
+    _retainedMemoryBuildsCompleted.add(v)
   private[spark] def incUpdatedBlockStatuses(v: (BlockId, BlockStatus)): Unit =
     _updatedBlockStatuses.add(v)
   private[spark] def setUpdatedBlockStatuses(v: java.util.List[(BlockId, BlockStatus)]): Unit =
@@ -246,6 +253,7 @@ class TaskMetrics private[spark] () extends Serializable {
     PEAK_EXECUTION_MEMORY -> _peakExecutionMemory,
     PEAK_ON_HEAP_EXECUTION_MEMORY -> _peakOnHeapExecutionMemory,
     PEAK_OFF_HEAP_EXECUTION_MEMORY -> _peakOffHeapExecutionMemory,
+    RETAINED_MEMORY_BUILDS_COMPLETED -> _retainedMemoryBuildsCompleted,
     UPDATED_BLOCK_STATUSES -> _updatedBlockStatuses,
     shuffleRead.REMOTE_BLOCKS_FETCHED -> shuffleReadMetrics._remoteBlocksFetched,
     shuffleRead.LOCAL_BLOCKS_FETCHED -> shuffleReadMetrics._localBlocksFetched,

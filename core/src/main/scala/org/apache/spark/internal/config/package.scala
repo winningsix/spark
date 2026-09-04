@@ -2061,8 +2061,9 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.preparedReader.initialMaxTasksPerExecutor")
       .doc("Initial per-executor compute attach cap for a streaming-shuffle reader or a " +
         "memory-retaining consumer behind a regular-shuffle fallback. After enough stable " +
-        "lightweight samples the cap is lifted; stages with high peak execution memory or spill " +
-        "retain it. A value of zero disables sampled attach admission.")
+        "lightweight samples the cap is lifted; an explicitly completed retained build may " +
+        "instead derive a larger byte-budgeted cap. Stages with spill retain the initial cap. " +
+        "A value of zero disables sampled attach admission.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
@@ -2074,7 +2075,9 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.preparedReader.memorySampleTasks")
       .doc("Number of stable streaming-reader task samples required before lifting the initial " +
         "per-executor attach cap for a lightweight stage. Operators whose execution memory may " +
-        "grow with streamed input use completed tasks rather than running heartbeat samples.")
+        "grow with streamed input use completed tasks rather than running heartbeat samples. A " +
+        "build-before-probe operator may use running samples only after every retained build in " +
+        "that task has reported completion.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
@@ -2098,10 +2101,11 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.preparedReader.maxRetainedExecutionMemoryPerExecutor")
       .doc("Executor-wide budget for execution memory retained by attached streaming-shuffle " +
         "readers and regular-shuffle memory-retaining consumers. After a stage has enough " +
-        "completed task samples, its per-executor attach cap is derived from the largest observed " +
-        "task peak and this budget. The scheduler accounts all such active stages against the same " +
-        "budget. An unsampled consumer conservatively reserves the full budget. Zero disables " +
-        "byte-based admission.")
+        "completed task samples, or running samples fenced by explicit retained-build completion, " +
+        "its per-executor attach cap is derived from the largest observed task peak and this " +
+        "budget. The scheduler accounts all such active stages against the same budget. An " +
+        "unsampled consumer conservatively reserves the full budget. Zero disables byte-based " +
+        "admission.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

@@ -136,6 +136,12 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
               if (!assignments.contains(key) && candidates.nonEmpty) {
                 val executorId = candidates(taskIndex % candidates.size)
                 val partitionId = taskSet.tasks(taskIndex).partitionId
+                // With a regular SHJ build input, reader memory can stabilize independently of
+                // probe completion. Keep credit outstanding on unattached probe routes so the
+                // producer stops instead of converting the receive service into a disk sink.
+                val stageBeforeConsumerAttach =
+                  !taskSet.taskSet.retainsExecutionMemory ||
+                    taskSet.taskSet.pipelinedReaderStartupShuffleIds.nonEmpty
                 val nextOrdinalByShuffle = new HashMap[Int, Int]
                 val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
                   val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
@@ -146,7 +152,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
                     taskSet.taskSet.stageAttemptId,
                     partitionId,
                     nextPreparedInboxGeneration.getAndDecrement(),
-                    readerOrdinal)
+                    readerOrdinal,
+                    stageBeforeConsumerAttach)
                 }
                 pending += key -> ReaderAssignment(executorId, inboxes)
               }
