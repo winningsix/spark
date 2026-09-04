@@ -27,12 +27,13 @@ import org.apache.spark.internal.config._
 import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
 
 /**
- * Driver-side admission and placement state for executor-owned pipelined-shuffle inboxes.
+ * Driver-side admission and placement state for executor-owned pipelined-shuffle inboxes and
+ * memory-retaining consumers.
  *
  * The ordinary scheduler remains responsible for locality, resource profiles, exclusions, and
- * task serialization. This coordinator contributes only the transport-specific decisions:
- * prepare an inbox before assigning its task, prioritize an inbox that has begun draining, and
- * bound pure producers until their direct reader frontier is routable or has started.
+ * task serialization. This coordinator prepares and prioritizes transport inboxes, bounds pure
+ * producers until their direct reader frontier can make progress, and enforces the same sampled
+ * execution-memory admission for memory-retaining consumers after a regular-shuffle fallback.
  */
 private[scheduler] final class PipelinedShuffleTaskCoordinator(
     conf: SparkConf,
@@ -228,7 +229,11 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       executorId: String,
       activeTaskSets: Iterable[TaskSetManager],
       upstreamReaderProducers: Seq[TaskSetManager]): Boolean = {
-    if (!enabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+    def admissionParticipant(manager: TaskSetManager): Boolean = {
+      manager.taskSet.isPipelinedShuffleReader || manager.taskSet.retainsExecutionMemory
+    }
+
+    if (!admissionParticipant(taskSet)) {
       true
     } else {
       val stageCap = taskSet.preparedReaderMaxTasksPerExecutor
@@ -241,7 +246,7 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
         }
       val totalReaders = if (effectiveTotalReaderCap > 0) {
         activeTaskSets.iterator
-          .filter(manager => !manager.isZombie && manager.taskSet.isPipelinedShuffleReader)
+          .filter(manager => !manager.isZombie && admissionParticipant(manager))
           .map(_.runningTasksOnExecutor(executorId))
           .sum
       } else {
@@ -249,7 +254,7 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       }
       val withinRetainedMemoryBudget = if (maxRetainedReaderExecutionMemory > 0L) {
         val runningRetainedBytes = activeTaskSets.iterator
-          .filter(manager => !manager.isZombie && manager.taskSet.isPipelinedShuffleReader)
+          .filter(manager => !manager.isZombie && admissionParticipant(manager))
           .foldLeft(0L) { (total, manager) =>
             val perTaskBytes = manager.preparedReaderEstimatedPeakExecutionMemory
               .getOrElse(maxRetainedReaderExecutionMemory)
@@ -268,8 +273,9 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
       } else {
         true
       }
-      belowStageCap && !upstreamReaderAttachmentReserved(
-        executorId, upstreamReaderProducers) &&
+      val upstreamAttachmentAvailable = !taskSet.taskSet.isPipelinedShuffleReader ||
+        !upstreamReaderAttachmentReserved(executorId, upstreamReaderProducers)
+      belowStageCap && upstreamAttachmentAvailable &&
         (effectiveTotalReaderCap <= 0 || totalReaders < effectiveTotalReaderCap) &&
         withinRetainedMemoryBudget
     }

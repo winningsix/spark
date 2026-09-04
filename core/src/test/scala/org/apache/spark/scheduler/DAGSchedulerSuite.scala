@@ -8325,6 +8325,29 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("regular TaskSet preserves memory-retaining consumer admission metadata") {
+    val input = new MyRDD(sc, 2, Nil)
+    val resultRdd = new MyRDD(
+      sc,
+      2,
+      List(new OneToOneDependency(input)),
+      tracker = mapOutputTracker)
+      .setPipelinedStartupInputs(Seq(input))
+      .setPipelinedMemoryMayGrow()
+
+    submit(resultRdd, Array(0, 1))
+    assert(taskSets.size === 1)
+    assert(!taskSets.head.isPipelinedShuffleReader)
+    assert(taskSets.head.retainsExecutionMemory,
+      "regular shuffle fallback must not bypass retained-memory admission")
+    assert(taskSets.head.pipelinedReaderMemoryMayGrow,
+      "a hash build must use completed rather than early heartbeat memory samples")
+
+    complete(taskSets.head, Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
+    assertDataStructuresEmpty()
+  }
+
   // Resource-profile rejection. The gang slot check measures capacity against the DEFAULT
   // resource profile, so the whole group must run on the default profile; any member with an
   // explicit non-default profile is rejected. The three shapes below must all be rejected; the

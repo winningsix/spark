@@ -399,6 +399,19 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
         assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
           s"a memory-retaining shuffled hash join must fall back to regular shuffle; plan:\n$plan")
 
+        val executionRDDs = mutable.ArrayDeque[RDD[_]](joined.queryExecution.toRdd)
+        val visitedRDDs = mutable.HashSet.empty[Int]
+        var retainedBuildMarker = false
+        while (executionRDDs.nonEmpty && !retainedBuildMarker) {
+          val current = executionRDDs.removeHead()
+          if (visitedRDDs.add(current.id)) {
+            retainedBuildMarker = current.pipelinedStartupInputs.nonEmpty
+            current.dependencies.foreach(dependency => executionRDDs.append(dependency.rdd))
+          }
+        }
+        assert(retainedBuildMarker,
+          "regular shuffled-hash execution must preserve its retained-memory admission marker")
+
         // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden shuffle.
         // It must inherit the whole-plan regular fallback instead of producing an illegal mixed
         // job whose inactive SHJ partitions can only make progress by staging the full input.

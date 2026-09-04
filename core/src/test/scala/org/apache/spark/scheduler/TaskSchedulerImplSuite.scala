@@ -3141,6 +3141,48 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "sampled readers must expand only while their retained-memory estimates fit the budget")
   }
 
+  test("regular memory-retaining stages use sampled per-executor byte admission") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "false",
+      config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS.key -> "1",
+      config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY.key -> "16m",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "4",
+      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "8",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY.key -> "64m")
+    val taskSet = new TaskSet(
+      Array.tabulate[Task[_]](4)(i => new FakeTask(4, i)),
+      stageId = 4,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      pipelinedReaderMemoryMayGrow = true,
+      retainsExecutionMemory = true)
+    taskScheduler.submitTasks(taskSet)
+    val offer = IndexedSeq(WorkerOffer("executor0", "host0", 7))
+
+    val initial = taskScheduler.resourceOffers(offer).flatten
+    assert(initial.size === 1)
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
+      "a regular shuffled-hash reader must retain the conservative initial cap")
+
+    val peakMemory = new LongAccumulator()
+    peakMemory.register(sc, Some(InternalAccumulator.PEAK_EXECUTION_MEMORY))
+    peakMemory.add(32L << 20)
+    val valueSer = SparkEnv.get.serializer.newInstance()
+    val result = new DirectTaskResult[Int](
+      valueSer.serialize(initial.head.index), Seq(peakMemory), Array.emptyLongArray)
+    val manager = taskScheduler.taskSetManagerForAttempt(4, 0).get
+    taskScheduler.handleSuccessfulTask(manager, initial.head.taskId, result)
+
+    assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
+      "the regular stage cap must derive from the sampled 32 MiB task and 64 MiB budget")
+    assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
+      "the sampled byte cap must prevent a third retained relation on the executor")
+  }
+
   test("prepared receive mode waits only for declared startup shuffle inboxes") {
     val taskScheduler = setupScheduler()
     val inboxes = Seq(
