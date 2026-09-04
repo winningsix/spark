@@ -2046,10 +2046,11 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.expandedMaxTotalTasksPerExecutor")
       .doc("Executor-wide streaming-reader compute attach cap after the candidate stage has " +
-        "reported enough stable lightweight execution-memory samples. Unsampled, memory-heavy, or " +
-        "memory-spilling stages retain maxTotalTasksPerExecutor. Zero disables expansion. This " +
-        "is a safety ceiling; prepared inbox readiness and the executor byte budgets remain the " +
-        "primary work-conserving flow-control signals.")
+        "reported enough stable lightweight execution-memory samples or a stable retained-memory " +
+        "estimate that can be enforced by the executor byte budget. Unsampled or memory-spilling " +
+        "stages retain maxTotalTasksPerExecutor. Zero disables expansion. This is a safety " +
+        "ceiling; prepared inbox readiness and the executor byte budgets remain the primary " +
+        "work-conserving flow-control signals.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

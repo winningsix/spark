@@ -245,8 +245,16 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     } else {
       val stageCap = taskSet.preparedReaderMaxTasksPerExecutor
       val belowStageCap = stageCap <= 0 || taskSet.runningTasksOnExecutor(executorId) < stageCap
+      // Once retained execution memory has a stable byte estimate, the executor-wide byte budget
+      // is the primary admission limit even when the task is intentionally classified as heavy.
+      // Keeping the initial task-count cap in that state double-limits safe SHJ readers (for
+      // example, four 2 GiB builds behind a 24 GiB budget) and strands CPU. The expanded count is
+      // still a safety ceiling; unsampled or spilling stages remain at the initial cap.
+      val hasStableRetainedMemoryEstimate =
+        taskSet.preparedReaderEstimatedPeakExecutionMemory.isDefined
       val effectiveTotalReaderCap =
-        if (expandedMaxTotalReaderTasksPerExecutor > 0 && taskSet.preparedReaderCanExpand) {
+        if (expandedMaxTotalReaderTasksPerExecutor > 0 &&
+            (taskSet.preparedReaderCanExpand || hasStableRetainedMemoryEstimate)) {
           expandedMaxTotalReaderTasksPerExecutor
         } else {
           maxTotalReaderTasksPerExecutor
