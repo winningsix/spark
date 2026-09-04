@@ -2062,8 +2062,9 @@ class TaskSetManagerSuite
     val reportedRetainedBuildManager =
       new TaskSetManager(sched, retainedBuildTaskSet, MAX_TASK_FAILURES)
     Seq(41L, 42L).zipWithIndex.foreach { case (taskId, index) =>
-      val update = reportedHeartbeat(5L << 30) :+
-        metric(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED, 2L)
+      val update = reportedHeartbeat(5L << 30) ++ heartbeat(6L << 30) ++ Seq(
+        metric(InternalAccumulator.RETAINED_MEMORY_BYTES, 5L << 30),
+        metric(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED, 2L))
       assert(!reportedRetainedBuildManager.updatePreparedReaderRunningMemorySample(taskId, update))
       val changed = reportedRetainedBuildManager.updatePreparedReaderRunningMemorySample(
         taskId, update)
@@ -2071,7 +2072,7 @@ class TaskSetManagerSuite
     }
     assert(reportedRetainedBuildManager.preparedReaderEstimatedPeakExecutionMemory
       .contains(5L << 30),
-      "an SHJ-reported retained peak must support live byte-budget admission")
+      "explicit retained bytes must exclude transient TaskMemoryManager execution memory")
   }
 
   test("prepared reader does not classify running zero-memory tasks as lightweight") {
