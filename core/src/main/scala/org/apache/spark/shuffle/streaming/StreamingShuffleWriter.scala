@@ -21,8 +21,8 @@ import java.io.{File, RandomAccessFile}
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.{CancellationException, CompletableFuture, CountDownLatch,
-  Executor, ForkJoinPool, LinkedBlockingDeque, ScheduledThreadPoolExecutor, Semaphore,
-  ThreadFactory, TimeUnit}
+  CompletionException, Executor, ForkJoinPool, LinkedBlockingDeque, ScheduledThreadPoolExecutor,
+  Semaphore, ThreadFactory, TimeUnit, TimeoutException}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 import javax.annotation.concurrent.NotThreadSafe
 
@@ -51,13 +51,15 @@ import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_WRITER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER,
   STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_SERVER_THREADS,
+  STREAMING_SHUFFLE_WRITER_CONNECTION_TIMEOUT_MS,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.server.TransportServer
-import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
+import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum,
+  StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{JavaSerializerInstance, SerializationStream}
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriter}
@@ -122,6 +124,7 @@ class StreamingShuffleWriter[K, V](
     conf.get(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED)
   private val REPLAY_MAX_MEMORY =
     conf.get(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY).toLong
+  private val CONNECTION_TIMEOUT_MS = conf.get(STREAMING_SHUFFLE_WRITER_CONNECTION_TIMEOUT_MS)
 
   // Shuffle details.
   private val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, V, _]]
@@ -473,7 +476,21 @@ class StreamingShuffleWriter[K, V](
   private[streaming] case class ShardState(id: Int) {
     // client may be accessed from other threads via cancel(); @volatile to be safe.
     @volatile private var client: Either[TransportClient, CompletableFuture[TransportClient]] =
-      Right(transportServerHandler.futureClients(id).thenApply(c => {
+      Right((if (CONNECTION_TIMEOUT_MS == -1) {
+        transportServerHandler.futureClients(id)
+      } else {
+        transportServerHandler.futureClients(id)
+          .orTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+          .exceptionally {
+            case _: TimeoutException =>
+              throw StreamingShuffleManager.streamingShuffleWriterConnectionTimeout(
+                streamingShuffleHandle.shuffleId,
+                shuffleWriterId,
+                id,
+                CONNECTION_TIMEOUT_MS)
+            case error => throw error
+          }
+      }).thenApply(c => {
         if (sharedExecutorServer.isEmpty) {
           // Dedicated community connections carry one route's tiny reverse control stream. The
           // executor-shared endpoint configures its aggregate physical lane when the channel is
@@ -1980,7 +1997,7 @@ class StreamingShuffleWriter[K, V](
     // For testing only.
     def hasClient: Boolean = client match {
       case Left(_) => true
-      case Right(future) => future.isDone
+      case Right(future) => future.isDone && !future.isCompletedExceptionally
     }
 
     /**
@@ -2167,6 +2184,11 @@ class StreamingShuffleWriter[K, V](
       s"replaySpilledBytes=${replaySpilledBytes.get()}")
   }
 
+  private def unwrapCompletionException(error: Throwable): Throwable = error match {
+    case e: CompletionException if e.getCause != null => e.getCause
+    case _ => error
+  }
+
   private def throwErrorIfExists(): Unit = {
     context.killTaskIfInterrupted()
     context.getTaskFailure.foreach { throw _ }
@@ -2291,7 +2313,7 @@ class StreamingShuffleWriter[K, V](
         Try {
           while (!isWriteFinished.await(MAX_BUFFERING_TIME_MS, TimeUnit.MILLISECONDS))
             shards.foreach(_.send())
-        }.recover { case e => errorNotifier.markError(e) },
+        }.recover { case e => errorNotifier.markError(unwrapCompletionException(e)) },
         "time-based-flush-for-shuffle-writer-" +
           s"${streamingShuffleHandle.shuffleId}-${shuffleWriterId}"))
     } else {
@@ -2421,6 +2443,9 @@ class StreamingShuffleWriter[K, V](
       if (WAIT_FOR_TERMINATION_ACKS && LINGER_AFTER_TERMINATION_MS == 0) {
         shards.foreach(_.releaseReplayHistory())
       }
+    } catch {
+      case e: CompletionException =>
+        throw unwrapCompletionException(e)
     } finally {
       writeInputFinished.set(true)
       releasePooledInputBuffers()
