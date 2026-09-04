@@ -1990,6 +1990,8 @@ class TaskSetManagerSuite
       12L, heartbeat(64L << 20)), "two stable running tasks should expand")
     assert(manager.preparedReaderMaxTasksPerExecutor === 0)
     assert(manager.preparedReaderCanExpand)
+    assert(manager.preparedReaderEstimatedPeakExecutionMemory.isEmpty,
+      "running heartbeats must never estimate final retained memory for byte admission")
 
     val growingReaderTaskSet = new TaskSet(
       Array.tabulate[Task[_]](4)(index => new FakeTask(1, index)),
