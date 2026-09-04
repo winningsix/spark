@@ -122,6 +122,7 @@ case class ShuffledHashJoinExec private (
     // relation. Multiple hash relations in the same task are additive because they coexist until
     // the task-completion listeners close them.
     context.taskMetrics().incPeakExecutionMemory(relation.estimatedSize)
+    context.taskMetrics().incRetainedMemoryBytes(relation.estimatedSize)
     // This is the executor-to-driver stability fence for sampled reader admission. The hash
     // relation can no longer grow after HashedRelation.apply returns, even though it remains
     // retained while the streamed/probe side is consumed.

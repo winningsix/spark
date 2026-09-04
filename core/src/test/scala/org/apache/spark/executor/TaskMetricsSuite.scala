@@ -37,6 +37,7 @@ class TaskMetricsSuite extends SparkFunSuite {
     assert(tm.memoryBytesSpilled == 0L)
     assert(tm.diskBytesSpilled == 0L)
     assert(tm.peakExecutionMemory == 0L)
+    assert(tm.retainedMemoryBytes == 0L)
     assert(tm.updatedBlockStatuses.isEmpty)
     // set or increment values
     tm.setExecutorDeserializeTime(100L)
@@ -55,6 +56,8 @@ class TaskMetricsSuite extends SparkFunSuite {
     tm.incDiskBytesSpilled(7L)
     tm.incPeakExecutionMemory(800L)
     tm.incPeakExecutionMemory(8L)
+    tm.incRetainedMemoryBytes(900L)
+    tm.incRetainedMemoryBytes(9L)
     val block1 = (TestBlockId("a"), BlockStatus(MEMORY_ONLY, 1L, 2L))
     val block2 = (TestBlockId("b"), BlockStatus(MEMORY_ONLY, 3L, 4L))
     tm.incUpdatedBlockStatuses(block1)
@@ -68,6 +71,7 @@ class TaskMetricsSuite extends SparkFunSuite {
     assert(tm.memoryBytesSpilled == 606L)
     assert(tm.diskBytesSpilled == 707L)
     assert(tm.peakExecutionMemory == 808L)
+    assert(tm.retainedMemoryBytes == 909L)
     assert(tm.updatedBlockStatuses == Seq(block1, block2))
   }
 

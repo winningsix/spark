@@ -243,6 +243,7 @@ private[spark] class TaskSetManager(
     var reportedPeakExecutionMemory = 0L
     var peakOnHeapExecutionMemory = 0L
     var peakOffHeapExecutionMemory = 0L
+    var retainedMemoryBytes = 0L
     var retainedMemoryBuildsCompleted = 0L
     updates.foreach { accumulator =>
       accumulator.name match {
@@ -252,6 +253,8 @@ private[spark] class TaskSetManager(
           peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
           peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+        case Some(InternalAccumulator.RETAINED_MEMORY_BYTES) =>
+          retainedMemoryBytes = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED) =>
           retainedMemoryBuildsCompleted = accumulator.asInstanceOf[LongAccumulator].value
         case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
@@ -267,17 +270,22 @@ private[spark] class TaskSetManager(
       runningReaderMemorySamples.remove(taskId)
       return false
     }
-    // Retained operators such as ShuffledHashJoin explicitly add their relation sizes to the
-    // legacy peak metric once each build is complete. Those allocations are not necessarily
-    // visible through TaskMemoryManager's on/off-heap counters. Use the larger observation,
-    // rather than adding them, because both metrics may describe the same allocation.
+    // A retained-memory budget must compare like with like. TaskMemoryManager's peak can include
+    // transient aggregation/probe allocations in addition to the hash relations that coexist
+    // until task completion. Prefer the explicit retained byte total once every build is fenced;
+    // fall back to the larger legacy/TMM observation for operators that do not report it yet.
     val taskMemoryManagerPeak = if (
         Long.MaxValue - peakOnHeapExecutionMemory < peakOffHeapExecutionMemory) {
       Long.MaxValue
     } else {
       peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
     }
-    val peakExecutionMemory = math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
+    val peakExecutionMemory = if (
+        taskSet.retainedMemoryBuildCount > 0 && retainedMemoryBytes > 0L) {
+      retainedMemoryBytes
+    } else {
+      math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
+    }
     val next = runningReaderMemorySamples.get(taskId) match {
       case Some(previous) if previous.peakBytes == peakExecutionMemory =>
         RunningReaderMemorySample(
@@ -1070,16 +1078,37 @@ private[spark] class TaskSetManager(
     }
     if (!successful(index)) {
       runningReaderMemorySamples.remove(tid)
-      var peakExecutionMemory = 0L
+      var reportedPeakExecutionMemory = 0L
+      var peakOnHeapExecutionMemory = 0L
+      var peakOffHeapExecutionMemory = 0L
+      var retainedMemoryBytes = 0L
       result.accumUpdates.foreach { accumulator =>
         accumulator.name match {
           case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
-            peakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+            reportedPeakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+          case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
+            peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+          case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
+            peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
+          case Some(InternalAccumulator.RETAINED_MEMORY_BYTES) =>
+            retainedMemoryBytes = accumulator.asInstanceOf[LongAccumulator].value
           case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
               if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
             observedMemorySpill = true
           case _ =>
         }
+      }
+      val taskMemoryManagerPeak = if (
+          Long.MaxValue - peakOnHeapExecutionMemory < peakOffHeapExecutionMemory) {
+        Long.MaxValue
+      } else {
+        peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
+      }
+      val peakExecutionMemory = if (taskSet.retainedMemoryBuildCount > 0 &&
+          retainedMemoryBytes > 0L) {
+        retainedMemoryBytes
+      } else {
+        math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
       }
       successfulPeakExecutionMemorySamples += 1
       maximumSuccessfulPeakExecutionMemory =
