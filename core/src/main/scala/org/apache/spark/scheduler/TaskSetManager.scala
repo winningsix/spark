@@ -178,9 +178,9 @@ private[spark] class TaskSetManager(
 
   private def sampledPreparedReaderPeakExecutionMemory: Option[Long] = {
     Option.when(
-      preparedReaderMemorySampleCount >= preparedReaderMemorySampleTasks &&
-        maximumPreparedReaderPeakExecutionMemory > 0L &&
-        !observedMemorySpill)(maximumPreparedReaderPeakExecutionMemory)
+      successfulPeakExecutionMemorySamples >= preparedReaderMemorySampleTasks &&
+        maximumSuccessfulPeakExecutionMemory > 0L &&
+        !observedMemorySpill)(maximumSuccessfulPeakExecutionMemory)
   }
 
   private[scheduler] def preparedReaderEstimatedPeakExecutionMemory: Option[Long] = synchronized {

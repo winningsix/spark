@@ -800,9 +800,17 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
         }
       }
     }
+    val pipelinedMemoryMayGrow = child.exists {
+      // A shuffled hash join is not globally blocking, but its build-side hash relation grows
+      // with a live pipelined input and remains retained for the rest of the task. Its early
+      // heartbeat peak is therefore no safer for admission than a sort or hash aggregate peak.
+      case _: ShuffledHashJoinExec => true
+      case _: BlockingOperatorWithCodegen => true
+      case _ => false
+    }
     outputRDD
       .setPipelinedStartupInputs(pipelinedStartupRDDs)
-      .setPipelinedMemoryMayGrow(child.exists(_.isInstanceOf[BlockingOperatorWithCodegen]))
+      .setPipelinedMemoryMayGrow(pipelinedMemoryMayGrow)
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {

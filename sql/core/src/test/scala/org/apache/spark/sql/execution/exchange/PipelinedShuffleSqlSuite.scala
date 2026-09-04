@@ -385,10 +385,12 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       val visited = mutable.HashSet.empty[Int]
       val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
       val startupInputs = mutable.ArrayBuffer.empty[RDD[_]]
+      var markedMemoryGrowing = false
       while (pending.nonEmpty) {
         val current = pending.removeHead()
         if (visited.add(current.id)) {
           startupInputs ++= current.pipelinedStartupInputs
+          markedMemoryGrowing = markedMemoryGrowing || current.pipelinedMemoryMayGrow
           current.dependencies.foreach(dependency => pending.append(dependency.rdd))
         }
       }
@@ -400,6 +402,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       assert(startupInputs.exists(_.dependencies.exists(
         _.isInstanceOf[PipelinedShuffleDependency[_, _, _]])),
         "the shuffled hash join build input must resolve to a pipelined shuffle")
+      assert(markedMemoryGrowing,
+        "shuffled hash joins must use completed retained-memory samples for reader admission")
 
       assert(executionRDD.collect().length === 5)
     }
