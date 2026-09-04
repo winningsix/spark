@@ -3112,7 +3112,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       pipelinedReaderShuffleIds = Seq(7),
       // Asymmetric SHJ: its startup/build dependency is regular, while this is the probe stream.
       pipelinedReaderStartupShuffleIds = Set.empty,
-      retainsExecutionMemory = true)
+      retainsExecutionMemory = true,
+      retainedMemoryBuildCount = 1)
     taskScheduler.submitTasks(reader)
     val offer = IndexedSeq(WorkerOffer(executorId, "host0", 15))
 
@@ -3185,6 +3186,56 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "a sampled heavy stage must use its 64 MiB byte budget, not the initial total count cap")
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty,
       "the sampled byte cap must prevent a third retained relation on the executor")
+  }
+
+  test("nested shuffled-hash readers stage only genuinely late unattached partitions") {
+    val taskScheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1")
+    val executorId = "executor0"
+    val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"nested-shj-late-reader-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInbox(id) =>
+            prepared.synchronized(prepared += id)
+            context.reply(true)
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            prepared.synchronized(prepared ++= ids)
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](4)(i => new FakeTask(3, i)),
+      stageId = 3,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(9),
+      pipelinedReaderStartupShuffleIds = Set.empty,
+      retainsExecutionMemory = true,
+      retainedMemoryBuildCount = 2)
+    taskScheduler.submitTasks(reader)
+
+    assert(taskScheduler.resourceOffers(
+      IndexedSeq(WorkerOffer(executorId, "host0", 7))).flatten.isEmpty)
+    eventually(timeout(10.seconds)) {
+      assert(prepared.synchronized(prepared.size) === 4)
+      assert(prepared.synchronized(prepared.forall(_.stageDataBeforeConsumerAttach)),
+        "unattached partitions behind fused retained builds must make durable progress")
+    }
   }
 
   test("prepared receive mode waits only for declared startup shuffle inboxes") {

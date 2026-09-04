@@ -136,12 +136,17 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
               if (!assignments.contains(key) && candidates.nonEmpty) {
                 val executorId = candidates(taskIndex % candidates.size)
                 val partitionId = taskSet.tasks(taskIndex).partitionId
-                // With a regular SHJ build input, reader memory can stabilize independently of
+                // With one regular SHJ build input, reader memory can stabilize independently of
                 // probe completion. Keep credit outstanding on unattached probe routes so the
                 // producer stops instead of converting the receive service into a disk sink.
+                // A fused chain with multiple retained builds is different: its first admitted
+                // tasks can wait on the streamed probe before every build fence becomes sampleable,
+                // while writers need the other reduce partitions to make progress. Those pending
+                // partitions are genuine late-reader history and must be durably staged.
                 val stageBeforeConsumerAttach =
                   !taskSet.taskSet.retainsExecutionMemory ||
-                    taskSet.taskSet.pipelinedReaderStartupShuffleIds.nonEmpty
+                    taskSet.taskSet.pipelinedReaderStartupShuffleIds.nonEmpty ||
+                    taskSet.taskSet.retainedMemoryBuildCount > 1
                 val nextOrdinalByShuffle = new HashMap[Int, Int]
                 val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
                   val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)

@@ -1978,6 +1978,9 @@ class TaskSetManagerSuite
     def heartbeat(peakBytes: Long): Seq[AccumulatorV2[_, _]] = {
       Seq(metric(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY, peakBytes))
     }
+    def reportedHeartbeat(peakBytes: Long): Seq[AccumulatorV2[_, _]] = {
+      Seq(metric(InternalAccumulator.PEAK_EXECUTION_MEMORY, peakBytes))
+    }
 
     assert(!manager.updatePreparedReaderRunningMemorySample(
       11L, heartbeat(32L << 20)), "the first heartbeat is not stable yet")
@@ -2055,6 +2058,20 @@ class TaskSetManagerSuite
     assert(retainedBuildManager.preparedReaderEstimatedPeakExecutionMemory.contains(5L << 30))
     assert(retainedBuildManager.preparedReaderMaxTasksPerExecutor === 2,
       "the stable live build peak must derive a 12 GiB / 5 GiB admission cap")
+
+    val reportedRetainedBuildManager =
+      new TaskSetManager(sched, retainedBuildTaskSet, MAX_TASK_FAILURES)
+    Seq(41L, 42L).zipWithIndex.foreach { case (taskId, index) =>
+      val update = reportedHeartbeat(5L << 30) :+
+        metric(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED, 2L)
+      assert(!reportedRetainedBuildManager.updatePreparedReaderRunningMemorySample(taskId, update))
+      val changed = reportedRetainedBuildManager.updatePreparedReaderRunningMemorySample(
+        taskId, update)
+      assert(changed === (index == 1))
+    }
+    assert(reportedRetainedBuildManager.preparedReaderEstimatedPeakExecutionMemory
+      .contains(5L << 30),
+      "an SHJ-reported retained peak must support live byte-budget admission")
   }
 
   test("prepared reader does not classify running zero-memory tasks as lightweight") {

@@ -448,7 +448,21 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
         s"each SHJ must retain one regular build boundary; plan:\n$plan")
       assert(exchanges.count(_.pipelined) === 1,
         s"the nested joins must share one pipelined probe spine; plan:\n$plan")
-      assert(joined.collect().length === 10)
+
+      val executionRDD = joined.queryExecution.toRdd
+      val visited = mutable.HashSet.empty[Int]
+      val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
+      var retainedMemoryBuildCount = 0
+      while (pending.nonEmpty) {
+        val current = pending.removeHead()
+        if (visited.add(current.id)) {
+          retainedMemoryBuildCount += current.retainedMemoryBuildCount
+          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
+        }
+      }
+      assert(retainedMemoryBuildCount === hashJoins.size,
+        "the nested reader task must wait for every retained hash-build fence")
+      assert(executionRDD.collect().length === 10)
     }
   }
 
