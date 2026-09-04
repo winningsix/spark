@@ -2093,6 +2093,20 @@ package object config {
       .checkValue(_ > 0, "prepared reader heavy-task memory threshold must be positive")
       .createWithDefaultString("4g")
 
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.maxRetainedExecutionMemoryPerExecutor")
+      .doc("Executor-wide budget for execution memory retained by attached streaming-shuffle " +
+        "readers. After a stage has enough completed task samples, its per-executor attach cap " +
+        "is derived from the largest observed task peak and this budget. The scheduler also " +
+        "accounts running readers from every active stage against the same budget. An unsampled " +
+        "reader conservatively reserves the full budget. Zero disables byte-based admission.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "prepared reader retained execution-memory budget must be non-negative")
+      .createWithDefaultString("0")
+
   private[spark] val STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.clientCreationThreads")
       .doc("Maximum executor-scoped threads used to install prepared reader routes and create " +

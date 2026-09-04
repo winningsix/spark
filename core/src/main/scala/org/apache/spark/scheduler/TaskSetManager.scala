@@ -153,6 +153,8 @@ private[spark] class TaskSetManager(
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS)
   private val preparedReaderHeavyTaskPeakMemory =
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY)
+  private val preparedReaderMaxRetainedExecutionMemory =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY)
 
   private def preparedReaderMemorySampleCount: Int = {
     successfulPeakExecutionMemorySamples +
@@ -174,13 +176,31 @@ private[spark] class TaskSetManager(
       !observedMemorySpill
   }
 
+  private def sampledPreparedReaderPeakExecutionMemory: Option[Long] = {
+    Option.when(
+      preparedReaderMemorySampleCount >= preparedReaderMemorySampleTasks &&
+        maximumPreparedReaderPeakExecutionMemory > 0L &&
+        !observedMemorySpill)(maximumPreparedReaderPeakExecutionMemory)
+  }
+
+  private[scheduler] def preparedReaderEstimatedPeakExecutionMemory: Option[Long] = synchronized {
+    sampledPreparedReaderPeakExecutionMemory
+  }
+
   private[scheduler] def preparedReaderMaxTasksPerExecutor: Int = synchronized {
     if (preparedReaderInitialMaxTasksPerExecutor <= 0) {
       0
-    } else if (!preparedReaderCanExpandNow) {
-      preparedReaderInitialMaxTasksPerExecutor
-    } else {
+    } else if (preparedReaderCanExpandNow) {
       0
+    } else {
+      sampledPreparedReaderPeakExecutionMemory.filter { _ =>
+        preparedReaderMaxRetainedExecutionMemory > 0L
+      }.map { peakBytes =>
+        val budgetCap = math.min(
+          Int.MaxValue.toLong,
+          preparedReaderMaxRetainedExecutionMemory / peakBytes).toInt
+        math.max(preparedReaderInitialMaxTasksPerExecutor, budgetCap)
+      }.getOrElse(preparedReaderInitialMaxTasksPerExecutor)
     }
   }
 

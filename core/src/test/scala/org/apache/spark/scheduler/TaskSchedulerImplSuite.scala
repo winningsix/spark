@@ -3064,13 +3064,14 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "reader startup must not let one producer consume its sibling inputs' progress slots")
   }
 
-  test("prepared reader compute attach expands after lightweight sampling") {
+  test("prepared reader compute attach expands within retained-memory budget after sampling") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
       config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "1",
       config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS.key -> "1",
       config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "1",
-      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "2",
+      config.STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "3",
+      config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY.key -> "64m",
       config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.1")
     val countingBackend = new FakeSchedulerBackend {
       var reviveCount = 0
@@ -3099,7 +3100,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(tracker.registerReceiveEndpoint(executorId, endpoint))
 
     val reader = new TaskSet(
-      Array.tabulate[Task[_]](3)(i => new FakeTask(2, i)),
+      Array.tabulate[Task[_]](4)(i => new FakeTask(2, i)),
       stageId = 2,
       stageAttemptId = 0,
       priority = 0,
@@ -3115,7 +3116,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
 
     assert(taskScheduler.resourceOffers(offer).flatten.isEmpty)
     eventually(timeout(10.seconds)) {
-      assert(prepared.synchronized(prepared.size) === 3,
+      assert(prepared.synchronized(prepared.size) === 4,
         "all network inboxes must be prepared even though compute attach is capped")
     }
     prepared.synchronized(prepared.toSeq).foreach(tracker.markInboxDrainReady(executorId, _))
@@ -3137,7 +3138,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "completion-based expansion must immediately revive all executor offers")
 
     assert(taskScheduler.resourceOffers(offer).flatten.size === 2,
-      "a lightweight sampled reader must expand to the executor-wide safety ceiling")
+      "sampled readers must expand only while their retained-memory estimates fit the budget")
   }
 
   test("prepared receive mode waits only for declared startup shuffle inboxes") {

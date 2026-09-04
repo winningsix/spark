@@ -1910,6 +1910,44 @@ class TaskSetManagerSuite
     assert(!spilling.preparedReaderCanExpand)
   }
 
+  test("prepared reader attach cap is derived from retained execution-memory samples") {
+    val testConf = new SparkConf()
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 2)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY, 4L << 30)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY, 12L << 30)
+    sc = new SparkContext("local", "test", testConf)
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    def metric(name: String, value: Long): LongAccumulator = {
+      val accumulator = new LongAccumulator()
+      accumulator.register(sc, Some(name))
+      accumulator.add(value)
+      accumulator
+    }
+
+    def complete(manager: TaskSetManager, taskIndex: Int, peakBytes: Long): Unit = {
+      val task = manager.resourceOffer("exec1", "host1", ANY)._1.get
+      manager.handleSuccessfulTask(task.taskId, createTaskResult(taskIndex,
+        Seq(metric(InternalAccumulator.PEAK_EXECUTION_MEMORY, peakBytes))))
+    }
+
+    val measured = new TaskSetManager(
+      sched, FakeTask.createTaskSet(4, stageId = 0, stageAttemptId = 0), MAX_TASK_FAILURES)
+    assert(measured.preparedReaderMaxTasksPerExecutor === 1)
+    complete(measured, 0, 5L << 30)
+    assert(measured.preparedReaderMaxTasksPerExecutor === 1)
+    complete(measured, 1, 5L << 30)
+    assert(measured.preparedReaderEstimatedPeakExecutionMemory.contains(5L << 30))
+    assert(measured.preparedReaderMaxTasksPerExecutor === 2)
+
+    val exceedsBudget = new TaskSetManager(
+      sched, FakeTask.createTaskSet(4, stageId = 1, stageAttemptId = 0), MAX_TASK_FAILURES)
+    complete(exceedsBudget, 0, 13L << 30)
+    complete(exceedsBudget, 1, 13L << 30)
+    assert(exceedsBudget.preparedReaderMaxTasksPerExecutor === 1)
+  }
+
   test("prepared reader cap uses running samples only when memory cannot grow with input") {
     val testConf = new SparkConf()
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
