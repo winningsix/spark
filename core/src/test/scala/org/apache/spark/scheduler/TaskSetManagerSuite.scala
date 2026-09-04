@@ -1953,6 +1953,7 @@ class TaskSetManagerSuite
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR, 1)
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS, 2)
       .set(config.STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY, 4L << 30)
+      .set(config.STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY, 12L << 30)
     sc = new SparkContext("local", "test", testConf)
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
     val readerTasks = Array.tabulate[Task[_]](4)(index => new FakeTask(0, index))
@@ -1968,13 +1969,13 @@ class TaskSetManagerSuite
       isPipelinedShuffleReader = true)
     val manager = new TaskSetManager(sched, readerTaskSet, MAX_TASK_FAILURES)
 
+    def metric(name: String, value: Long): LongAccumulator = {
+      val accumulator = new LongAccumulator()
+      accumulator.register(sc, Some(name))
+      accumulator.add(value)
+      accumulator
+    }
     def heartbeat(peakBytes: Long): Seq[AccumulatorV2[_, _]] = {
-      def metric(name: String, value: Long): LongAccumulator = {
-        val accumulator = new LongAccumulator()
-        accumulator.register(sc, Some(name))
-        accumulator.add(value)
-        accumulator
-      }
       Seq(metric(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY, peakBytes))
     }
 
@@ -2015,6 +2016,45 @@ class TaskSetManagerSuite
     assert(growingManager.preparedReaderMaxTasksPerExecutor === 1)
     assert(!growingManager.preparedReaderCanExpand,
       "an external sort's early stable peak must not release every reader")
+
+    val retainedBuildTaskSet = new TaskSet(
+      Array.tabulate[Task[_]](4)(index => new FakeTask(2, index)),
+      stageId = 2,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      retainsExecutionMemory = true,
+      retainedMemoryBuildCount = 2)
+    val retainedBuildManager =
+      new TaskSetManager(sched, retainedBuildTaskSet, MAX_TASK_FAILURES)
+    def retainedHeartbeat(peakBytes: Long, completedBuilds: Long): Seq[AccumulatorV2[_, _]] = {
+      heartbeat(peakBytes) :+
+        metric(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED, completedBuilds)
+    }
+    Seq(31L, 32L).foreach { taskId =>
+      assert(!retainedBuildManager.updatePreparedReaderRunningMemorySample(
+        taskId, retainedHeartbeat(32L << 20, completedBuilds = 1)))
+      assert(!retainedBuildManager.updatePreparedReaderRunningMemorySample(
+        taskId, retainedHeartbeat(32L << 20, completedBuilds = 1)))
+    }
+    assert(!retainedBuildManager.preparedReaderCanExpand,
+      "a stable prefix before every nested hash build completes is not a safe sample")
+    Seq(31L, 32L).zipWithIndex.foreach { case (taskId, index) =>
+      assert(!retainedBuildManager.updatePreparedReaderRunningMemorySample(
+        taskId, retainedHeartbeat(5L << 30, completedBuilds = 2)))
+      val changed = retainedBuildManager.updatePreparedReaderRunningMemorySample(
+        taskId, retainedHeartbeat(5L << 30, completedBuilds = 2))
+      assert(changed === (index == 1))
+    }
+    assert(!retainedBuildManager.preparedReaderCanExpand,
+      "a heavy retained build must remain byte-budgeted rather than expand without a cap")
+    assert(retainedBuildManager.preparedReaderEstimatedPeakExecutionMemory.contains(5L << 30))
+    assert(retainedBuildManager.preparedReaderMaxTasksPerExecutor === 2,
+      "the stable live build peak must derive a 12 GiB / 5 GiB admission cap")
   }
 
   test("prepared reader does not classify running zero-memory tasks as lightweight") {

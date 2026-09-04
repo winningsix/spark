@@ -386,11 +386,13 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
       val startupInputs = mutable.ArrayBuffer.empty[RDD[_]]
       var markedMemoryGrowing = false
+      var retainedMemoryBuildCount = 0
       while (pending.nonEmpty) {
         val current = pending.removeHead()
         if (visited.add(current.id)) {
           startupInputs ++= current.pipelinedStartupInputs
           markedMemoryGrowing = markedMemoryGrowing || current.pipelinedMemoryMayGrow
+          retainedMemoryBuildCount += current.retainedMemoryBuildCount
           current.dependencies.foreach(dependency => pending.append(dependency.rdd))
         }
       }
@@ -402,14 +404,16 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
       assert(startupInputs.exists(_.dependencies.exists(
         _.isInstanceOf[PipelinedShuffleDependency[_, _, _]])),
         "the shuffled hash join build input must resolve to a pipelined shuffle")
-      assert(markedMemoryGrowing,
-        "shuffled hash joins must use completed retained-memory samples for reader admission")
+      assert(!markedMemoryGrowing,
+        "shuffled hash joins have an explicit build-complete memory stability fence")
+      assert(retainedMemoryBuildCount === 1,
+        "the reader task must report one completed retained hash build")
 
       assert(executionRDD.collect().length === 5)
     }
   }
 
-  test("prepared receive keeps a shuffled hash join and its hidden limit shuffle regular") {
+  test("prepared receive materializes the shuffled hash build and pipelines its probe side") {
     withDistributedPipelinedSession(adaptive = false) { spark =>
       import spark.implicits._
       withTempDir { dir =>
@@ -424,8 +428,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
         val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
 
         assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
-        assert(exchanges.size >= 2 && exchanges.forall(exchange => !exchange.pipelined),
-          s"a memory-retaining shuffled hash join must fall back to regular shuffle; plan:\n$plan")
+        assert(exchanges.size === 2 && exchanges.count(_.pipelined) === 1,
+          s"SHJ must have one regular build and one pipelined probe exchange; plan:\n$plan")
 
         val executionRDDs = mutable.ArrayDeque[RDD[_]](joined.queryExecution.toRdd)
         val visitedRDDs = mutable.HashSet.empty[Int]
@@ -440,13 +444,39 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite with AdaptiveSparkPlanHelpe
         assert(retainedBuildMarker,
           "regular shuffled-hash execution must preserve its retained-memory admission marker")
 
-        // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden shuffle.
-        // It must inherit the whole-plan regular fallback instead of producing an illegal mixed
-        // job whose inactive SHJ partitions can only make progress by staging the full input.
+        // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden regular
+        // shuffle above the asymmetric SHJ pipeline. Prepared receive supports that boundary.
         val output = new java.io.File(dir, "shj-limit-output").getAbsolutePath
         joined.write.parquet(output)
         assert(spark.read.parquet(output).count() === 3L)
       }
+    }
+  }
+
+  test("prepared receive preserves asymmetric boundaries across nested shuffled hash joins") {
+    withDistributedPipelinedSession(adaptive = false) { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+      val left = spark.range(0, 40, 1, 2).select($"id".as("leftKey"))
+      val middle = spark.range(0, 20, 1, 2).select($"id".as("middleKey"))
+      val right = spark.range(0, 10, 1, 2).select($"id".as("rightKey"))
+      val joined = left
+        .join(middle, $"leftKey" === $"middleKey")
+        .join(right, $"leftKey" === $"rightKey")
+      val plan = joined.queryExecution.executedPlan
+      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
+      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+
+      assert(hashJoins.size === 2, s"expected two shuffled hash joins; plan:\n$plan")
+      // The inner join already preserves the outer join's partitioning, so the two joins share
+      // one pipelined probe spine rather than inserting a redundant fourth exchange.
+      assert(exchanges.size === 3, s"expected three join exchanges; plan:\n$plan")
+      assert(exchanges.count(exchange => !exchange.pipelined) === hashJoins.size,
+        s"each SHJ must retain one regular build boundary; plan:\n$plan")
+      assert(exchanges.count(_.pipelined) === 1,
+        s"the nested joins must share one pipelined probe spine; plan:\n$plan")
+      assert(joined.collect().length === 10)
     }
   }
 

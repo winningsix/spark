@@ -20,25 +20,25 @@ package org.apache.spark.sql.execution.exchange
 import scala.collection.mutable
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.execution.joins.{CartesianProductExec, ShuffledHashJoinExec}
 
 /**
- * Opt-in (SPARK-57399). Rewrites EVERY [[ShuffleExchangeExec]] in a
- * batch physical plan to `pipelined = true`, so each shuffle is served by the configured
- * pipelined shuffle manager and the concurrent-stage scheduler runs the map and reduce stages
- * together. This is the minimal SQL entry point that lets a batch query exercise a
- * pipelined execution path; a production version would be a targeted,
- * cost/shape-aware replacement rather than a blanket rewrite.
+ * Opt-in (SPARK-57399). Rewrites eligible [[ShuffleExchangeExec]] nodes in a batch physical plan
+ * to `pipelined = true`, so the concurrent-stage scheduler can run map and reduce stages together.
+ * Most supported plans are fully pipelined. For a memory-retaining shuffled hash join on a
+ * prepared-receive transport, build subtrees remain regular while the streamed spine is
+ * pipelined; this gives reader admission a durable build input without changing the join type.
  *
  * Enabled only when `spark.sql.shuffle.localPipelined.enabled=true`. It runs in the non-AQE
  * `preparations` list, so it also requires AQE to be off (under AQE the plan is hidden behind
  * an opaque `AdaptiveSparkPlanExec` leaf and this rule sees no exchanges).
  *
- * Rewriting ALL visible shuffles (not just hash-partitioning ones) keeps the job all-pipelined.
- * A manager with executor-owned prepared inboxes may additionally support a hidden regular
- * boundary above the pipeline; other unmaterialized mixed shapes are rejected by DAGScheduler.
+ * Eligible shuffles are not limited to hash-partitioning ones. A manager with executor-owned
+ * prepared inboxes may additionally support a regular frontier before the pipeline or a hidden
+ * regular boundary above it; other unmaterialized mixed shapes are rejected by DAGScheduler.
  * SinglePartition and RangePartitioning exchanges pipeline fine -- the channel transport only
  * routes by `partitioner.getPartition(key)` and does not care which partitioning produced the
  * id (SinglePartition is the numPartitions == 1 degenerate case).
@@ -124,10 +124,11 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
     val supportsSequentialReplay =
       SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay
 
-    def rewriteExchanges(asPipelined: Boolean): SparkPlan = {
+    def rewriteExchanges(shouldPipeline: ShuffleExchangeExec => Boolean): SparkPlan = {
       val rewrittenByExchangeKey = mutable.HashMap.empty[Int, ShuffleExchangeExec]
       def rewritten(exchange: ShuffleExchangeExec): ShuffleExchangeExec = {
         rewrittenByExchangeKey.getOrElseUpdate(exchange.pipelinedReuseKey, {
+          val asPipelined = shouldPipeline(exchange)
           val copied = if (exchange.pipelined == asPipelined) {
             exchange
           } else {
@@ -155,26 +156,9 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
     }
 
     def rewriteAsRegular(): SparkPlan = {
-      val regularPlan = rewriteExchanges(asPipelined = false)
+      val regularPlan = rewriteExchanges(_ => false)
       PipelinedShuffleEligibility.disableHiddenShuffles(regularPlan)
       regularPlan
-    }
-
-    // A shuffled hash join drains and retains its build input before touching its streamed input.
-    // Prepared receive may admit fewer reduce tasks than the shuffle width to bound those hash
-    // maps. Map writers interleave reducer shards, however, so data for the inactive reducers can
-    // consume every bounded writer/raw permit and prevent the active reducers from ever seeing
-    // EOS. There is no work-conserving in-memory ordering that breaks that cycle: the missing
-    // shards must either be durably staged or all readers must be resident. Keep the whole
-    // non-AQE plan regular unless the transport explicitly supports that contract.
-    val hasMemoryRetainingConsumer = plan.collectWithSubqueries {
-      case _: ShuffledHashJoinExec => true
-    }.nonEmpty
-    if (hasMemoryRetainingConsumer &&
-        !PipelinedShuffleEligibility.supportsMemoryRetainingConsumer) {
-      logDebug("EnablePipelinedShuffle: plan has a shuffled hash join but the configured " +
-        "transport cannot safely admit a memory-retaining consumer; leaving it regular.")
-      return rewriteAsRegular()
     }
 
     if ((sameScopeReuseCountByExchangeKey.nonEmpty && !supportsFanOut) ||
@@ -200,7 +184,33 @@ case class EnablePipelinedShuffle() extends Rule[SparkPlan] {
       return rewriteAsRegular()
     }
 
-    rewriteExchanges(asPipelined = true)
+    // A shuffled hash join retains its build relation while it consumes the streamed side. Keep
+    // every shuffle in each build subtree regular, so those smaller inputs materialize before the
+    // corresponding probe pipeline starts. Exchanges on the streamed spine remain pipelined.
+    // This asymmetric boundary lets a sampled reader build from durable input while an
+    // unadmitted probe route applies real credit backpressure; it therefore needs neither an
+    // all-reader memory reservation nor pre-attachment disk staging. A reused exchange is keyed
+    // by pipelinedReuseKey so one physical exchange never receives contradictory transport modes.
+    val memoryRetainingJoins = plan.collectWithSubqueries {
+      case join: ShuffledHashJoinExec => join
+    }
+    if (memoryRetainingJoins.nonEmpty &&
+        !PipelinedShuffleEligibility.supportsMemoryRetainingConsumer) {
+      val regularBuildExchangeKeys: Set[Int] = memoryRetainingJoins.iterator.flatMap { join =>
+        val buildPlan = if (join.buildSide == BuildLeft) join.left else join.right
+        buildPlan.collect {
+          case exchange: ShuffleExchangeExec => exchange.pipelinedReuseKey
+          case ReusedExchangeExec(_, exchange: ShuffleExchangeExec) =>
+            exchange.pipelinedReuseKey
+        }
+      }.toSet
+      logDebug("EnablePipelinedShuffle: using regular build inputs and pipelined streamed " +
+        "inputs for shuffled hash joins.")
+      return rewriteExchanges(exchange =>
+        !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey))
+    }
+
+    rewriteExchanges(_ => true)
   }
 
   /**

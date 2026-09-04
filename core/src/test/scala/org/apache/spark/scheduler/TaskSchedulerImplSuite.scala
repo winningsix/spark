@@ -3110,7 +3110,9 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       isPipelined = true,
       isPipelinedShuffleReader = true,
       pipelinedReaderShuffleIds = Seq(7),
-      pipelinedReaderStartupShuffleIds = Set(7))
+      // Asymmetric SHJ: its startup/build dependency is regular, while this is the probe stream.
+      pipelinedReaderStartupShuffleIds = Set.empty,
+      retainsExecutionMemory = true)
     taskScheduler.submitTasks(reader)
     val offer = IndexedSeq(WorkerOffer(executorId, "host0", 15))
 
@@ -3118,6 +3120,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     eventually(timeout(10.seconds)) {
       assert(prepared.synchronized(prepared.size) === 4,
         "all network inboxes must be prepared even though compute attach is capped")
+      assert(prepared.synchronized(prepared.forall(id => !id.stageDataBeforeConsumerAttach)),
+        "an unattached asymmetric-SHJ probe must retain credit instead of staging to disk")
     }
     prepared.synchronized(prepared.toSeq).foreach(tracker.markInboxDrainReady(executorId, _))
     val initial = taskScheduler.resourceOffers(offer).flatten

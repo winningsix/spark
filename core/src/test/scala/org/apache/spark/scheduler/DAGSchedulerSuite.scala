@@ -6433,6 +6433,57 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
+  test("pipelined shuffle: prepared receive materializes a regular frontier before pipeline") {
+    val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+    val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+    val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+    val previousTotalQueue =
+      sc.conf.get(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY)
+    val previousSharedConnections =
+      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+    val previousSharedServer =
+      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+    sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+    sc.conf.set(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY, 4096L)
+    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    try {
+      val probeProducer = new MyRDD(sc, 2, Nil)
+      val probeDep = new PipelinedShuffleDependency(probeProducer, new HashPartitioner(2))
+      val buildProducer = new MyRDD(sc, 2, Nil)
+      val buildDep = new ShuffleDependency(buildProducer, new HashPartitioner(2))
+      val consumer = new MyRDD(sc, 2, List(probeDep, buildDep), tracker = mapOutputTracker)
+
+      submit(consumer, Array(0, 1))
+      assert(taskSets.size === 1,
+        "only the regular build frontier may start before it materializes")
+      assert(taskSets.head.shuffleId.contains(buildDep.shuffleId))
+      assert(!taskSets.head.isPipelinedShuffleProducer)
+
+      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+      assert(taskSets.size === 3,
+        "the probe producer and consumer must start together after the build frontier")
+      assert(taskSets(1).shuffleId.contains(probeDep.shuffleId))
+      assert(taskSets(1).isPipelinedShuffleProducer)
+      assert(taskSets(2).isPipelinedShuffleReader)
+
+      completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
+      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
+      assertDataStructuresEmpty()
+    } finally {
+      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY, previousTotalQueue)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+        previousSharedConnections)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+    }
+  }
+
   test("pipelined shuffle: a regular-shuffle prefix feeding a pipelined producer is rejected") {
     // An UNMATERIALIZED regular shuffle in the PREFIX that feeds a pipelined producer
     // (regularRoot --regular--> producer(pipelined) --pipelined--> consumer) is rejected: the
