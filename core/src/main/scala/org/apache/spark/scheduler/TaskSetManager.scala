@@ -191,19 +191,21 @@ private[spark] class TaskSetManager(
   /**
    * Use executor heartbeats to classify a long-running prepared reader before it completes.
    *
-   * Blocking shuffle consumers often finish as one wave after every producer terminal arrives,
-   * so completion-only sampling cannot lift an initial attach cap in time to help that wave. A
-   * running memory consumer becomes a sample only after its peak execution-memory value is
-   * unchanged across two heartbeats. A zero-memory running task is never a sample: credit repair,
-   * decoding, or input wait can all precede a large hash-table allocation, so only successful
-   * completion proves that such a task is lightweight.
+   * Some shuffle consumers finish as one wave after every producer terminal arrives, so
+   * completion-only sampling cannot lift an initial attach cap in time to help lightweight
+   * stages. A running task becomes a sample only after its peak execution-memory value is
+   * unchanged across two heartbeats. A zero-memory task is never a sample, nor is a stage marked
+   * as memory-growing: input wait can precede allocation, and a sorter's stable early peak can
+   * grow again when more streamed rows arrive. Only successful completion can classify those
+   * tasks safely.
    *
    * @return true when this update changes the stage from capped to expandable.
    */
   private[scheduler] def updatePreparedReaderRunningMemorySample(
       taskId: Long,
       updates: Seq[AccumulatorV2[_, _]]): Boolean = synchronized {
-    if (!taskSet.isPipelinedShuffleReader || preparedReaderInitialMaxTasksPerExecutor <= 0) {
+    if (!taskSet.isPipelinedShuffleReader || taskSet.pipelinedReaderMemoryMayGrow ||
+        preparedReaderInitialMaxTasksPerExecutor <= 0) {
       return false
     }
     val expandableBefore = preparedReaderCanExpandNow

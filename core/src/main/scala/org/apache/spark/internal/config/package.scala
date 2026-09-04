@@ -2072,7 +2072,8 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS =
     ConfigBuilder("spark.shuffle.streaming.preparedReader.memorySampleTasks")
       .doc("Number of stable streaming-reader task samples required before lifting the initial " +
-        "per-executor attach cap for a lightweight stage.")
+        "per-executor attach cap for a lightweight stage. Operators whose execution memory may " +
+        "grow with streamed input use completed tasks rather than running heartbeat samples.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

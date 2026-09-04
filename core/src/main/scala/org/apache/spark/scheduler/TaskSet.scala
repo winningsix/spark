@@ -50,7 +50,10 @@ private[spark] class TaskSet(
     // Shuffle inputs that must be ready before this stage can make useful progress. Empty means
     // all reader inputs are required, preserving the conservative default for operators such as
     // SortMergeJoin. ShuffledHashJoin identifies only its build-side shuffle(s).
-    val pipelinedReaderStartupShuffleIds: Set[Int] = Set.empty) {
+    val pipelinedReaderStartupShuffleIds: Set[Int] = Set.empty,
+    // True when an operator in this reader stage can keep growing execution memory as streamed
+    // input arrives. Its early heartbeat samples cannot safely lift reader admission limits.
+    val pipelinedReaderMemoryMayGrow: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id
