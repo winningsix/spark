@@ -21,7 +21,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 
 /**
- * Reader → writer control message.
+ * Reader-to-writer control message.
  *
  * Besides connection establishment, distributed multiplexed routes use this message for
  * byte-based flow control. A negative {@link #numMessages} advertises the initial absolute byte

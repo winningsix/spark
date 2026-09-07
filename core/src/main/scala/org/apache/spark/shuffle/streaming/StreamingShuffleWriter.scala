@@ -332,25 +332,26 @@ class StreamingShuffleWriter[K, V](
 
   /**
    * Allocate a compression destination without letting Netty arena chunks become an untracked
-   * executor-wide cache. A full direct budget must not turn into an unbounded heap allocation:
-   * return no destination so the caller keeps its already-accounted raw input as the wire frame.
-   * That raw frame retains the writer permit until network completion, so the producer stops at
-   * the executor raw-buffer boundary instead of computing ahead into heap or replay spill.
+   * executor-wide cache. A full executor wire budget is a scheduling point: keep every producer
+   * task live, but park this task until an existing wire payload completes. This avoids turning
+   * the executor raw pool into thousands of uncompressed transport leases. If JVM direct memory
+   * is temporarily exhausted, the budget itself supplies a bounded exact heap buffer.
    *
    * The returned byte count is the exact direct reservation owned by the returned buffer.
    */
   private def allocateWireBuffer(maxSize: Int): (ByteBuf, Int) = {
     sharedExecutorServer match {
-      case Some(shared) if shared.wireBufferBudget.tryAcquire(maxSize) =>
-        try (Unpooled.directBuffer(maxSize, maxSize), maxSize)
-        catch {
-          case error: Throwable =>
-            shared.wireBufferBudget.release(maxSize)
-            throw error
-        }
       case Some(shared) =>
-        shared.wireBufferBudget.recordRawFallback(maxSize)
-        (null, 0)
+        if (!shared.wireBufferBudget.canReserve(maxSize)) {
+          shared.wireBufferBudget.recordRawFallback(maxSize)
+          return (null, 0)
+        }
+        var buffer = shared.wireBufferBudget.tryAllocate(maxSize)
+        while (buffer == null) {
+          throwErrorIfExists()
+          buffer = shared.wireBufferBudget.awaitAllocate(maxSize, 10L)
+        }
+        (buffer, maxSize)
       case None =>
         // Low-level tests and the legacy dedicated-server path do not share executor state.
         (server.getPooledByteBufAllocator.directBuffer(maxSize, maxSize), 0)
@@ -1601,9 +1602,16 @@ class StreamingShuffleWriter[K, V](
       }
     }
 
+    // Compression and sequence publication must preserve the order in which the task and the
+    // time-based flush thread detach buffers from this shard.  Use a lock that is deliberately
+    // separate from the ShardState monitor: a wire-budget wait may block here, while Netty
+    // completions need the ShardState monitor to return in-flight bytes and schedule more sends.
+    // Holding that monitor across awaitAllocate forms a credit-return deadlock.
+    private val sendTimestampedBufferLock = new Object
+
     private def sendTimestampedBuffer(
         timestampedBuffer: TimestampedBuffer,
-        flushBatch: Boolean): Unit = synchronized {
+        flushBatch: Boolean): Unit = sendTimestampedBufferLock.synchronized {
       timestampedBuffer.serializationStream.foreach(_.close())
       val rawBuffer = timestampedBuffer.buffer
       val rawReservationBytes = timestampedBuffer.reservedBytes
@@ -1658,7 +1666,7 @@ class StreamingShuffleWriter[K, V](
       val wireReleased = new AtomicBoolean(false)
       val uncompressedLease = if (wireBuffer eq rawBuffer) {
         val lease = new RawBufferLease(rawBuffer)
-        uncompressedBufferLeases += lease
+        synchronized { uncompressedBufferLeases += lease }
         Some(lease)
       } else {
         None
@@ -1717,10 +1725,12 @@ class StreamingShuffleWriter[K, V](
     }
 
     // Consume the current buffer, if it exists, and send it as a DataMessage.
-    def send(): Unit = synchronized {
+    def send(): Unit = {
       val b = takeBuffer()
       if (b != null) enqueue(b)
-      flushPendingBatch()
+      // flushPendingBatch mutates the ordered action queue, but the potentially blocking
+      // compression above must not retain this monitor while network completions return credit.
+      synchronized { flushPendingBatch() }
     }
 
     def takeBuffer(): TimestampedBuffer = buffer.getAndSet(null)

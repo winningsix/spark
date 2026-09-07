@@ -21,7 +21,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 
 /**
- * Writer → reader data message. Carries a contiguous payload of serialized shuffle
+ * Writer-to-reader data message. Carries a contiguous payload of serialized shuffle
  * records together with the routing metadata (shuffleWriterId, shuffleReaderId,
  * dataSize) and a CRC32C {@link #checksum} over the uncompressed serialized records. Each
  * DataMessage corresponds to one network frame on the streaming-shuffle wire.
@@ -116,7 +116,7 @@ public final class DataMessage extends StreamingShuffleMessage {
    * its {@code ownedBuf} field (refcount is incremented in the constructor), and the
    * caller transfers ownership.
    *
-   * On failure (an {@link IllegalArgumentException} is thrown — see the constructor's
+   * On failure (an {@link IllegalArgumentException} is thrown; see the constructor's
    * validation), the caller still owns {@code message} and is responsible for
    * releasing it, since the constructor's {@code data.retain()} never ran.
    */

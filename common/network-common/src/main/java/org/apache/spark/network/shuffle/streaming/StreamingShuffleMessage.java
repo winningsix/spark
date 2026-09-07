@@ -153,7 +153,7 @@ public abstract sealed class StreamingShuffleMessage
   /**
    * Releases any resources associated with this message.
    * In VERY RARE cases when the task fails unexpectedly, this method may be called twice.
-   * This method is idempotent — a second call on the same thread is a no-op — but it is
+   * This method is idempotent: a second call on the same thread is a no-op, but it is
    * NOT thread-safe.
    */
   public void release() {

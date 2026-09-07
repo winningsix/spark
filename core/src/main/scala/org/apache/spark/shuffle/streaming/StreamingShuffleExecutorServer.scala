@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 import io.netty.buffer.{ByteBuf, Unpooled}
 import io.netty.channel.ChannelOption
+import io.netty.util.internal.OutOfDirectMemoryError
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
@@ -230,9 +231,10 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
 
   // Compression destinations used to come from Netty's pooled allocator independently in every
   // writer. Under a wide pipelined stage, requested 128 KiB buffers materialized and retained 4 MiB
-  // arena chunks until the JVM hit MaxDirectMemorySize. Reserve exact unpooled direct payloads at
-  // executor scope. When the budget is full, callers keep the already-accounted raw input buffer
-  // as the wire payload; allocating an unbounded heap fallback would bypass writer backpressure.
+  // arena chunks until the JVM hit MaxDirectMemorySize. Reserve exact unpooled payloads at executor
+  // scope. Writers wait at this byte boundary when it is full instead of retaining thousands of
+  // uncompressed raw buffers in the transport backlog. A JVM direct-memory allocation failure
+  // falls back only for this already-reserved wire payload, keeping heap growth under the same cap.
   private[streaming] val wireBufferBudget = new StreamingShuffleDirectBufferBudget(
     conf.get(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY))
 
@@ -273,6 +275,7 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     val (bodies, frames) = controlBodyStats
     val (wireUsed, wirePeak, wireLimit, wireRawFallbacks, wireRawFallbackBytes) =
       wireBufferBudget.stats
+    val (wireHeapFallbacks, wireHeapFallbackBytes) = wireBufferBudget.heapFallbackStats
     val (batchBodies, batchWrites, transportedBodies, peakBodiesPerWrite) =
       crossRouteBatcher.transportBatchStats
     logInfo(
@@ -284,7 +287,9 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
         s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite " +
         s"wireDirectUsedBytes=$wireUsed wireDirectPeakBytes=$wirePeak " +
         s"wireDirectLimitBytes=$wireLimit wireRawFallbacks=$wireRawFallbacks " +
-        s"wireRawFallbackBytes=$wireRawFallbackBytes")
+        s"wireRawFallbackBytes=$wireRawFallbackBytes " +
+        s"wireHeapFallbacks=$wireHeapFallbacks " +
+        s"wireHeapFallbackBytes=$wireHeapFallbackBytes")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     rawBufferPool.close()
@@ -300,13 +305,18 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
 }
 
 /** Executor-wide accounting for exact, unpooled direct wire payloads. */
-private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes: Long) {
+private[streaming] final class StreamingShuffleDirectBufferBudget(
+    maxMemoryBytes: Long,
+    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
+    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
   require(maxMemoryBytes > 0L, "direct buffer budget must be positive")
 
   private val usedBytes = new AtomicLong(0L)
   private val peakBytes = new AtomicLong(0L)
   private val rawFallbacks = new AtomicLong(0L)
   private val rawFallbackBytes = new AtomicLong(0L)
+  private val heapFallbacks = new AtomicLong(0L)
+  private val heapFallbackBytes = new AtomicLong(0L)
   @volatile private var closed = false
 
   def tryAcquire(bytes: Int): Boolean = {
@@ -322,10 +332,50 @@ private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes
     acquired
   }
 
+  def canReserve(bytes: Int): Boolean = bytes > 0 && bytes.toLong <= maxMemoryBytes
+
+  /**
+   * Reserves and allocates one wire buffer, returning null only while this budget is full. A JVM
+   * direct-memory failure can happen before this component's private limit because reader queues,
+   * raw buffers, replay, and transport arenas share MaxDirectMemorySize. In that case allocate an
+   * exact heap buffer while retaining the same byte reservation; this is a bounded pressure valve,
+   * not an untracked heap transport mode.
+   */
+  def tryAllocate(bytes: Int): ByteBuf = {
+    if (!tryAcquire(bytes)) {
+      return null
+    }
+    try allocateDirect(bytes)
+    catch {
+      case _: OutOfDirectMemoryError =>
+        try {
+          val buffer = allocateHeap(bytes)
+          heapFallbacks.incrementAndGet()
+          heapFallbackBytes.addAndGet(bytes.toLong)
+          buffer
+        } catch {
+          case error: Throwable =>
+            release(bytes)
+            throw error
+        }
+      case error: Throwable =>
+        release(bytes)
+        throw error
+    }
+  }
+
+  /** Wait briefly for a released reservation, then retry allocation. */
+  def awaitAllocate(bytes: Int, waitMillis: Long): ByteBuf = {
+    require(waitMillis > 0L, "wire-buffer wait must be positive")
+    this.synchronized { if (!closed) wait(waitMillis) }
+    tryAllocate(bytes)
+  }
+
   def release(bytes: Int): Unit = {
     require(bytes > 0, "direct buffer release must be positive")
     val remaining = usedBytes.addAndGet(-bytes.toLong)
     require(remaining >= 0L, "direct buffer budget released more bytes than it acquired")
+    this.synchronized { notifyAll() }
   }
 
   def recordRawFallback(bytes: Int): Unit = {
@@ -338,13 +388,21 @@ private[streaming] final class StreamingShuffleDirectBufferBudget(maxMemoryBytes
     (usedBytes.get(), peakBytes.get(), maxMemoryBytes,
       rawFallbacks.get(), rawFallbackBytes.get())
 
-  def close(): Unit = closed = true
+  private[streaming] def heapFallbackStats: (Long, Long) =
+    (heapFallbacks.get(), heapFallbackBytes.get())
+
+  def close(): Unit = {
+    closed = true
+    this.synchronized { notifyAll() }
+  }
 }
 
 /** Executor-wide reusable direct buffers for relaxed streaming writers. */
 private[streaming] final class StreamingShuffleRawBufferPool(
     bufferSize: Int,
-    maxMemoryBytes: Long) {
+    maxMemoryBytes: Long,
+    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
+    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
   require(bufferSize > 0, "bufferSize must be positive")
   require(maxMemoryBytes >= bufferSize,
     "raw buffer pool must admit at least one serialization buffer")
@@ -355,6 +413,8 @@ private[streaming] final class StreamingShuffleRawBufferPool(
   // bypass the raw in-flight budget simultaneously.
   private val usedBytes = new AtomicLong(0L)
   private val peakBytes = new AtomicLong(0L)
+  private val heapFallbacks = new AtomicLong(0L)
+  private val heapFallbackBytes = new AtomicLong(0L)
   private val available = new LinkedBlockingDeque[ByteBuf]()
   @volatile private var closed = false
 
@@ -372,8 +432,19 @@ private[streaming] final class StreamingShuffleRawBufferPool(
 
   private def allocate(capacity: Int): ByteBuf = {
     if (!tryReserve(capacity)) return null
-    try Unpooled.directBuffer(capacity, capacity)
+    try allocateDirect(capacity)
     catch {
+      case _: OutOfDirectMemoryError =>
+        try {
+          val buffer = allocateHeap(capacity)
+          heapFallbacks.incrementAndGet()
+          heapFallbackBytes.addAndGet(capacity.toLong)
+          buffer
+        } catch {
+          case error: Throwable =>
+            usedBytes.addAndGet(-capacity.toLong)
+            throw error
+        }
       case error: Throwable =>
         usedBytes.addAndGet(-capacity.toLong)
         throw error
@@ -435,6 +506,9 @@ private[streaming] final class StreamingShuffleRawBufferPool(
 
   private[streaming] def stats: (Long, Long, Long) =
     (usedBytes.get(), peakBytes.get(), maxMemoryBytes)
+
+  private[streaming] def heapFallbackStats: (Long, Long) =
+    (heapFallbacks.get(), heapFallbackBytes.get())
 
   private def destroy(buffer: ByteBuf): Unit = {
     val capacity = buffer.capacity()

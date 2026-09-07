@@ -143,6 +143,27 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("executor raw pool falls back to its bounded heap budget at the JVM direct limit") {
+    val directOomConstructor =
+      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
+        .getDeclaredConstructor(classOf[String])
+    directOomConstructor.setAccessible(true)
+    val pool = new StreamingShuffleRawBufferPool(
+      bufferSize = 128,
+      maxMemoryBytes = 256,
+      allocateDirect = _ => throw directOomConstructor.newInstance("test direct limit"))
+
+    val fallback = pool.tryBorrow()
+    try {
+      assert(fallback != null && !fallback.isDirect && fallback.capacity() === 128)
+      assert(pool.stats === (128L, 128L, 256L))
+      assert(pool.heapFallbackStats === (1L, 128L))
+    } finally {
+      pool.recycle(fallback)
+      pool.close()
+    }
+  }
+
   test("writer does not spill a live transport frame before its reader connects") {
     val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>

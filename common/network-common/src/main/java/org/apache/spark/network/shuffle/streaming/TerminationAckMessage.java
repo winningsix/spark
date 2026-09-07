@@ -21,7 +21,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 
 /**
- * Reader → writer acknowledgement of {@link TerminationControlMessage}. The
+ * Reader-to-writer acknowledgement of {@link TerminationControlMessage}. The
  * {@code seqNum} field carries the last sequence number the reader observed from
  * this writer; the writer compares that value against its own last-sent sequence
  * number to detect lost or reordered messages, failing the task with

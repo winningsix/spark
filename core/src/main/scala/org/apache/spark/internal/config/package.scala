@@ -1991,7 +1991,8 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.readerTotalQueueMaxMemory")
       .doc("Maximum aggregate bytes of streaming shuffle data retained by all prepared reader " +
         "queues in one executor. The same bound limits aggregate prepared-route receive windows: " +
-        "all routes remain discoverable, but routes without executor budget advertise a zero-byte " +
+        "all routes remain discoverable, but routes without executor budget advertise a " +
+        "zero-byte " +
         "window until capacity is released. The queue reservation remains a final safety net for " +
         "oversized frames. This prevents prepared inboxes from multiplying the per-reader limit.")
       .version("4.3.0")
@@ -2102,7 +2103,8 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.preparedReader.maxRetainedExecutionMemoryPerExecutor")
       .doc("Executor-wide budget for execution memory retained by attached streaming-shuffle " +
         "readers and regular-shuffle memory-retaining consumers. After a stage has enough " +
-        "completed task samples, or running samples fenced by explicit retained-build completion, " +
+        "completed task samples, or running samples fenced by explicit retained-build " +
+        "completion, " +
         "its per-executor attach cap is derived from the largest observed task peak and this " +
         "budget. The scheduler accounts all such active stages against the same budget. An " +
         "unsampled consumer conservatively reserves the full budget. Zero disables byte-based " +

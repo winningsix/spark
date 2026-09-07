@@ -146,7 +146,7 @@ public class StreamingShuffleMessageSuite {
     msg.release();
     assertEquals(1, payloadBuf.refCnt());
 
-    // Second release should be a no-op — refcount must not drop further or throw.
+    // Second release should be a no-op; refcount must not drop further or throw.
     msg.release();
     assertEquals(1, payloadBuf.refCnt());
 
@@ -166,7 +166,7 @@ public class StreamingShuffleMessageSuite {
     msg.release();
     assertEquals(1, callbackInvocations.get());
 
-    // Second release: idempotent — callback must NOT fire again.
+    // Second release: idempotent; callback must NOT fire again.
     msg.release();
     assertEquals(1, callbackInvocations.get());
 

@@ -257,10 +257,32 @@ private[streaming] final class StreamingShuffleMessageQueue
       data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
   }
 
+  private def stageDataBeforeAttach(data: DataMessage): QueueEntry = {
+    val bytes = data.dataSize.toLong
+    updateMaximum(maxDataMessageBytes, bytes)
+    if (!reserveInMemory(bytes)) {
+      spillData(data, releaseCreditNow = true)
+    } else {
+      // No task exists yet to consume this entry and return its route credit. Return that credit
+      // after reserving the executor-wide queue budget, while retaining payload ownership until
+      // the eventual consumer releases the DataMessage. This lets small prepared frontiers stay
+      // in memory without turning the executor into an unbounded receiver.
+      val creditReleaseCallback = data.takeReleaseCallback()
+      try {
+        if (creditReleaseCallback != null) creditReleaseCallback.run()
+      } catch {
+        case t: Throwable =>
+          releaseInMemory(bytes)
+          throw t
+      }
+      new InMemoryEntry(data)
+    }
+  }
+
   private def toEntry(message: StreamingShuffleMessage): QueueEntry = message match {
     case data: DataMessage
         if canSpill && stageDataBeforeConsumerAttach && !consumerAttached.get() =>
-      spillData(data, releaseCreditNow = true)
+      stageDataBeforeAttach(data)
     case data: DataMessage if canSpill && !reserveInMemory(data.dataSize.toLong) =>
       // Free the copied payload now, but keep receive credit outstanding until the downstream
       // task consumes or cancels this entry. Returning credit at spill time turns a bounded inbox
