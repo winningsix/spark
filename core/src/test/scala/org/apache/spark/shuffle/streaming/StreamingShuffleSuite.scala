@@ -1010,7 +1010,7 @@ class StreamingShuffleSuite
       val future = StreamingShuffleSuite.verifyBlockingCall { () =>
         // writer should enqueue a DataMessage and a termination message in the message queue
         // after which wait on the termination ack from the reader
-        writer.write(Iterator((1, 1), (2, 2)))
+        writer.write(Iterator((1, 1)))
       }
 
       eventually(Timeout(30.seconds)) {
@@ -1633,7 +1633,7 @@ class StreamingShuffleSuite
 
       // write() will block waiting for termination acks; run it asynchronously.
       val future = StreamingShuffleSuite.verifyBlockingCall { () =>
-        writer.write(Iterator((1, 1), (2, 2)))
+        writer.write(Iterator((1, 1)))
       }
 
       // Wait for the writer to send data and termination messages.

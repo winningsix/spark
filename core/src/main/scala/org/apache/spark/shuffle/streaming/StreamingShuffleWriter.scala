@@ -2318,24 +2318,30 @@ class StreamingShuffleWriter[K, V](
       records.foreach { record =>
         val shard = shards(partitioner.getPartition(record._1))
         val serializedSize = byteBufSerializer.flatMap(_.serializedValueSize(record._2))
+        // Generic SerializationStream implementations do not expose the size of the next record
+        // before writing it. Their ByteBuf must not grow beyond its executor-pool reservation, so
+        // reserve the writer's complete bounded capacity up front. UnsafeRow and other streaming
+        // serializers retain the exact-size path and therefore pay only for the record they write.
+        val requiredBufferSize = serializedSize.getOrElse(MAX_BUFFER_BYTES.toInt)
         var timestampedBuffer = if (TIME_BASED_FLUSH_ENABLED) {
           shard.takeBuffer()
         } else {
           singleThreadedBuffers(shard.id)
         }
         if (timestampedBuffer == null) {
-          timestampedBuffer = newBuffer(serializedSize.getOrElse(BUFFER_SIZE))
+          timestampedBuffer = newBuffer(requiredBufferSize)
           if (!TIME_BASED_FLUSH_ENABLED) {
             // Publish immediately to the task-owned array so failure cleanup can release it even
             // if serialization throws before this record finishes.
             singleThreadedBuffers(shard.id) = timestampedBuffer
           }
-        } else if (serializedSize.exists(_ > timestampedBuffer.buffer.writableBytes())) {
-          // Flush the current partial frame before a known-size value would grow it. The new
-          // frame reserves enough writer and executor capacity before serialization begins.
+        } else if (requiredBufferSize > timestampedBuffer.buffer.writableBytes()) {
+          // Flush the current partial frame before the next value would exceed its accounted
+          // capacity. The new frame reserves enough writer and executor capacity before
+          // serialization begins.
           if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = null
           shard.enqueue(timestampedBuffer)
-          timestampedBuffer = newBuffer(serializedSize.get)
+          timestampedBuffer = newBuffer(requiredBufferSize)
           if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = timestampedBuffer
         }
         val dataStartPos = timestampedBuffer.buffer.writerIndex()
