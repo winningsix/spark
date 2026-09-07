@@ -25,7 +25,8 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, CompositeByteBuf}
+import io.netty.buffer.{ByteBuf, CompositeByteBuf, Unpooled}
+import io.netty.util.internal.OutOfDirectMemoryError
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkContext, SparkEnv}
@@ -143,6 +144,54 @@ private[streaming] object StreamingShuffleExecutorClient {
   }
 }
 
+/**
+ * Detaches queued route groups from Netty's pooled receive chunks.
+ *
+ * A multiplexed transport body can contain frames for many logical readers. Retaining a small
+ * slice for one slow reader otherwise pins the entire pooled arena chunk even though reader
+ * memory accounting charges only the slice's encoded bytes. Exact unpooled copies make physical
+ * direct-memory ownership track that accounting; heap is only a last-resort fallback when the
+ * JVM-wide direct limit is already exhausted.
+ */
+private[streaming] final class StreamingShuffleTransportBodyCompactor(
+    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
+    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
+  private val directCopies = new AtomicLong(0L)
+  private val directBytes = new AtomicLong(0L)
+  private val heapFallbacks = new AtomicLong(0L)
+  private val heapFallbackBytes = new AtomicLong(0L)
+
+  def copy(source: ByteBuf, start: Int, length: Int): ByteBuf = {
+    require(length > 0, "transport route group must not be empty")
+    var result: ByteBuf = null
+    var direct = true
+    try {
+      result = try allocateDirect(length)
+      catch {
+        case _: OutOfDirectMemoryError =>
+          direct = false
+          allocateHeap(length)
+      }
+      result.writeBytes(source, start, length)
+      if (direct) {
+        directCopies.incrementAndGet()
+        directBytes.addAndGet(length.toLong)
+      } else {
+        heapFallbacks.incrementAndGet()
+        heapFallbackBytes.addAndGet(length.toLong)
+      }
+      result
+    } catch {
+      case error: Throwable =>
+        if (result != null) result.release()
+        throw error
+    }
+  }
+
+  private[streaming] def stats: (Long, Long, Long, Long) =
+    (directCopies.get(), directBytes.get(), heapFallbacks.get(), heapFallbackBytes.get())
+}
+
 /** Executor-scoped client that multiplexes logical reader/writer streams over pooled channels. */
 private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private case class Route(shuffleId: Int, writerId: Int, readerId: Int)
@@ -168,6 +217,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       handler: StreamingShuffleClientHandler,
       writerId: Int,
       sequenceNumber: Long)
+
+  private val transportBodyCompactor = new StreamingShuffleTransportBodyCompactor()
 
   // A shuffle partition can be consumed by more than one downstream stage. Those logical readers
   // intentionally share one pooled transport connection and therefore have the same wire route.
@@ -298,15 +349,10 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
   }
 
-  /**
-   * Routes a body containing complete frames, preserving contiguous frame batches for each
-   * logical route. A normal one-route body therefore still reaches the reader in one call, while
-   * a cross-route body is split with retained zero-copy slices.
-   */
+  /** Routes a body containing complete frames, preserving contiguous groups for each route. */
   private def receiveMultiplexedBody(
       client: TransportClient,
-      body: ByteBuf,
-      message: ManagedBuffer): Unit = {
+      body: ByteBuf): Unit = {
     // Scan once to find contiguous route groups. The old mixed-route path first scanned the whole
     // body to decide whether it was single-route, then scanned it again while making slices. The
     // handler still performs the authoritative frame decode after routing, but the router no
@@ -334,37 +380,30 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
     groups += RouteGroup(currentRoute, groupStart, view.readerIndex())
 
-    if (groups.length == 1) {
-      val routeRegistrations = registrationsFor(groups.head.route, client)
-      if (routeRegistrations.isEmpty) {
-        logDebug("Dropping late streaming shuffle body for an inactive route")
-      } else {
-        routeRegistrations.foreach(_.handler.receiveMultiplexed(client, body, message))
-      }
-    } else {
-      groups.foreach { group =>
-        val frameGroup = body.retainedSlice(group.start, group.end - group.start)
-        val routeBody = new NettyManagedBuffer(frameGroup)
-        try {
-          val routeRegistrations = registrationsFor(group.route, client)
-          if (routeRegistrations.isEmpty) {
-            // A task may unregister immediately after consuming termination while a coalesced body
-            // is already in flight on the shared channel. The body is still owned by this method;
-            // dropping that late frame is safe because no active reader can consume it.
-            logDebug(
-              s"Dropping late streaming shuffle body for inactive route " +
-                s"shuffle=${group.route.shuffleId}, writer=${group.route.writerId}, " +
-                s"reader=${group.route.readerId}")
-          } else {
-            routeRegistrations.foreach { registration =>
-              registration.handler.receiveMultiplexed(client, frameGroup, routeBody)
-            }
+    groups.foreach { group =>
+      // Never let an asynchronously queued logical frame retain a pooled receive chunk. Copy one
+      // contiguous route group (not each frame) into exact storage so the queue's byte budget is
+      // also a useful bound on physical direct memory.
+      val frameGroup = transportBodyCompactor.copy(body, group.start, group.end - group.start)
+      val routeBody = new NettyManagedBuffer(frameGroup)
+      try {
+        val routeRegistrations = registrationsFor(group.route, client)
+        if (routeRegistrations.isEmpty) {
+          // A task may unregister immediately after consuming termination while a coalesced body
+          // is already in flight. No active reader can consume this late group.
+          logDebug(
+            s"Dropping late streaming shuffle body for inactive route " +
+              s"shuffle=${group.route.shuffleId}, writer=${group.route.writerId}, " +
+              s"reader=${group.route.readerId}")
+        } else {
+          routeRegistrations.foreach { registration =>
+            registration.handler.receiveMultiplexed(client, frameGroup, routeBody)
           }
-        } finally {
-          // Data messages retain routeBody until their queue consumer releases them; controls do
-          // not retain it and are released here.
-          routeBody.release()
         }
+      } finally {
+        // Data messages retain routeBody until their queue consumer releases them; controls do
+        // not retain it and are released here.
+        routeBody.release()
       }
     }
   }
@@ -388,7 +427,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       val body = message.convertToNetty().asInstanceOf[ByteBuf]
       try {
         withTerminationAckBatch {
-          receiveMultiplexedBody(client, body, message)
+          receiveMultiplexedBody(client, body)
         }
       } finally {
         body.release()
@@ -846,6 +885,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   def close(): Unit = {
     if (!closed.compareAndSet(false, true)) return
     val (creditRegistrations, creditWrites) = initialCreditBatchStats
+    val (compactDirectCopies, compactDirectBytes, compactHeapFallbacks,
+      compactHeapFallbackBytes) = transportBodyCompactor.stats
     logInfo(
       s"Closing executor streaming-shuffle client: " +
       s"initialCreditRegistrations=$creditRegistrations " +
@@ -855,7 +896,11 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       s"cumulativeCreditWrites=${cumulativeCreditWrites.get()} " +
       s"cumulativeCreditFrames=${cumulativeCreditFrames.get()} " +
       s"terminationAckWrites=${terminationAckWrites.get()} " +
-      s"terminationAckFrames=${terminationAckFrames.get()}")
+      s"terminationAckFrames=${terminationAckFrames.get()} " +
+      s"compactDirectCopies=$compactDirectCopies " +
+      s"compactDirectBytes=$compactDirectBytes " +
+      s"compactHeapFallbacks=$compactHeapFallbacks " +
+      s"compactHeapFallbackBytes=$compactHeapFallbackBytes")
     val activeRegistrations = registrations.values().asScala.flatMap(_.asScala).toSeq
     activeRegistrations.foreach(_.initialCreditPending.set(false))
     activeRegistrations.foreach { registration =>

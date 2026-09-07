@@ -80,6 +80,41 @@ class StreamingShuffleManagerSuite
     budget.tryAcquire(1) shouldBe false
   }
 
+  test("executor wire budget uses a bounded heap fallback at the JVM direct limit") {
+    val directOomConstructor =
+      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
+        .getDeclaredConstructor(classOf[String])
+    directOomConstructor.setAccessible(true)
+    val budget = new StreamingShuffleDirectBufferBudget(
+      1024L,
+      _ => throw directOomConstructor.newInstance("test direct limit"))
+
+    val buffer = budget.tryAllocate(512)
+    buffer should not be null
+    buffer.isDirect shouldBe false
+    budget.stats shouldBe (512L, 512L, 1024L, 0L, 0L)
+    budget.heapFallbackStats shouldBe (1L, 512L)
+    buffer.release()
+    budget.release(512)
+  }
+
+  test("executor wire budget wakes a waiter after a payload completes") {
+    val budget = new StreamingShuffleDirectBufferBudget(1024L)
+    val first = budget.tryAllocate(1024)
+    first should not be null
+
+    val waiting = CompletableFuture.supplyAsync(() => budget.awaitAllocate(1024, 10000L))
+    Thread.sleep(50L)
+    waiting.isDone shouldBe false
+    first.release()
+    budget.release(1024)
+
+    val second = waiting.get(10L, TimeUnit.SECONDS)
+    second should not be null
+    second.release()
+    budget.release(1024)
+  }
+
   // ---- getWriterId ----
 
   test("getWriterId returns the writer id for a data message") {
@@ -553,7 +588,7 @@ class StreamingShuffleManagerSuite
       eventually(Timeout(10.seconds)) {
         session.errorNotifier.getError().map(_.getMessage) shouldBe
           Some("Prepared shuffle route registration timed out for " +
-            "StreamingShuffleReceiveInboxId(7,9,0,0,-1,0): " +
+            "StreamingShuffleReceiveInboxId(7,9,0,0,-1,0,true): " +
             "completed=0, advertised=1, expected=1")
         discovery.stats._1 shouldBe 0
       }

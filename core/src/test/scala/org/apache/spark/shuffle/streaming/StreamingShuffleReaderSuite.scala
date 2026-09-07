@@ -45,6 +45,82 @@ class StreamingShuffleReaderSuite
   with Matchers
   with MockitoSugar {
 
+  test("transport body compactor detaches an exact direct route group") {
+    val source = _root_.io.netty.buffer.Unpooled.directBuffer(8192, 8192)
+    source.writeZero(8192)
+    source.setInt(1024, 0x12345678)
+    val compactor = new StreamingShuffleTransportBodyCompactor()
+    val detached = compactor.copy(source, 1024, 2048)
+    try {
+      assert(detached.isDirect)
+      assert(detached.capacity() === 2048)
+      assert(detached.readableBytes() === 2048)
+      assert(detached.getInt(0) === 0x12345678)
+      source.release()
+      assert(detached.getInt(0) === 0x12345678)
+      assert(compactor.stats === ((1L, 2048L, 0L, 0L)))
+    } finally {
+      if (source.refCnt() > 0) source.release()
+      detached.release()
+    }
+  }
+
+  test("transport body compactor falls back to exact heap storage at direct limit") {
+    val directOomConstructor =
+      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
+        .getDeclaredConstructor(classOf[String])
+    directOomConstructor.setAccessible(true)
+    val compactor = new StreamingShuffleTransportBodyCompactor(
+      _ => throw directOomConstructor.newInstance("test direct limit"),
+      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
+    val source = _root_.io.netty.buffer.Unpooled.buffer(4096, 4096).writeZero(4096)
+    val detached = compactor.copy(source, 512, 1024)
+    try {
+      assert(!detached.isDirect)
+      assert(detached.capacity() === 1024)
+      assert(compactor.stats === ((0L, 0L, 1L, 1024L)))
+    } finally {
+      source.release()
+      detached.release()
+    }
+  }
+
+  test("decompression buffer falls back to heap at the JVM direct limit") {
+    val directOomConstructor =
+      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
+        .getDeclaredConstructor(classOf[String])
+    directOomConstructor.setAccessible(true)
+    val scratch = new StreamingShuffleDecompressionBuffer(
+      _ => throw directOomConstructor.newInstance("test direct limit"),
+      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
+    val buffer = scratch.acquire(4096)
+    try {
+      assert(!buffer.isDirect && buffer.capacity() === 4096)
+    } finally {
+      scratch.close()
+    }
+  }
+
+  test("decompression buffer reuses task-local direct storage and grows only when required") {
+    var allocations = 0
+    val scratch = new StreamingShuffleDecompressionBuffer(
+      size => {
+        allocations += 1
+        _root_.io.netty.buffer.Unpooled.directBuffer(size, size)
+      },
+      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
+    try {
+      val first = scratch.acquire(4096)
+      scratch.acquire(2048) should be theSameInstanceAs first
+      val grown = scratch.acquire(8192)
+      grown should not be theSameInstanceAs(first)
+      allocations should be(2)
+    } finally {
+      scratch.close()
+      scratch.close()
+    }
+  }
+
   private def newConf(): SparkConf =
     // StreamingShuffleManager is pipelined, so it belongs in the incremental slot (the default
     // spark.shuffle.manager must be a BlockingShuffleManager). This is what initializes the
@@ -277,10 +353,10 @@ class StreamingShuffleReaderSuite
     }
   }
 
-  test("unattached prepared inbox stages data and returns producer credit") {
+  test("unattached prepared inbox stages data in bounded memory before spilling") {
     withTempDir { spillDir =>
       val queue = new StreamingShuffleMessageQueue(
-        1024L,
+        256L,
         Some(spillDir),
         stageDataBeforeConsumerAttach = true)
       val payloadReleases = new AtomicInteger(0)
@@ -298,25 +374,32 @@ class StreamingShuffleReaderSuite
 
       try {
         queue.put(dataMessage(1))
+        queue.put(dataMessage(2))
+        queue.put(dataMessage(3))
+        queue.queuedMemoryBytesCount shouldBe 256L
+        queue.receivedDataBytesCount shouldBe 384L
+        queue.spilledBytesCount shouldBe 128L
+        payloadReleases.get() shouldBe 1
+        creditReleases.get() shouldBe 3
+
+        queue.take().release()
+        queue.take().release()
+        queue.take().release()
         queue.queuedMemoryBytesCount shouldBe 0L
         queue.receivedDataBytesCount shouldBe 128L
         queue.spilledBytesCount shouldBe 128L
-        payloadReleases.get() shouldBe 1
-        creditReleases.get() shouldBe 1
-
-        val staged = queue.take()
-        staged.release()
-        creditReleases.get() shouldBe 1
+        payloadReleases.get() shouldBe 3
+        creditReleases.get() shouldBe 3
 
         queue.markConsumerAttached()
-        queue.put(dataMessage(2))
+        queue.put(dataMessage(4))
         queue.queuedMemoryBytesCount shouldBe 128L
         queue.spilledBytesCount shouldBe 128L
-        payloadReleases.get() shouldBe 1
-        creditReleases.get() shouldBe 1
+        payloadReleases.get() shouldBe 3
+        creditReleases.get() shouldBe 3
         queue.take().release()
-        payloadReleases.get() shouldBe 2
-        creditReleases.get() shouldBe 2
+        payloadReleases.get() shouldBe 4
+        creditReleases.get() shouldBe 4
       } finally {
         val messages = new java.util.ArrayList[StreamingShuffleMessage]()
         queue.drainTo(messages)

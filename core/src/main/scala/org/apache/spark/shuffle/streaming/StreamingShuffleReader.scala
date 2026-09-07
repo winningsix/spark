@@ -24,7 +24,8 @@ import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.ByteBufInputStream
+import io.netty.buffer.{ByteBuf, ByteBufInputStream, Unpooled}
+import io.netty.util.internal.OutOfDirectMemoryError
 
 import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
@@ -110,6 +111,37 @@ class StreamingShuffleReaderIteratorFactory {
       override def close(): Unit = {
         // no-op. handleTerminationMessage will take care of final cleanup.
       }
+    }
+  }
+}
+
+private[streaming] final class StreamingShuffleDecompressionBuffer(
+    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
+    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
+  private var reusable: ByteBuf = _
+
+  def acquire(size: Int): ByteBuf = {
+    require(size > 0, "decompression buffer size must be positive")
+    if (reusable == null || reusable.capacity() < size) {
+      if (reusable != null) {
+        reusable.release()
+        reusable = null
+      }
+      reusable = try allocateDirect(size)
+      catch {
+        // This task-local scratch buffer is reusable, so a heap fallback is bounded by the active
+        // consumer count and does not put transport/control allocations behind an OOM cliff.
+        case _: OutOfDirectMemoryError => allocateHeap(size)
+      }
+    }
+    reusable.clear()
+    reusable
+  }
+
+  def close(): Unit = {
+    if (reusable != null) {
+      reusable.release()
+      reusable = null
     }
   }
 }
@@ -230,6 +262,7 @@ class StreamingShuffleReader[K, C](
   @volatile private var taskDiscoveryShouldStop = false
 
   private var currentDataMessage: StreamingShuffleMessage = _
+  private val decompressionScratch = new StreamingShuffleDecompressionBuffer()
   private var queueWaitNanosRemainder = 0L
   private val reportedInboxSpilledBytes = new AtomicLong(0L)
 
@@ -300,6 +333,9 @@ class StreamingShuffleReader[K, C](
         currentDataMessage.release()
         currentDataMessage = null
       }
+    }
+    Utils.tryLogNonFatalError {
+      decompressionScratch.close()
     }
     val inboxStats = receiveInbox.map(_.close()).getOrElse {
       val list = new java.util.ArrayList[StreamingShuffleMessage]()
@@ -654,8 +690,7 @@ class StreamingShuffleReader[K, C](
       } else {
         val decompressor = compressionCodec.getOrElse(throw new IllegalStateException(
           "Received a compressed streaming shuffle message while spark.shuffle.compress=false"))
-        decompressedBuffer = dataMessage.data.alloc().directBuffer(
-          dataMessage.uncompressedSize, dataMessage.uncompressedSize)
+        decompressedBuffer = decompressionScratch.acquire(dataMessage.uncompressedSize)
         try {
           val compressed = dataMessage.getRecordData()
           val source = compressed.nioBuffer(compressed.readerIndex(), dataMessage.dataSize)
@@ -672,7 +707,6 @@ class StreamingShuffleReader[K, C](
           decompressedBuffer
         } catch {
           case t: Throwable =>
-            decompressedBuffer.release()
             decompressedBuffer = null
             throw t
         }
@@ -705,10 +739,7 @@ class StreamingShuffleReader[K, C](
           }
         }
         override def close(): Unit = {
-          if (decompressedBuffer != null) {
-            decompressedBuffer.release()
-            decompressedBuffer = null
-          }
+          decompressedBuffer = null
           dataMessage.release()
           currentDataMessage = null
         }
