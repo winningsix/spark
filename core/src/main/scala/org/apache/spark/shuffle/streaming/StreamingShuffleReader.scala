@@ -18,7 +18,8 @@
 package org.apache.spark.shuffle.streaming
 
 import java.io.File
-import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
+import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
+  ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import scala.collection.mutable

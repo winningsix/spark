@@ -17,7 +17,8 @@
 
 package org.apache.spark.shuffle.streaming
 
-import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkException, SparkRuntimeException, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkException,
+  SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
