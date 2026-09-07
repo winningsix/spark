@@ -18,6 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.zip.CRC32C
 
 import io.netty.buffer.{ByteBuf, Unpooled}
@@ -77,6 +78,55 @@ class StreamingShuffleWriterSuite
       localProperties = properties,
       metricsSystem = mock[MetricsSystem],
       cpuAmount = 1)
+  }
+
+  test("terminal cannot overtake a timer-detached shard buffer") {
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val shard = writer.shards(0)
+        val pending = writer.TimestampedBuffer(Unpooled.buffer(1024, 1024), 1024)
+        pending.buffer.writeInt(1)
+        pending.updateChecksum()
+        shard.putBuffer(pending)
+
+        val bufferDetached = new CountDownLatch(1)
+        val allowDataPublication = new CountDownLatch(1)
+        val closeStarted = new CountDownLatch(1)
+        val timerThread = new Thread(() => shard.withSendSequenceLock {
+          val detached = shard.takeBuffer()
+          bufferDetached.countDown()
+          allowDataPublication.await()
+          shard.enqueue(detached)
+        })
+        val closeThread = new Thread(() => {
+          closeStarted.countDown()
+          shard.close()
+        })
+
+        timerThread.start()
+        try {
+          assert(bufferDetached.await(10, TimeUnit.SECONDS))
+          closeThread.start()
+          assert(closeStarted.await(10, TimeUnit.SECONDS))
+          closeThread.join(100L)
+          closeThread.isAlive shouldBe true
+          shard.lastSentSequenceNum.get() shouldBe -1L
+        } finally {
+          allowDataPublication.countDown()
+          timerThread.join(TimeUnit.SECONDS.toMillis(10L))
+          if (closeThread.getState != Thread.State.NEW) {
+            closeThread.join(TimeUnit.SECONDS.toMillis(10L))
+          }
+        }
+        timerThread.isAlive shouldBe false
+        closeThread.isAlive shouldBe false
+        shard.lastSentSequenceNum.get() shouldBe 1L
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
   }
 
   test("getWriter returns a StreamingShuffleWriter") {

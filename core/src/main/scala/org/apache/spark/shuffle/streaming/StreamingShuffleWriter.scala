@@ -1609,6 +1609,9 @@ class StreamingShuffleWriter[K, V](
     // Holding that monitor across awaitAllocate forms a credit-return deadlock.
     private val sendTimestampedBufferLock = new Object
 
+    private[streaming] def withSendSequenceLock[T](body: => T): T =
+      sendTimestampedBufferLock.synchronized(body)
+
     private def sendTimestampedBuffer(
         timestampedBuffer: TimestampedBuffer,
         flushBatch: Boolean): Unit = sendTimestampedBufferLock.synchronized {
@@ -1725,7 +1728,10 @@ class StreamingShuffleWriter[K, V](
     }
 
     // Consume the current buffer, if it exists, and send it as a DataMessage.
-    def send(): Unit = {
+    def send(): Unit = withSendSequenceLock {
+      // Detaching the buffer belongs to the same critical section as assigning its sequence
+      // number. Otherwise close() can publish the terminal after this getAndSet(null), but before
+      // the timer thread publishes the detached data frame.
       val b = takeBuffer()
       if (b != null) enqueue(b)
       // flushPendingBatch mutates the ordered action queue, but the potentially blocking
@@ -1737,7 +1743,9 @@ class StreamingShuffleWriter[K, V](
 
     def putBuffer(b: TimestampedBuffer): Unit = assert(buffer.getAndSet(b) == null)
 
-    def close(): Unit = {
+    def close(): Unit = withSendSequenceLock {
+      // Fence only this shard. A writer-wide timer join can deadlock a multi-input pipeline when
+      // a flush is waiting for wire budget that another shard's terminal is needed to release.
       send()
       send(new TerminationControlMessage(streamingShuffleHandle.shuffleId, shuffleWriterId, id))
     }
