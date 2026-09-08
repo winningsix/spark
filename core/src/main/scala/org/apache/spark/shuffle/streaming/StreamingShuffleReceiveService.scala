@@ -1096,6 +1096,11 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
         }
       }
     }
+    // With a zero byte threshold, wait only until a physical writer route exists. Waiting for a
+    // first data frame is unsafe for fan-in: bounded pre-attachment credit can stop each input on
+    // a different reduce partition, leaving no task whose complete input set is message-ready.
+    // Attaching after route registration lets the reader drain its own inboxes and return credit.
+    if (drainReadyBytes == 0L && routeHandlers.nonEmpty) markDrainReady()
   }
 
   def failDiscovery(error: Throwable): Unit = {

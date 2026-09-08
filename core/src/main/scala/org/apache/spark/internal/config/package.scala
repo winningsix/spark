@@ -2011,7 +2011,9 @@ package object config {
         "positive threshold avoids spending scheduler CPU capacity on readers that would only " +
         "wait for producers. An inbox still becomes ready after every writer has terminated or " +
         "after a full receive window stops making progress, so small partitions and bounded " +
-        "producer waves cannot hang. Zero restores first-message attachment.")
+        "producer waves cannot hang. Zero attaches after the first writer route is registered, " +
+        "so bounded pre-attachment credit cannot strand a multi-input reader before its first " +
+        "message.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

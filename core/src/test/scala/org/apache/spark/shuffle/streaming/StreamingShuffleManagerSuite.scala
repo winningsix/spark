@@ -448,6 +448,49 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("zero ready bytes attaches after the first writer route is registered") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
+      .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES, 0L)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
+    val clientCreationExecutor =
+      ThreadUtils.newDaemonFixedThreadPool(1, "prepared-route-ready-test-client")
+    val sharedClient = mock[StreamingShuffleExecutorClient]
+    val transportClient = mock[TransportClient]
+    val drainReady = new CountDownLatch(1)
+    when(sharedClient.registerBatch(
+      eqTo(7),
+      eqTo(0),
+      eqTo("writer-host"),
+      eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenReturn(Map(3 -> transportClient))
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox,
+      sharedClient,
+      conf,
+      discovery,
+      clientCreationExecutor,
+      () => drainReady.countDown())
+
+    try {
+      session.start()
+      session.onWriterSnapshot(ShuffleLocationResponse(
+        Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)),
+        1))
+
+      drainReady.await(10, TimeUnit.SECONDS) shouldBe true
+      inbox.queue.isEmpty shouldBe true
+    } finally {
+      session.close()
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+
   test("writer-location notification wakes discovery before the periodic refresh") {
     val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
     val initialPoll = new CountDownLatch(1)
