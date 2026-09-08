@@ -332,14 +332,16 @@ class StreamingShuffleWriter[K, V](
 
   /**
    * Allocate a compression destination without letting Netty arena chunks become an untracked
-   * executor-wide cache. A full executor wire budget is a scheduling point: keep every producer
-   * task live, but park this task until an existing wire payload completes. This avoids turning
-   * the executor raw pool into thousands of uncompressed transport leases. If JVM direct memory
-   * is temporarily exhausted, the budget itself supplies a bounded exact heap buffer.
+   * executor-wide cache. A relaxed writer first retires one replayable pending frame when the
+   * budget is full, then falls back to its already-accounted raw buffer if no reservation becomes
+   * available. Otherwise a chained plan can fill the budget with output for an unscheduled
+   * downstream reader while every scheduled reader waits for an upstream writer parked here.
+   * Backpressured writers retain the strict wait-before-pull behavior. If JVM direct memory is
+   * temporarily exhausted, the budget itself supplies a bounded exact heap buffer.
    *
    * The returned byte count is the exact direct reservation owned by the returned buffer.
    */
-  private def allocateWireBuffer(maxSize: Int): (ByteBuf, Int) = {
+  private[streaming] def allocateWireBuffer(maxSize: Int): (ByteBuf, Int) = {
     sharedExecutorServer match {
       case Some(shared) =>
         if (!shared.wireBufferBudget.canReserve(maxSize)) {
@@ -347,6 +349,19 @@ class StreamingShuffleWriter[K, V](
           return (null, 0)
         }
         var buffer = shared.wireBufferBudget.tryAllocate(maxSize)
+        if (buffer == null && !WRITER_BACKPRESSURE_ENABLED) {
+          if (REPLAY_MAX_MEMORY > 0L) {
+            shards.iterator.exists(_.spillOnePendingData())
+            buffer = shared.wireBufferBudget.tryAllocate(maxSize)
+          }
+          if (buffer == null) {
+            // The raw input buffer already belongs to the executor-wide raw pool. Sending it
+            // uncompressed adds no allocation, and newBuffer() will spill its pending replay
+            // envelope before that separate bounded pool can block the producer.
+            shared.wireBufferBudget.recordRawFallback(maxSize)
+            return (null, 0)
+          }
+        }
         while (buffer == null) {
           throwErrorIfExists()
           buffer = shared.wireBufferBudget.awaitAllocate(maxSize, 10L)
@@ -358,7 +373,7 @@ class StreamingShuffleWriter[K, V](
     }
   }
 
-  private def releaseWireReservation(bytes: Int): Unit = {
+  private[streaming] def releaseWireReservation(bytes: Int): Unit = {
     if (bytes > 0) sharedExecutorServer.foreach(_.wireBufferBudget.release(bytes))
   }
   // A relaxed pipelined writer can return from write() long before every downstream reader has

@@ -38,6 +38,10 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCRE
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
+  STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY,
+  STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED,
   STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
@@ -269,6 +273,7 @@ class StreamingShuffleWriterSuite
     val conf = newConf()
       .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1)
       .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
+      .set(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, true)
       .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
       val context = createTaskContext(sc.conf, 0)
@@ -282,20 +287,21 @@ class StreamingShuffleWriterSuite
         dep.markReplayLeaseAvailable()
         val writer = new StreamingShuffleWriter[Int, Int](
           new StreamingShuffleHandle(0, dep), 0, context)
-        bindMockClient(writer, 0)(_ => ())
+        val client = bindMockClient(writer, 0)(_ => ())
+        writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
+          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
 
         def sendFrame(): Unit = {
-          val delivered = new CountDownLatch(1)
           val bytes = Array.fill[Byte](128)(1)
           val buffer = Unpooled.wrappedBuffer(bytes)
           val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
           buffer.release()
-          writer.shards(0).send(data, () => delivered.countDown())
-          delivered.await(10, TimeUnit.SECONDS) shouldBe true
+          writer.shards(0).send(data)
         }
 
         sendFrame()
         sendFrame()
+        writer.shards(0).spillOnePendingData() shouldBe true
         writer.stop(success = true)
 
         val replaySpilled = context.taskMetrics.streamingShuffleWriterReplayBytesSpilled
@@ -306,6 +312,44 @@ class StreamingShuffleWriterSuite
         context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe replaySpilled
       } finally {
         context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("relaxed writer uses its raw buffer instead of waiting for executor wire memory") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 40L << 10)
+      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        dep.markReplayLeaseAvailable()
+        val handle = new StreamingShuffleHandle(0, dep)
+        val writer = new StreamingShuffleManager()
+          .getWriter[Int, Int](handle, 0, context, null)
+          .asInstanceOf[StreamingShuffleWriter[Int, Int]]
+        val first = writer.allocateWireBuffer(40 << 10)
+        try {
+          first._1 should not be null
+          first._2 shouldBe (40 << 10)
+          writer.allocateWireBuffer(40 << 10) shouldBe (null, 0)
+        } finally {
+          first._1.release()
+          writer.releaseWireReservation(first._2)
+        }
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        context.markTaskFailed(cleanupError)
+        context.markTaskCompleted(Some(cleanupError))
       }
     }
   }
