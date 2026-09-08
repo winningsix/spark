@@ -316,7 +316,7 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("relaxed writer uses its raw buffer instead of waiting for executor wire memory") {
+  test("relaxed writer spills its raw fallback before network dispatch") {
     val conf = newConf()
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
       .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 40L << 10)
@@ -334,17 +334,25 @@ class StreamingShuffleWriterSuite
           rdd, new HashPartitioner(1))
         dep.markReplayLeaseAvailable()
         val handle = new StreamingShuffleHandle(0, dep)
-        val writer = new StreamingShuffleManager()
-          .getWriter[Int, Int](handle, 0, context, null)
-          .asInstanceOf[StreamingShuffleWriter[Int, Int]]
-        val first = writer.allocateWireBuffer(40 << 10)
+        val server = new StreamingShuffleExecutorServer()
+        val writer = new StreamingShuffleWriter[Int, Int](
+          handle, 0, context, sharedExecutorServer = Some(server))
+        val reserved = writer.allocateWireBuffer(40 << 10)
         try {
-          first._1 should not be null
-          first._2 shouldBe (40 << 10)
+          reserved._1 should not be null
+          reserved._2 shouldBe (40 << 10)
           writer.allocateWireBuffer(40 << 10) shouldBe (null, 0)
+
+          val raw = server.rawBufferPool.tryBorrow()
+          val pending = writer.TimestampedBuffer(raw, raw.capacity())
+          pending.buffer.writeZero(1024)
+          writer.shards(0).send(pending)
+          writer.stop(success = true)
+          context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
         } finally {
-          first._1.release()
-          writer.releaseWireReservation(first._2)
+          reserved._1.release()
+          writer.releaseWireReservation(reserved._2)
+          server.close()
         }
       } finally {
         val cleanupError = new RuntimeException("test cleanup")

@@ -1355,7 +1355,19 @@ class StreamingShuffleWriter[K, V](
         done: () => Unit = () => (),
         releaseReplayResources: () => Unit = () => (),
         releaseInputResources: () => Unit = () => (),
-        networkComplete: () => Unit = () => ()): Unit = synchronized {
+        networkComplete: () => Unit = () => ()): Unit = {
+      sendInternal(
+        message, done, releaseReplayResources, releaseInputResources, networkComplete,
+        spillBeforeDispatch = false)
+    }
+
+    private def sendInternal(
+        message: StreamingShuffleMessage,
+        done: () => Unit,
+        releaseReplayResources: () => Unit,
+        releaseInputResources: () => Unit,
+        networkComplete: () => Unit,
+        spillBeforeDispatch: Boolean): Unit = synchronized {
       // No downstream task owns this reducer route (for example, a TakeOrdered result stage may
       // read only a prefix). Retire producer-side ownership immediately instead of queuing an
       // action behind a connection future that can never complete.
@@ -1407,10 +1419,18 @@ class StreamingShuffleWriter[K, V](
         pendingBatch += pending
         livePendingSequences += sequenceNum
         pendingBatchBytes += replayEntry.length
-        // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate is
-        // not itself a memory bound if the queued send still owns an encoded duplicate of the
-        // same payload; retiring both copies is what lets a blocked route release direct memory.
-        spillReplayHistoryIfNeeded()
+        if (spillBeforeDispatch) {
+          // The relaxed compression path could not reserve a separate wire buffer. Persist this
+          // raw-backed envelope before the drain can hand it to Netty; otherwise a dormant route
+          // pins the executor raw pool until its socket write completes and recreates the same
+          // cross-input cycle at a different memory boundary.
+          spillReplayEntry(replayEntry)
+        } else {
+          // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate
+          // is not itself a memory bound if the queued send still owns an encoded duplicate of
+          // the same payload; retiring both copies is what lets a blocked route release memory.
+          spillReplayHistoryIfNeeded()
+        }
         if (pendingBatchBytes >= BATCH_SIZE) flushPendingBatch()
         return
       }
@@ -1637,6 +1657,7 @@ class StreamingShuffleWriter[K, V](
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
       var wireDirectReservation = 0
+      var spillRawBeforeDispatch = false
       val wireBuffer = compressionCodec match {
         case Some(compressor) =>
           // Compress directly between NIO views of the Netty buffers. If compression is not
@@ -1645,6 +1666,8 @@ class StreamingShuffleWriter[K, V](
           val (compressed, reservedDirectBytes) = allocateWireBuffer(maxCompressedSize)
           wireDirectReservation = reservedDirectBytes
           if (compressed == null) {
+            spillRawBeforeDispatch = sharedExecutorServer.isDefined &&
+              !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0L
             rawBuffer
           } else try {
             val source = rawBuffer.nioBuffer(rawBuffer.readerIndex(), dataSize)
@@ -1730,9 +1753,9 @@ class StreamingShuffleWriter[K, V](
       } else {
         releaseRawAfterSend
       }
-      send(dataMessage, () => {
+      sendInternal(dataMessage, () => {
         // Completion is accounted separately from input-buffer ownership.
-      }, releaseReplayResources, releaseInputResources, networkComplete)
+      }, releaseReplayResources, releaseInputResources, networkComplete, spillRawBeforeDispatch)
       // DataMessage.encode() installs a retained payload slice in the encoded frame before
       // send() returns. When compression produced a separate wire buffer, rawBuffer is no
       // longer part of either the pending send or replay history and can immediately go back to
