@@ -55,6 +55,8 @@ class TaskMetrics private[spark] () extends Serializable {
   private val _resultSerializationTime = new LongAccumulator
   private val _memoryBytesSpilled = new LongAccumulator
   private val _diskBytesSpilled = new LongAccumulator
+  private val _streamingShuffleReaderQueueBytesSpilled = new LongAccumulator
+  private val _streamingShuffleWriterReplayBytesSpilled = new LongAccumulator
   private val _peakExecutionMemory = new LongAccumulator
   private val _peakOnHeapExecutionMemory = new LongAccumulator
   private val _peakOffHeapExecutionMemory = new LongAccumulator
@@ -107,6 +109,14 @@ class TaskMetrics private[spark] () extends Serializable {
    * The number of on-disk bytes spilled by this task.
    */
   def diskBytesSpilled: Long = _diskBytesSpilled.sum
+
+  /** Encoded streaming-shuffle reader inbox bytes written to executor-local spill files. */
+  private[spark] def streamingShuffleReaderQueueBytesSpilled: Long =
+    _streamingShuffleReaderQueueBytesSpilled.sum
+
+  /** Encoded streaming-shuffle writer replay bytes written to executor-local spill files. */
+  private[spark] def streamingShuffleWriterReplayBytesSpilled: Long =
+    _streamingShuffleWriterReplayBytesSpilled.sum
 
   /**
    * Peak memory used by internal data structures created during shuffles, aggregations and
@@ -169,6 +179,10 @@ class TaskMetrics private[spark] () extends Serializable {
     _peakOffHeapExecutionMemory.setValue(v)
   private[spark] def incMemoryBytesSpilled(v: Long): Unit = _memoryBytesSpilled.add(v)
   private[spark] def incDiskBytesSpilled(v: Long): Unit = _diskBytesSpilled.add(v)
+  private[spark] def incStreamingShuffleReaderQueueBytesSpilled(v: Long): Unit =
+    _streamingShuffleReaderQueueBytesSpilled.add(v)
+  private[spark] def incStreamingShuffleWriterReplayBytesSpilled(v: Long): Unit =
+    _streamingShuffleWriterReplayBytesSpilled.add(v)
   private[spark] def incPeakExecutionMemory(v: Long): Unit = _peakExecutionMemory.add(v)
   private[spark] def incRetainedMemoryBytes(v: Long): Unit = _retainedMemoryBytes.add(v)
   private[spark] def incRetainedMemoryBuildsCompleted(v: Long = 1L): Unit =
@@ -255,6 +269,10 @@ class TaskMetrics private[spark] () extends Serializable {
     RESULT_SERIALIZATION_TIME -> _resultSerializationTime,
     MEMORY_BYTES_SPILLED -> _memoryBytesSpilled,
     DISK_BYTES_SPILLED -> _diskBytesSpilled,
+    STREAMING_SHUFFLE_READER_QUEUE_BYTES_SPILLED ->
+      _streamingShuffleReaderQueueBytesSpilled,
+    STREAMING_SHUFFLE_WRITER_REPLAY_BYTES_SPILLED ->
+      _streamingShuffleWriterReplayBytesSpilled,
     PEAK_EXECUTION_MEMORY -> _peakExecutionMemory,
     PEAK_ON_HEAP_EXECUTION_MEMORY -> _peakOnHeapExecutionMemory,
     PEAK_OFF_HEAP_EXECUTION_MEMORY -> _peakOffHeapExecutionMemory,

@@ -71,9 +71,12 @@ class StreamingShuffleClientHandler(
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
+  private var activeReceiveWindowBytes: Long = byteLimit
+  private var activeReceiveWindowExhausted = false
   private val receiveCreditLeaseClosed = new AtomicBoolean(false)
   private val receiveCreditWindowOpened = new AtomicBoolean(true)
   @volatile private var receiveCreditBudget: Option[StreamingShuffleReceiveCreditBudget] = None
+  @volatile private var receiveCreditOwner: Any = _
   @volatile private var routeReservationBytes: Long = 0L
   @volatile private var receiveCreditLease: StreamingShuffleReceiveCreditLease = _
   // Total encoded data bytes released by the task on this connection. Multiplexed routes send
@@ -124,11 +127,13 @@ class StreamingShuffleClientHandler(
 
   private[streaming] def useExecutorReceiveCreditBudget(
       budget: StreamingShuffleReceiveCreditBudget,
-      reservationBytes: Long): Unit = synchronized {
+      reservationBytes: Long,
+      owner: Any = StreamingShuffleReceiveCreditBudget.LegacyOwner): Unit = synchronized {
     require(receiveCreditLease == null, "Receive credit budget was installed after registration")
     require(receiveCreditBudget.isEmpty, "Receive credit budget was installed more than once")
     require(reservationBytes > 0L, "Receive credit reservation must be positive")
     receiveCreditBudget = Some(budget)
+    receiveCreditOwner = owner
     routeReservationBytes = reservationBytes
     receiveCreditWindowOpened.set(false)
   }
@@ -208,7 +213,10 @@ class StreamingShuffleClientHandler(
     if (backpressureEnabled && !perStreamAutoReadEnabled) {
       // A negative first credit opts this logical stream into writer-side byte admission. Positive
       // credits retain the historical connection-discovery-only protocol for dedicated channels.
-      if (windowOpened) -math.min(byteLimit, Int.MaxValue.toLong).toInt
+      val grantedBytes = synchronized {
+        if (receiveCreditLease == null) byteLimit else receiveCreditLease.bytes
+      }
+      if (windowOpened) -math.min(grantedBytes, Int.MaxValue.toLong).toInt
       else StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT
     } else {
       // Preserve the original connection-discovery marker when reader backpressure is disabled.
@@ -232,32 +240,114 @@ class StreamingShuffleClientHandler(
           if (receiveCreditLease == null) {
             val requested = if (routeReservationBytes > 0L) routeReservationBytes else byteLimit
             receiveCreditLease = budget.acquire(
-              requested, () => openDeferredReceiveWindow(client))
+              receiveCreditOwner, requested, openDeferredReceiveWindow(client, _))
           }
           val granted = receiveCreditLease.isGranted
-          if (granted) receiveCreditWindowOpened.set(true)
+          if (granted) {
+            activeReceiveWindowBytes = receiveCreditLease.bytes
+            remainingBytesQuota = activeReceiveWindowBytes
+            activeReceiveWindowExhausted = false
+            receiveCreditWindowOpened.set(true)
+          }
           granted
         }
       }
     }
   }
 
-  private def openDeferredReceiveWindow(client: TransportClient): Unit = {
-    if (!receiveCreditLeaseClosed.get() && receiveCreditWindowOpened.compareAndSet(false, true)) {
-      sendAvailableCreditFloor(client, byteLimit)
+  private def openDeferredReceiveWindow(
+      client: TransportClient,
+      grantedLease: StreamingShuffleReceiveCreditLease): Unit = {
+    val granted = synchronized {
+      if (receiveCreditLeaseClosed.get()) {
+        None
+      } else {
+        if (receiveCreditLease == null) receiveCreditLease = grantedLease
+        if ((receiveCreditLease ne grantedLease) ||
+            !receiveCreditWindowOpened.compareAndSet(false, true)) {
+          None
+        } else {
+          activeReceiveWindowBytes = grantedLease.bytes
+          remainingBytesQuota = grantedLease.bytes
+          activeReceiveWindowExhausted = false
+          Some(grantedLease.bytes)
+        }
+      }
     }
+    granted.foreach { bytes =>
+      if (lastSeqNum < 0L) {
+        sendAvailableCreditFloor(client, bytes)
+      } else {
+        sendCumulativeCreditAck(client, cumulativeReleasedBytes.get())
+      }
+    }
+  }
+
+  /**
+   * Yield a fully consumed logical receive window and queue this route for another fair turn.
+   * The executor budget is shared by every prepared inbox, so retaining a lease for the complete
+   * writer lifetime lets one join input occupy all windows while its sibling is the input the
+   * operator is currently trying to consume.
+   */
+  private def rotateReceiveCreditLease(
+      client: TransportClient,
+      releasedBytes: Long): Boolean = {
+    val budget = receiveCreditBudget.orNull
+    if (budget == null || receiveCreditLeaseClosed.get()) return false
+
+    val previous = synchronized {
+      if (receiveCreditLeaseClosed.get()) return false
+      if (!activeReceiveWindowExhausted) return false
+      if (remainingBytesQuota < activeReceiveWindowBytes) return true
+      receiveCreditWindowOpened.set(false)
+      val lease = receiveCreditLease
+      receiveCreditLease = null
+      lease
+    }
+    if (previous != null) previous.close()
+
+    val requested = if (routeReservationBytes > 0L) routeReservationBytes else byteLimit
+    val next = budget.acquire(
+      receiveCreditOwner, requested, openDeferredReceiveWindow(client, _))
+    val (retained, sendAckNow) = synchronized {
+      if (receiveCreditLeaseClosed.get()) {
+        (false, false)
+      } else {
+        if (receiveCreditLease == null) receiveCreditLease = next
+        require(receiveCreditLease eq next, "A different receive credit lease was granted")
+        val openedHere = next.isGranted &&
+          receiveCreditWindowOpened.compareAndSet(false, true)
+        if (next.isGranted) {
+          activeReceiveWindowBytes = next.bytes
+          remainingBytesQuota = next.bytes
+          activeReceiveWindowExhausted = false
+        }
+        (true, openedHere)
+      }
+    }
+    if (!retained) {
+      next.close()
+    } else if (sendAckNow) {
+      sendCumulativeCreditAck(client, releasedBytes)
+    }
+    true
   }
 
   private def maybeReleaseReceiveCredit(): Unit = {
     val releasable = synchronized {
-      terminationReceived && remainingBytesQuota >= byteLimit
+      terminationReceived && remainingBytesQuota >= activeReceiveWindowBytes
     }
     if (releasable) closeReceiveCreditLease()
   }
 
   private[streaming] def closeReceiveCreditLease(): Unit = {
     if (receiveCreditLeaseClosed.compareAndSet(false, true)) {
-      val lease = synchronized { receiveCreditLease }
+      receiveCreditWindowOpened.set(false)
+      val lease = synchronized {
+        val current = receiveCreditLease
+        receiveCreditLease = null
+        current
+      }
       if (lease != null) lease.close()
     }
   }
@@ -332,6 +422,7 @@ class StreamingShuffleClientHandler(
   private def updateQuota(bytes: Long): Long = synchronized {
     if (!backpressureEnabled) return byteLimit
     remainingBytesQuota -= bytes
+    if (bytes > 0L && remainingBytesQuota <= 0L) activeReceiveWindowExhausted = true
     if (perStreamAutoReadEnabled) {
       val autoRead = remainingBytesQuota > 0
       if (channel.config.isAutoRead != autoRead) {
@@ -348,7 +439,7 @@ class StreamingShuffleClientHandler(
 
   private def clampedAvailableReceiveBytes: Long = {
     if (receiveCreditBudget.isDefined && !receiveCreditWindowOpened.get()) 0L
-    else math.max(0L, math.min(byteLimit, remainingBytesQuota))
+    else math.max(0L, math.min(activeReceiveWindowBytes, remainingBytesQuota))
   }
 
   private def availableReceiveBytes: Long = synchronized {
@@ -574,7 +665,6 @@ class StreamingShuffleClientHandler(
             dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
               updateQuota(-messageSize)
-              maybeReleaseReceiveCredit()
               if (backpressureEnabled && !terminationReceived) {
                 if (perStreamAutoReadEnabled) {
                   // Dedicated channels retain the original additive-credit protocol; their
@@ -588,9 +678,12 @@ class StreamingShuffleClientHandler(
                   // interval repairs a delayed final wake-up without adding the same credit
                   // twice or advertising receive capacity that may still be in flight.
                   val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
-                  sendCumulativeCreditAck(client, released)
+                  if (!rotateReceiveCreditLease(client, released)) {
+                    sendCumulativeCreditAck(client, released)
+                  }
                 }
               }
+              maybeReleaseReceiveCredit()
             })
             // We can only release the frame after all rows in the buffer have been decoded. The
             // release callback returns the exact encoded frame size to the writer, so a shared

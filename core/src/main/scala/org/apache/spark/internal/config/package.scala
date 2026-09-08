@@ -1964,9 +1964,10 @@ package object config {
 
   private[spark] val STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.readerBackpressure.enabled")
-      .doc("Whether streaming shuffle readers apply the per-writer byte quota by toggling " +
-        "Netty auto-read. Disabling this lets chained pipelined readers drain all incoming " +
-        "streams without a quota-induced cross-input cycle; executor memory is then the bound.")
+      .doc("Whether streaming shuffle readers apply bounded per-route byte windows. Dedicated " +
+        "connections use Netty auto-read; multiplexed prepared readers use writer-side credit " +
+        "that is shared fairly across inboxes and rotated after consumption so one join input " +
+        "cannot block progress on its siblings.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

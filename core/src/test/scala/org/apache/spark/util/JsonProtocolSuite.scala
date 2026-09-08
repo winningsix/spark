@@ -1332,6 +1332,10 @@ private[spark] object JsonProtocolSuite extends Assertions {
     assert(metrics1.resultSerializationTime === metrics2.resultSerializationTime)
     assert(metrics1.memoryBytesSpilled === metrics2.memoryBytesSpilled)
     assert(metrics1.diskBytesSpilled === metrics2.diskBytesSpilled)
+    assert(metrics1.streamingShuffleReaderQueueBytesSpilled ===
+      metrics2.streamingShuffleReaderQueueBytesSpilled)
+    assert(metrics1.streamingShuffleWriterReplayBytesSpilled ===
+      metrics2.streamingShuffleWriterReplayBytesSpilled)
     assertEquals(metrics1.shuffleReadMetrics, metrics2.shuffleReadMetrics)
     assertEquals(metrics1.shuffleWriteMetrics, metrics2.shuffleWriteMetrics)
     assertEquals(metrics1.inputMetrics, metrics2.inputMetrics)
@@ -1613,6 +1617,8 @@ private[spark] object JsonProtocolSuite extends Assertions {
     t.setJvmGCTime(d)
     t.setResultSerializationTime(a + b)
     t.incMemoryBytesSpilled(a + c)
+    t.incStreamingShuffleReaderQueueBytesSpilled(a + c)
+    t.incStreamingShuffleWriterReplayBytesSpilled(b + c)
 
     if (hasHadoopInput) {
       val inputMetrics = t.inputMetrics
@@ -1894,6 +1900,8 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Result Serialization Time": 700,
       |    "Memory Bytes Spilled": 800,
       |    "Disk Bytes Spilled": 0,
+      |    "Streaming Shuffle Reader Queue Bytes Spilled": 800,
+      |    "Streaming Shuffle Writer Replay Bytes Spilled": 900,
       |    "Shuffle Read Metrics": {
       |      "Remote Blocks Fetched": 800,
       |      "Local Blocks Fetched": 700,
@@ -2037,6 +2045,8 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Result Serialization Time": 700,
       |    "Memory Bytes Spilled": 800,
       |    "Disk Bytes Spilled": 0,
+      |    "Streaming Shuffle Reader Queue Bytes Spilled": 800,
+      |    "Streaming Shuffle Writer Replay Bytes Spilled": 900,
       |    "Shuffle Read Metrics" : {
       |      "Remote Blocks Fetched" : 0,
       |      "Local Blocks Fetched" : 0,
@@ -2180,6 +2190,8 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Result Serialization Time": 700,
       |    "Memory Bytes Spilled": 800,
       |    "Disk Bytes Spilled": 0,
+      |    "Streaming Shuffle Reader Queue Bytes Spilled": 800,
+      |    "Streaming Shuffle Writer Replay Bytes Spilled": 900,
       |    "Shuffle Read Metrics" : {
       |      "Remote Blocks Fetched" : 0,
       |      "Local Blocks Fetched" : 0,
@@ -2838,195 +2850,223 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |        },
       |        {
       |          "ID": 9,
+      |          "Name": "$STREAMING_SHUFFLE_READER_QUEUE_BYTES_SPILLED",
+      |          "Update": 800,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 10,
+      |          "Name": "$STREAMING_SHUFFLE_WRITER_REPLAY_BYTES_SPILLED",
+      |          "Update": 900,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 11,
       |          "Name": "$PEAK_EXECUTION_MEMORY",
       |          "Update": 500,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 10,
+      |          "ID": 12,
       |          "Name": "$PEAK_ON_HEAP_EXECUTION_MEMORY",
       |          "Update": 500,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 11,
+      |          "ID": 13,
       |          "Name": "$PEAK_OFF_HEAP_EXECUTION_MEMORY",
       |          "Update": 500,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 13,
-      |          "Name": "${shuffleRead.REMOTE_BLOCKS_FETCHED}",
-      |          "Update": 0,
-      |          "Internal": true,
-      |          "Count Failed Values": true
-      |        },
-      |        {
       |          "ID": 14,
-      |          "Name": "${shuffleRead.LOCAL_BLOCKS_FETCHED}",
+      |          "Name": "$RETAINED_MEMORY_BYTES",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 15,
-      |          "Name": "${shuffleRead.REMOTE_BYTES_READ}",
-      |          "Update": 0,
-      |          "Internal": true,
-      |          "Count Failed Values": true
-      |        },
-      |        {
-      |          "ID": 16,
-      |          "Name": "${shuffleRead.REMOTE_BYTES_READ_TO_DISK}",
+      |          "Name": "$RETAINED_MEMORY_BUILDS_COMPLETED",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 17,
-      |          "Name": "${shuffleRead.LOCAL_BYTES_READ}",
+      |          "Name": "${shuffleRead.REMOTE_BLOCKS_FETCHED}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 18,
-      |          "Name": "${shuffleRead.FETCH_WAIT_TIME}",
+      |          "Name": "${shuffleRead.LOCAL_BLOCKS_FETCHED}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 19,
-      |          "Name": "${shuffleRead.RECORDS_READ}",
+      |          "Name": "${shuffleRead.REMOTE_BYTES_READ}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 20,
-      |          "Name": "${shuffleRead.CORRUPT_MERGED_BLOCK_CHUNKS}",
+      |          "Name": "${shuffleRead.REMOTE_BYTES_READ_TO_DISK}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
       |          "ID": 21,
+      |          "Name": "${shuffleRead.LOCAL_BYTES_READ}",
+      |          "Update": 0,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 22,
+      |          "Name": "${shuffleRead.FETCH_WAIT_TIME}",
+      |          "Update": 0,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 23,
+      |          "Name": "${shuffleRead.RECORDS_READ}",
+      |          "Update": 0,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 24,
+      |          "Name": "${shuffleRead.CORRUPT_MERGED_BLOCK_CHUNKS}",
+      |          "Update": 0,
+      |          "Internal": true,
+      |          "Count Failed Values": true
+      |        },
+      |        {
+      |          "ID": 25,
       |          "Name": "${shuffleRead.MERGED_FETCH_FALLBACK_COUNT}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID" : 22,
+      |          "ID" : 26,
       |          "Name" : "${shuffleRead.REMOTE_MERGED_BLOCKS_FETCHED}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 23,
+      |          "ID" : 27,
       |          "Name" : "${shuffleRead.LOCAL_MERGED_BLOCKS_FETCHED}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 24,
+      |          "ID" : 28,
       |          "Name" : "${shuffleRead.REMOTE_MERGED_CHUNKS_FETCHED}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 25,
+      |          "ID" : 29,
       |          "Name" : "${shuffleRead.LOCAL_MERGED_CHUNKS_FETCHED}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 26,
+      |          "ID" : 30,
       |          "Name" : "${shuffleRead.REMOTE_MERGED_BYTES_READ}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 27,
+      |          "ID" : 31,
       |          "Name" : "${shuffleRead.LOCAL_MERGED_BYTES_READ}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 28,
+      |          "ID" : 32,
       |          "Name" : "${shuffleRead.REMOTE_REQS_DURATION}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID" : 29,
+      |          "ID" : 33,
       |          "Name" : "${shuffleRead.REMOTE_MERGED_REQS_DURATION}",
       |          "Update" : 0,
       |          "Internal" : true,
       |          "Count Failed Values" : true
       |        },
       |        {
-      |          "ID": 30,
+      |          "ID": 34,
       |          "Name": "${shuffleWrite.BYTES_WRITTEN}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 31,
+      |          "ID": 35,
       |          "Name": "${shuffleWrite.RECORDS_WRITTEN}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 32,
+      |          "ID": 36,
       |          "Name": "${shuffleWrite.WRITE_TIME}",
       |          "Update": 0,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 33,
+      |          "ID": 37,
       |          "Name": "${input.BYTES_READ}",
       |          "Update": 2100,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 34,
+      |          "ID": 38,
       |          "Name": "${input.RECORDS_READ}",
       |          "Update": 21,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 35,
+      |          "ID": 39,
       |          "Name": "${output.BYTES_WRITTEN}",
       |          "Update": 1200,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 36,
+      |          "ID": 40,
       |          "Name": "${output.RECORDS_WRITTEN}",
       |          "Update": 12,
       |          "Internal": true,
       |          "Count Failed Values": true
       |        },
       |        {
-      |          "ID": 37,
+      |          "ID": 41,
       |          "Name": "$TEST_ACCUM",
       |          "Update": 0,
       |          "Internal": true,

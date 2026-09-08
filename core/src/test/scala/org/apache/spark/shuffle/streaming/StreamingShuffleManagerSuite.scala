@@ -837,6 +837,86 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("consumed route window rotates without starving a sibling input") {
+    withSpark(new SparkContext("local", "prepared-cross-input-credit", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val budget = new StreamingShuffleReceiveCreditBudget(64L)
+      budget.registerOwners(Seq("left-input", "right-input"))
+      val queues = (3 to 5).map { writerId =>
+        writerId -> new LinkedBlockingQueue[StreamingShuffleMessage]()
+      }.toMap
+      val readerHandlers = Seq(
+        3 -> new StreamingShuffleClientHandler(
+          3, 0, queues(3), 7, 64L, null, new ErrorNotifier()),
+        4 -> new StreamingShuffleClientHandler(
+          4, 0, queues(4), 7, 64L, null, new ErrorNotifier()),
+        5 -> new StreamingShuffleClientHandler(
+          5, 0, queues(5), 7, 64L, null, new ErrorNotifier()))
+      readerHandlers.take(2).foreach { case (_, handler) =>
+        handler.useExecutorReceiveCreditBudget(budget, 64L, "left-input")
+      }
+      readerHandlers.drop(2).foreach { case (_, handler) =>
+        handler.useExecutorReceiveCreditBudget(budget, 64L, "right-input")
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => (), 7, 1, mock[TaskContext], new ErrorNotifier())
+      }.toMap
+      var queuedData: StreamingShuffleMessage = null
+      try {
+        val routeClients = client.registerBatch(
+          7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          writerHandlers(3).availableDataCredit(
+            0, writerHandlers(3).clientsFor(0).head) shouldBe 32L
+          writerHandlers(4).availableDataCredit(
+            0, writerHandlers(4).clientsFor(0).head) shouldBe 0L
+          writerHandlers(5).availableDataCredit(
+            0, writerHandlers(5).clientsFor(0).head) shouldBe 32L
+        }
+
+        val firstWriterClient = writerHandlers(3).clientsFor(0).head
+        writerHandlers(3).consumeDataCredit(0, firstWriterClient, 40L)
+        val encoded = ByteBuffer.allocate(40)
+        encoded.putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id())
+        encoded.putLong(0L)
+        encoded.putInt(7)
+        encoded.putInt(3)
+        encoded.putInt(0)
+        encoded.putInt(0)
+        encoded.putInt(0)
+        encoded.putLong(0L)
+        encoded.flip()
+        readerHandlers.head._2.receive(routeClients(3), encoded, null)
+        queuedData = queues(3).poll(10, TimeUnit.SECONDS)
+        queuedData should not be null
+        queuedData.release()
+        queuedData = null
+
+        eventually(Timeout(10.seconds)) {
+          writerHandlers(4).availableDataCredit(
+            0, writerHandlers(4).clientsFor(0).head) shouldBe 32L
+          writerHandlers(3).availableDataCredit(0, firstWriterClient) shouldBe 0L
+        }
+      } finally {
+        if (queuedData != null) queuedData.release()
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
+        client.close()
+        server.close()
+      }
+      budget.usedBytesCount shouldBe 0L
+    }
+  }
+
   test("successive consumer generations pool routes on replay-isolated lanes") {
     withSpark(new SparkContext("local", "prepared-consumer-generation-lanes", new SparkConf())) {
       _ =>

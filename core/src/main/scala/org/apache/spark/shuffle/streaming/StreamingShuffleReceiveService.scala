@@ -33,12 +33,13 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
+  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT,
   STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT,
-  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY,
-  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
+  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY,
+  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
@@ -94,6 +95,8 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
   require(maxBytes > 0L, "maxBytes must be positive")
 
   private val pending = new TreeMap[Long, LinkedHashSet[StreamingShuffleReceiveCreditLease]]()
+  private val owners = mutable.HashSet.empty[Any]
+  private val usedBytesByOwner = mutable.HashMap.empty[Any, Long]
   private var usedBytes = 0L
   private var pendingLeases = 0
   private var peakUsedBytes = 0L
@@ -101,16 +104,50 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
   private var deferredGrants = 0L
   private var closed = false
 
+  def registerOwners(newOwners: Iterable[Any]): Unit = synchronized {
+    owners ++= newOwners
+  }
+
+  def unregisterOwner(owner: Any): Unit = synchronized {
+    owners -= owner
+    if (usedBytesByOwner.getOrElse(owner, 0L) == 0L) usedBytesByOwner -= owner
+  }
+
+  private def ownerLimit(owner: Any): Long = {
+    if (owners.contains(owner) && owners.nonEmpty) math.max(1L, maxBytes / owners.size)
+    else maxBytes
+  }
+
+  private def canGrant(lease: StreamingShuffleReceiveCreditLease): Boolean = {
+    lease.bytes <= maxBytes - usedBytes &&
+      lease.bytes <= ownerLimit(lease.owner) - usedBytesByOwner.getOrElse(lease.owner, 0L)
+  }
+
+  private def grant(lease: StreamingShuffleReceiveCreditLease): Unit = {
+    usedBytes += lease.bytes
+    usedBytesByOwner.update(
+      lease.owner, usedBytesByOwner.getOrElse(lease.owner, 0L) + lease.bytes)
+    peakUsedBytes = math.max(peakUsedBytes, usedBytes)
+    lease.markGranted()
+  }
+
   def acquire(bytes: Long, onGranted: () => Unit): StreamingShuffleReceiveCreditLease = {
-    val requested = math.max(1L, math.min(bytes, maxBytes))
-    val lease = new StreamingShuffleReceiveCreditLease(this, requested, onGranted)
+    acquire(StreamingShuffleReceiveCreditBudget.LegacyOwner, bytes, _ => onGranted())
+  }
+
+  def acquire(
+      owner: Any,
+      bytes: Long,
+      onGranted: StreamingShuffleReceiveCreditLease => Unit): StreamingShuffleReceiveCreditLease = {
+    val requested = synchronized {
+      math.max(1L, math.min(bytes, ownerLimit(owner)))
+    }
+    val lease = new StreamingShuffleReceiveCreditLease(this, owner, requested, onGranted)
     synchronized {
       if (closed) {
         lease.markClosed()
-      } else if (requested <= maxBytes - usedBytes) {
-        usedBytes += requested
-        peakUsedBytes = math.max(peakUsedBytes, usedBytes)
-        lease.markGranted()
+      } else if (canGrant(lease)) {
+        grant(lease)
       } else {
         pending.computeIfAbsent(
           requested, _ => new LinkedHashSet[StreamingShuffleReceiveCreditLease]()).add(lease)
@@ -134,6 +171,11 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
         if (lease.isGranted) {
           usedBytes -= lease.bytes
           require(usedBytes >= 0L, s"Receive credit budget underflow: $usedBytes")
+          val ownerBytes = usedBytesByOwner.getOrElse(lease.owner, 0L) - lease.bytes
+          require(ownerBytes >= 0L,
+            s"Receive credit owner budget underflow for ${lease.owner}: $ownerBytes")
+          if (ownerBytes == 0L) usedBytesByOwner -= lease.owner
+          else usedBytesByOwner.update(lease.owner, ownerBytes)
         } else {
           val sameSize = pending.get(lease.bytes)
           if (sameSize != null && sameSize.remove(lease)) {
@@ -142,22 +184,34 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
           }
         }
         val ready = new mutable.ArrayBuffer[() => Unit]()
-        var next = if (closed) null else pending.firstEntry()
-        while (next != null && next.getKey <= maxBytes - usedBytes) {
-          val candidates = next.getValue
-          val iterator = candidates.iterator()
-          val candidate = iterator.next()
-          iterator.remove()
-          pendingLeases -= 1
-          if (candidates.isEmpty) pending.remove(next.getKey)
-          if (!candidate.isClosed) {
-            usedBytes += candidate.bytes
-            peakUsedBytes = math.max(peakUsedBytes, usedBytes)
-            deferredGrants += 1L
-            candidate.markGranted()
-            ready += candidate.onGranted
+        var madeProgress = !closed
+        while (madeProgress && !closed) {
+          madeProgress = false
+          val entries = pending.entrySet().iterator()
+          var candidate: StreamingShuffleReceiveCreditLease = null
+          while (candidate == null && entries.hasNext) {
+            val entry = entries.next()
+            val candidates = entry.getValue.iterator()
+            while (candidate == null && candidates.hasNext) {
+              val current = candidates.next()
+              if (current.isClosed) {
+                candidates.remove()
+                pendingLeases -= 1
+              } else if (canGrant(current)) {
+                candidate = current
+                candidates.remove()
+                pendingLeases -= 1
+              }
+            }
+            if (entry.getValue.isEmpty) entries.remove()
           }
-          next = pending.firstEntry()
+          if (candidate != null) {
+            val grantedCandidate = candidate
+            grant(grantedCandidate)
+            deferredGrants += 1L
+            ready += (() => grantedCandidate.onGranted(grantedCandidate))
+            madeProgress = true
+          }
         }
         ready.toSeq
       }
@@ -186,10 +240,15 @@ private[streaming] final class StreamingShuffleReceiveCreditBudget(val maxBytes:
   }
 }
 
+private[streaming] object StreamingShuffleReceiveCreditBudget {
+  private[streaming] val LegacyOwner = new Object()
+}
+
 private[streaming] final class StreamingShuffleReceiveCreditLease(
     budget: StreamingShuffleReceiveCreditBudget,
+    private[streaming] val owner: Any,
     val bytes: Long,
-    private[streaming] val onGranted: () => Unit) {
+    private[streaming] val onGranted: StreamingShuffleReceiveCreditLease => Unit) {
   @volatile private var granted = false
   @volatile private var closed = false
 
@@ -352,6 +411,7 @@ private[streaming] class StreamingShuffleReceiveService(
       return logicalRace.id == id && logicalRace.session.isDefined
     }
     try {
+      readerCreditBudget.foreach(_.registerOwners(Seq(id)))
       val executorClient = sharedClient().getOrElse(throw new IllegalStateException(
         "Prepared receive inbox requires the shared executor client"))
       val resources = getPreparedResources
@@ -366,6 +426,7 @@ private[streaming] class StreamingShuffleReceiveService(
       logDebug(s"Prepared streaming shuffle receive inbox $id")
     } catch {
       case t: Throwable =>
+        readerCreditBudget.foreach(_.unregisterOwner(id))
         preparedInboxes.remove(key, inbox)
         inboxes.remove(id, inbox)
         inbox.close()
@@ -375,8 +436,17 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
+    // Publish the complete prepared frontier to credit admission before any session begins route
+    // registration. This prevents the first join input in the batch from claiming the whole
+    // executor window merely because its discovery callbacks ran first.
+    readerCreditBudget.foreach(_.registerOwners(ids.distinct))
     val newlyPrepared = mutable.ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
-    def rollback(): Unit = newlyPrepared.reverseIterator.foreach(releasePrepared)
+    def rollback(): Unit = {
+      newlyPrepared.reverseIterator.foreach(releasePrepared)
+      ids.distinct.filterNot(inboxes.containsKey).foreach { id =>
+        readerCreditBudget.foreach(_.unregisterOwner(id))
+      }
+    }
     try {
       val remaining = ids.distinct.iterator
       var prepared = true
@@ -400,6 +470,7 @@ private[streaming] class StreamingShuffleReceiveService(
     inbox != null && inboxes.remove(id, inbox) && {
       preparedInboxes.remove(preparedInboxKey(id), inbox)
       inbox.close()
+      readerCreditBudget.foreach(_.unregisterOwner(id))
       true
     }
   }
@@ -409,6 +480,7 @@ private[streaming] class StreamingShuffleReceiveService(
       if (entry.getKey.shuffleId == shuffleId && inboxes.remove(entry.getKey, entry.getValue)) {
         preparedInboxes.remove(preparedInboxKey(entry.getKey), entry.getValue)
         entry.getValue.close()
+        readerCreditBudget.foreach(_.unregisterOwner(entry.getKey))
       }
     }
   }
@@ -426,6 +498,7 @@ private[streaming] class StreamingShuffleReceiveService(
       if (inboxes.remove(entry.getKey, entry.getValue)) {
         preparedInboxes.remove(preparedInboxKey(entry.getKey), entry.getValue)
         entry.getValue.close()
+        readerCreditBudget.foreach(_.unregisterOwner(entry.getKey))
       }
     }
     val resources = preparedResources
@@ -453,7 +526,9 @@ private[streaming] class StreamingShuffleReceiveService(
     if (inbox.id.taskAttemptId < 0L) {
       preparedInboxes.remove(preparedInboxKey(inbox.id), inbox)
     }
-    inbox.close()
+    val stats = inbox.close()
+    readerCreditBudget.foreach(_.unregisterOwner(inbox.id))
+    stats
   }
 
   private def createQueue(
@@ -901,9 +976,9 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     // lifetime writer, not only for the writers that happen to run concurrently.
     val perWriterByteLimit = StreamingShuffleReceiveService.routeByteLimit(
       conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY), numWriters)
-    // A controlled writer admits one complete frame whenever a route has positive credit, even
-    // when the fair-share window is smaller than the frame. Reserve for that largest normal frame
-    // so the sum of active logical windows remains within the executor budget.
+    // A controlled writer admits one complete frame whenever a route has positive credit. Prefer
+    // a reservation large enough for that normal frame; owner fairness may clamp the advertised
+    // window when many inboxes share the executor, leaving only a one-frame bounded overshoot.
     val routeReservationBytes = math.max(
       perWriterByteLimit,
       conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE).toLong + 40L)
@@ -986,7 +1061,7 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
         () => onMessageAvailable(),
         () => onReceiveWindowExhausted())
       receiveCreditBudget.foreach(
-        handler.useExecutorReceiveCreditBudget(_, routeReservationBytes))
+        handler.useExecutorReceiveCreditBudget(_, routeReservationBytes, inbox.id))
       handler.setOnTermAckResponseHandler { writerId =>
         terminationAckControlMessageSet.add(writerId.toLong)
         if (terminationAckControlMessageSet.size() == totalNumShuffleWriters.get()) {

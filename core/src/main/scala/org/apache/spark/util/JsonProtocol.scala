@@ -667,6 +667,12 @@ private[spark] object JsonProtocol extends JsonUtils {
     g.writeNumberField("Result Serialization Time", taskMetrics.resultSerializationTime)
     g.writeNumberField("Memory Bytes Spilled", taskMetrics.memoryBytesSpilled)
     g.writeNumberField("Disk Bytes Spilled", taskMetrics.diskBytesSpilled)
+    g.writeNumberField(
+      "Streaming Shuffle Reader Queue Bytes Spilled",
+      taskMetrics.streamingShuffleReaderQueueBytesSpilled)
+    g.writeNumberField(
+      "Streaming Shuffle Writer Replay Bytes Spilled",
+      taskMetrics.streamingShuffleWriterReplayBytesSpilled)
     g.writeFieldName("Shuffle Read Metrics")
     writeShuffleReadMetrics()
     g.writeFieldName("Shuffle Write Metrics")
@@ -1333,6 +1339,12 @@ private[spark] object JsonProtocol extends JsonUtils {
     metrics.setResultSerializationTime(json.get("Result Serialization Time").extractLong)
     metrics.incMemoryBytesSpilled(json.get("Memory Bytes Spilled").extractLong)
     metrics.incDiskBytesSpilled(json.get("Disk Bytes Spilled").extractLong)
+    metrics.incStreamingShuffleReaderQueueBytesSpilled(
+      jsonOption(json.get("Streaming Shuffle Reader Queue Bytes Spilled"))
+        .map(_.extractLong).getOrElse(0L))
+    metrics.incStreamingShuffleWriterReplayBytesSpilled(
+      jsonOption(json.get("Streaming Shuffle Writer Replay Bytes Spilled"))
+        .map(_.extractLong).getOrElse(0L))
 
     // Shuffle read metrics
     jsonOption(json.get("Shuffle Read Metrics")).foreach { readJson =>

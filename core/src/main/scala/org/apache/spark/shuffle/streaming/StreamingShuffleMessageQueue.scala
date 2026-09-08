@@ -234,11 +234,9 @@ private[streaming] final class StreamingShuffleMessageQueue
     val bytes = new Array[Byte](data.dataSize)
     data.data.getBytes(data.data.readerIndex(), bytes)
     val offset = writeFully(bytes)
-    // Payload ownership can end as soon as its durable copy exists. For an unattached prepared
-    // inbox, return receive credit at that same durability boundary: no compute task exists that
-    // could consume the entry, and retaining one window per inactive route eventually strands
-    // every executor credit lease. Once the task attaches, keep the normal consume-time credit
-    // lifecycle so a slow live reader still backpressures its producers.
+    // Payload ownership can end as soon as its durable copy exists. Receive credit remains tied
+    // to the queue entry until the consumer materializes and releases it; otherwise an unattached
+    // inbox can turn its spill file into an unbounded extension of the receive window.
     var consumerReleaseCallback = data.takeReleaseCallback()
     try {
       data.releaseOwnedResources()
@@ -261,20 +259,11 @@ private[streaming] final class StreamingShuffleMessageQueue
     val bytes = data.dataSize.toLong
     updateMaximum(maxDataMessageBytes, bytes)
     if (!reserveInMemory(bytes)) {
-      spillData(data, releaseCreditNow = true)
+      spillData(data, releaseCreditNow = false)
     } else {
-      // No task exists yet to consume this entry and return its route credit. Return that credit
-      // after reserving the executor-wide queue budget, while retaining payload ownership until
-      // the eventual consumer releases the DataMessage. This lets small prepared frontiers stay
-      // in memory without turning the executor into an unbounded receiver.
-      val creditReleaseCallback = data.takeReleaseCallback()
-      try {
-        if (creditReleaseCallback != null) creditReleaseCallback.run()
-      } catch {
-        case t: Throwable =>
-          releaseInMemory(bytes)
-          throw t
-      }
+      // The prepared inbox owns both the payload and its receive credit until compute attaches.
+      // Executor-wide credit admission guarantees that sibling inputs retain a fair window, so
+      // progress no longer depends on returning this credit before consumption.
       new InMemoryEntry(data)
     }
   }

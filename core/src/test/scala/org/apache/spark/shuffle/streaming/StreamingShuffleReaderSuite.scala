@@ -321,8 +321,11 @@ class StreamingShuffleReaderSuite
         context.markTaskCompleted(None)
 
         context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
+        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe bytes.length.toLong
+        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe 0L
         reader.cleanupResources()
         context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
+        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe bytes.length.toLong
       }
     }
   }
@@ -380,7 +383,7 @@ class StreamingShuffleReaderSuite
         queue.receivedDataBytesCount shouldBe 384L
         queue.spilledBytesCount shouldBe 128L
         payloadReleases.get() shouldBe 1
-        creditReleases.get() shouldBe 3
+        creditReleases.get() shouldBe 0
 
         queue.take().release()
         queue.take().release()
@@ -487,5 +490,26 @@ class StreamingShuffleReaderSuite
     Seq(first, second, blockedLarge, blockedSmall).foreach(_.close())
     budget.usedBytesCount shouldBe 0L
     budget.pendingLeaseCount shouldBe 0
+  }
+
+  test("executor receive credit reserves a fair window for every prepared inbox") {
+    val budget = new StreamingShuffleReceiveCreditBudget(120L)
+    budget.registerOwners(Seq("left-input", "right-input"))
+
+    val leftFirst = budget.acquire("left-input", 120L, _ => ())
+    val leftSecond = budget.acquire("left-input", 120L, _ => ())
+    val rightFirst = budget.acquire("right-input", 120L, _ => ())
+
+    leftFirst.bytes shouldBe 60L
+    leftFirst.isGranted shouldBe true
+    leftSecond.isGranted shouldBe false
+    rightFirst.bytes shouldBe 60L
+    rightFirst.isGranted shouldBe true
+    budget.usedBytesCount shouldBe 120L
+
+    leftFirst.close()
+    leftSecond.isGranted shouldBe true
+    Seq(leftSecond, rightFirst).foreach(_.close())
+    budget.usedBytesCount shouldBe 0L
   }
 }

@@ -2032,8 +2032,9 @@ class StreamingShuffleWriter[K, V](
     val currentReplaySpilledBytes = replaySpilledBytes.get()
     val previouslyReported = reportedReplaySpilledBytes.getAndSet(currentReplaySpilledBytes)
     if (currentReplaySpilledBytes > previouslyReported) {
-      context.taskMetrics().incDiskBytesSpilled(
-        currentReplaySpilledBytes - previouslyReported)
+      val newlySpilled = currentReplaySpilledBytes - previouslyReported
+      context.taskMetrics().incDiskBytesSpilled(newlySpilled)
+      context.taskMetrics().incStreamingShuffleWriterReplayBytesSpilled(newlySpilled)
     }
     Some(MapStatus(
       SparkEnv.get.blockManager.shuffleServerId,

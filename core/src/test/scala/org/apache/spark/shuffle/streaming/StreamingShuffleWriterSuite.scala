@@ -35,8 +35,9 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
-  STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
+  STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
+  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
@@ -258,6 +259,51 @@ class StreamingShuffleWriterSuite
 
         context.taskMetrics.diskBytesSpilled shouldBe 0L
         writer.errorNotifier.getError() shouldBe empty
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("writer replay spill has an independent task metric") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        dep.markReplayLeaseAvailable()
+        val writer = new StreamingShuffleWriter[Int, Int](
+          new StreamingShuffleHandle(0, dep), 0, context)
+        bindMockClient(writer, 0)(_ => ())
+
+        def sendFrame(): Unit = {
+          val delivered = new CountDownLatch(1)
+          val bytes = Array.fill[Byte](128)(1)
+          val buffer = Unpooled.wrappedBuffer(bytes)
+          val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+          buffer.release()
+          writer.shards(0).send(data, () => delivered.countDown())
+          delivered.await(10, TimeUnit.SECONDS) shouldBe true
+        }
+
+        sendFrame()
+        sendFrame()
+        writer.stop(success = true)
+
+        val replaySpilled = context.taskMetrics.streamingShuffleWriterReplayBytesSpilled
+        replaySpilled should be > 0L
+        context.taskMetrics.diskBytesSpilled shouldBe replaySpilled
+        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe 0L
+        writer.stop(success = true)
+        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe replaySpilled
       } finally {
         context.markTaskCompleted(None)
       }

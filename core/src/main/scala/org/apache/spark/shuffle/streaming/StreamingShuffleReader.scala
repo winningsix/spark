@@ -356,7 +356,9 @@ class StreamingShuffleReader[K, C](
     // event logs do not describe an executor-local RTM spill file as a spill-free shuffle.
     val previouslyReported = reportedInboxSpilledBytes.getAndSet(inboxStats.spilledBytes)
     if (inboxStats.spilledBytes > previouslyReported) {
-      context.taskMetrics().incDiskBytesSpilled(inboxStats.spilledBytes - previouslyReported)
+      val newlySpilled = inboxStats.spilledBytes - previouslyReported
+      context.taskMetrics().incDiskBytesSpilled(newlySpilled)
+      context.taskMetrics().incStreamingShuffleReaderQueueBytesSpilled(newlySpilled)
     }
     if (inboxStats.spilledBytes > 0L) {
       val (queuePeakBytes, maxMessageBytes) = messageQueue match {
