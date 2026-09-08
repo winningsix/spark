@@ -317,6 +317,46 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("submitted replay reclamation consumes each candidate once") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        dep.markReplayLeaseAvailable()
+        val writer = new StreamingShuffleWriter[Int, Int](
+          new StreamingShuffleHandle(0, dep), 0, context)
+        bindMockClient(writer, 0)(_ => ())
+
+        (0 until 3).foreach { value =>
+          val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](128)(value.toByte))
+          val data = new DataMessage(0, 0, buffer.readableBytes(), buffer, 0L)
+          buffer.release()
+          writer.shards(0).send(data)
+        }
+
+        (0 until 3).foreach { _ =>
+          eventually(Timeout(10.seconds)) {
+            writer.shards(0).spillOneSubmittedReplayData() shouldBe true
+          }
+        }
+        writer.shards(0).spillOneSubmittedReplayData() shouldBe false
+        writer.stop(success = true)
+        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   test("relaxed writer uses its raw buffer instead of waiting for executor wire memory") {
     val conf = newConf()
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)

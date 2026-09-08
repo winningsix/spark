@@ -521,6 +521,12 @@ class StreamingShuffleWriter[K, V](
       def length: Int = if (buffer != null) buffer.readableBytes() else fileLength
     }
     private val replayHistory = new mutable.ArrayDeque[ReplayEntry]()
+    private val replayBySequence = new mutable.LongMap[ReplayEntry]()
+    // Entries become reclaimable when their ordered DataAction has been submitted. Keep that
+    // transition explicitly instead of rescanning the full replay history for every raw-buffer
+    // request. A blocked route can retain hundreds of thousands of old frames, making the scan
+    // quadratic exactly when pool pressure requires reclamation to make forward progress.
+    private val submittedReplayCandidates = new mutable.ArrayDeque[ReplayEntry]()
     // The common all-readers-connected path never opens this file. It is created lazily only when
     // a configured replay cap is exceeded, allowing late readers to recover old frames without
     // retaining an unbounded amount of executor direct memory.
@@ -729,8 +735,14 @@ class StreamingShuffleWriter[K, V](
       if (firstFailure != null) throw firstFailure
     }
 
+    private def markDataSubmitted(sequenceNum: Long): Unit = synchronized {
+      livePendingSequences -= sequenceNum
+      replayBySequence.get(sequenceNum).filter(_.buffer != null)
+        .foreach(submittedReplayCandidates.append)
+    }
+
     private def replayLength(sequenceNum: Long, fallback: PendingSend): Long = {
-      replayHistory.find(_.sequenceNum == sequenceNum)
+      replayBySequence.get(sequenceNum)
         .map(_.length.toLong)
         .getOrElse(Option(fallback.buf).map(_.readableBytes().toLong).getOrElse(0L))
     }
@@ -1327,7 +1339,7 @@ class StreamingShuffleWriter[K, V](
           entry.releaseInput()
           Option(entry.buf).foreach(_.release())
           entry.buf = null
-          synchronized { livePendingSequences -= entry.sequenceNum }
+          markDataSubmitted(entry.sequenceNum)
         }
         case _ =>
       }
@@ -1414,6 +1426,7 @@ class StreamingShuffleWriter[K, V](
         buf.retainedDuplicate(),
         releaseReplayResources)
       replayHistory += replayEntry
+      replayBySequence(sequenceNum) = replayEntry
       inMemoryReplayBytes += replayEntry.length
 
       if (message.isInstanceOf[DataMessage]) {
@@ -1525,6 +1538,7 @@ class StreamingShuffleWriter[K, V](
         while (replayHistory.nonEmpty && replayHistory.head.sequenceNum <= minEnqueued &&
             !unackedTerminalSequence.contains(replayHistory.head.sequenceNum)) {
           val entry = replayHistory.removeHead()
+          replayBySequence.remove(entry.sequenceNum)
           releaseReplayEntry(entry)
         }
       }
@@ -1834,6 +1848,8 @@ class StreamingShuffleWriter[K, V](
         releaseReplayEntry(entry)
       }
       replayHistory.clear()
+      replayBySequence.clear()
+      submittedReplayCandidates.clear()
       livePendingSequences.clear()
       lastEnqueuedByClient.clear()
       replayPendingClients.clear()
@@ -2005,7 +2021,7 @@ class StreamingShuffleWriter[K, V](
           case DataAction(entries) => entries.find(_.buf != null)
         }.flatten
       }
-      pending.flatMap(entry => replayHistory.find(_.sequenceNum == entry.sequenceNum)) match {
+      pending.flatMap(entry => replayBySequence.get(entry.sequenceNum)) match {
         case Some(replayEntry) =>
           if (replayEntry.buffer != null) {
             spillReplayEntry(replayEntry)
@@ -2028,14 +2044,16 @@ class StreamingShuffleWriter[K, V](
     /** Spill one in-memory data entry whose ordered send is no longer pending. */
     private[streaming] def spillOneSubmittedReplayData(): Boolean = synchronized {
       if (REPLAY_MAX_MEMORY <= 0) return false
-      replayHistory.find { entry =>
-        entry.isData && entry.buffer != null && !livePendingSequences.contains(entry.sequenceNum)
-      } match {
-        case Some(entry) =>
+      while (submittedReplayCandidates.nonEmpty) {
+        val entry = submittedReplayCandidates.removeHead()
+        if (entry.isData && entry.buffer != null &&
+            !livePendingSequences.contains(entry.sequenceNum) &&
+            replayBySequence.get(entry.sequenceNum).exists(_ eq entry)) {
           spillReplayEntry(entry)
-          true
-        case None => false
+          return true
+        }
       }
+      false
     }
 
     private def closeReplayFile(): Unit = {
