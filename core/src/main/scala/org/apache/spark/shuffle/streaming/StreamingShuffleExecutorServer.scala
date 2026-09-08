@@ -48,6 +48,10 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   private case class PendingCredit(client: TransportClient, message: CreditControlMessage)
 
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
+  // Raw buffers are owned by the executor pool but can remain pinned in a different writer's
+  // dormant route. Let a writer that cannot borrow ask its siblings to move one queued frame to
+  // replay storage. A task-local scan cannot reclaim buffers retained by completed map tasks.
+  private val rawBufferReclaimers = new ConcurrentHashMap[Long, () => Boolean]()
   // Prepared inboxes advertise their receive windows before producer tasks are launched. The
   // executor endpoint therefore has to retain discovery credits that race ahead of a writer's
   // handler registration; dropping them turns a successful prepareInbox ACK into a route that is
@@ -246,13 +250,15 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   def register(
       shuffleId: Int,
       writerId: Int,
-      handler: StreamingShuffleServerHandler): Unit = {
+      handler: StreamingShuffleServerHandler,
+      reclaimRawBuffer: () => Boolean = () => false): Unit = {
     val routeKey = key(shuffleId, writerId)
     routeLock(routeKey).synchronized {
       retiredRoutes.remove(routeKey)
       val existing = handlers.putIfAbsent(routeKey, handler)
       require(existing == null,
         s"Streaming shuffle $shuffleId writer $writerId is already active")
+      rawBufferReclaimers.put(routeKey, reclaimRawBuffer)
       // Drain while holding the same route lock used by early-credit retention. When this returns,
       // every credit that observed an absent handler is owned by this handler, and every later
       // credit observes the installed handler directly.
@@ -266,8 +272,20 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       handler: StreamingShuffleServerHandler): Unit = {
     val routeKey = key(shuffleId, writerId)
     routeLock(routeKey).synchronized {
-      if (handlers.remove(routeKey, handler)) retiredRoutes.add(routeKey)
+      if (handlers.remove(routeKey, handler)) {
+        rawBufferReclaimers.remove(routeKey)
+        retiredRoutes.add(routeKey)
+      }
     }
+  }
+
+  /** Spill one queued frame owned by any writer sharing this executor's raw-buffer pool. */
+  private[streaming] def reclaimOneRawBuffer(): Boolean = {
+    val reclaimers = rawBufferReclaimers.values().iterator()
+    while (reclaimers.hasNext) {
+      if (reclaimers.next()()) return true
+    }
+    false
   }
 
   def close(): Unit = {
@@ -295,6 +313,7 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     rawBufferPool.close()
     wireBufferBudget.close()
     pendingCredits.clear()
+    rawBufferReclaimers.clear()
     retiredRoutes.clear()
     server.close()
   }

@@ -405,6 +405,57 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("relaxed writer reclaims a raw buffer from a sibling writer") {
+    val conf = newConf()
+      .set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 32768L)
+      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val firstContext = createTaskContext(sc.conf, 0)
+      val secondContext = createTaskContext(sc.conf, 1)
+      val server = new StreamingShuffleExecutorServer()
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 2, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        val handle = new StreamingShuffleHandle(0, dep)
+        val first = new StreamingShuffleWriter[Int, Int](
+          handle, 0, firstContext, sharedExecutorServer = Some(server))
+        val second = new StreamingShuffleWriter[Int, Int](
+          handle, 1, secondContext, sharedExecutorServer = Some(server))
+
+        val client = bindMockClient(first, 0)(_ => ())
+        first.transportServerHandler.handleMessage(client, new CreditControlMessage(
+          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
+        val held = first.newBuffer()
+        held.buffer.writeZero(1024)
+        first.shards(0).send(held)
+
+        val reclaimed = second.newBuffer()
+        try {
+          reclaimed.buffer should not be null
+          first.stop(success = true)
+          firstContext.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
+        } finally {
+          server.rawBufferPool.recycle(reclaimed.buffer)
+        }
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        firstContext.markTaskFailed(cleanupError)
+        firstContext.markTaskCompleted(Some(cleanupError))
+        secondContext.markTaskFailed(cleanupError)
+        secondContext.markTaskCompleted(Some(cleanupError))
+        server.close()
+      }
+    }
+  }
+
   test("server handler uses credit-map presence as the route control marker") {
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)

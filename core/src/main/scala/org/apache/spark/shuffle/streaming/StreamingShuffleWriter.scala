@@ -414,7 +414,10 @@ class StreamingShuffleWriter[K, V](
     val server = sharedExecutorServer match {
       case Some(shared) =>
         shared.register(
-          streamingShuffleHandle.shuffleId, shuffleWriterId, transportServerHandler)
+          streamingShuffleHandle.shuffleId,
+          shuffleWriterId,
+          transportServerHandler,
+          () => spillOnePendingRawBuffer())
         shared.server
       case None =>
         val role = conf.get(EXECUTOR_ID).map { id =>
@@ -2263,7 +2266,11 @@ class StreamingShuffleWriter[K, V](
     schedule()
   }
 
-  private def newBuffer(minCapacity: Int = BUFFER_SIZE): TimestampedBuffer = {
+  private[streaming] def spillOnePendingRawBuffer(): Boolean = {
+    shards.iterator.exists(_.spillOnePendingData())
+  }
+
+  private[streaming] def newBuffer(minCapacity: Int = BUFFER_SIZE): TimestampedBuffer = {
     val reservationBytes = math.max(BUFFER_SIZE, minCapacity)
     require(reservationBytes <= MAX_BUFFER_BYTES,
       s"Serialized shuffle row requires $reservationBytes bytes, exceeding the per-writer " +
@@ -2292,7 +2299,10 @@ class StreamingShuffleWriter[K, V](
       // reuse its raw input buffer before growing executor direct memory.  If every candidate is
       // genuinely in flight, the executor-level transport window remains the finite bound and a
       // new allocation is required for progress.
-      shards.iterator.exists(_.spillOnePendingData())
+      val reclaimedLocally = spillOnePendingRawBuffer()
+      if (!reclaimedLocally) {
+        sharedExecutorServer.foreach(_.reclaimOneRawBuffer())
+      }
       if (reservationBytes == BUFFER_SIZE) buffer = bufferPool.pollLast()
     }
     if (buffer == null) {
@@ -2303,7 +2313,8 @@ class StreamingShuffleWriter[K, V](
             // A relaxed writer may retire a queued frame to break a multi-input scheduling
             // cycle. A backpressured writer must instead wait before pulling more input.
             if (!WRITER_BACKPRESSURE_ENABLED) {
-              shards.iterator.exists(_.spillOnePendingData())
+              val reclaimedLocally = spillOnePendingRawBuffer()
+              if (!reclaimedLocally) shared.reclaimOneRawBuffer()
             }
             buffer = if (reservationBytes == BUFFER_SIZE) bufferPool.pollLast() else null
             if (buffer == null) buffer = shared.rawBufferPool.tryBorrow(reservationBytes)
