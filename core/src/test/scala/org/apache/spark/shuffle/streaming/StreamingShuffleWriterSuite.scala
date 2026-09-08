@@ -220,6 +220,26 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("executor raw pool preserves the active-writer progress frontier") {
+    val pool = new StreamingShuffleRawBufferPool(bufferSize = 128, maxMemoryBytes = 512)
+    val first = pool.tryBorrow()
+    val second = pool.tryBorrow()
+    val third = pool.tryBorrow()
+    var firstReturned = false
+    try {
+      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 128) shouldBe false
+      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 256) shouldBe true
+      pool.recycle(first)
+      firstReturned = true
+      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 256) shouldBe false
+    } finally {
+      if (!firstReturned) pool.discard(first)
+      pool.discard(second)
+      pool.discard(third)
+      pool.close()
+    }
+  }
+
   test("writer does not spill a live transport frame before its reader connects") {
     val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>

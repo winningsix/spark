@@ -52,6 +52,12 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   // dormant route. Let a writer that cannot borrow ask its siblings to move one queued frame to
   // replay storage. A task-local scan cannot reclaim buffers retained by completed map tasks.
   private val rawBufferReclaimers = new ConcurrentHashMap[Long, () => Boolean]()
+  // A writer may need one partial serialization buffer per reducer before any of those buffers
+  // becomes full enough to dispatch. Preserve that aggregate active-writer frontier in the raw
+  // pool; otherwise concurrently submitted network bodies can consume every slot and leave all
+  // producers unable to reach their next dispatch point.
+  private val rawBufferProgressReservations = new ConcurrentHashMap[Long, java.lang.Long]()
+  private val rawBufferProgressReserveBytes = new AtomicLong(0L)
   // Prepared inboxes advertise their receive windows before producer tasks are launched. The
   // executor endpoint therefore has to retain discovery credits that race ahead of a writer's
   // handler registration; dropping them turns a successful prepareInbox ACK into a route that is
@@ -250,8 +256,24 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
   def register(
       shuffleId: Int,
       writerId: Int,
+      handler: StreamingShuffleServerHandler): Unit = {
+    register(shuffleId, writerId, handler, () => false, 0L)
+  }
+
+  def register(
+      shuffleId: Int,
+      writerId: Int,
       handler: StreamingShuffleServerHandler,
-      reclaimRawBuffer: () => Boolean = () => false): Unit = {
+      reclaimRawBuffer: () => Boolean): Unit = {
+    register(shuffleId, writerId, handler, reclaimRawBuffer, 0L)
+  }
+
+  def register(
+      shuffleId: Int,
+      writerId: Int,
+      handler: StreamingShuffleServerHandler,
+      reclaimRawBuffer: () => Boolean,
+      rawProgressReserveBytes: Long): Unit = {
     val routeKey = key(shuffleId, writerId)
     routeLock(routeKey).synchronized {
       retiredRoutes.remove(routeKey)
@@ -259,6 +281,13 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       require(existing == null,
         s"Streaming shuffle $shuffleId writer $writerId is already active")
       rawBufferReclaimers.put(routeKey, reclaimRawBuffer)
+      if (rawProgressReserveBytes > 0L) {
+        val previous = rawBufferProgressReservations.putIfAbsent(
+          routeKey, rawProgressReserveBytes)
+        require(previous == null,
+          s"Streaming shuffle $shuffleId writer $writerId already has a raw progress reserve")
+        rawBufferProgressReserveBytes.addAndGet(rawProgressReserveBytes)
+      }
       // Drain while holding the same route lock used by early-credit retention. When this returns,
       // every credit that observed an absent handler is owned by this handler, and every later
       // credit observes the installed handler directly.
@@ -274,6 +303,7 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     routeLock(routeKey).synchronized {
       if (handlers.remove(routeKey, handler)) {
         rawBufferReclaimers.remove(routeKey)
+        releaseRawProgressReservation(routeKey)
         retiredRoutes.add(routeKey)
       }
     }
@@ -286,6 +316,23 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       if (reclaimers.next()()) return true
     }
     false
+  }
+
+  private def releaseRawProgressReservation(routeKey: Long): Unit = {
+    val released = rawBufferProgressReservations.remove(routeKey)
+    if (released != null) {
+      val remaining = rawBufferProgressReserveBytes.addAndGet(-released.longValue())
+      require(remaining >= 0L, "raw progress reservation released more bytes than registered")
+    }
+  }
+
+  private[streaming] def releaseRawProgressReservation(
+      shuffleId: Int,
+      writerId: Int): Unit = releaseRawProgressReservation(key(shuffleId, writerId))
+
+  private[streaming] def shouldSpillRawBeforeDispatch(minCapacity: Int): Boolean = {
+    rawBufferPool.shouldPreserveProgressReserve(
+      minCapacity, rawBufferProgressReserveBytes.get())
   }
 
   def close(): Unit = {
@@ -314,6 +361,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     wireBufferBudget.close()
     pendingCredits.clear()
     rawBufferReclaimers.clear()
+    rawBufferProgressReservations.clear()
+    rawBufferProgressReserveBytes.set(0L)
     retiredRoutes.clear()
     server.close()
   }
@@ -504,6 +553,15 @@ private[streaming] final class StreamingShuffleRawBufferPool(
   def isExhausted(minCapacity: Int = bufferSize): Boolean = {
     val capacity = math.max(bufferSize, minCapacity)
     available.isEmpty && usedBytes.get() + capacity > maxMemoryBytes
+  }
+
+  /** Whether retaining the current frame would consume the active writers' progress frontier. */
+  def shouldPreserveProgressReserve(minCapacity: Int, reserveBytes: Long): Boolean = {
+    if (reserveBytes <= 0L) return isExhausted(minCapacity)
+    val unallocatedBytes = math.max(0L, maxMemoryBytes - usedBytes.get())
+    val cachedBytes = available.size().toLong * bufferSize.toLong
+    val boundedReserve = math.min(maxMemoryBytes, reserveBytes)
+    unallocatedBytes + cachedBytes < boundedReserve
   }
 
   def recycle(buffer: ByteBuf): Unit = {

@@ -417,7 +417,8 @@ class StreamingShuffleWriter[K, V](
           streamingShuffleHandle.shuffleId,
           shuffleWriterId,
           transportServerHandler,
-          () => spillOneReclaimableRawBuffer())
+          () => spillOneReclaimableRawBuffer(),
+          numPartitions.toLong * BUFFER_SIZE.toLong)
         shared.server
       case None =>
         val role = conf.get(EXECUTOR_ID).map { id =>
@@ -1777,7 +1778,7 @@ class StreamingShuffleWriter[K, V](
         releaseRawAfterSend
       }
       val spillRawBeforeDispatch = (wireBuffer eq rawBuffer) &&
-        sharedExecutorServer.exists(_.rawBufferPool.isExhausted(rawReservationBytes)) &&
+        sharedExecutorServer.exists(_.shouldSpillRawBeforeDispatch(rawReservationBytes)) &&
         !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0L
       sendInternal(dataMessage, () => {
         // Completion is accounted separately from input-buffer ownership.
@@ -2538,6 +2539,8 @@ class StreamingShuffleWriter[K, V](
       }
     } finally {
       writeInputFinished.set(true)
+      sharedExecutorServer.foreach(_.releaseRawProgressReservation(
+        streamingShuffleHandle.shuffleId, shuffleWriterId))
       releasePooledInputBuffers()
       isWriteFinished.countDown() // Duplicate countDowns are a no-op.
       flushThread.foreach(_.join())
