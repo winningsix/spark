@@ -355,7 +355,7 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("relaxed writer spills raw-backed data before network dispatch") {
+  test("relaxed writer returns raw-backed data after replay and network completion") {
     val conf = newConf()
       .set(SHUFFLE_COMPRESS, false)
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
@@ -372,20 +372,27 @@ class StreamingShuffleWriterSuite
         val rdd = sc.parallelize(1 to 4).map(x => (x, x))
         val dep = new PipelinedShuffleDependency[Int, Int, Int](
           rdd, new HashPartitioner(1))
-        dep.markReplayLeaseAvailable()
         val handle = new StreamingShuffleHandle(0, dep)
         val server = new StreamingShuffleExecutorServer()
         val writer = new StreamingShuffleWriter[Int, Int](
           handle, 0, context, sharedExecutorServer = Some(server))
         try {
+          val client = bindMockClient(writer, 0)(_ => ())
+          writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
+            0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
+          writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
+            0, 0, 0, 32768))
           val raw = server.rawBufferPool.tryBorrow()
           val pending = writer.TimestampedBuffer(raw, raw.capacity())
           pending.buffer.writeZero(1024)
           writer.shards(0).send(pending)
           writer.stop(success = true)
-          context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
-          val recycled = server.rawBufferPool.tryBorrow()
-          recycled should not be null
+          context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe 0L
+          var recycled: ByteBuf = null
+          eventually(Timeout(10.seconds)) {
+            recycled = server.rawBufferPool.tryBorrow()
+            recycled should not be null
+          }
           server.rawBufferPool.recycle(recycled)
         } finally {
           server.close()

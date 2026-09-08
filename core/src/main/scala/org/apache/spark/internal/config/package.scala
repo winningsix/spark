@@ -2226,9 +2226,9 @@ package object config {
   private[spark] val STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY =
     ConfigBuilder("spark.shuffle.streaming.wireBufferMaxMemory")
       .doc("Maximum executor-wide direct bytes reserved for compressed streaming-shuffle wire " +
-        "payloads. When no compressed buffer is used, a relaxed writer durably spools its " +
-        "raw-backed envelope before network dispatch so dormant routes cannot pin the " +
-        "serialization pool. " +
+        "payloads. When this budget is full, a relaxed writer sends its raw buffer instead of " +
+        "waiting for a second direct allocation. The raw-buffer pool and the replay/network " +
+        "completion lease continue to bound and retire that buffer. " +
         "This prevents per-task replay limits and Netty arena chunks from multiplying to the " +
         "executor direct memory limit without turning a fixed writer-task count into the primary " +
         "flow control.")
