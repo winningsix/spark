@@ -500,6 +500,12 @@ private[streaming] final class StreamingShuffleRawBufferPool(
     }
   }
 
+  /** True when another fixed-size borrower cannot make progress without a recycle or spill. */
+  def isExhausted(minCapacity: Int = bufferSize): Boolean = {
+    val capacity = math.max(bufferSize, minCapacity)
+    available.isEmpty && usedBytes.get() + capacity > maxMemoryBytes
+  }
+
   def recycle(buffer: ByteBuf): Unit = {
     buffer.clear()
     if (!closed && buffer.capacity() == bufferSize) {

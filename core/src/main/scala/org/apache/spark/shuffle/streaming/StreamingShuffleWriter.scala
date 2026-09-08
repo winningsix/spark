@@ -351,7 +351,7 @@ class StreamingShuffleWriter[K, V](
         var buffer = shared.wireBufferBudget.tryAllocate(maxSize)
         if (buffer == null && !WRITER_BACKPRESSURE_ENABLED) {
           if (REPLAY_MAX_MEMORY > 0L) {
-            shards.iterator.exists(_.spillOnePendingData())
+            spillOneReclaimableRawBuffer()
             buffer = shared.wireBufferBudget.tryAllocate(maxSize)
           }
           if (buffer == null) {
@@ -417,7 +417,7 @@ class StreamingShuffleWriter[K, V](
           streamingShuffleHandle.shuffleId,
           shuffleWriterId,
           transportServerHandler,
-          () => spillOnePendingRawBuffer())
+          () => spillOneReclaimableRawBuffer())
         shared.server
       case None =>
         val role = conf.get(EXECUTOR_ID).map { id =>
@@ -1358,7 +1358,19 @@ class StreamingShuffleWriter[K, V](
         done: () => Unit = () => (),
         releaseReplayResources: () => Unit = () => (),
         releaseInputResources: () => Unit = () => (),
-        networkComplete: () => Unit = () => ()): Unit = synchronized {
+        networkComplete: () => Unit = () => ()): Unit = {
+      sendInternal(
+        message, done, releaseReplayResources, releaseInputResources, networkComplete,
+        spillBeforeDispatch = false)
+    }
+
+    private def sendInternal(
+        message: StreamingShuffleMessage,
+        done: () => Unit,
+        releaseReplayResources: () => Unit,
+        releaseInputResources: () => Unit,
+        networkComplete: () => Unit,
+        spillBeforeDispatch: Boolean): Unit = synchronized {
       // No downstream task owns this reducer route (for example, a TakeOrdered result stage may
       // read only a prefix). Retire producer-side ownership immediately instead of queuing an
       // action behind a connection future that can never complete.
@@ -1410,10 +1422,17 @@ class StreamingShuffleWriter[K, V](
         pendingBatch += pending
         livePendingSequences += sequenceNum
         pendingBatchBytes += replayEntry.length
-        // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate is
-        // not itself a memory bound if the queued send still owns an encoded duplicate of the
-        // same payload; retiring both copies is what lets a blocked route release memory.
-        spillReplayHistoryIfNeeded()
+        if (spillBeforeDispatch) {
+          // Once the shared raw pool is exhausted, a raw-backed socket write can close the
+          // producer/reader cycle before another task gets a buffer. Persist only this
+          // pressure-path frame before dispatch; ordinary raw frames remain memory-only.
+          spillReplayEntry(replayEntry)
+        } else {
+          // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate
+          // is not itself a memory bound if the queued send still owns an encoded duplicate of
+          // the same payload; retiring both copies is what lets a blocked route release memory.
+          spillReplayHistoryIfNeeded()
+        }
         if (pendingBatchBytes >= BATCH_SIZE) flushPendingBatch()
         return
       }
@@ -1743,9 +1762,12 @@ class StreamingShuffleWriter[K, V](
       } else {
         releaseRawAfterSend
       }
-      send(dataMessage, () => {
+      val spillRawBeforeDispatch = (wireBuffer eq rawBuffer) &&
+        sharedExecutorServer.exists(_.rawBufferPool.isExhausted(rawReservationBytes)) &&
+        !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0L
+      sendInternal(dataMessage, () => {
         // Completion is accounted separately from input-buffer ownership.
-      }, releaseReplayResources, releaseInputResources, networkComplete)
+      }, releaseReplayResources, releaseInputResources, networkComplete, spillRawBeforeDispatch)
       // DataMessage.encode() installs a retained payload slice in the encoded frame before
       // send() returns. When compression produced a separate wire buffer, rawBuffer is no
       // longer part of either the pending send or replay history and can immediately go back to
@@ -2000,6 +2022,19 @@ class StreamingShuffleWriter[K, V](
           true
         case None =>
           false
+      }
+    }
+
+    /** Spill one in-memory data entry whose ordered send is no longer pending. */
+    private[streaming] def spillOneSubmittedReplayData(): Boolean = synchronized {
+      if (REPLAY_MAX_MEMORY <= 0) return false
+      replayHistory.find { entry =>
+        entry.isData && entry.buffer != null && !livePendingSequences.contains(entry.sequenceNum)
+      } match {
+        case Some(entry) =>
+          spillReplayEntry(entry)
+          true
+        case None => false
       }
     }
 
@@ -2266,8 +2301,9 @@ class StreamingShuffleWriter[K, V](
     schedule()
   }
 
-  private[streaming] def spillOnePendingRawBuffer(): Boolean = {
-    shards.iterator.exists(_.spillOnePendingData())
+  private[streaming] def spillOneReclaimableRawBuffer(): Boolean = {
+    shards.iterator.exists(_.spillOnePendingData()) ||
+      shards.iterator.exists(_.spillOneSubmittedReplayData())
   }
 
   private[streaming] def newBuffer(minCapacity: Int = BUFFER_SIZE): TimestampedBuffer = {
@@ -2299,7 +2335,7 @@ class StreamingShuffleWriter[K, V](
       // reuse its raw input buffer before growing executor direct memory.  If every candidate is
       // genuinely in flight, the executor-level transport window remains the finite bound and a
       // new allocation is required for progress.
-      val reclaimedLocally = spillOnePendingRawBuffer()
+      val reclaimedLocally = spillOneReclaimableRawBuffer()
       if (!reclaimedLocally) {
         sharedExecutorServer.foreach(_.reclaimOneRawBuffer())
       }
@@ -2313,7 +2349,7 @@ class StreamingShuffleWriter[K, V](
             // A relaxed writer may retire a queued frame to break a multi-input scheduling
             // cycle. A backpressured writer must instead wait before pulling more input.
             if (!WRITER_BACKPRESSURE_ENABLED) {
-              val reclaimedLocally = spillOnePendingRawBuffer()
+              val reclaimedLocally = spillOneReclaimableRawBuffer()
               if (!reclaimedLocally) shared.reclaimOneRawBuffer()
             }
             buffer = if (reservationBytes == BUFFER_SIZE) bufferPool.pollLast() else null

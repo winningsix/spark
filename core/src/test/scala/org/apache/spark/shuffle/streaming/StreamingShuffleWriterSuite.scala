@@ -359,7 +359,7 @@ class StreamingShuffleWriterSuite
     val conf = newConf()
       .set(SHUFFLE_COMPRESS, false)
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 32768L)
+      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 65536L)
       .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
       .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
       .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
@@ -405,11 +405,53 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("relaxed writer reclaims a raw buffer from a sibling writer") {
+  test("relaxed writer pre-spills a raw frame only at executor-pool pressure") {
     val conf = newConf()
       .set(SHUFFLE_COMPRESS, false)
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
       .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 32768L)
+      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        val writer = new StreamingShuffleWriter[Int, Int](
+          new StreamingShuffleHandle(0, dep), 0, context,
+          sharedExecutorServer = Some(server))
+        val client = bindMockClient(writer, 0)(_ => ())
+        writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
+          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
+
+        val held = writer.newBuffer()
+        held.buffer.writeZero(1024)
+        writer.shards(0).send(held)
+        writer.stop(success = true)
+        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
+        val recycled = server.rawBufferPool.tryBorrow()
+        recycled should not be null
+        server.rawBufferPool.recycle(recycled)
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        context.markTaskFailed(cleanupError)
+        context.markTaskCompleted(Some(cleanupError))
+        server.close()
+      }
+    }
+  }
+
+  test("relaxed writer reclaims a raw buffer from a sibling writer") {
+    val conf = newConf()
+      .set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 65536L)
       .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
       .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
       .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
@@ -436,6 +478,8 @@ class StreamingShuffleWriterSuite
         val held = first.newBuffer()
         held.buffer.writeZero(1024)
         first.shards(0).send(held)
+        val blocker = server.rawBufferPool.tryBorrow()
+        blocker should not be null
 
         val reclaimed = second.newBuffer()
         try {
@@ -444,6 +488,7 @@ class StreamingShuffleWriterSuite
           firstContext.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
         } finally {
           server.rawBufferPool.recycle(reclaimed.buffer)
+          server.rawBufferPool.recycle(blocker)
         }
       } finally {
         val cleanupError = new RuntimeException("test cleanup")
