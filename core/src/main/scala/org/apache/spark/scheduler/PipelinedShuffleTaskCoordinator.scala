@@ -393,15 +393,14 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   }
 
   /**
-   * Reserve enough CPU on each executor for one complete prepared-reader partition frontier.
+   * Reserve enough CPU on each executor to attach one prepared reader in every active run epoch.
    *
-   * A single running reader is not sufficient for a wide fan-in. It can finish before the next
-   * reader stage becomes route-ready, letting pure producers occupy the released fractional slots.
-   * If the remaining reduce partitions cannot attach, their bounded receive credit eventually
-   * stops those producers and leaves the executor full of tasks that cannot make progress. Keep
-   * the largest unfinished reader-stage frontier protected and subtract reader CPU already in use.
-   * This hands each released reader slot directly to another reader or holds it until one becomes
-   * ready, while still leaving the rest of the executor available to producers.
+   * Pure producers normally consume whole CPUs while prepared readers use a fractional charge.
+   * If producers take the final whole CPU before an inbox becomes drain-ready, bounded transport
+   * backpressure can stop every producer while the reader that would return credit has no
+   * schedulable CPU. The old heap wire fallback hid that cycle by letting producers allocate past
+   * the transport budget. Keep the small reservation only until a reader in that epoch is already
+   * running on the executor; its own CPU charge then preserves the progress path.
    */
   def readerCpuReservations(
       taskSets: Iterable[TaskSetManager]): Map[(Option[String], String), BigDecimal] = {
@@ -419,11 +418,16 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     val readersByAttempt = activeReaders.map { taskSet =>
       (taskSet.stageId, taskSet.taskSet.stageAttemptId) -> taskSet
     }.toMap
-    val frontierByStage =
-      new HashMap[(Option[String], String, Int, Int), BigDecimal]
+    val result = new HashMap[(Option[String], String), BigDecimal]
+
     assignments.foreach { case (key, assignment) =>
       readersByAttempt.get((key.stageId, key.stageAttemptId)).foreach { reader =>
-        if (!reader.successful(key.taskIndex)) {
+        val reservationKey = runEpoch(reader) -> assignment.executorId
+        val hasRunningReader = activeReaders.exists { candidate =>
+          runEpoch(candidate) == reservationKey._1 &&
+            candidate.runningTasksOnExecutor(assignment.executorId) > 0
+        }
+        if (!hasRunningReader && reader.isTaskPendingForOffer(key.taskIndex)) {
           val configuredCpus = if (reader.taskSet.isPipelinedShuffleProducer) {
             readerProducerTaskCpus
           } else {
@@ -434,50 +438,13 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
           // scheduling in that case; the reservation is specifically the progress guarantee for
           // fractional prepared-reader execution.
           configuredCpus.filter(_ < 1).foreach { cpus =>
-            val frontierKey =
-              (runEpoch(reader), assignment.executorId, key.stageId, key.stageAttemptId)
-            frontierByStage.updateWith(frontierKey) {
-              case Some(current) => Some(current + cpus)
+            result.updateWith(reservationKey) {
+              case Some(current) => Some(current.max(cpus))
               case None => Some(cpus)
             }
           }
         }
       }
-    }
-
-    val targetByExecutor = new HashMap[(Option[String], String), BigDecimal]
-    frontierByStage.foreach { case ((runEpoch, executorId, _, _), cpus) =>
-      targetByExecutor.updateWith(runEpoch -> executorId) {
-        case Some(current) => Some(current.max(cpus))
-        case None => Some(cpus)
-      }
-    }
-    val runningByExecutor = new HashMap[(Option[String], String), BigDecimal]
-    targetByExecutor.keysIterator.foreach { reservationKey =>
-      activeReaders.foreach { reader =>
-        if (runEpoch(reader) == reservationKey._1) {
-          val configuredCpus = if (reader.taskSet.isPipelinedShuffleProducer) {
-            readerProducerTaskCpus
-          } else {
-            readerTaskCpus
-          }
-          configuredCpus.filter(_ < 1).foreach { cpus =>
-            val running = reader.runningTasksOnExecutor(reservationKey._2)
-            if (running > 0) {
-              runningByExecutor.updateWith(reservationKey) {
-                case Some(current) => Some(current + cpus * running)
-                case None => Some(cpus * running)
-              }
-            }
-          }
-        }
-      }
-    }
-    val result = new HashMap[(Option[String], String), BigDecimal]
-    targetByExecutor.foreach { case (key, target) =>
-      val reservation = (target - runningByExecutor.getOrElse(key, BigDecimal(0)))
-        .max(BigDecimal(0))
-      if (reservation > 0) result.put(key, reservation)
     }
     result.toMap
   }
