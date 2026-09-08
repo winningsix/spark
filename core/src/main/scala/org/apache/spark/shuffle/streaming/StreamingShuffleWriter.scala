@@ -1657,7 +1657,6 @@ class StreamingShuffleWriter[K, V](
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
       var wireDirectReservation = 0
-      var spillRawBeforeDispatch = false
       val wireBuffer = compressionCodec match {
         case Some(compressor) =>
           // Compress directly between NIO views of the Netty buffers. If compression is not
@@ -1666,8 +1665,6 @@ class StreamingShuffleWriter[K, V](
           val (compressed, reservedDirectBytes) = allocateWireBuffer(maxCompressedSize)
           wireDirectReservation = reservedDirectBytes
           if (compressed == null) {
-            spillRawBeforeDispatch = sharedExecutorServer.isDefined &&
-              !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0L
             rawBuffer
           } else try {
             val source = rawBuffer.nioBuffer(rawBuffer.readerIndex(), dataSize)
@@ -1691,6 +1688,10 @@ class StreamingShuffleWriter[K, V](
           }
         case None => rawBuffer
       }
+      // A relaxed shared writer must never let a socket write own a serialization-pool buffer.
+      // That includes both wire-budget fallback and payloads whose compression was not useful.
+      val spillRawBeforeDispatch = (wireBuffer eq rawBuffer) && sharedExecutorServer.isDefined &&
+        !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0L
       val wireSize = wireBuffer.readableBytes()
       rawBytesSent.addAndGet(dataSize)
       wireBytesSent.addAndGet(wireSize)

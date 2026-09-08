@@ -316,7 +316,7 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("relaxed writer spills its raw fallback before network dispatch") {
+  test("relaxed writer uses its raw buffer instead of waiting for executor wire memory") {
     val conf = newConf()
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
       .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 40L << 10)
@@ -334,15 +334,48 @@ class StreamingShuffleWriterSuite
           rdd, new HashPartitioner(1))
         dep.markReplayLeaseAvailable()
         val handle = new StreamingShuffleHandle(0, dep)
-        val server = new StreamingShuffleExecutorServer()
-        val writer = new StreamingShuffleWriter[Int, Int](
-          handle, 0, context, sharedExecutorServer = Some(server))
+        val writer = new StreamingShuffleManager()
+          .getWriter[Int, Int](handle, 0, context, null)
+          .asInstanceOf[StreamingShuffleWriter[Int, Int]]
         val reserved = writer.allocateWireBuffer(40 << 10)
         try {
           reserved._1 should not be null
           reserved._2 shouldBe (40 << 10)
           writer.allocateWireBuffer(40 << 10) shouldBe (null, 0)
+        } finally {
+          reserved._1.release()
+          writer.releaseWireReservation(reserved._2)
+        }
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        context.markTaskFailed(cleanupError)
+        context.markTaskCompleted(Some(cleanupError))
+      }
+    }
+  }
 
+  test("relaxed writer spills raw-backed data before network dispatch") {
+    val conf = newConf()
+      .set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new PipelinedShuffleDependency[Int, Int, Int](
+          rdd, new HashPartitioner(1))
+        dep.markReplayLeaseAvailable()
+        val handle = new StreamingShuffleHandle(0, dep)
+        val server = new StreamingShuffleExecutorServer()
+        val writer = new StreamingShuffleWriter[Int, Int](
+          handle, 0, context, sharedExecutorServer = Some(server))
+        try {
           val raw = server.rawBufferPool.tryBorrow()
           val pending = writer.TimestampedBuffer(raw, raw.capacity())
           pending.buffer.writeZero(1024)
@@ -350,8 +383,6 @@ class StreamingShuffleWriterSuite
           writer.stop(success = true)
           context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
         } finally {
-          reserved._1.release()
-          writer.releaseWireReservation(reserved._2)
           server.close()
         }
       } finally {
