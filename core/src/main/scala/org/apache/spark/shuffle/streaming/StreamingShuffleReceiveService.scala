@@ -79,6 +79,12 @@ private[streaming] object StreamingShuffleReceiveService {
   private[streaming] def routeByteLimit(readerMaxMemory: Long, numWriters: Int): Long = {
     math.max(readerMaxMemory / math.max(1, numWriters), 1L)
   }
+
+  private[streaming] def routeReservationBytes(
+      perWriterByteLimit: Long,
+      networkBufferSize: Int): Long = {
+    math.max(1L, math.min(perWriterByteLimit, networkBufferSize.toLong + 40L))
+  }
 }
 
 /**
@@ -976,12 +982,12 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     // lifetime writer, not only for the writers that happen to run concurrently.
     val perWriterByteLimit = StreamingShuffleReceiveService.routeByteLimit(
       conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY), numWriters)
-    // A controlled writer admits one complete frame whenever a route has positive credit. Prefer
-    // a reservation large enough for that normal frame; owner fairness may clamp the advertised
-    // window when many inboxes share the executor, leaving only a one-frame bounded overshoot.
-    val routeReservationBytes = math.max(
-      perWriterByteLimit,
-      conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE).toLong + 40L)
+    // Keep a route turn no larger than one normal frame. A writer may overshoot a smaller positive
+    // credit by that one frame, but exhausting the turn then rotates the owner share to another
+    // writer. Reserving the full per-writer queue limit here can consume an inbox's complete fair
+    // share even when that route has less data than the limit, stranding every sibling route.
+    val routeReservationBytes = StreamingShuffleReceiveService.routeReservationBytes(
+      perWriterByteLimit, conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE))
     val newlyPublished = locations.filter { case (mapId, location) =>
       val duplicate = location.mapIndex >= 0 && mapIndexes.contains(location.mapIndex)
       if (!duplicate && !clientFutures.containsKey(mapId)) {

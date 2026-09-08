@@ -457,6 +457,11 @@ class StreamingShuffleReaderSuite
     StreamingShuffleReceiveService.routeByteLimit(1024L, 32) shouldBe 32L
     StreamingShuffleReceiveService.routeByteLimit(1024L, 1900) shouldBe 1L
     StreamingShuffleReceiveService.routeByteLimit(1024L, 0) shouldBe 1024L
+
+    // A large per-writer queue allowance must not let one short route retain the inbox's complete
+    // owner share. The receive turn is capped at one normal data frame so sibling routes rotate.
+    StreamingShuffleReceiveService.routeReservationBytes(4096L, 1024) shouldBe 1064L
+    StreamingShuffleReceiveService.routeReservationBytes(512L, 1024) shouldBe 512L
   }
 
   test("executor receive credit leases are bounded and work conserving") {
