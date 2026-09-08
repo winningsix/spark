@@ -1593,8 +1593,12 @@ class StreamingShuffleWriter[K, V](
     /** Return a raw input buffer after its network send no longer needs it. */
     private def releaseRawBuffer(rawBuffer: ByteBuf): Unit = {
       rawBuffer.clear()
-      if (writeInputFinished.get() || context.isFailed() || context.isCompleted() ||
+      if ((sharedExecutorServer.isDefined && !WRITER_BACKPRESSURE_ENABLED) ||
+          writeInputFinished.get() || context.isFailed() || context.isCompleted() ||
           rawBuffer.capacity() != BUFFER_SIZE) {
+        // A relaxed writer cannot privately cache buffers borrowed from the executor pool. A
+        // wide pipeline has many live map writers; letting an idle writer retain returned slots
+        // can fill the global accounting limit while another writer waits on an empty pool.
         recycleRawBuffer(rawBuffer)
       } else {
         bufferPool.offerLast(rawBuffer)
@@ -1622,9 +1626,15 @@ class StreamingShuffleWriter[K, V](
         }
       }
 
-      def markReplayComplete(): Unit = retireIfReady()
+      def markReplayComplete(): Unit = {
+        replayComplete.set(true)
+        retireIfReady()
+      }
 
-      def markNetworkComplete(): Unit = retireIfReady()
+      def markNetworkComplete(): Unit = {
+        networkComplete.set(true)
+        retireIfReady()
+      }
 
       /** Release only the producer owner during failure cleanup; never recycle an in-flight buf. */
       def forceRelease(): Unit = {

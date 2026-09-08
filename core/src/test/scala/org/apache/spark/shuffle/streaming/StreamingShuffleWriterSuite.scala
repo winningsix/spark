@@ -38,6 +38,7 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCRE
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
   STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
   STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY,
@@ -358,6 +359,7 @@ class StreamingShuffleWriterSuite
     val conf = newConf()
       .set(SHUFFLE_COMPRESS, false)
       .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 32768L)
       .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
       .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
       .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
@@ -382,6 +384,9 @@ class StreamingShuffleWriterSuite
           writer.shards(0).send(pending)
           writer.stop(success = true)
           context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
+          val recycled = server.rawBufferPool.tryBorrow()
+          recycled should not be null
+          server.rawBufferPool.recycle(recycled)
         } finally {
           server.close()
         }
