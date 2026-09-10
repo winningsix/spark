@@ -356,7 +356,7 @@ class StreamingShuffleReaderSuite
     }
   }
 
-  test("unattached prepared inbox stages data in bounded memory before spilling") {
+  test("unattached prepared inbox returns credit after durably spilling") {
     withTempDir { spillDir =>
       val queue = new StreamingShuffleMessageQueue(
         256L,
@@ -383,7 +383,7 @@ class StreamingShuffleReaderSuite
         queue.receivedDataBytesCount shouldBe 384L
         queue.spilledBytesCount shouldBe 128L
         payloadReleases.get() shouldBe 1
-        creditReleases.get() shouldBe 0
+        creditReleases.get() shouldBe 3
 
         queue.take().release()
         queue.take().release()

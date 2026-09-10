@@ -415,6 +415,59 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("wire budget pressure flushes a partial network batch") {
+    val reservationSize = 32 << 10
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1 << 20)
+      .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 48L << 10)
+      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, true)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "wire-pressure-partial-batch", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      try {
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
+        val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+        val writer = new StreamingShuffleWriter[Int, Int](
+          new StreamingShuffleHandle(0, dep), 0, context,
+          sharedExecutorServer = Some(server))
+        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
+        bindMockClient(writer, 0)(_ => sends.incrementAndGet())
+
+        // Model a compressed frame whose direct reservation is retained by a partial batch. The
+        // next same-sized allocation cannot fit until publishing that partial batch lets its
+        // network completion return the first reservation.
+        val first = writer.allocateWireBuffer(reservationSize)
+        first._1.writeZero(128)
+        val data = new DataMessage(0, 0, 128, first._1, 0L)
+        first._1.release()
+        writer.shards(0).send(
+          data, () => (), () => (), () => (), () => writer.releaseWireReservation(first._2))
+        server.wireBufferBudget.stats._1 shouldBe reservationSize.toLong
+
+        val second = writer.allocateWireBuffer(
+          reservationSize, () => writer.shards(0).send())
+        second._1 should not be null
+        eventually(Timeout(10.seconds)) {
+          sends.get() should be >= 1
+        }
+        second._1.release()
+        writer.releaseWireReservation(second._2)
+        writer.stop(success = true)
+        writer.errorNotifier.getError() shouldBe empty
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        context.markTaskFailed(cleanupError)
+        context.markTaskCompleted(Some(cleanupError))
+        server.close()
+      }
+    }
+  }
+
   test("relaxed writer returns raw-backed data after replay and network completion") {
     val conf = newConf()
       .set(SHUFFLE_COMPRESS, false)

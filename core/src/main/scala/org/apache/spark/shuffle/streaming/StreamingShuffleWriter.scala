@@ -341,7 +341,9 @@ class StreamingShuffleWriter[K, V](
    *
    * The returned byte count is the exact direct reservation owned by the returned buffer.
    */
-  private[streaming] def allocateWireBuffer(maxSize: Int): (ByteBuf, Int) = {
+  private[streaming] def allocateWireBuffer(
+      maxSize: Int,
+      onBudgetPressure: () => Unit = () => ()): (ByteBuf, Int) = {
     sharedExecutorServer match {
       case Some(shared) =>
         if (!shared.wireBufferBudget.canReserve(maxSize)) {
@@ -361,6 +363,15 @@ class StreamingShuffleWriter[K, V](
             shared.wireBufferBudget.recordRawFallback(maxSize)
             return (null, 0)
           }
+        }
+        if (buffer == null) {
+          // A wide writer can hold several sub-threshold network batches at once. If all active
+          // writers do that, those partial batches can fill the executor wire budget before any
+          // one partition reaches NETWORK_BATCH_SIZE: producers then wait here while readers wait
+          // for data that has never been dispatched. Publish this shard's partial batch before
+          // joining the budget wait so its existing wire buffers can make forward progress.
+          onBudgetPressure()
+          buffer = shared.wireBufferBudget.tryAllocate(maxSize)
         }
         while (buffer == null) {
           throwErrorIfExists()
@@ -1694,7 +1705,9 @@ class StreamingShuffleWriter[K, V](
           // Compress directly between NIO views of the Netty buffers. If compression is not
           // beneficial, discard the destination and send the original buffer.
           val maxCompressedSize = compressor.maxCompressedLength(dataSize)
-          val (compressed, reservedDirectBytes) = allocateWireBuffer(maxCompressedSize)
+          val (compressed, reservedDirectBytes) = allocateWireBuffer(
+            maxCompressedSize,
+            () => synchronized { flushPendingBatch() })
           wireDirectReservation = reservedDirectBytes
           if (compressed == null) {
             rawBuffer

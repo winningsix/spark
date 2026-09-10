@@ -259,12 +259,29 @@ private[streaming] final class StreamingShuffleMessageQueue
     val bytes = data.dataSize.toLong
     updateMaximum(maxDataMessageBytes, bytes)
     if (!reserveInMemory(bytes)) {
-      spillData(data, releaseCreditNow = false)
+      // A prepared inbox has no compute task yet, so retaining receive credit for its durable
+      // spill makes credit return depend on future task scheduling. Across many routes, writers
+      // can then fill every executor wire budget with frames for unattached inboxes while the
+      // few resident readers wait for those writers: neither side can release the other's
+      // resource. Once the payload is durable, return its credit immediately. This is the same
+      // finite-input disk fallback used by blocking shuffle and keeps network progress independent
+      // from reader compute admission. Attached consumers retain the bounded-credit behavior in
+      // toEntry below, so a merely slow reader cannot continuously extend its receive window.
+      spillData(data, releaseCreditNow = true)
     } else {
-      // The prepared inbox owns both the payload and its receive credit until compute attaches.
-      // Executor-wide credit admission guarantees that sibling inputs retain a fair window, so
-      // progress no longer depends on returning this credit before consumption.
-      new InMemoryEntry(data)
+      // The executor inbox, rather than a task, now owns this retained payload. Acknowledge that
+      // ownership transfer immediately: if credit stayed attached to resident prepared data,
+      // the aggregate sender wire budgets could saturate before this queue reached its spill
+      // threshold, recreating the same scheduling cycle without ever entering the branch above.
+      val releaseCredit = data.takeReleaseCallback()
+      try {
+        if (releaseCredit != null) releaseCredit.run()
+        new InMemoryEntry(data)
+      } catch {
+        case t: Throwable =>
+          releaseInMemory(bytes)
+          throw t
+      }
     }
   }
 
