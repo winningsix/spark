@@ -642,20 +642,100 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("registration replay does not consume data credit twice") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1 << 20)
+      .set(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, true)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "registration-replay-credit", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val errorNotifier = new ErrorNotifier()
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 0,
+        numReaders = 1,
+        context = context,
+        errorNotifier = errorNotifier)
+      try {
+        val writer = newWriter(sc, context, errorNotifier, Some(handler))
+        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
+        val sentBytes = new java.util.concurrent.atomic.AtomicLong(0L)
+        val client = bindMockClient(writer, 0) { body =>
+          sends.incrementAndGet()
+          sentBytes.addAndGet(body.readableBytes().toLong)
+        }
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -1))
+
+        val dataActionCompleted = new CountDownLatch(3)
+        def enqueueFrame(value: Byte): Unit = {
+          val payload = Unpooled.wrappedBuffer(Array.fill[Byte](128)(value))
+          val data = new DataMessage(0, 0, payload.readableBytes(), payload, 0L)
+          payload.release()
+          writer.shards(0).send(data, () => dataActionCompleted.countDown())
+        }
+        enqueueFrame(1)
+        enqueueFrame(2)
+
+        // Registration replay snapshots the frames while they are still in pendingBatch. Its
+        // ReplayAction is therefore ordered before the DataAction that later owns completion of
+        // those frames. Add one more frame after that snapshot so the stale DataAction prefix is
+        // skipped without charging it, while the new suffix still consumes one window.
+        writer.shards(0).beginReplay(client)
+        writer.shards(0).replayTo(client)
+        enqueueFrame(3)
+        writer.shards(0).send()
+        eventually(Timeout(10.seconds)) {
+          sends.get() shouldBe 1
+          handler.availableDataCredit(0, client) shouldBe 0L
+        }
+
+        def releaseSentBytes(): Unit = {
+          val released = new CreditControlMessage(0, 0, 0, 0)
+          released.setSeqNum(sentBytes.get())
+          handler.handleMessage(client, released)
+          writer.shards(0).creditAvailable(client)
+        }
+        releaseSentBytes()
+        eventually(Timeout(10.seconds)) {
+          sends.get() shouldBe 2
+          handler.availableDataCredit(0, client) shouldBe 0L
+        }
+        releaseSentBytes()
+        eventually(Timeout(10.seconds)) {
+          sends.get() shouldBe 3
+          handler.availableDataCredit(0, client) shouldBe 0L
+        }
+
+        assert(dataActionCompleted.await(10, TimeUnit.SECONDS))
+        releaseSentBytes()
+        sends.get() shouldBe 3
+        handler.availableDataCredit(0, client) shouldBe 1L
+        errorNotifier.getError() shouldBe empty
+      } finally {
+        val cleanupError = new RuntimeException("test cleanup")
+        context.markTaskFailed(cleanupError)
+        context.markTaskCompleted(Some(cleanupError))
+      }
+    }
+  }
+
   // Builds a single-partition writer against a freshly registered shuffle. The caller must run
   // this inside a withSpark block and must eventually call context.markTaskCompleted(None) to
   // tear down the Netty server the writer starts in its constructor.
   private def newWriter(
       sc: SparkContext,
       context: TaskContext,
-      errorNotifier: ErrorNotifier = new ErrorNotifier()): StreamingShuffleWriter[Int, Int] = {
+      errorNotifier: ErrorNotifier = new ErrorNotifier(),
+      serverHandler: Option[StreamingShuffleServerHandler] = None)
+      : StreamingShuffleWriter[Int, Int] = {
     SparkEnv.get.streamingShuffleOutputTracker.get
       .asInstanceOf[StreamingShuffleOutputTrackerMaster]
       .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
     val rdd = sc.parallelize(1 to 4).map(x => (x, x))
     val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
     val handle = new StreamingShuffleHandle(0, dep)
-    new StreamingShuffleWriter[Int, Int](handle, 0, context, errorNotifier = errorNotifier)
+    new StreamingShuffleWriter[Int, Int](
+      handle, 0, context, serverHandler = serverHandler, errorNotifier = errorNotifier)
   }
 
   // A mock TransportClient whose send(ByteBuf) invokes `onSend` and then completes the write

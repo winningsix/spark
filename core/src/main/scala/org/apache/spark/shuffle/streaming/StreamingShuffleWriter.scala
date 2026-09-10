@@ -748,13 +748,6 @@ class StreamingShuffleWriter[K, V](
         .getOrElse(Option(fallback.buf).map(_.readableBytes().toLong).getOrElse(0L))
     }
 
-    private def estimatedNetworkBytes(entries: Seq[PendingSend]): Long = {
-      val bytes = entries.iterator.map(entry => replayLength(entry.sequenceNum, entry)).sum
-      // A route normally has one live client, but count replacement/late clients already
-      // registered so the reservation remains conservative during replay.
-      bytes * math.max(1, transportServerHandler.clientsFor(id).size).toLong
-    }
-
     private def releaseNetworkBytes(bytes: Long): Unit = synchronized {
       if (bytes > 0) {
         inFlightNetworkBytes = math.max(0L, inFlightNetworkBytes - bytes)
@@ -839,10 +832,6 @@ class StreamingShuffleWriter[K, V](
         .filterNot(replayPendingClients.contains)
     }
 
-    private def dataBodyBytes(entries: Seq[PendingSend]): Long = {
-      entries.iterator.map(entry => replayLength(entry.sequenceNum, entry)).sum
-    }
-
     /** Return the next encoded frame that this logical route still needs. */
     private def nextReplayEntry(
         target: TransportClient,
@@ -876,27 +865,42 @@ class StreamingShuffleWriter[K, V](
         if (!transportServerHandler.isCreditControlled(id, target)) {
           true
         } else {
-          nextReplayEntry(target, maxSequenceNum).forall(replayEntryHasCredit(target, _))
+          val pending = replayEntriesForAction(target, maxSequenceNum).filter(_.isData)
+          val bytes = pending.iterator.map(_.length.toLong).sum
+          pending.isEmpty ||
+            (replayEntryHasCredit(target, pending.head) &&
+              (pending.size == 1 ||
+                bytes <= transportServerHandler.availableDataCredit(id, target)))
         }
       }
     }
 
-    /** Consume credit for the exact frame selected for each controlled route. */
+    private def replayEntriesForAction(
+        target: TransportClient,
+        maxSequenceNum: Long): Seq[ReplayEntry] = synchronized {
+      replayAfter(lastEnqueuedByClient.getOrElse(target, -1L), maxSequenceNum)
+    }
+
+    /** Consume credit for the exact frames selected for each controlled route. */
     private def consumeDataCreditForAction(
         connected: TransportClient,
         maxSequenceNum: Long): Unit = {
       connectedTargets(connected).foreach { target =>
-        nextReplayEntry(target, maxSequenceNum).foreach(consumeReplayEntryCredit(target, _))
+        if (transportServerHandler.isCreditControlled(id, target)) {
+          val bytes = replayEntriesForAction(target, maxSequenceNum).iterator
+            .filter(_.isData).map(_.length.toLong).sum
+          if (bytes > 0L) transportServerHandler.consumeDataCredit(id, target, bytes)
+        }
       }
     }
 
-    /** Check the per-logical-reader credit for a data body. */
-    private def dataCreditAvailable(
+    /** Reserve only the bytes that each route will actually submit for this action. */
+    private def estimatedNetworkBytesForAction(
         connected: TransportClient,
-        entries: Seq[PendingSend]): Boolean = {
-      val bytes = dataBodyBytes(entries)
-      val targets = connectedTargets(connected)
-      targets.forall(target => transportServerHandler.hasDataCredit(id, target, bytes))
+        maxSequenceNum: Long): Long = {
+      connectedTargets(connected).iterator.flatMap { target =>
+        replayEntriesForAction(target, maxSequenceNum)
+      }.map(_.length.toLong).sum
     }
 
     private def creditControlledTargets(connected: TransportClient): Boolean = {
@@ -915,34 +919,33 @@ class StreamingShuffleWriter[K, V](
     private def creditAdmissiblePrefix(
         connected: TransportClient,
         entries: Seq[PendingSend]): Int = {
-      val controlledTargets = connectedTargets(connected).filter(target =>
-        transportServerHandler.isCreditControlled(id, target))
+      val controlledTargets = connectedTargets(connected).filter(
+        transportServerHandler.isCreditControlled(id, _))
       if (controlledTargets.isEmpty) return entries.size
+      if (entries.isEmpty) return 0
 
-      val available = controlledTargets.iterator
-        .map(target => transportServerHandler.availableDataCredit(id, target))
-        .min
-      if (available <= 0L || entries.isEmpty) return 0
-
-      var count = 0
-      var bytes = 0L
-      while (count < entries.size) {
-        val nextBytes = replayLength(entries(count).sequenceNum, entries(count))
-        if (count > 0 && bytes + nextBytes > available) return count
-        bytes += nextBytes
-        count += 1
-      }
-      count
-    }
-
-    /** Reserve the credit after all other writer-side admission checks have passed. */
-    private def consumeDataCredit(
-        connected: TransportClient,
-        entries: Seq[PendingSend]): Unit = {
-      val bytes = dataBodyBytes(entries)
-      connectedTargets(connected).foreach { target =>
-        transportServerHandler.consumeDataCredit(id, target, bytes)
-      }
+      controlledTargets.iterator.map { target =>
+        val lastEnqueued = lastEnqueuedByClient.getOrElse(target, -1L)
+        val available = transportServerHandler.availableDataCredit(id, target)
+        var count = 0
+        var bytes = 0L
+        var frames = 0
+        var exhausted = false
+        while (count < entries.size && !exhausted &&
+            (entries(count).sequenceNum <= lastEnqueued || available > 0L)) {
+          if (entries(count).sequenceNum > lastEnqueued) {
+            val nextBytes = replayLength(entries(count).sequenceNum, entries(count))
+            if (frames > 0 && bytes + nextBytes > available) {
+              exhausted = true
+            } else {
+              bytes += nextBytes
+              frames += 1
+            }
+          }
+          if (!exhausted) count += 1
+        }
+        count
+      }.min
     }
 
     private def sendDataBody(
@@ -1094,17 +1097,18 @@ class StreamingShuffleWriter[K, V](
                 case other =>
                   (other, None)
               }
-              val reservedBytes = action match {
-                case DataAction(entries) => estimatedNetworkBytes(entries)
-                case _ => 0L
-              }
               val maxSequenceNum = action match {
                 case DataAction(entries) => entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
                 case ReplayAction(_, maxSeq) => maxSeq
                 case _ => -1L
               }
+              val reservedBytes = action match {
+                case DataAction(_) =>
+                  estimatedNetworkBytesForAction(connected, maxSequenceNum)
+                case _ => 0L
+              }
               val creditReady = action match {
-                case DataAction(entries) => dataCreditAvailable(connected, entries)
+                case DataAction(_) => dataCreditAvailableForAction(connected, maxSequenceNum)
                 case ReplayAction(target, maxSeq) =>
                   nextReplayEntry(target, maxSeq).forall(replayEntryHasCredit(target, _))
                 case _ => true
@@ -1125,7 +1129,8 @@ class StreamingShuffleWriter[K, V](
                 None
               } else {
                 action match {
-                case DataAction(entries) => consumeDataCredit(connected, entries)
+                case DataAction(_) =>
+                  consumeDataCreditForAction(connected, maxSequenceNum)
                 case ReplayAction(target, maxSeq) =>
                   nextReplayEntry(target, maxSeq).foreach(
                     consumeReplayEntryCredit(target, _))
