@@ -55,7 +55,7 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
       .config("spark.sql.adaptive.enabled", adaptive.toString)
       .config("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled", "true")
-      .config("spark.sql.pipelinedShuffle.enabled", "true")
+      .config("spark.sql.shuffle.localPipelined.enabled", "true")
       .config("spark.sql.shuffle.partitions", "2")
       .config("spark.speculation", "false")
       .config("spark.ui.enabled", "false")

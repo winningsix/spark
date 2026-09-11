@@ -73,7 +73,7 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
       // let the distributed transport attach every logical consumer to the shared producer.
       // This changes only exchange wrappers and transport flags; join algorithms and build sides
       // are untouched.
-      EnablePipelinedShuffle().apply(ReuseExchangeAndSubquery(plan))
+      EnablePipelinedShuffle.apply(ReuseExchangeAndSubquery(plan))
     } else {
       flipEligibleExchanges(plan)
     }

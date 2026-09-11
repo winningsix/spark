@@ -52,14 +52,14 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
     test(s"$name is transport-only fully streaming at p52") {
       val queryText = resourceToString(s"tpch/$name.sql",
         classLoader = Thread.currentThread().getContextClassLoader)
-      val bspPlan = withSQLConf(SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "false") {
+      val bspPlan = withSQLConf(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "false") {
         sql(queryText).queryExecution.executedPlan
       }
 
       val rtmPlan = withSQLConf(
-          SQLConf.PIPELINED_SHUFFLE_ENABLED.key -> "true",
+          SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key -> "true",
           SQLConf.PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED.key -> "true") {
-        AQEEnablePipelinedShuffle().apply(bspPlan)
+        AQEEnablePipelinedShuffle.apply(bspPlan)
       }
       val directShuffles = rtmPlan.collectWithSubqueries {
         case exchange: ShuffleExchangeExec => exchange
