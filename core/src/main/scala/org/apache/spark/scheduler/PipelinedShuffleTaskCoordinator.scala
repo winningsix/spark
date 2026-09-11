@@ -450,7 +450,10 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
           val activePureProducerStages =
             activePureProducerStagesByRunEpoch.getOrElse(runEpoch(reader), 0)
           val configuredCpus = taskCpus(
-            reader.taskSet, defaultTaskCpus, activePureProducerStages)
+            reader.taskSet,
+            defaultTaskCpus,
+            activePureProducerStages,
+            feedsMultiInputReader(reader.taskSet, taskSets))
           // Without an explicit fractional charge there is no CPU amount that can let a reader
           // overlap a whole-CPU producer (notably on a one-core executor). Preserve ordinary
           // scheduling in that case; the reservation is specifically the progress guarantee for
@@ -579,7 +582,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   def taskCpus(
       taskSet: TaskSet,
       profileTaskCpus: BigDecimal,
-      activePureProducerStages: Int = 0): BigDecimal = {
+      activePureProducerStages: Int = 0,
+      feedsMultiInputReader: Boolean = false): BigDecimal = {
     val configuredCpus = if (taskSet.isPipelinedShuffleReader &&
         taskSet.isPipelinedShuffleProducer) {
       readerProducerTaskCpus.getOrElse(profileTaskCpus)
@@ -588,9 +592,20 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     } else {
       profileTaskCpus
     }
+    val producerBacklogNeedsProtection = producerMaxTasks.exists { activeWindow =>
+      taskSet.pipelinedReaderMaxProducerTasks.toLong >=
+        activeWindow.toLong * PipelinedShuffleTaskCoordinator.MIN_MEMORY_GROWING_PRODUCER_WAVES
+    }
+    // A terminal binary streaming join needs useful progress from both input frontiers. Reserving
+    // only the generic memory-pressure producer allowance gives each side roughly one slot and
+    // can double scan time even when neither side spills. Keep protecting an intermediate binary
+    // join whose output feeds another multi-input reader: overlapping those stages is precisely
+    // where reducer execution-memory pressure becomes multiplicative.
+    val independentlyCompetingInputs = taskSet.pipelinedReaderShuffleIds.distinct.size
     if (taskSet.isPipelinedShuffleReader && taskSet.isPipelinedShuffleProducer &&
         taskSet.pipelinedReaderMemoryMayGrow && activePureProducerStages > 0 &&
-        maxTotalReaderTasksPerExecutor > 0) {
+        maxTotalReaderTasksPerExecutor > 0 && producerBacklogNeedsProtection &&
+        (independentlyCompetingInputs != 2 || feedsMultiInputReader)) {
       // Every partition's reader compute must attach to keep bounded writer credit live, so a
       // task-count cap cannot protect execution memory. Bound the producer input rate per
       // executor instead. Leave one producer slot per active input stage, and at least two for a
@@ -622,6 +637,18 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     }
   }
 
+  def feedsMultiInputReader(
+      producer: TaskSet,
+      activeTaskSets: Iterable[TaskSetManager]): Boolean = {
+    producer.shuffleId.exists { outputShuffleId =>
+      activeTaskSets.iterator.exists { candidate =>
+        !candidate.isZombie &&
+          candidate.taskSet.pipelinedReaderShuffleIds.distinct.size > 1 &&
+          candidate.taskSet.pipelinedReaderShuffleIds.contains(outputShuffleId)
+      }
+    }
+  }
+
   def removeExecutor(executorId: String): Unit = {
     assignments.filterInPlace { case (_, assignment) => assignment.executorId != executorId }
     trackerMaster.foreach(_.removeReceiveExecutor(executorId))
@@ -629,6 +656,9 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
 }
 
 private object PipelinedShuffleTaskCoordinator {
+  // Short producer frontiers finish before reader execution-memory pressure can repay reduced
+  // scan concurrency. Require a sustained backlog before charging readers for a producer reserve.
+  val MIN_MEMORY_GROWING_PRODUCER_WAVES: Long = 16L
   // Fixed-state consumers can let a small shuffle accumulate in their prepared inboxes instead of
   // occupying CPU while the producer is still scanning. Large inputs still attach when their
   // bounded receive window stops making progress, via the existing idle-ready fallback.

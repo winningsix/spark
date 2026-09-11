@@ -8367,6 +8367,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(readerTaskSet.pipelinedReaderShuffleIds.toSet ===
       Set(streamedDep.shuffleId, buildDep.shuffleId))
     assert(readerTaskSet.pipelinedReaderStartupShuffleIds === Set(buildDep.shuffleId))
+    assert(readerTaskSet.pipelinedReaderMaxProducerTasks === 2)
 
     taskSets.filter(_.shuffleId.nonEmpty).foreach { producerTaskSet =>
       completeShuffleMapStageSuccessfully(producerTaskSet.stageId, 0, 2)

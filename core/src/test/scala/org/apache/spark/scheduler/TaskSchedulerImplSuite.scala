@@ -2929,9 +2929,14 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       config.CPUS_PER_TASK.key -> "0.5",
       config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.5",
       config.STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS.key -> "0.5",
+      config.STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE.key -> "168",
       config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "7")
 
-    def reader(memoryMayGrow: Boolean, producer: Boolean = false): TaskSet = new TaskSet(
+    def reader(
+        memoryMayGrow: Boolean,
+        producer: Boolean = false,
+        inputShuffleIds: Seq[Int] = Seq(1),
+        maxProducerTasks: Int = 4096): TaskSet = new TaskSet(
       Array(new FakeTask(0, 0)),
       stageId = 0,
       stageAttemptId = 0,
@@ -2941,8 +2946,10 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       shuffleId = Option.when(producer)(1),
       isPipelined = true,
       isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = inputShuffleIds,
       isPipelinedShuffleProducer = producer,
-      pipelinedReaderMemoryMayGrow = memoryMayGrow)
+      pipelinedReaderMemoryMayGrow = memoryMayGrow,
+      pipelinedReaderMaxProducerTasks = maxProducerTasks)
 
     assert(taskScheduler.taskCpusForTaskSet(
       reader(memoryMayGrow = false), BigDecimal("0.5"), 3) === BigDecimal("0.5"))
@@ -2956,6 +2963,15 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskScheduler.taskCpusForTaskSet(
       reader(memoryMayGrow = true, producer = true),
       BigDecimal("0.5"), 3) === BigDecimal(11) / 14)
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true, producer = true, maxProducerTasks = 2048),
+      BigDecimal("0.5"), 1) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true, producer = true, inputShuffleIds = Seq(1, 2)),
+      BigDecimal("0.5"), 2) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true, producer = true, inputShuffleIds = Seq(1, 2)),
+      BigDecimal("0.5"), 2, feedsMultiInputReader = true) === BigDecimal(6) / 7)
   }
 
   test("fractional pipelined reader charge leaves executor slots for producers") {

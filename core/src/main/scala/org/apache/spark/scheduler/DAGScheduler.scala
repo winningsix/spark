@@ -1488,6 +1488,21 @@ private[spark] class DAGScheduler(
     shuffleIds.sorted.toSeq
   }
 
+  /** Largest task frontier behind a direct pipelined input read by this stage. */
+  private def maxPipelinedProducerTasksReadByStage(rdd: RDD[_]): Int = {
+    var maxTasks = 0
+    def visit(current: RDD[_]): Unit = {
+      current.dependencies.foreach {
+        case dependency: PipelinedShuffleDependency[_, _, _] =>
+          maxTasks = math.max(maxTasks, dependency.rdd.partitions.length)
+        case _: ShuffleDependency[_, _, _] =>
+        case dependency => visit(dependency.rdd)
+      }
+    }
+    visit(rdd)
+    maxTasks
+  }
+
   /** Pipelined inputs that an operator in this stage must consume before other inputs. */
   private def pipelinedStartupShuffleIdsReadByStage(rdd: RDD[_]): Set[Int] = {
     val startupInputRoots = new HashSet[RDD[_]]
@@ -3279,6 +3294,11 @@ private[spark] class DAGScheduler(
       val readerMemoryMayGrow =
         (pipelinedReaderShuffleIds.nonEmpty || retainsExecutionMemory) &&
         pipelinedReaderMemoryMayGrow(stage.rdd)
+      val readerMaxProducerTasks = if (pipelinedReaderShuffleIds.nonEmpty) {
+        maxPipelinedProducerTasksReadByStage(stage.rdd)
+      } else {
+        0
+      }
       val isPipelinedShuffleProducer = isPipelinedProducer(stage)
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
@@ -3288,6 +3308,7 @@ private[spark] class DAGScheduler(
         pipelinedReaderStartupShuffleIds = pipelinedReaderStartupShuffleIds,
         isPipelinedShuffleProducer = isPipelinedShuffleProducer,
         pipelinedReaderMemoryMayGrow = readerMemoryMayGrow,
+        pipelinedReaderMaxProducerTasks = readerMaxProducerTasks,
         retainsExecutionMemory = retainsExecutionMemory,
         retainedMemoryBuildCount = retainedBuildCount))
     } else {

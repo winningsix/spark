@@ -55,6 +55,10 @@ private[spark] class TaskSet(
     // True when an operator in this reader stage can keep growing execution memory as streamed
     // input arrives. Its early heartbeat samples cannot safely lift reader admission limits.
     val pipelinedReaderMemoryMayGrow: Boolean = false,
+    // Largest number of producer tasks behind any direct pipelined input. The scheduler uses this
+    // to distinguish a long producer backlog, where overlapping every memory-growing reader can
+    // force execution-memory spill, from a short input that should finish at full concurrency.
+    val pipelinedReaderMaxProducerTasks: Int = 0,
     // True when tasks in this stage retain substantial execution memory until task completion.
     // This is independent of shuffle transport: a shuffled hash join needs the same sampled,
     // executor-wide admission after its inputs fall back to regular materialized exchanges.
