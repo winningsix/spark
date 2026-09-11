@@ -393,14 +393,15 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
   }
 
   /**
-   * Reserve enough CPU on each executor to attach one prepared reader in every active run epoch.
+   * Reserve enough CPU on each executor to attach a prepared reader in every active run epoch.
    *
    * Pure producers normally consume whole CPUs while prepared readers use a fractional charge.
    * If producers take the final whole CPU before an inbox becomes drain-ready, bounded transport
    * backpressure can stop every producer while the reader that would return credit has no
    * schedulable CPU. The old heap wire fallback hid that cycle by letting producers allocate past
-   * the transport budget. Keep the small reservation only until a reader in that epoch is already
-   * running on the executor; its own CPU charge then preserves the progress path.
+   * the transport budget. After the first attachment, reserve only for ready readers that pass
+   * admission. A reader can require more CPU than one completed producer returns: without this
+   * reservation, replacement producers can repeatedly refill the freed slice and starve it.
    */
   def readerCpuReservations(
       taskSets: Iterable[TaskSetManager]): Map[(Option[String], String), BigDecimal] = {
@@ -427,7 +428,12 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
           runEpoch(candidate) == reservationKey._1 &&
             candidate.runningTasksOnExecutor(assignment.executorId) > 0
         }
-        if (!hasRunningReader && reader.isTaskPendingForOffer(key.taskIndex)) {
+        val readyForAttachment = hasRunningReader &&
+          taskIndexAllowed(reader, assignment.executorId, key.taskIndex) &&
+          readerLaunchAllowed(reader, assignment.executorId, taskSets,
+            upstreamReaderProducers(reader, taskSets))
+        if ((!hasRunningReader || readyForAttachment) &&
+            reader.isTaskPendingForOffer(key.taskIndex)) {
           val configuredCpus = if (reader.taskSet.isPipelinedShuffleProducer) {
             readerProducerTaskCpus
           } else {

@@ -2996,6 +2996,79 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.forall(_.executorId === executorId))
   }
 
+  gridTest("ready readers accumulate fractional CPU without bypassing admission")(Seq(1, 2)) {
+      readerCap =>
+    val taskScheduler = setupScheduler(
+      "spark.task.cpus" -> "0.5",
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.75",
+      config.STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR.key -> "2",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> readerCap.toString)
+    val executorId = "executor0"
+    val prepared = new ArrayBuffer[StreamingShuffleReceiveInboxId]
+    val endpoint = sc.env.rpcEnv.setupEndpoint(
+      s"fractional-ready-reader-${System.nanoTime()}",
+      new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+
+        override def receiveAndReply(
+            context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInboxes(ids) =>
+            prepared.synchronized(prepared ++= ids)
+            context.reply(true)
+        }
+      })
+    val tracker = sc.env.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    assert(tracker.registerReceiveEndpoint(executorId, endpoint))
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](2)(i => new FakeTask(1, i)),
+      stageId = 1,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      pipelinedReaderShuffleIds = Seq(7),
+      pipelinedReaderStartupShuffleIds = Set(7))
+    taskScheduler.submitTasks(reader)
+    def offer(cpus: String): Seq[TaskDescription] = {
+      taskScheduler.resourceOffers(
+        IndexedSeq(WorkerOffer(executorId, "host0", BigDecimal(cpus)))).flatten.toSeq
+    }
+    assert(offer("0.75").isEmpty)
+    val inboxes = prepared.synchronized(prepared.toSeq)
+    assert(inboxes.size === 2)
+    tracker.markInboxDrainReady(executorId, inboxes.head)
+    assert(offer("0.75").size === 1)
+
+    val producer = new TaskSet(
+      Array.tabulate[Task[_]](8)(i => new FakeTask(0, i)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Some(7),
+      isPipelined = true,
+      isPipelinedShuffleProducer = true)
+    taskScheduler.submitTasks(producer)
+    assert(offer("0.5").size === 1, "an empty reader must not reserve another CPU slice")
+    tracker.markInboxDrainReady(executorId, inboxes.last)
+    if (readerCap == 1) {
+      assert(offer("0.5").size === 1,
+        "a reader blocked by admission must not reserve CPU needed by producers")
+    } else {
+      assert(offer("0.5").isEmpty,
+        "a producer must not refill CPU needed by a ready reader larger than one freed slice")
+      assert(offer("0.75").size === 1)
+      assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 2)
+      assert(offer("0.5").size === 1, "reservation must end once the ready reader attaches")
+    }
+  }
+
   test("pure producer slots stay shared fairly across prepared reader startup") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
