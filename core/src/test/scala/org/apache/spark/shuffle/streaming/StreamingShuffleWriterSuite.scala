@@ -253,6 +253,24 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("a retained raw buffer is not returned to the writer pool") {
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val writer = newWriter(sc, context)
+      val buffer = Unpooled.directBuffer(
+        sc.conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE))
+      val retained = buffer.retainedDuplicate()
+      try {
+        writer.shards(0).releaseRawBuffer(buffer)
+        writer.bufferPool shouldBe empty
+        retained.refCnt() shouldBe 1
+      } finally {
+        retained.release()
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   test("checksum is computed and embedded in the DataMessage sent on the wire") {
     // Keep the wire bytes identical to the uncompressed record bytes whose checksum is stored in
     // DataMessage. Compression/decompression correctness is covered by the end-to-end suite.
@@ -272,8 +290,10 @@ class StreamingShuffleWriterSuite
         // Serialize a record through the writer's own buffer/checksum path and send it.
         val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
         val serializationStream = tsBuffer.serializationStream.get
-        serializationStream.writeKey(1.asInstanceOf[Any])
-        serializationStream.writeValue(2.asInstanceOf[Any])
+        (0 until 1000).foreach { value =>
+          serializationStream.writeKey(value.asInstanceOf[Any])
+          serializationStream.writeValue((value * 2).asInstanceOf[Any])
+        }
         serializationStream.flush()
         writer.shards(0).send(tsBuffer)
 

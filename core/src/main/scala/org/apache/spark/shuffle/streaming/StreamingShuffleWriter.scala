@@ -421,7 +421,7 @@ class StreamingShuffleWriter[K, V](
     def totalByteSize(): Long = buffer.readableBytes()
     def ageMs(): Long = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - creationTimeNs)
 
-    /* Checksum calculation for order-dependent per-row checksums. */
+    // Incremental coverage also includes serialization stream headers and final close bytes.
     def updateChecksum(): Unit = {
       if (shuffleChecksum != null) {
         val currentPosition = buffer.writerIndex()
@@ -1407,7 +1407,13 @@ class StreamingShuffleWriter[K, V](
       sendTimestampedBuffer(timestampedBuffer, flushBatch = false)
 
     /** Return a raw input buffer after its network send no longer needs it. */
-    private def releaseRawBuffer(rawBuffer: ByteBuf): Unit = {
+    private[streaming] def releaseRawBuffer(rawBuffer: ByteBuf): Unit = {
+      // A late replay may still retain a slice after this route's network and replay owners have
+      // completed. Never clear and pool a buffer while that transport reference can read it.
+      if (rawBuffer.refCnt() != 1) {
+        discardRawBuffer(rawBuffer)
+        return
+      }
       rawBuffer.clear()
       if (writeInputFinished.get() || context.isFailed() || context.isCompleted() ||
           rawBuffer.capacity() != BUFFER_SIZE) {
@@ -2160,8 +2166,6 @@ class StreamingShuffleWriter[K, V](
             log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, largeRowThreshold)}. " +
             log"Consider increasing the block size.")
         }
-
-        timestampedBuffer.updateChecksum()
 
         // Flush immediately if the buffer is almost full or stale.
         if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&
