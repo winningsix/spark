@@ -22,8 +22,11 @@ import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
 
+import io.netty.buffer.{ByteBuf, ByteBufInputStream}
+
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
+import org.apache.spark.shuffle.streaming.StreamingShuffleSerializerInstance
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.unsafe.Platform
@@ -50,7 +53,61 @@ class UnsafeRowSerializer(
 
 private class UnsafeRowSerializerInstance(
     numFields: Int,
-    dataSize: SQLMetric) extends SerializerInstance {
+    dataSize: SQLMetric)
+    extends SerializerInstance with StreamingShuffleSerializerInstance {
+
+  override def writeValueToByteBuf(value: Any, output: ByteBuf): Unit = {
+    val row = value.asInstanceOf[UnsafeRow]
+    val rowSize = row.getSizeInBytes
+    if (dataSize != null) dataSize.add(rowSize)
+    output.ensureWritable(Integer.BYTES + rowSize)
+    output.writeInt(rowSize)
+    val targetIndex = output.writerIndex()
+    if (output.hasMemoryAddress) {
+      row.writeToMemory(null, output.memoryAddress() + targetIndex)
+      output.writerIndex(targetIndex + rowSize)
+    } else if (output.hasArray) {
+      row.writeToMemory(
+        output.array(), Platform.BYTE_ARRAY_OFFSET + output.arrayOffset() + targetIndex)
+      output.writerIndex(targetIndex + rowSize)
+    } else {
+      output.writeBytes(row.getBytes)
+    }
+  }
+
+  override def keyValueIteratorFromByteBuf(input: ByteBuf): Iterator[(Any, Any)] = {
+    if (!input.hasMemoryAddress && !input.hasArray) {
+      return deserializeStream(new ByteBufInputStream(input)).asKeyValueIterator
+        .asInstanceOf[Iterator[(Any, Any)]]
+    }
+    new Iterator[(Any, Any)] {
+      private val row = new UnsafeRow(numFields)
+      private val rowTuple: (Int, UnsafeRow) = (0, row)
+
+      override def hasNext: Boolean = input.isReadable
+
+      override def next(): (Any, Any) = {
+        if (input.readableBytes() < Integer.BYTES) {
+          throw new EOFException("Incomplete UnsafeRow length in streaming shuffle buffer")
+        }
+        val rowSize = input.readInt()
+        if (rowSize < 0 || rowSize > input.readableBytes()) {
+          throw new EOFException(
+            s"Invalid UnsafeRow size $rowSize with ${input.readableBytes()} readable bytes")
+        }
+        val rowIndex = input.readerIndex()
+        if (input.hasMemoryAddress) {
+          row.pointTo(null, input.memoryAddress() + rowIndex, rowSize)
+        } else {
+          row.pointTo(
+            input.array(), Platform.BYTE_ARRAY_OFFSET + input.arrayOffset() + rowIndex, rowSize)
+        }
+        input.skipBytes(rowSize)
+        rowTuple
+      }
+    }
+  }
+
   /**
    * Serializes a stream of UnsafeRows. Within the stream, each record consists of a record
    * length (stored as a 4-byte integer, written high byte first), followed by the record's bytes.
