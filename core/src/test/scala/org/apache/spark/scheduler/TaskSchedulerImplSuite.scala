@@ -2892,6 +2892,27 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       "the producer must not launch another task while its two-task window is full")
   }
 
+  test("pipelined reader CPU charge leaves executor slots for producers") {
+    val taskScheduler = setupScheduler(
+      "spark.shuffle.streaming.reader.taskCpus" -> "0.25")
+    val reader = new TaskSet(
+      Array.tabulate[Task[_]](8)(i => new FakeTask(0, i)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = None,
+      isPipelined = true,
+      isPipelinedShuffleReader = true)
+    taskScheduler.submitTasks(reader)
+
+    val launched = taskScheduler.resourceOffers(
+      IndexedSeq(new WorkerOffer("executor0", "host0", 1))).flatten
+    assert(launched.length === 4)
+    assert(launched.forall(_.cpus === BigDecimal("0.25")))
+  }
+
   test("prepared receive mode does not expand a sole producer before its reader is submitted") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",

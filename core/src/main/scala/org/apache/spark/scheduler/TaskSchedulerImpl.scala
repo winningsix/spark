@@ -40,7 +40,8 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
+import org.apache.spark.shuffle.streaming.{StreamingShuffleReceiveInboxId,
+  StreamingShuffleTaskResources}
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
@@ -637,7 +638,9 @@ private[spark] class TaskSchedulerImpl(
     // would otherwise re-derive it for every slot.
     val taskSetProf = sc.resourceProfileManager
       .resourceProfileFromId(taskSet.taskSet.resourceProfileId)
-    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
+    val profileTaskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
+    val taskCpus = StreamingShuffleTaskResources.taskCpus(
+      conf, taskSet.taskSet, profileTaskCpus)
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
     for (i <- shuffledOffers.indices) {
