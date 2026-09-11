@@ -64,6 +64,8 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     "expanded producer task limit must be at least the base producer task limit")
   private val readerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_TASK_CPUS)
   private val readerProducerTaskCpus = conf.get(STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS)
+  private val defaultTaskCpus = conf.get(CPUS_PER_TASK)
+  private val executorCores = conf.get(EXECUTOR_CORES)
   private val maxTotalReaderTasksPerExecutor =
     conf.get(STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR)
   private val expandedMaxTotalReaderTasksPerExecutor =
@@ -158,7 +160,11 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
                     partitionId,
                     nextPreparedInboxGeneration.getAndDecrement(),
                     readerOrdinal,
-                    stageBeforeConsumerAttach)
+                    stageBeforeConsumerAttach,
+                    readyBytesOverride = Option.unless(
+                      taskSet.taskSet.pipelinedReaderMemoryMayGrow) {
+                      PipelinedShuffleTaskCoordinator.NON_GROWING_READER_READY_BYTES
+                    })
                 }
                 pending += key -> ReaderAssignment(executorId, inboxes)
               }
@@ -416,6 +422,13 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     val activeReaders = taskSets.iterator.filter { taskSet =>
       !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader
     }.toSeq
+    val activePureProducerStagesByRunEpoch = taskSets.iterator
+      .filter(isActivePureProducer)
+      .toSeq
+      .groupBy(runEpoch)
+      .view
+      .mapValues(_.size)
+      .toMap
     val readersByAttempt = activeReaders.map { taskSet =>
       (taskSet.stageId, taskSet.taskSet.stageAttemptId) -> taskSet
     }.toMap
@@ -434,16 +447,15 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
             upstreamReaderProducers(reader, taskSets))
         if ((!hasRunningReader || readyForAttachment) &&
             reader.isTaskPendingForOffer(key.taskIndex)) {
-          val configuredCpus = if (reader.taskSet.isPipelinedShuffleProducer) {
-            readerProducerTaskCpus
-          } else {
-            readerTaskCpus
-          }
+          val activePureProducerStages =
+            activePureProducerStagesByRunEpoch.getOrElse(runEpoch(reader), 0)
+          val configuredCpus = taskCpus(
+            reader.taskSet, defaultTaskCpus, activePureProducerStages)
           // Without an explicit fractional charge there is no CPU amount that can let a reader
           // overlap a whole-CPU producer (notably on a one-core executor). Preserve ordinary
           // scheduling in that case; the reservation is specifically the progress guarantee for
           // fractional prepared-reader execution.
-          configuredCpus.filter(_ < 1).foreach { cpus =>
+          Option.when(configuredCpus < 1)(configuredCpus).foreach { cpus =>
             result.updateWith(reservationKey) {
               case Some(current) => Some(current.max(cpus))
               case None => Some(cpus)
@@ -564,13 +576,36 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
     !enabled || !pureProducer || taskLimit.forall(taskSet.runningTasks < _)
   }
 
-  def taskCpus(taskSet: TaskSet, profileTaskCpus: BigDecimal): BigDecimal = {
-    if (taskSet.isPipelinedShuffleReader && taskSet.isPipelinedShuffleProducer) {
+  def taskCpus(
+      taskSet: TaskSet,
+      profileTaskCpus: BigDecimal,
+      activePureProducerStages: Int = 0): BigDecimal = {
+    val configuredCpus = if (taskSet.isPipelinedShuffleReader &&
+        taskSet.isPipelinedShuffleProducer) {
       readerProducerTaskCpus.getOrElse(profileTaskCpus)
     } else if (taskSet.isPipelinedShuffleReader) {
       readerTaskCpus.getOrElse(profileTaskCpus)
     } else {
       profileTaskCpus
+    }
+    if (taskSet.isPipelinedShuffleReader && taskSet.isPipelinedShuffleProducer &&
+        taskSet.pipelinedReaderMemoryMayGrow && activePureProducerStages > 0 &&
+        maxTotalReaderTasksPerExecutor > 0) {
+      // Every partition's reader compute must attach to keep bounded writer credit live, so a
+      // task-count cap cannot protect execution memory. Bound the producer input rate per
+      // executor instead. Leave one producer slot per active input stage, and at least two for a
+      // sole input so scan and reader compute can overlap. Charging the configured maximum reader
+      // wave against the remaining CPUs turns that local producer reserve into a stable resource
+      // limit without reducing the number of attached reader partitions.
+      val producerSlots = math.max(2, activePureProducerStages)
+      val producerCpuReserve = (profileTaskCpus * producerSlots)
+        .min(BigDecimal(executorCores) - profileTaskCpus)
+        .max(BigDecimal(0))
+      val adaptiveCpus = (BigDecimal(executorCores) - producerCpuReserve) /
+        maxTotalReaderTasksPerExecutor
+      configuredCpus.max(adaptiveCpus)
+    } else {
+      configuredCpus
     }
   }
 
@@ -594,5 +629,9 @@ private[scheduler] final class PipelinedShuffleTaskCoordinator(
 }
 
 private object PipelinedShuffleTaskCoordinator {
+  // Fixed-state consumers can let a small shuffle accumulate in their prepared inboxes instead of
+  // occupying CPU while the producer is still scanning. Large inputs still attach when their
+  // bounded receive window stops making progress, via the existing idle-ready fallback.
+  val NON_GROWING_READER_READY_BYTES: Long = 64L << 20
   val INBOX_READY_REVIVE_COALESCE_MS = 10L
 }

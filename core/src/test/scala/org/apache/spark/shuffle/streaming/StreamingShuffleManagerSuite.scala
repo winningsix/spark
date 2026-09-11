@@ -369,7 +369,7 @@ class StreamingShuffleManagerSuite
   test("prepared inbox becomes drain-ready when its receive window fills below threshold") {
     val conf = new SparkConf()
       .set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 60000L)
-      .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES, 32L << 20)
+      .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES, 1L)
       .set(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT, 200L)
     val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Map.empty)
     val clientCreationExecutor =
@@ -391,7 +391,8 @@ class StreamingShuffleManagerSuite
       }
     val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
     val inbox = new StreamingShuffleReceiveInbox(
-      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L), queue)
+      StreamingShuffleReceiveInboxId(
+        7, 9, 0, 0, -1L, readyBytesOverride = Some(32L << 20)), queue)
     val session = new StreamingShufflePreparedReceiveSession(
       inbox,
       sharedClient,
@@ -631,7 +632,7 @@ class StreamingShuffleManagerSuite
       eventually(Timeout(10.seconds)) {
         session.errorNotifier.getError().map(_.getMessage) shouldBe
           Some("Prepared shuffle route registration timed out for " +
-            "StreamingShuffleReceiveInboxId(7,9,0,0,-1,0,true): " +
+            "StreamingShuffleReceiveInboxId(7,9,0,0,-1,0,true,None): " +
             "completed=0, advertised=1, expected=1")
         discovery.stats._1 shouldBe 0
       }

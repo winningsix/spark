@@ -56,7 +56,10 @@ private[spark] case class StreamingShuffleReceiveInboxId(
     // True only when producer progress fundamentally requires durable late-reader staging.
     // Asymmetric SHJ readers build from a regular input, so their unattached probe routes must
     // retain credit and backpressure the producer instead.
-    stageDataBeforeConsumerAttach: Boolean = true)
+    stageDataBeforeConsumerAttach: Boolean = true,
+    // A scheduler-selected threshold can defer compute for fixed-state readers while their
+    // executor-owned inbox receives data. None preserves the executor-wide configured default.
+    readyBytesOverride: Option[Long] = None)
 
 private[spark] case class PrepareStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
@@ -868,7 +871,8 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
   private val closed = new AtomicBoolean(false)
   private val discoveryComplete = new AtomicBoolean(false)
   private val drainReady = new AtomicBoolean(false)
-  private val drainReadyBytes = conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES)
+  private val drainReadyBytes = inbox.id.readyBytesOverride.getOrElse(
+    conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES))
   private val drainReadyIdleNanos = TimeUnit.MILLISECONDS.toNanos(
     conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT))
   private val lastMessageAvailableNanos = new AtomicLong(System.nanoTime())

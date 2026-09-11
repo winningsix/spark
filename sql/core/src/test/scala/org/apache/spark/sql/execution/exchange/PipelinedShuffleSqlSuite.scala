@@ -23,9 +23,10 @@ import scala.collection.mutable
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkFunSuite}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+import org.apache.spark.sql.functions.sum
 
 /**
  * End-to-end SQL coverage of the pipelined channel path: a batch query whose hash
@@ -483,6 +484,36 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
           org.apache.spark.sql.catalyst.plans.physical.SinglePartition),
         s"expected a SinglePartition exchange; plan:\n${df.queryExecution.executedPlan}")
       assert(result.toSeq === Seq((0L until 1000L).sum))
+    }
+  }
+
+  test("only blocking operators with input-sized state mark pipelined memory as growing") {
+    withPipelinedSession { spark =>
+      import spark.implicits._
+
+      def memoryMayGrow(df: DataFrame): Boolean = {
+        val pending = mutable.ArrayDeque[RDD[_]](df.queryExecution.toRdd)
+        val visited = mutable.HashSet.empty[Int]
+        var result = false
+        while (pending.nonEmpty && !result) {
+          val current = pending.removeHead()
+          if (visited.add(current.id)) {
+            result = current.pipelinedMemoryMayGrow
+            current.dependencies.foreach(dependency => pending.append(dependency.rdd))
+          }
+        }
+        result
+      }
+
+      val global = spark.range(0, 1000, 1, 2).agg(sum($"id"))
+      val grouped = spark.range(0, 1000, 1, 2)
+        .groupBy($"id" % 17)
+        .agg(sum($"id"))
+
+      assert(!memoryMayGrow(global),
+        "an ungrouped aggregate retains a fixed-size buffer regardless of input size")
+      assert(memoryMayGrow(grouped),
+        "a grouped hash aggregate can retain one state entry per input key")
     }
   }
 

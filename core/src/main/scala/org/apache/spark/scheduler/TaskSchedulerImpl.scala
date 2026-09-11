@@ -236,8 +236,10 @@ private[spark] class TaskSchedulerImpl(
 
   private[scheduler] def taskCpusForTaskSet(
       taskSet: TaskSet,
-      profileTaskCpus: BigDecimal): BigDecimal = {
-    pipelinedShuffleTaskCoordinator.taskCpus(taskSet, profileTaskCpus)
+      profileTaskCpus: BigDecimal,
+      activePureProducerStages: Int = 0): BigDecimal = {
+    pipelinedShuffleTaskCoordinator.taskCpus(
+      taskSet, profileTaskCpus, activePureProducerStages)
   }
 
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
@@ -481,7 +483,8 @@ private[spark] class TaskSchedulerImpl(
     val taskSetProf = sc.resourceProfileManager
       .resourceProfileFromId(taskSet.taskSet.resourceProfileId)
     val profileTaskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
-    val taskCpus = taskCpusForTaskSet(taskSet.taskSet, profileTaskCpus)
+    val taskCpus = taskCpusForTaskSet(
+      taskSet.taskSet, profileTaskCpus, activePureProducerStages)
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
     for (i <- shuffledOffers.indices) {

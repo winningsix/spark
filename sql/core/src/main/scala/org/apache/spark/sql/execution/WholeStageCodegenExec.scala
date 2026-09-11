@@ -813,7 +813,8 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
     val pipelinedMemoryMayGrow = child.exists {
       // ShuffledHashJoin has an explicit build-complete heartbeat fence. Operators in this
       // category do not, so their memory remains unsafe to sample until task completion.
-      case _: BlockingOperatorWithCodegen => true
+      case aggregate: HashAggregateExec => aggregate.groupingExpressions.nonEmpty
+      case _: SortExec => true
       case _ => false
     }
     outputRDD

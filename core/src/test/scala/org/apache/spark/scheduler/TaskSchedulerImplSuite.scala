@@ -2923,6 +2923,41 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       taskSet(reader = false, producer = false), BigDecimal(2)) === BigDecimal(2))
   }
 
+  test("memory-growing readers reserve local CPU for every active producer stage") {
+    val taskScheduler = setupScheduler(
+      config.EXECUTOR_CORES.key -> "7",
+      config.CPUS_PER_TASK.key -> "0.5",
+      config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.5",
+      config.STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS.key -> "0.5",
+      config.STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR.key -> "7")
+
+    def reader(memoryMayGrow: Boolean, producer: Boolean = false): TaskSet = new TaskSet(
+      Array(new FakeTask(0, 0)),
+      stageId = 0,
+      stageAttemptId = 0,
+      priority = 0,
+      properties = null,
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      shuffleId = Option.when(producer)(1),
+      isPipelined = true,
+      isPipelinedShuffleReader = true,
+      isPipelinedShuffleProducer = producer,
+      pipelinedReaderMemoryMayGrow = memoryMayGrow)
+
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = false), BigDecimal("0.5"), 3) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true), BigDecimal("0.5"), 0) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true), BigDecimal("0.5"), 1) === BigDecimal("0.5"))
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true, producer = true),
+      BigDecimal("0.5"), 1) === BigDecimal(6) / 7)
+    assert(taskScheduler.taskCpusForTaskSet(
+      reader(memoryMayGrow = true, producer = true),
+      BigDecimal("0.5"), 3) === BigDecimal(11) / 14)
+  }
+
   test("fractional pipelined reader charge leaves executor slots for producers") {
     val taskScheduler = setupScheduler(
       config.STREAMING_SHUFFLE_READER_TASK_CPUS.key -> "0.25")
@@ -3196,6 +3231,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         "all network inboxes must be prepared even though compute attach is capped")
       assert(prepared.synchronized(prepared.forall(id => !id.stageDataBeforeConsumerAttach)),
         "an unattached asymmetric-SHJ probe must retain credit instead of staging to disk")
+      assert(prepared.synchronized(prepared.forall(_.readyBytesOverride.contains(64L << 20))),
+        "a fixed-state reader should wait for a useful input batch before occupying compute")
     }
     prepared.synchronized(prepared.toSeq).foreach(tracker.markInboxDrainReady(executorId, _))
     val initial = taskScheduler.resourceOffers(offer).flatten
