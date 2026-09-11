@@ -296,6 +296,26 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("distributed shuffled hash join materializes build and pipelines probe") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+      val left = spark.range(0, 200, 1, 2).withColumn("k", $"id" % 10)
+      val right = spark.range(0, 120, 1, 2).withColumn("k", $"id" % 6)
+      val joined = left.join(right, "k")
+
+      assert(joined.count() === 2400L)
+      val exchanges = collect(joined.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+      assert(exchanges.count(_.pipelined) === 1,
+        s"the probe exchange must be pipelined; plan:\n${joined.queryExecution.executedPlan}")
+      assert(exchanges.count(exchange => !exchange.pipelined) === 1,
+        s"the build exchange must be regular; plan:\n${joined.queryExecution.executedPlan}")
+    }
+  }
+
   test("global aggregate (single-partition exchange) runs through the pipelined channel") {
     // An ungrouped aggregate requires AllTuples, planned as a SinglePartition exchange: the
     // channel's numPartitions == 1 degenerate case (everything routes to queue 0).

@@ -20,9 +20,10 @@ package org.apache.spark.sql.execution.exchange
 import scala.collection.mutable
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
-import org.apache.spark.sql.execution.joins.CartesianProductExec
+import org.apache.spark.sql.execution.joins.{CartesianProductExec, ShuffledHashJoinExec}
 
 /**
  * Opt-in (SPARK-57399). Rewrites EVERY [[ShuffleExchangeExec]] in a
@@ -124,10 +125,11 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
     val supportsSequentialReplay =
       SparkEnv.get.pipelinedShuffleManager.supportsSequentialReplay
 
-    def rewriteExchanges(asPipelined: Boolean): SparkPlan = {
+    def rewriteExchanges(shouldPipeline: ShuffleExchangeExec => Boolean): SparkPlan = {
       val rewrittenByExchangeKey = mutable.HashMap.empty[Int, ShuffleExchangeExec]
       def rewritten(exchange: ShuffleExchangeExec): ShuffleExchangeExec = {
         rewrittenByExchangeKey.getOrElseUpdate(exchange.pipelinedReuseKey, {
+          val asPipelined = shouldPipeline(exchange)
           val copied = if (exchange.pipelined == asPipelined) {
             exchange
           } else {
@@ -162,7 +164,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       // rather than WARN, which would fire on every reuse-bearing query and read as a fault.
       logDebug("EnablePipelinedShuffle: plan has a reused shuffle exchange but the configured " +
         "manager lacks fan-out or sequential replay; leaving it regular.")
-      return rewriteExchanges(asPipelined = false)
+      return rewriteExchanges(_ => false)
     }
 
     // An operator that would read a shuffle in a way the configured transport cannot serve, or that
@@ -174,10 +176,29 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       logDebug("EnablePipelinedShuffle: a shuffle is read through an operator the configured " +
         "transport cannot serve (coalesce / cartesian product / a limit operator that builds a " +
         "hidden shuffle); leaving the plan regular.")
-      return rewriteExchanges(asPipelined = false)
+      return rewriteExchanges(_ => false)
     }
 
-    rewriteExchanges(asPipelined = true)
+    // A shuffled hash join retains its build relation until its probe side is drained. Prepared
+    // receive can keep the probe spine live while AQE materializes every exchange in the build
+    // subtree first. This avoids making the large probe compete with short build work, without
+    // adding a scheduler-specific priority path.
+    if (supportsUnmaterializedRegularBoundary) {
+      val regularBuildExchangeKeys = plan.collectWithSubqueries {
+        case join: ShuffledHashJoinExec =>
+          if (join.buildSide == BuildLeft) join.left else join.right
+      }.iterator.flatMap(_.collect {
+        case exchange: ShuffleExchangeExec => exchange.pipelinedReuseKey
+        case ReusedExchangeExec(_, exchange: ShuffleExchangeExec) =>
+          exchange.pipelinedReuseKey
+      }).toSet
+      if (regularBuildExchangeKeys.nonEmpty) {
+        return rewriteExchanges(exchange =>
+          !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey))
+      }
+    }
+
+    rewriteExchanges(_ => true)
   }
 
   /**
