@@ -179,7 +179,8 @@ class StreamingShuffleWriterSuite
   // send directly to this mock instead of over the network.
   private def bindMockClient(
       writer: StreamingShuffleWriter[Int, Int],
-      shardId: Int)(onSend: ByteBuf => Unit): Unit = {
+      shardId: Int,
+      completeWrites: Boolean = true)(onSend: ByteBuf => Unit): TransportClient = {
     val client = mock[TransportClient]
     val channel = mock[Channel]
     val channelConfig = mock[ChannelConfig]
@@ -189,8 +190,10 @@ class StreamingShuffleWriterSuite
     when(succeededFuture.isSuccess).thenReturn(true)
     when(succeededFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
       .thenAnswer { invocation =>
-        invocation.getArgument[GenericFutureListener[ChannelFuture]](0)
-          .operationComplete(succeededFuture)
+        if (completeWrites) {
+          invocation.getArgument[GenericFutureListener[ChannelFuture]](0)
+            .operationComplete(succeededFuture)
+        }
         succeededFuture
       }
     when(client.send(any[ByteBuf])).thenAnswer { invocation =>
@@ -203,6 +206,30 @@ class StreamingShuffleWriterSuite
       succeededFuture
     }
     writer.transportServerHandler.futureClients(shardId).complete(client)
+    client
+  }
+
+  test("termination repair stays ordered without a write-completion fence") {
+    withSpark(new SparkContext("local", "ordered-terminal-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0, completeWrites = false) {
+          _ => sends.incrementAndGet()
+        }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
+
+        writer.shards(0).send(new TerminationControlMessage(0, 0))
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
+
+        writer.shards(0).retryUnackedTermination() shouldBe 1
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
   }
 
   test("a synchronous transport failure is surfaced through the ErrorNotifier") {

@@ -514,6 +514,8 @@ class StreamingShuffleWriter[K, V](
       extends OutboundAction
     private case class ReplayAction(target: TransportClient, maxSequenceNum: Long)
       extends OutboundAction
+    private case class RetryTerminalAction(target: TransportClient, terminal: ReplayEntry)
+      extends OutboundAction
     private val pendingBatch = new mutable.ArrayBuffer[PendingSend]()
     private var pendingBatchBytes = 0
     // State changes (sequence numbers, replay cursors, and the action queue) stay serialized on
@@ -531,11 +533,10 @@ class StreamingShuffleWriter[K, V](
     // broadcast termination must not overtake that sibling's replay.
     private val replayPendingClients = new mutable.HashSet[TransportClient]()
     private val terminationAckedClients = new mutable.HashSet[TransportClient]()
-    // lastEnqueuedByClient is an outbound-queue cursor, not a transport delivery fence. A late
-    // route's ReplayAction advances it through the terminal before every preceding data write has
-    // completed. Keep a separate fence so the periodic ACK repair cannot send a terminal directly
-    // and overtake sequence zero on a replacement connection.
-    private val terminalWriteCompletedClients = new mutable.HashSet[TransportClient]()
+    // Keep at most one ordered terminal repair queued per physical route. A replay cursor advances
+    // before the transport completion callback, so requiring that callback before retrying leaves
+    // a blind spot when the terminal disappears between local enqueue and remote publication.
+    private val terminalRetryPendingClients = new mutable.HashSet[TransportClient]()
     // Uncompressed data keeps the producer-owned reference until both replay and network
     // ownership have ended. Keeping the leases here also lets failure cleanup release an owner
     // reference without putting a buffer back in the pool while an in-flight transport slice may
@@ -867,6 +868,10 @@ class StreamingShuffleWriter[K, V](
           pendingSends.decrementAndGet()
           maybeCompleteDeliveryBarrier()
         case ReplayAction(_, _) =>
+        case RetryTerminalAction(target, terminal) => synchronized {
+          terminalRetryPendingClients -= target
+          unpinReplayEntries(Seq(terminal))
+        }
       }
     }
 
@@ -1070,9 +1075,13 @@ class StreamingShuffleWriter[K, V](
         case DataAction(entries) => entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
         case ControlAction(sequenceNum, _) => sequenceNum
         case ReplayAction(_, maxSequenceNum) => maxSequenceNum
+        case RetryTerminalAction(_, terminal) => terminal.sequenceNum
       }
       val sends = action match {
         case ReplayAction(target, _) => clientsAndReplay(client, maxSequenceNum, Some(target))
+        case RetryTerminalAction(target, terminal) =>
+          synchronized { terminalRetryPendingClients -= target }
+          Seq(target -> Seq(terminal))
         case DataAction(_) => clientsAndReplay(
           client, maxSequenceNum, batchControlledRoute = true)
         case _ => clientsAndReplay(client, maxSequenceNum)
@@ -1092,7 +1101,7 @@ class StreamingShuffleWriter[K, V](
             pendingSends.decrementAndGet()
             maybeCompleteDeliveryBarrier()
           }
-        case ReplayAction(_, _) => () => ()
+        case ReplayAction(_, _) | RetryTerminalAction(_, _) => () => ()
       }
       val remaining = new AtomicInteger(sends.size)
       def completeBroadcast(): Unit = {
@@ -1104,11 +1113,7 @@ class StreamingShuffleWriter[K, V](
         var outbound: CompositeByteBuf = null
         try {
           outbound = encodeBatch(batchEntries)
-          val containsTerminal = batchEntries.exists(!_.isData)
           sendDataBody(target, outbound, () => {
-            if (containsTerminal) synchronized {
-              terminalWriteCompletedClients += target
-            }
             completeBroadcast()
           })
           outbound = null
@@ -1166,7 +1171,7 @@ class StreamingShuffleWriter[K, V](
         case _ =>
       }
       action match {
-        case ControlAction(_, _) | ReplayAction(_, _) =>
+        case ControlAction(_, _) | ReplayAction(_, _) | RetryTerminalAction(_, _) =>
           sends.map(_._1).distinct.foreach(target => crossRouteBatcher.foreach(_.flush(target)))
         case _ =>
       }
@@ -1361,37 +1366,26 @@ class StreamingShuffleWriter[K, V](
       }
     }
 
-    /** Retransmit only an already-enqueued terminal to routes whose application ACK is missing. */
+    /** Queue an ordered terminal repair for routes whose application ACK is missing. */
     private[streaming] def retryUnackedTermination(): Int = {
-      val retry = synchronized {
-        replayHistory.lastOption.filter(entry => !entry.isData).toSeq.flatMap { terminal =>
+      synchronized {
+        val retry = replayHistory.lastOption.filter(entry => !entry.isData).toSeq.flatMap {
+          terminal =>
           transportServerHandler.clientsFor(id).filter { target =>
             !terminationAckedClients.contains(target) &&
-              terminalWriteCompletedClients.contains(target) &&
+              !terminalRetryPendingClients.contains(target) &&
               !replayPendingClients.contains(target) &&
               lastEnqueuedByClient.getOrElse(target, -1L) >= terminal.sequenceNum
           }.map { target =>
             pinReplayEntries(Seq(terminal))
-            (target, terminal)
+            terminalRetryPendingClients += target
+            outboundActions.append(RetryTerminalAction(target, terminal))
+            target
           }
         }
+        if (retry.nonEmpty) scheduleOutboundDrainLocked()
+        retry.size
       }
-      retry.foreach { case (target, terminal) =>
-        var outbound: CompositeByteBuf = null
-        try {
-          outbound = encodeBatch(Seq(terminal))
-          sendDataBody(target, outbound, () => ())
-          outbound = null
-          crossRouteBatcher.foreach(_.flush(target))
-        } catch {
-          case error: Throwable =>
-            if (outbound != null) outbound.release()
-            if (!isExpectedCancellationClose(target, error)) errorNotifier.markError(error)
-        } finally {
-          unpinReplayEntries(Seq(terminal))
-        }
-      }
-      retry.size
     }
 
     def markTerminationAck(client: TransportClient): Unit = synchronized {
@@ -1624,7 +1618,7 @@ class StreamingShuffleWriter[K, V](
       replayHistory.clear()
       lastEnqueuedByClient.clear()
       replayPendingClients.clear()
-      terminalWriteCompletedClients.clear()
+      terminalRetryPendingClients.clear()
       deferredReplayBuffers.foreach(_.release())
       deferredReplayBuffers.clear()
       uncompressedBufferLeases.toSeq.foreach(_.forceRelease())
