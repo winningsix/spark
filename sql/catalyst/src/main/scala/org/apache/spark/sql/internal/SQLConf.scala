@@ -1278,6 +1278,17 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED =
+    buildConf("spark.sql.shuffle.pipelined.nestedProbe.enabled")
+      .internal()
+      .doc("When true, keep the immediate build exchanges of shuffled hash joins regular, " +
+        "but allow probe exchanges below those boundaries to pipeline. Requires a transport " +
+        "supporting unmaterialized regular boundaries. Experimental; disabled by default.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   val ADAPTIVE_EXECUTION_ENABLED_IN_STATELESS_STREAMING =
     buildConf("spark.sql.adaptive.streaming.stateless.enabled")
       .internal()
