@@ -112,10 +112,18 @@ class StreamingShuffleWriterSuite
         handler.availableDataCredit(0, client) shouldBe 100L
         wakeups shouldBe 4
 
+        // Local submission can consume the complete route window even when no frame becomes
+        // reader-visible. A sequence repair must restore one bounded window or the requested
+        // replay remains queued forever behind the lost frame's zero-credit state.
+        handler.consumeDataCredit(0, client, 100L)
+        handler.availableDataCredit(0, client) shouldBe 0L
         val replay = new CreditControlMessage(0, 0, 0, Int.MinValue)
         replay.setSeqNum(17L)
         handler.handleMessage(client, replay)
         replayRequest shouldBe Some(17L)
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        handler.handleMessage(client, replay)
         handler.availableDataCredit(0, client) shouldBe 100L
       } finally {
         context.markTaskCompleted(None)

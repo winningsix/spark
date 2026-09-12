@@ -234,6 +234,17 @@ class StreamingShuffleServerHandler(
         // complementary sequence repair sent by an idle reader: local Netty submission can
         // advance the writer cursor even when a final frame never becomes reader-visible.
         if (creditControlMessage.numMessages == Int.MinValue) {
+          // The locally submitted suffix has already consumed this route's byte window. If that
+          // suffix disappeared before it became reader-visible, the reader cannot release its
+          // bytes and cursor repair alone leaves replay permanently blocked at zero credit.
+          // Reopen one bounded window along with the explicit sequence repair. Repeated repairs
+          // remain idempotent because available credit is set to, rather than added to, the
+          // negotiated window; a late original frame and its replay also cannot grow the window
+          // when their cumulative release watermarks arrive.
+          val repairState = creditState(readerId, client)
+          if (repairState != null) {
+            repairState.available.set(repairState.window.get())
+          }
           onReplayRequested(readerId, client, creditControlMessage.getSeqNum)
           return
         }
