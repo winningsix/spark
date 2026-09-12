@@ -1289,9 +1289,9 @@ private[spark] class DAGScheduler(
   /**
    * Reject a job that uses a pipelined shuffle in combination with a cluster feature that a
    * pipelined group cannot support. Checked up front, before any stage is created, so a rejection
-   * leaves no partial scheduler state. Used by the result-job path (handleJobSubmitted); the
-   * map-stage-job path rejects a pipelined dependency outright (see handleMapStageSubmitted), which
-   * subsumes these. Returns true (and fails the job via `listener`) if rejected; false otherwise.
+   * leaves no partial scheduler state. Used by result jobs and regular map-stage jobs with
+   * pipelined ancestors. A pipelined dependency itself cannot be a map-stage job's output.
+   * Returns true (and fails the job via `listener`) if rejected; false otherwise.
    * The RDD-graph walk runs only when a relevant feature is enabled and is inert for jobs without a
    * pipelined dependency.
    *
@@ -2407,7 +2407,20 @@ private[spark] class DAGScheduler(
       SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
     val supportedPipelinedBelowRegular = supportsUnmaterializedRegularBoundary &&
       shape.hasPipelinedBelowRegular && !shape.hasPipelined
-    if (shape.isUnsupportedMix && !supportedPipelinedBelowRegular) {
+    // Prepared receive can also materialize a regular frontier before starting the pipelined
+    // suffix. This is the asymmetric SHJ shape: regular build-side shuffles and a pipelined
+    // streamed side, with no pipelined dependency hidden below a regular boundary.
+    val supportedUnmaterializedRegularFrontier = supportsUnmaterializedRegularBoundary &&
+      shape.hasPipelined && shape.hasUnmaterializedRegularBoundary &&
+      !shape.hasPipelinedBelowRegular
+    // Prepared receive admits each pipeline segment separately. A regular boundary between
+    // segments must materialize before the downstream segment starts (submitStage enforces
+    // this), while its map tasks may consume an upstream pipelined segment.
+    val supportedSegmentedPipeline = supportsUnmaterializedRegularBoundary &&
+      !SparkEnv.get.pipelinedShuffleManager.requiresWholeGroupSlotAdmission &&
+      shape.hasPipelined && shape.hasPipelinedBelowRegular
+    if (shape.isUnsupportedMix && !supportedPipelinedBelowRegular &&
+        !supportedUnmaterializedRegularFrontier && !supportedSegmentedPipeline) {
       logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
         log"a regular shuffle is only supported when every regular shuffle is a materialized " +
         log"prefix below the pipelined shuffles")
@@ -2561,12 +2574,28 @@ private[spark] class DAGScheduler(
           "map output to produce statistics from. This is not supported."))
       return
     }
+    // AQE can materialize a regular exchange whose map tasks consume a pipelined input.
+    // Preserve the same job membership and validation as result jobs, otherwise those tasks
+    // launch without the reader metadata needed to prepare their receive inboxes.
+    var hasPipelined = false
     // Submitting this map stage might still require the creation of some parent stages, so make
     // sure that happens.
     var finalStage: ShuffleMapStage = null
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
+      hasPipelined = classifyJobShuffleKinds(dependency.rdd)._1
+      if (hasPipelined) {
+        if (rejectUnsupportedPipelinedJob(jobId, dependency.rdd, listener)) return
+        val manager = SparkEnv.get.pipelinedShuffleManager
+        if (!manager.supportsUnmaterializedRegularBoundary ||
+            manager.requiresWholeGroupSlotAdmission) {
+          listener.jobFailed(new SparkException(
+            "A regular map-stage job consuming a pipelined shuffle requires prepared receive."))
+          return
+        }
+        checkPipelinedGroupsSupportedInRDDGraph(dependency.rdd)
+      }
       finalStage = getOrCreateShuffleMapStage(dependency, jobId)
     } catch {
       case e: Exception =>
@@ -2575,7 +2604,8 @@ private[spark] class DAGScheduler(
         return
     }
 
-    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, properties)
+    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, properties,
+      hasPipelinedDependency = hasPipelined)
     clearCacheLocs()
     logInfo(log"Got map stage job ${MDC(JOB_ID, jobId)} " +
       log"(${MDC(CALL_SITE_SHORT_FORM, callSite.shortForm)}) with " +
@@ -2630,7 +2660,15 @@ private[spark] class DAGScheduler(
             // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
             submitWaitingPipelinedChildStages(stage)
           } else {
-            for (parent <- missing) {
+            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
+            // Materialize regular build inputs before launching a segment's probe producers.
+            val parentsToSubmit = if (pipelinedMissing.nonEmpty && regularMissing.nonEmpty &&
+                SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary) {
+              regularMissing
+            } else {
+              missing
+            }
+            for (parent <- parentsToSubmit) {
               submitStage(parent)
             }
 
@@ -2653,7 +2691,6 @@ private[spark] class DAGScheduler(
             // stages (from getMissingParentStages), so classify them by their shuffle dependency
             // type -- no extra graph walk. For a job with no pipelined dependency, pipelinedMissing
             // is empty and this stage simply parks in waitingStages, exactly as before.
-            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
             // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
             // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
             // has its own regular missing parent); running this stage against a not-yet-running

@@ -6458,46 +6458,70 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: prepared receive mode allows a regular stage above a pipeline") {
-    val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
-    val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
-    val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
-    val previousSharedConnections =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
-    val previousSharedServer =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
-    sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-    try {
-      val producerRdd = new MyRDD(sc, 2, Nil)
-      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-      val pipelinedConsumer =
-        new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-      val regularDep = new ShuffleDependency(pipelinedConsumer, new HashPartitioner(2))
-      val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+  for (submission <- Seq("result", "map", "segmented")) {
+    test(s"pipelined shuffle: prepared receive regular boundary submission=$submission") {
+      val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+      val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+      val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+      val previousSharedConnections =
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+      val previousSharedServer =
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      try {
+        val producerRdd = new MyRDD(sc, 2, Nil)
+        val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+        val pipelinedConsumer =
+          new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+        val regularDep = new ShuffleDependency(pipelinedConsumer, new HashPartitioner(2))
+        val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
 
-      submit(resultRdd, Array(0, 1))
-      assert(taskSets.size === 2,
-        "the pipelined producer and its regular shuffle-map consumer must run together")
-      assert(taskSets.head.isPipelinedShuffleProducer)
-      assert(taskSets(1).isPipelinedShuffleReader)
+        submission match {
+          case "map" => submitMapStage(regularDep)
+          case "segmented" =>
+            val downstreamDep = new PipelinedShuffleDependency(resultRdd, new HashPartitioner(2))
+            val downstream = new MyRDD(sc, 2, List(downstreamDep), tracker = mapOutputTracker)
+            submit(downstream, Array(0, 1))
+          case _ => submit(resultRdd, Array(0, 1))
+        }
+        assert(taskSets.size === 2,
+          "the pipelined producer and its regular shuffle-map consumer must run together")
+        assert(taskSets.head.isPipelinedShuffleProducer)
+        assert(taskSets(1).isPipelinedShuffleReader)
 
-      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
-      completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
-      assert(taskSets.size === 3, "the final regular-shuffle reader starts after materialization")
-      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
-      assert(results === Map(0 -> 42, 1 -> 43))
-      assertDataStructuresEmpty()
-    } finally {
-      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
-        previousSharedConnections)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+        completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+        completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
+        submission match {
+          case "map" =>
+            assert(taskSets.size === 2, "the regular map-stage job must now be complete")
+            assert(scheduler.activeJobs.isEmpty)
+          case "segmented" =>
+            assert(taskSets.size === 4,
+              "the downstream segment must start only after the regular boundary materializes")
+            assert(taskSets(2).isPipelinedShuffleProducer)
+            assert(taskSets(3).isPipelinedShuffleReader)
+            completeShuffleMapStageSuccessfully(taskSets(2).stageId, 0, 2)
+            complete(taskSets(3), Seq((Success, 42), (Success, 43)))
+            assert(results === Map(0 -> 42, 1 -> 43))
+          case _ =>
+            assert(taskSets.size === 3,
+              "the final regular-shuffle reader starts after materialization")
+            complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+            assert(results === Map(0 -> 42, 1 -> 43))
+        }
+        assertDataStructuresEmpty()
+      } finally {
+        sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+        sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+        sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+        sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+          previousSharedConnections)
+        sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+      }
     }
   }
 
