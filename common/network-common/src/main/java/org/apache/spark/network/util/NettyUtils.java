@@ -128,6 +128,12 @@ public class NettyUtils {
     return new TransportFrameDecoder();
   }
 
+  /** Creates a frame decoder that also compacts the fragmented tail of a large frame. */
+  public static TransportFrameDecoder createFrameDecoder(
+      boolean consolidateRemainingOnFrameCompletion) {
+    return new TransportFrameDecoder(consolidateRemainingOnFrameCompletion);
+  }
+
   /** Returns the remote address on the channel or "&lt;unknown remote&gt;" if none exists. */
   public static String getRemoteAddress(Channel channel) {
     if (channel != null && channel.remoteAddress() != null) {

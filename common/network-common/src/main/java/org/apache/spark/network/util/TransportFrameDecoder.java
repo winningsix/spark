@@ -53,6 +53,7 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
   private final LinkedList<ByteBuf> buffers = new LinkedList<>();
   private final ByteBuf frameLenBuf = Unpooled.buffer(LENGTH_SIZE, LENGTH_SIZE);
   private final long consolidateThreshold;
+  private final boolean consolidateRemainingOnFrameCompletion;
 
   private CompositeByteBuf frameBuf = null;
   private long consolidatedFrameBufSize = 0;
@@ -64,12 +65,24 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
   private volatile Interceptor interceptor;
 
   public TransportFrameDecoder() {
-    this(CONSOLIDATE_THRESHOLD);
+    this(CONSOLIDATE_THRESHOLD, false);
+  }
+
+  TransportFrameDecoder(boolean consolidateRemainingOnFrameCompletion) {
+    this(CONSOLIDATE_THRESHOLD, consolidateRemainingOnFrameCompletion);
   }
 
   @VisibleForTesting
   TransportFrameDecoder(long consolidateThreshold) {
+    this(consolidateThreshold, false);
+  }
+
+  @VisibleForTesting
+  TransportFrameDecoder(
+      long consolidateThreshold,
+      boolean consolidateRemainingOnFrameCompletion) {
     this.consolidateThreshold = consolidateThreshold;
+    this.consolidateRemainingOnFrameCompletion = consolidateRemainingOnFrameCompletion;
   }
 
   @Override
@@ -181,6 +194,17 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
     }
     if (frameRemainingBytes > 0) {
       return null;
+    }
+
+    // Large streaming-shuffle transport batches have already consolidated their leading chunks
+    // as they crossed the memory-protection threshold. Consolidate only the fragmented tail at
+    // frame completion. This preserves the bounded-copy behavior above while letting the many
+    // compressed logical messages inside that tail expose contiguous NIO views to their readers.
+    if (consolidateRemainingOnFrameCompletion && consolidatedNumComponents > 0) {
+      int remainingComponents = frameBuf.numComponents() - consolidatedNumComponents;
+      if (remainingComponents > 1) {
+        frameBuf.consolidate(consolidatedNumComponents, remainingComponents);
+      }
     }
 
     return consumeCurrentFrameBuf();
