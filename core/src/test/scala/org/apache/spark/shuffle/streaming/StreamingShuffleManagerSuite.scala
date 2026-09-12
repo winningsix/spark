@@ -162,6 +162,8 @@ class StreamingShuffleManagerSuite
     withSpark(new SparkContext("local", "cumulative-credit-batch", conf)) { _ =>
       val server = new StreamingShuffleExecutorServer()
       val client = new StreamingShuffleExecutorClient()
+      server.crossRouteBatcher(7) should be theSameInstanceAs server.crossRouteBatcher(7)
+      server.crossRouteBatcher(8) should not be theSameInstanceAs(server.crossRouteBatcher(7))
       val queues = (0 until 8).map { writerId =>
         writerId -> new LinkedBlockingQueue[StreamingShuffleMessage]()
       }.toMap

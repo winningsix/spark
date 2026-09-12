@@ -132,15 +132,22 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     (outboundThreads, outboundSubmitted.get(), outboundCompleted.get(), outboundPeakQueued.get())
   }
 
-  // All writers on this executor send through the same physical reader connection when shared
-  // connections are enabled. Keep one batcher at that scope so bodies from different map tasks
-  // can be coalesced; a writer-specific batcher can only combine that writer's own routes.
-  private[streaming] val crossRouteBatcher = new StreamingShuffleTransportBatcher(
-    server.getPooledByteBufAllocator,
-    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE),
-    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS),
-    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES),
-    new ErrorNotifier())
+  // Writers for one exchange share physical reader lanes and should coalesce their small bodies.
+  // Keep the batcher's lock and in-flight admission local to that exchange: a sibling input that
+  // is intentionally not being consumed must not hold another exchange's terminal frames behind
+  // its full network window.
+  private val crossRouteBatchers =
+    new ConcurrentHashMap[Int, StreamingShuffleTransportBatcher]()
+
+  private[streaming] def crossRouteBatcher(shuffleId: Int):
+      StreamingShuffleTransportBatcher = {
+    crossRouteBatchers.computeIfAbsent(shuffleId, _ => new StreamingShuffleTransportBatcher(
+      server.getPooledByteBufAllocator,
+      conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE),
+      conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS),
+      conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES),
+      new ErrorNotifier()))
+  }
 
   // Raw serialization buffers used to be allocated and cached independently by every map task.
   // In a full-streaming multi-input join, three producer stages can have dozens of live writers
@@ -174,7 +181,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
         s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
     outboundPool.shutdownNow()
-    crossRouteBatcher.discard()
+    crossRouteBatchers.values().forEach(_.discard())
+    crossRouteBatchers.clear()
     rawBufferPool.close()
     server.close()
   }
