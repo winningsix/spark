@@ -1028,7 +1028,21 @@ class StreamingShuffleWriter[K, V](
                 s"${pending.headOption.map(_.sequenceNum).getOrElse(-1L)}")
           }
           if (transportServerHandler.isCreditControlled(id, target)) {
-            val admitted = if (batchControlledRoute) pending else pending.headOption.toSeq
+            val admitted = if (batchControlledRoute) {
+              pending
+            } else {
+              // A replayed data frame consumes the route's current credit window, but an ordered
+              // control frame does not. Carry a following terminal in the same transport body so
+              // it cannot become a separate dispatcher tail after the reader has consumed all
+              // data. This is especially important when thousands of completed map writers are
+              // replaying two small data frames to every late reader.
+              val first = pending.headOption.toSeq
+              first ++ (if (first.exists(_.isData)) {
+                pending.drop(1).headOption.filter(!_.isData)
+              } else {
+                None
+              })
+            }
             if (admitted.nonEmpty) {
               pinReplayEntries(admitted)
               lastEnqueuedByClient.update(target, admitted.last.sequenceNum)
