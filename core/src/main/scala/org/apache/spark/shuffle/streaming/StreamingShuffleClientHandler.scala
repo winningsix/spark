@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.BlockingQueue
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -76,6 +76,10 @@ class StreamingShuffleClientHandler(
   // Multiplexed routes acknowledge an absolute released-byte watermark. This makes an idle
   // retry idempotent and lets the executor collapse many frame releases into one control body.
   private val cumulativeReleasedBytes = new AtomicLong(0L)
+  // Set before publishing a reader-visible sequence repair. TCP preserves order, but the repair
+  // request can cross newer normal frames already in flight; duplicates are legal only while this
+  // explicit replay window is active.
+  private val replayRepairActive = new AtomicBoolean(false)
   private val backpressureEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
   private val messageBatchingEnabled =
@@ -187,6 +191,7 @@ class StreamingShuffleClientHandler(
   /** Ask the writer to reconcile its local send cursor with the last reader-visible sequence. */
   private[streaming] def prepareMultiplexedReplayRepair(): Option[CreditControlMessage] = {
     if (terminationReceived || lastSeqNum < 0) return None
+    replayRepairActive.set(true)
     val message = new CreditControlMessage(
       shuffleId, shuffleWriterId, shuffleReaderId, Int.MinValue)
     message.setSeqNum(lastSeqNum)
@@ -434,10 +439,27 @@ class StreamingShuffleClientHandler(
             terminationReceived && shuffleMessage.getSeqNum == lastSeqNum
           case _ => false
         }
-        if (!duplicateTermination) {
+        val duplicateReplayData = shuffleMessage match {
+          case _: DataMessage =>
+            replayRepairActive.get() && shuffleMessage.getSeqNum <= lastSeqNum
+          case _ => false
+        }
+        if (!duplicateTermination && !duplicateReplayData) {
           updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
         }
         shuffleMessage match {
+          case _: DataMessage if duplicateReplayData =>
+            // The writer charged this retransmission to the logical receive window. Drop the
+            // already-published record bytes, but advance the cumulative released-byte watermark
+            // so replay cannot consume credit permanently.
+            if (backpressureEnabled) {
+              if (perStreamAutoReadEnabled) {
+                sendCreditControlMessage(client, shuffleWriterId, messageSize)
+              } else {
+                val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                sendCumulativeCreditAck(client, released)
+              }
+            }
           case dataMessage: DataMessage =>
             updateQuota(messageSize)
             val retainedBody = managedBody.map(_.retain())
@@ -481,7 +503,7 @@ class StreamingShuffleClientHandler(
             throw new IllegalArgumentException(
               s"Unexpected message type in ShuffleClientHandler: ${shuffleMessage.messageType()}")
         }
-        if (duplicateTermination) {
+        if (duplicateTermination || duplicateReplayData) {
           shuffleMessage.release()
         } else if (messageBatchingEnabled && queue.isInstanceOf[StreamingShuffleMessageQueue]) {
           decodedMessages += shuffleMessage

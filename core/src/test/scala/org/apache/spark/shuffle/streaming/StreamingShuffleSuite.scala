@@ -25,7 +25,7 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
-import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator, Unpooled}
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future => NettyFuture}
 import org.scalatest.Assertions.intercept
@@ -661,6 +661,58 @@ class StreamingShuffleSuite
           "actSeqNum" -> "0")
       )
     }
+  }
+
+  test("reader drops stale data retransmitted by an active sequence repair") {
+    val errorNotifier = new ErrorNotifier()
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    var returnedCredit = 0L
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errorNotifier) {
+      override protected def sendCumulativeCreditAck(
+          client: TransportClient,
+          releasedBytes: Long): Unit = {
+        returnedCredit = releasedBytes
+      }
+    }
+    handler.useMultiplexedChannel()
+
+    def encodeData(sequenceNumber: Long): ByteBuffer = {
+      val payload = Unpooled.wrappedBuffer(Array[Byte](1, 2, 3))
+      val dataMessage = new DataMessage(shuffleId, 0, 0, payload.readableBytes(), payload, 0L)
+      dataMessage.setSeqNum(sequenceNumber)
+      val encoded = Unpooled.compositeBuffer()
+      encoded.capacity(dataMessage.headerLength())
+      dataMessage.encode(encoded)
+      val bytes = new Array[Byte](encoded.readableBytes())
+      encoded.getBytes(encoded.readerIndex(), bytes)
+      encoded.release()
+      dataMessage.release()
+      payload.release()
+      ByteBuffer.wrap(bytes)
+    }
+
+    handler.receive(null, encodeData(0L), null)
+    queue.size() should be(1)
+    handler.lastSequenceNumberForDiagnostics should be(0L)
+
+    val repair = handler.prepareMultiplexedReplayRepair()
+    repair should not be empty
+    repair.get.getSeqNum should be(0L)
+
+    // The request above can cross sequence 1 already in flight. A replay of sequence 0 is then a
+    // harmless duplicate: return its receive credit without publishing its rows a second time.
+    handler.receive(null, encodeData(0L), null)
+    queue.size() should be(1)
+    handler.lastSequenceNumberForDiagnostics should be(0L)
+    returnedCredit should be(43L) // 40-byte DataMessage header plus the 3-byte payload.
+    errorNotifier.getError() should be(None)
+
+    // New data remains strictly sequenced after the duplicate is discarded.
+    handler.receive(null, encodeData(1L), null)
+    queue.size() should be(2)
+    handler.lastSequenceNumberForDiagnostics should be(1L)
+    Iterator.continually(queue.poll()).takeWhile(_ != null).foreach(_.release())
   }
 
   test("reader catches out of order message sequence number from writer - missing msg in between") {
