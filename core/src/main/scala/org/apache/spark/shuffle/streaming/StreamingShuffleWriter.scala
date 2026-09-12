@@ -598,11 +598,14 @@ class StreamingShuffleWriter[K, V](
       val batch = server.getPooledByteBufAllocator.compositeBuffer()
       try {
         entries.foreach { entry =>
-          val (source, temporary) = synchronized {
+          val source = synchronized {
             if (entry.buffer != null) {
-              (entry.buffer, false)
+              // spillReplayEntry may retire the replay-history owner as soon as this monitor is
+              // released. Take an encoder-owned reference while still holding the monitor so the
+              // source remains accessible until its component duplicates have been retained.
+              entry.buffer.retain()
             } else {
-              (readSpilledReplayEntry(entry), true)
+              readSpilledReplayEntry(entry)
             }
           }
           try {
@@ -620,7 +623,7 @@ class StreamingShuffleWriter[K, V](
                 batch.addComponent(true, source.retainedDuplicate())
             }
           } finally {
-            if (temporary) source.release()
+            source.release()
           }
         }
         batch
