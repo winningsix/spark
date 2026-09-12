@@ -178,9 +178,13 @@ class StreamingShuffleManagerSuite
       try {
         val routeClients = client.registerBatch(
           7, 0, "127.0.0.1", server.port, readerHandlers)
+        eventually(Timeout(10.seconds)) {
+          server.pendingCreditRouteCount shouldBe readerHandlers.size
+        }
         writerHandlers.foreach { case (writerId, handler) =>
           server.register(7, writerId, handler)
         }
+        server.pendingCreditRouteCount shouldBe 0
         eventually(Timeout(10.seconds)) {
           writerHandlers.foreach { case (_, handler) =>
             handler.clientsFor(0).size shouldBe 1

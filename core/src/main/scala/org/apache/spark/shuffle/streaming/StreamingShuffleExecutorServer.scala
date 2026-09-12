@@ -21,6 +21,8 @@ import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, Semaphore}
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.jdk.CollectionConverters._
+
 import io.netty.buffer.{ByteBuf, Unpooled}
 
 import org.apache.spark.{SparkContext, SparkEnv}
@@ -42,6 +44,10 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 /** Executor-scoped transport listener that multiplexes reader control messages to map writers. */
 private[streaming] class StreamingShuffleExecutorServer extends Logging {
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
+  private case class PendingCreditRoute(client: TransportClient, readerId: Int)
+  private val pendingCredits = new ConcurrentHashMap[
+    Long, ConcurrentHashMap[PendingCreditRoute, CreditControlMessage]]()
+  private val knownWriterRoutes = ConcurrentHashMap.newKeySet[Long]()
 
   private def key(shuffleId: Int, writerId: Int): Long =
     (shuffleId.toLong << 32) | (writerId.toLong & 0xffffffffL)
@@ -58,7 +64,23 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
           throw new IllegalArgumentException(
             s"Unexpected message type in shared shuffle server: ${other.messageType()}")
       }
-      val handler = handlers.get(key(route._1, route._2))
+      val routeKey = key(route._1, route._2)
+      val handler = handlers.synchronized {
+        val current = handlers.get(routeKey)
+        decoded match {
+          case credit: CreditControlMessage
+              if current == null && !knownWriterRoutes.contains(routeKey) =>
+            // Prepared readers may publish their initial credit while the map task is between
+            // advertising its shared endpoint and registering this logical writer route. Keep
+            // the latest idempotent credit per physical reader route and apply it at register().
+            pendingCredits.computeIfAbsent(
+              routeKey,
+              _ => new ConcurrentHashMap[PendingCreditRoute, CreditControlMessage]())
+              .put(PendingCreditRoute(client, credit.shuffleReaderId), credit)
+          case _ =>
+        }
+        current
+      }
       if (handler == null) {
         // A shared physical reader connection may flush a final credit or termination ACK after
         // the corresponding map task has already unregistered its writer. This is a normal
@@ -157,8 +179,17 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
       shuffleId: Int,
       writerId: Int,
       handler: StreamingShuffleServerHandler): Unit = {
-    val existing = handlers.putIfAbsent(key(shuffleId, writerId), handler)
-    require(existing == null, s"Streaming shuffle $shuffleId writer $writerId is already active")
+    val routeKey = key(shuffleId, writerId)
+    val pending = handlers.synchronized {
+      val existing = handlers.putIfAbsent(routeKey, handler)
+      require(existing == null,
+        s"Streaming shuffle $shuffleId writer $writerId is already active")
+      knownWriterRoutes.add(routeKey)
+      Option(pendingCredits.remove(routeKey)).toSeq.flatMap(_.entrySet().asScala).map { entry =>
+        entry.getKey.client -> entry.getValue
+      }
+    }
+    pending.foreach { case (client, credit) => handler.handleMessage(client, credit) }
   }
 
   def unregister(
@@ -168,6 +199,10 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     handlers.remove(key(shuffleId, writerId), handler)
   }
 
+  private[streaming] def pendingCreditRouteCount: Int = {
+    pendingCredits.values().asScala.map(_.size()).sum
+  }
+
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
     logInfo(
@@ -175,6 +210,8 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
         s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
+    pendingCredits.clear()
+    knownWriterRoutes.clear()
     rawBufferPool.close()
     server.close()
   }
