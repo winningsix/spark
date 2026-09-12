@@ -164,6 +164,11 @@ class StreamingShuffleWriter[K, V](
       if (replayRoutes > 0) routes.map(_ + replayRoutes) else routes
     case _ => Array.fill(numPartitions)(1)
   }
+  // Prepared inbox placement can replace a reader route after an earlier physical route has
+  // already acknowledged termination. A positive linger is a quiet period after the most recent
+  // route registration, rather than an unconditional deadline from the first ACK barrier.
+  private val readerRouteLifecycleLock = new Object
+  private val lastReaderRouteRegistrationNanos = new AtomicLong(System.nanoTime())
   // Use the same map identity that is registered in StreamingShuffleOutputTracker and handed to
   // readers. context.partitionId() happened to work while every writer owned a unique port, but
   // it is not the same value as mapId for later stages and cannot route a multiplexed server.
@@ -230,7 +235,8 @@ class StreamingShuffleWriter[K, V](
         errorNotifier,
         onTerminationAckReceivedWithClient,
         (readerId, client) =>
-          {
+          readerRouteLifecycleLock.synchronized {
+            lastReaderRouteRegistrationNanos.set(System.nanoTime())
             // Install the fence synchronously; defer only the replay-history walk so the
             // transport event-loop thread is not held while a large prefix is prepared.
             shards(readerId).beginReplay(client)
@@ -1966,12 +1972,7 @@ class StreamingShuffleWriter[K, V](
     // query sweep can otherwise accumulate one native thread per completed writer, even though
     // those writers already passed the all-expected-readers barrier.
     if (LINGER_AFTER_TERMINATION_MS > 0) {
-      StreamingShuffleWriter.cleanupScheduler.schedule(
-        new Runnable {
-          override def run(): Unit = cleanupResourcesNow()
-        },
-        LINGER_AFTER_TERMINATION_MS,
-        TimeUnit.MILLISECONDS)
+      scheduleCleanupCheck(LINGER_AFTER_TERMINATION_MS)
     } else if (!WAIT_FOR_TERMINATION_ACKS) {
       // deliveryBarrierReached, allReadersConnected, and allRegisteredClientsAcked have all
       // completed before this method is reached.  At that point every expected reader has
@@ -1983,6 +1984,31 @@ class StreamingShuffleWriter[K, V](
       cleanupResourcesNow()
     } else {
       cleanupResourcesNow()
+    }
+  }
+
+  private def scheduleCleanupCheck(delayMs: Long): Unit = {
+    StreamingShuffleWriter.cleanupScheduler.schedule(
+      new Runnable {
+        override def run(): Unit = cleanupResourcesIfReaderRoutesQuiescent()
+      },
+      delayMs,
+      TimeUnit.MILLISECONDS)
+  }
+
+  /** Keep a relaxed writer alive when a prepared inbox replaces an already-ACKed route. */
+  private def cleanupResourcesIfReaderRoutesQuiescent(): Unit = {
+    readerRouteLifecycleLock.synchronized {
+      val elapsedMs = TimeUnit.NANOSECONDS.toMillis(
+        System.nanoTime() - lastReaderRouteRegistrationNanos.get())
+      val quietPeriodRemainingMs = math.max(0L, LINGER_AFTER_TERMINATION_MS - elapsedMs)
+      if (quietPeriodRemainingMs > 0L || !shards.forall(_.allRegisteredClientsAcked)) {
+        scheduleCleanupCheck(math.max(
+          StreamingShuffleWriter.TERMINATION_RETRY_DELAY_MS,
+          quietPeriodRemainingMs))
+      } else {
+        cleanupResourcesNow()
+      }
     }
   }
 

@@ -34,12 +34,14 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE}
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS,
+  STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage,
-  StreamingShuffleMessage, TerminationControlMessage}
+  StreamingShuffleMessage, TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -149,6 +151,46 @@ class StreamingShuffleWriterSuite
         // The writer submitted sequence 1, while the reader only observed data sequence 0.
         writer.shards(0).replayFromObserved(client, 0L)
         eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("writer linger waits for a replacement reader to acknowledge termination") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+      .set(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS, 50L)
+    withSpark(new SparkContext("local", "replacement-reader-linger", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val first = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          first, new CreditControlMessage(0, 0, 0, 1))
+        writer.write(Iterator.empty)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
+
+        val firstAck = new TerminationAckMessage(0, 0, 0)
+        firstAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(first, firstAck)
+        context.markTaskCompleted(None)
+
+        // Register a replacement before the first route's quiet period expires. Its missing ACK
+        // must postpone cleanup beyond the original fixed deadline.
+        val replacement = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          replacement, new CreditControlMessage(0, 0, 0, 1))
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+        Thread.sleep(150L)
+
+        writer.shards(0).replayFromObserved(replacement, -1L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
+
+        val replacementAck = new TerminationAckMessage(0, 0, 0)
+        replacementAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(replacement, replacementAck)
       } finally {
         context.markTaskCompleted(None)
       }
