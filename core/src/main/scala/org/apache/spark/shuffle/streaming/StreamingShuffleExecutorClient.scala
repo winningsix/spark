@@ -18,8 +18,11 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList}
+import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList, RejectedExecutionException,
+  ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.{ByteBuf, CompositeByteBuf}
@@ -27,13 +30,15 @@ import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID}
+import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.buffer.{ManagedBuffer, NettyManagedBuffer}
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
-import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessageType
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, StreamingShuffleMessageType}
+import org.apache.spark.util.ThreadUtils
 
 /** Executor-scoped client that multiplexes logical reader/writer streams over pooled channels. */
 private[streaming] class StreamingShuffleExecutorClient extends Logging {
@@ -51,6 +56,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       route: Route,
       registration: Registration,
       routeRegistrations: CopyOnWriteArrayList[Registration])
+  private case class PendingCredit(
+      handler: StreamingShuffleClientHandler,
+      message: CreditControlMessage)
 
   // A shuffle partition can be consumed by more than one downstream stage. Those logical readers
   // intentionally share one pooled transport connection and therefore have the same wire route.
@@ -70,6 +78,16 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   // stage's last data/termination frames behind seconds of unrelated traffic. The shuffle lane
   // keeps cross-route batching within one exchange while avoiding a connection per task/inbox.
   private val laneClients = new ConcurrentHashMap[ConnectionLane, TransportClient]()
+  private val cumulativeCreditReleases = new AtomicLong(0L)
+  private val cumulativeCreditWrites = new AtomicLong(0L)
+  private val cumulativeCreditFrames = new AtomicLong(0L)
+  private val creditRepairWrites = new AtomicLong(0L)
+  private val closed = new AtomicBoolean(false)
+  private val cumulativeCreditLock = new Object
+  private val pendingCumulativeCredits = new java.util.IdentityHashMap[
+    TransportClient, mutable.LinkedHashSet[StreamingShuffleClientHandler]]()
+  private val scheduledCumulativeCreditClients = java.util.Collections.newSetFromMap(
+    new java.util.IdentityHashMap[TransportClient, java.lang.Boolean]())
 
   private def decodeRoute(message: ByteBuffer): Route = {
     // Both routed writer-to-reader message types start with the same fixed layout:
@@ -275,6 +293,11 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     conf, "streaming-shuffle-reader-multiplexed", math.max(1, conf.get(EXECUTOR_CORES)), role)
   private val transportContext = new TransportContext(clientConf, rpcHandler, true, true)
   private val clientFactory: TransportClientFactory = transportContext.createClientFactory()
+  private val cumulativeCreditExecutor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+      "streaming-shuffle-cumulative-credit-flush")
+  private val cumulativeCreditMaxWaitMs = math.max(1L,
+    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS))
 
   private def installRegistration(
       shuffleId: Int,
@@ -300,6 +323,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       }
     }
     val registration = Registration(handler, client, laneShared)
+    handler.setMultiplexedCreditSender(scheduleCumulativeCredit)
     val routeRegistrations = registrations.computeIfAbsent(
       route, _ => new CopyOnWriteArrayList[Registration]())
     require(routeRegistrations.addIfAbsent(registration),
@@ -308,6 +332,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   }
 
   private def removeInstalled(installed: InstalledRegistration): Unit = {
+    discardPendingCumulativeCredit(installed.registration.handler)
+    installed.registration.handler.clearMultiplexedCreditSender()
     installed.routeRegistrations.remove(installed.registration)
     if (installed.routeRegistrations.isEmpty) {
       registrations.remove(installed.route, installed.routeRegistrations)
@@ -342,6 +368,110 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         })
     } finally {
       if (buf != null) buf.release()
+    }
+  }
+
+  /** Send a body containing the latest credit watermark for each selected logical route. */
+  private def sendCreditBatch(
+      credits: Seq[PendingCredit],
+      client: TransportClient): Unit = {
+    if (credits.isEmpty) return
+    var buf: CompositeByteBuf = null
+    try {
+      val encodedBytes = credits.foldLeft(0)(_ + _.message.headerLength())
+      buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
+      credits.foreach(_.message.encode(buf))
+      client.send(buf.retain()).addListener(
+        new GenericFutureListener[Future[Void]] {
+          override def operationComplete(future: Future[Void]): Unit = {
+            if (!future.isSuccess) {
+              val cause = Option(future.cause()).getOrElse(
+                new RuntimeException("Unknown batched credit send failure"))
+              credits.foreach(_.handler.creditBatchSendFailed(client, cause))
+            }
+          }
+        })
+    } catch {
+      case error: Throwable => credits.foreach(_.handler.creditBatchSendFailed(client, error))
+    } finally {
+      if (buf != null) buf.release()
+    }
+  }
+
+  /** Collapse hot frame releases to one cumulative watermark per route and physical lane. */
+  private def scheduleCumulativeCredit(
+      client: TransportClient,
+      handler: StreamingShuffleClientHandler): Unit = {
+    if (closed.get()) return
+    cumulativeCreditReleases.incrementAndGet()
+    val schedule = cumulativeCreditLock.synchronized {
+      if (closed.get()) return
+      var handlers = pendingCumulativeCredits.get(client)
+      if (handlers == null) {
+        handlers = new mutable.LinkedHashSet[StreamingShuffleClientHandler]()
+        pendingCumulativeCredits.put(client, handlers)
+      }
+      handlers += handler
+      scheduledCumulativeCreditClients.add(client)
+    }
+    if (schedule) {
+      try {
+        cumulativeCreditExecutor.schedule(
+          new Runnable { override def run(): Unit = flushCumulativeCredits(client) },
+          cumulativeCreditMaxWaitMs,
+          TimeUnit.MILLISECONDS)
+      } catch {
+        case _: RejectedExecutionException if closed.get() =>
+      }
+    }
+  }
+
+  private def flushCumulativeCredits(client: TransportClient): Unit = {
+    val handlers = cumulativeCreditLock.synchronized {
+      scheduledCumulativeCreditClients.remove(client)
+      Option(pendingCumulativeCredits.remove(client)).map(_.toSeq).getOrElse(Seq.empty)
+    }
+    val credits = handlers.flatMap { handler =>
+      handler.prepareMultiplexedCreditRepair().map(PendingCredit(handler, _))
+    }
+    if (credits.nonEmpty) {
+      cumulativeCreditWrites.incrementAndGet()
+      cumulativeCreditFrames.addAndGet(credits.size)
+      sendCreditBatch(credits, client)
+    }
+  }
+
+  private def discardPendingCumulativeCredit(
+      handler: StreamingShuffleClientHandler): Unit = cumulativeCreditLock.synchronized {
+    val clients = pendingCumulativeCredits.keySet().iterator()
+    val empty = new mutable.ArrayBuffer[TransportClient]()
+    while (clients.hasNext) {
+      val client = clients.next()
+      val handlers = pendingCumulativeCredits.get(client)
+      handlers -= handler
+      if (handlers.isEmpty) empty += client
+    }
+    empty.foreach(pendingCumulativeCredits.remove)
+  }
+
+  /** Coalesce periodic liveness repairs by physical lane. */
+  def repairCreditWindows(
+      routes: Iterable[(TransportClient, StreamingShuffleClientHandler)]): Unit = {
+    val byClient = new java.util.IdentityHashMap[
+      TransportClient, mutable.ArrayBuffer[PendingCredit]]()
+    routes.foreach { case (client, handler) =>
+      handler.prepareMultiplexedCreditRepair().foreach { message =>
+        var credits = byClient.get(client)
+        if (credits == null) {
+          credits = new mutable.ArrayBuffer[PendingCredit]()
+          byClient.put(client, credits)
+        }
+        credits += PendingCredit(handler, message)
+      }
+    }
+    byClient.entrySet().asScala.foreach { entry =>
+      creditRepairWrites.incrementAndGet()
+      sendCreditBatch(entry.getValue.toSeq, entry.getKey)
     }
   }
 
@@ -401,6 +531,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     val routeRegistrations = registrations.get(route)
     if (routeRegistrations != null) {
       routeRegistrations.asScala.find(_.handler eq handler).foreach { registration =>
+        discardPendingCumulativeCredit(handler)
+        handler.clearMultiplexedCreditSender()
         routeRegistrations.remove(registration)
         if (!registration.laneShared) registration.client.close()
       }
@@ -415,6 +547,10 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     registrations.entrySet().asScala.foreach { entry =>
       if (entry.getKey.shuffleId == shuffleId &&
           registrations.remove(entry.getKey, entry.getValue)) {
+        entry.getValue.asScala.foreach { registration =>
+          discardPendingCumulativeCredit(registration.handler)
+          registration.handler.clearMultiplexedCreditSender()
+        }
         entry.getValue.asScala.filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
         entry.getValue.clear()
       }
@@ -427,8 +563,29 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     usedRoutes.removeIf(_.shuffleId == shuffleId)
   }
 
+  private[streaming] def cumulativeCreditBatchStats: (Long, Long, Long, Long) =
+    (cumulativeCreditReleases.get(), cumulativeCreditWrites.get(),
+      cumulativeCreditFrames.get(), creditRepairWrites.get())
+
   def close(): Unit = {
-    registrations.values().asScala.flatMap(_.asScala)
+    if (!closed.compareAndSet(false, true)) return
+    logInfo(
+      s"Closing executor streaming-shuffle client: " +
+        s"cumulativeCreditReleases=${cumulativeCreditReleases.get()} " +
+        s"cumulativeCreditWrites=${cumulativeCreditWrites.get()} " +
+        s"cumulativeCreditFrames=${cumulativeCreditFrames.get()} " +
+        s"creditRepairWrites=${creditRepairWrites.get()}")
+    val activeRegistrations = registrations.values().asScala.flatMap(_.asScala).toSeq
+    activeRegistrations.foreach { registration =>
+      discardPendingCumulativeCredit(registration.handler)
+      registration.handler.clearMultiplexedCreditSender()
+    }
+    cumulativeCreditExecutor.shutdownNow()
+    cumulativeCreditLock.synchronized {
+      pendingCumulativeCredits.clear()
+      scheduledCumulativeCreditClients.clear()
+    }
+    activeRegistrations
       .filterNot(_.laneShared).map(_.client).toSeq.distinct.foreach(_.close())
     registrations.clear()
     laneClients.values().asScala.toSeq.distinct.foreach(_.close())

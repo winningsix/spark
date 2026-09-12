@@ -19,6 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -68,12 +69,17 @@ class StreamingShuffleClientHandler(
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
+  // Multiplexed routes acknowledge an absolute released-byte watermark. This makes an idle
+  // retry idempotent and lets the executor collapse many frame releases into one control body.
+  private val cumulativeReleasedBytes = new AtomicLong(0L)
   private val backpressureEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
   private val messageBatchingEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
   private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
   @volatile private var perStreamAutoReadEnabled = true
+  @volatile private var multiplexedCreditSender:
+      (TransportClient, StreamingShuffleClientHandler) => Unit = _
 
   setShuffleIdForLogging(shuffleId)
 
@@ -99,6 +105,15 @@ class StreamingShuffleClientHandler(
   /** A multiplexed channel cannot safely toggle autoRead for one logical stream. */
   private[streaming] def useMultiplexedChannel(): Unit = {
     perStreamAutoReadEnabled = false
+  }
+
+  private[streaming] def setMultiplexedCreditSender(
+      sender: (TransportClient, StreamingShuffleClientHandler) => Unit): Unit = {
+    multiplexedCreditSender = sender
+  }
+
+  private[streaming] def clearMultiplexedCreditSender(): Unit = {
+    multiplexedCreditSender = null
   }
 
   private def bindChannel(client: TransportClient, configureSocket: Boolean): Unit = {
@@ -147,18 +162,40 @@ class StreamingShuffleClientHandler(
     errorNotifier.markError(error)
   }
 
-  /** Repair route discovery while no writer frame has reached this logical route yet. */
-  private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
-    val sequence = lastSeqNum
-    val available = availableReceiveBytes
-    if (backpressureEnabled && !perStreamAutoReadEnabled && !terminationReceived &&
-        sequence < 0 && available > 0) {
-      // The initial negative advertisement is an idempotent absolute window and also serves as
-      // the route-ready message. Repeating it is safe only before the first frame: once data can
-      // be in flight, re-advertising an absolute window could manufacture credit. Every consumed
-      // frame returns an exact additive delta below, so an established route needs no repair.
-      sendAvailableCreditFloor(client, available)
+  /** Build the latest idempotent discovery or cumulative-credit repair frame. */
+  private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
+    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
+    if (lastSeqNum < 0) {
+      val advertised = math.min(availableReceiveBytes, Int.MaxValue.toLong).toInt
+      if (advertised > 0) {
+        Some(new CreditControlMessage(
+          shuffleId, shuffleWriterId, shuffleReaderId, -advertised))
+      } else {
+        None
+      }
+    } else {
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(cumulativeReleasedBytes.get())
+      Some(message)
     }
+  }
+
+  /** Surface a failed executor-level credit batch through this route's normal error path. */
+  private[streaming] def creditBatchSendFailed(
+      client: TransportClient,
+      cause: Throwable): Unit = {
+    if (!terminationAckFailureIsExpected(cause, client)) {
+      val error = new RuntimeException(
+        s"Error sending batched credit to shuffle writer $shuffleWriterId", cause)
+      logError(log"Streaming shuffle batched credit failed", error)
+      errorNotifier.markError(error)
+    }
+  }
+
+  /** Repair route discovery or repeat the latest cumulative release watermark. */
+  private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
+    prepareMultiplexedCreditRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
   }
 
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
@@ -195,15 +232,33 @@ class StreamingShuffleClientHandler(
     }
   }
 
+  protected def sendCumulativeCreditAck(
+      client: TransportClient,
+      releasedBytes: Long): Unit = {
+    val sender = multiplexedCreditSender
+    if (!perStreamAutoReadEnabled && sender != null) {
+      sender(client, this)
+    } else {
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(releasedBytes)
+      sendCreditControlMessage(client, message)
+    }
+  }
+
   protected def sendCreditControlMessage(
       client: TransportClient,
       shuffleWriterId: Int,
       credit: Int
   ): Unit = {
+    sendCreditControlMessage(
+      client, new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit))
+  }
+
+  private def sendCreditControlMessage(
+      client: TransportClient,
+      creditControlMessage: CreditControlMessage): Unit = {
     var buf: CompositeByteBuf = null
     try {
-      val creditControlMessage =
-        new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit)
       buf = client.getChannel().alloc().compositeBuffer()
         .capacity(creditControlMessage.headerLength())
       creditControlMessage.encode(buf)
@@ -382,14 +437,8 @@ class StreamingShuffleClientHandler(
                       shuffleWriterId,
                       math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
                   } else {
-                    // The release callback runs exactly once for this decoded frame. Return its
-                    // encoded size as an additive grant: unlike an absolute floor, the delta
-                    // cannot be consumed before it reaches the writer and then become a stale,
-                    // permanently-lost wake-up while EOS is queued behind zero-credit data.
-                    sendCreditControlMessage(
-                      client,
-                      shuffleWriterId,
-                      math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                    val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                    sendCumulativeCreditAck(client, released)
                   }
                 }
               } finally {

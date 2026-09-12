@@ -23,15 +23,10 @@ import io.netty.buffer.CompositeByteBuf;
 /**
  * Reader → writer control message.
  *
- * Current function: serves as a one-time connection-establishment signal. The writer
- * uses its receipt to associate the connection with a reader and does not act on the
- * numeric value of {@link #numMessages}. Backpressure today is handled by Netty send
- * completion, the writer's in-flight byte semaphore, and reader channel autoRead.
- *
- * Future function: this message is reserved as the carrier for a future credit-based
- * flow-control extension. When that extension lands, {@link #numMessages} will carry
- * the number of additional DataMessages the writer may send beyond any
- * previously-granted credit (i.e., a credit-grant delta).
+ * Besides connection establishment, multiplexed routes use this message for byte flow control.
+ * A negative {@link #numMessages} advertises the initial absolute byte window. Zero means that
+ * {@link #getSeqNum()} carries the cumulative number of encoded data bytes released by the
+ * reader. Positive values retain the dedicated-channel additive grant.
  */
 public final class CreditControlMessage extends StreamingShuffleMessage {
   public final int shuffleId;
@@ -39,12 +34,8 @@ public final class CreditControlMessage extends StreamingShuffleMessage {
   public final int shuffleReaderId;
 
   /**
-   * In the current protocol revision the writer ignores this value and treats the first
-   * CreditControlMessage as a reader connection-discovery signal; senders should pass 1.
-   *
-   * Reserved for the future credit-based flow-control extension, in which this field
-   * will carry the number of additional DataMessages the writer may send beyond any
-   * previously-granted credit.
+   * Negative values establish an absolute byte window, zero selects a cumulative release
+   * watermark in the inherited sequence field, and positive values are additive grants.
    */
   public final int numMessages;
 

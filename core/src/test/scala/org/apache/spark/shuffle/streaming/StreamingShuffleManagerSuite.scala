@@ -17,6 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.nio.ByteBuffer
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
@@ -32,6 +33,7 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREMENTAL,
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
@@ -40,7 +42,7 @@ import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
   TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 
 class StreamingShuffleManagerSuite
   extends SparkFunSuite
@@ -150,6 +152,65 @@ class StreamingShuffleManagerSuite
         SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
           receiveServiceEnabled
         SparkEnv.get.pipelinedShuffleManager.supportsFanOut shouldBe true
+      }
+    }
+  }
+
+  test("multiplexed routes coalesce cumulative credit updates by physical lane") {
+    val conf = new SparkConf()
+      .set(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS, 100L)
+    withSpark(new SparkContext("local", "cumulative-credit-batch", conf)) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val queues = (0 until 8).map { writerId =>
+        writerId -> new LinkedBlockingQueue[StreamingShuffleMessage]()
+      }.toMap
+      val readerHandlers = queues.toSeq.sortBy(_._1).map { case (writerId, queue) =>
+        writerId -> new StreamingShuffleClientHandler(
+          writerId, 0, queue, 7, 40L, null, new ErrorNotifier())
+      }
+      val writerHandlers = readerHandlers.map { case (writerId, _) =>
+        writerId -> new StreamingShuffleServerHandler(
+          (_, _) => (), 7, 1, TaskContext.empty(), new ErrorNotifier())
+      }
+      val writerHandlersById = writerHandlers.toMap
+      val queued = new scala.collection.mutable.ArrayBuffer[StreamingShuffleMessage]()
+      try {
+        val routeClients = client.registerBatch(
+          7, 0, "127.0.0.1", server.port, readerHandlers)
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.register(7, writerId, handler)
+        }
+        eventually(Timeout(10.seconds)) {
+          writerHandlers.foreach { case (_, handler) =>
+            handler.clientsFor(0).size shouldBe 1
+          }
+        }
+
+        readerHandlers.foreach { case (writerId, handler) =>
+          val writerHandler = writerHandlersById(writerId)
+          writerHandler.consumeDataCredit(0, writerHandler.clientsFor(0).head, 40L)
+          val encoded = ByteBuffer.allocate(40)
+          encoded.putInt(1).putLong(0L).putInt(7).putInt(writerId).putInt(0)
+            .putInt(0).putInt(0).putLong(0L).flip()
+          handler.receive(routeClients(writerId), encoded, null)
+          queued += queues(writerId).poll(10, TimeUnit.SECONDS)
+        }
+        queued.foreach(_.release())
+        queued.clear()
+
+        eventually(Timeout(10.seconds)) {
+          client.cumulativeCreditBatchStats shouldBe (8L, 1L, 8L, 0L)
+          writerHandlers.foreach { case (_, handler) =>
+            handler.availableDataCredit(0, handler.clientsFor(0).head) shouldBe 40L
+          }
+        }
+      } finally {
+        queued.filter(_ != null).foreach(_.release())
+        writerHandlers.foreach { case (writerId, handler) => server.unregister(7, writerId, handler) }
+        readerHandlers.foreach { case (writerId, handler) => client.unregister(7, writerId, 0, handler) }
+        client.close()
+        server.close()
       }
     }
   }

@@ -38,7 +38,8 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCRE
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
-import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage,
+  StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -73,6 +74,45 @@ class StreamingShuffleWriterSuite
       localProperties = properties,
       metricsSystem = mock[MetricsSystem],
       cpuAmount = 1)
+  }
+
+  test("cumulative route credit repairs are bounded and idempotent") {
+    withSpark(new SparkContext("local", "cumulative-credit-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      var wakeups = 0
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 0,
+        numReaders = 1,
+        context = context,
+        errorNotifier = new ErrorNotifier(),
+        onCreditAvailable = (_, _) => wakeups += 1)
+      val client = mock[TransportClient]
+      try {
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        handler.consumeDataCredit(0, client, 40L)
+        handler.availableDataCredit(0, client) shouldBe 60L
+        val released40 = new CreditControlMessage(0, 0, 0, 0)
+        released40.setSeqNum(40L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        // A repeated or older absolute watermark wakes a stranded dispatcher without granting
+        // the same bytes twice or exceeding the original receive window.
+        handler.consumeDataCredit(0, client, 30L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 70L
+        val released70 = new CreditControlMessage(0, 0, 0, 0)
+        released70.setSeqNum(70L)
+        handler.handleMessage(client, released70)
+        handler.availableDataCredit(0, client) shouldBe 100L
+        wakeups shouldBe 4
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
   }
 
   test("getWriter returns a StreamingShuffleWriter") {

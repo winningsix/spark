@@ -433,10 +433,13 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
 
   /** Re-advertise bounded route windows for writers that have not terminated yet. */
   def repairIdleCreditWindows(): Unit = {
-    handlers.forEach { (writerId, handler) =>
+    val routes = handlers.entrySet().asScala.flatMap { entry =>
+      val writerId = entry.getKey
+      val handler = entry.getValue
       val client = clients.get(writerId)
-      if (client != null) handler.repairCreditWindow(client)
-    }
+      if (client == null) None else Some(client -> handler)
+    }.toSeq
+    sharedClient.repairCreditWindows(routes)
   }
 
   def onWriterSnapshot(snapshot: ShuffleLocationResponse): Unit = {
