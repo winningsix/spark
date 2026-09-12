@@ -602,13 +602,16 @@ class StreamingShuffleSuite
     // termination message sets terminationReceived through the production code path -- so there is
     // no reliance on Netty event-loop timing.
     val errorNotifier = new ErrorNotifier()
+    val queue = new StreamingShuffleMessageQueue()
+    var ackObservedPublishedTerminal = false
     val handler = new StreamingShuffleClientHandler(
-      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
+      0, 0, queue, shuffleId, Long.MaxValue,
       context = null, errorNotifier = errorNotifier) {
-      // The reader would normally send an ack over the network here; suppress it since this test
-      // has no client/channel. terminationReceived is set in receive() before this is called.
-      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit =
-        ()
+      // The reader would normally send an ACK over the network here. Observe the queue instead so
+      // the test proves the terminal becomes reader-visible before the writer can see that ACK.
+      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
+        ackObservedPublishedTerminal = queue.peek().isInstanceOf[TerminationControlMessage]
+      }
     }
 
     // Encode a TerminationControlMessage on the wire and hand it to receive(), exactly as a real
@@ -623,6 +626,7 @@ class StreamingShuffleSuite
     encoded.putInt(0) // shuffleReaderId
     encoded.flip()
     handler.receive(null, encoded, null)
+    ackObservedPublishedTerminal should be(true)
 
     // A clean close after termination: the handler must record no error.
     handler.channelInactive(null)

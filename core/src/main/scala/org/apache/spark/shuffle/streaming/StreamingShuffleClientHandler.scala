@@ -66,6 +66,10 @@ class StreamingShuffleClientHandler(
   // died before terminating). @volatile because it is written on the Netty event-loop thread in
   // receive() and read in channelInactive().
   @volatile private var terminationReceived = false
+
+  private[streaming] def terminationReceivedForDiagnostics: Boolean = terminationReceived
+
+  private[streaming] def lastSequenceNumberForDiagnostics: Long = lastSeqNum
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
@@ -398,6 +402,7 @@ class StreamingShuffleClientHandler(
     var buf: ByteBuf = null
     var shuffleMessage: StreamingShuffleMessage = null
     val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
+    val pendingTerminationAcks = new ArrayBuffer[Int]()
     var publishedMessage = false
     try {
       // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
@@ -450,11 +455,17 @@ class StreamingShuffleClientHandler(
             // physical channel cannot continue filling this logical route while its queue is
             // waiting behind another sibling input.
           case controlMessage: TerminationControlMessage =>
-            // Record termination before sending the ack: the writer only closes its connection
-            // after it receives this ack, so setting the flag here guarantees it is visible before
-            // the resulting channelInactive fires, avoiding a false premature-disconnect error.
+            // Record receipt before publishing so a connection close cannot be mistaken for a
+            // premature disconnect. Do not ACK a new terminal until it is safely visible in the
+            // reader queue: the writer may release this route as soon as the ACK arrives.
             terminationReceived = true
-            sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+            if (duplicateTermination) {
+              // The original terminal was published before its ACK. A retransmission only means
+              // that ACK was lost, so acknowledge it again without adding a duplicate terminal.
+              sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+            } else {
+              pendingTerminationAcks += controlMessage.shuffleWriterId
+            }
           case _ =>
             throw new IllegalArgumentException(
               s"Unexpected message type in ShuffleClientHandler: ${shuffleMessage.messageType()}")
@@ -469,6 +480,8 @@ class StreamingShuffleClientHandler(
           // parsed.
           queue.put(shuffleMessage)
           publishedMessage = true
+          pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+          pendingTerminationAcks.clear()
         }
         shuffleMessage = null
       }
@@ -478,6 +491,8 @@ class StreamingShuffleClientHandler(
             batchedQueue.putBatch(decodedMessages.toArray)
             decodedMessages.clear()
             publishedMessage = true
+            pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+            pendingTerminationAcks.clear()
           case _ =>
             // Keep ownership tracking precise if an interrupt happens while putting into a
             // legacy queue. Messages whose put already succeeded belong to the queue; release
@@ -487,10 +502,17 @@ class StreamingShuffleClientHandler(
             var enqueued = 0
             try {
               while (enqueued < messages.length) {
-                queue.put(messages(enqueued))
+                val enqueuedMessage = messages(enqueued)
+                queue.put(enqueuedMessage)
                 enqueued += 1
                 publishedMessage = true
+                enqueuedMessage match {
+                  case controlMessage: TerminationControlMessage =>
+                    sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+                  case _ =>
+                }
               }
+              pendingTerminationAcks.clear()
             } finally {
               while (enqueued < messages.length) {
                 messages(enqueued).release()

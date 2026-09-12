@@ -579,6 +579,7 @@ class StreamingShuffleReader[K, C](
     // that we will not receive any future messages, and the reader can be closed. When a data
     // message is read, the actual data (UnsafeRow) is extracted and emitted through the iterator.
     val terminationControlMessageSet = collection.mutable.Set[Long]()
+    var lastIdleDiagnosticsNanos = 0L
 
     /**
      * Returns true if the reader should stop after handling the termination message, which means
@@ -694,7 +695,14 @@ class StreamingShuffleReader[K, C](
       checkTaskFailure,
       () => totalNumShuffleWriters.get() == 0,
       () => preparedSession match {
-        case Some(session) => session.repairIdleCreditWindows()
+        case Some(session) =>
+          session.repairIdleCreditWindows()
+          val now = System.nanoTime()
+          if (now - lastIdleDiagnosticsNanos >= TimeUnit.SECONDS.toNanos(30L)) {
+            logWarning(s"Streaming shuffle reader remains idle: " +
+              session.idleDiagnostics(terminationControlMessageSet.toSet))
+            lastIdleDiagnosticsNanos = now
+          }
         case None =>
           logicalClientHandlers.forEach { (writerId, handler) =>
             val client = clientMap.get(writerId)

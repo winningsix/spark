@@ -442,6 +442,22 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     sharedClient.repairCreditWindows(routes)
   }
 
+  /** Summarize route progress when an attached reader has stopped receiving messages. */
+  def idleDiagnostics(readerTerminations: Set[Long]): String = {
+    val routeSnapshot = handlers.entrySet().asScala.toSeq
+    val missingObservedTerminations = routeSnapshot.iterator.collect {
+      case entry if !entry.getValue.terminationReceivedForDiagnostics =>
+        s"${entry.getKey}:${entry.getValue.lastSequenceNumberForDiagnostics}"
+    }.take(16).mkString(",")
+    s"inbox=${inbox.id}, expectedWriters=${totalNumShuffleWriters.get()}, " +
+      s"discovered=${clientFutures.size()}, connected=${clients.size()}, " +
+      s"handlers=${handlers.size()}, handlerTerminations=" +
+      s"${routeSnapshot.count(_.getValue.terminationReceivedForDiagnostics)}, " +
+      s"queuedTerminations=${readerTerminations.size}, ackedTerminations=" +
+      s"${terminationAckControlMessageSet.size()}, missingHandlerWriter:lastSeq=" +
+      s"[$missingObservedTerminations]"
+  }
+
   def onWriterSnapshot(snapshot: ShuffleLocationResponse): Unit = {
     if (closed.get() || discoveryComplete.get()) return
     val ShuffleLocationResponse(locations, numWriters) = snapshot
