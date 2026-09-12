@@ -263,8 +263,7 @@ class StreamingShuffleWriter[K, V](
   // from different map writers can also be coalesced; non-shared connections keep the original
   // one-route path unchanged.
   private val crossRouteBatcher = if (conf.get(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)) {
-    Some(sharedExecutorServer.map(
-      _.crossRouteBatcher(streamingShuffleHandle.shuffleId)).getOrElse {
+    Some(sharedExecutorServer.map(_.crossRouteBatcher).getOrElse {
       // This should be unreachable because the manager requires a shared writer server whenever
       // shared connections are enabled, but retain a local fallback for low-level tests and
       // direct construction of a writer.
