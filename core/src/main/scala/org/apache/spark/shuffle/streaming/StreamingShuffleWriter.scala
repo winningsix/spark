@@ -77,6 +77,7 @@ private[streaming] object StreamingShuffleCompression {
 
 private[streaming] object StreamingShuffleWriter {
   private val TERMINATION_RETRY_DELAY_MS = 500L
+  private val effectiveBudgetWarningLogged = new AtomicBoolean(false)
   // A single daemon scheduler per executor JVM prevents one native thread per completed writer
   // when a positive late-reader linger is enabled across a wide sequential query sweep.
   private[streaming] val cleanupScheduler = new ScheduledThreadPoolExecutor(1, new ThreadFactory {
@@ -188,7 +189,8 @@ class StreamingShuffleWriter[K, V](
   // the configured writerMaxMemory when the partition count is high; surface the effective total
   // (including TCP buffers) so operators can see the limit they set is not the one in force.
   private val effectiveBudget = MAX_BUFFER_BYTES + TOTAL_TCPBUF_BYTES
-  if (effectiveBudget > conf.get(STREAMING_SHUFFLE_WRITER_MAX_MEMORY).toLong) {
+  if (effectiveBudget > conf.get(STREAMING_SHUFFLE_WRITER_MAX_MEMORY).toLong &&
+      StreamingShuffleWriter.effectiveBudgetWarningLogged.compareAndSet(false, true)) {
     logWarning(log"Streaming shuffle writer effective memory budget " +
       log"${MDC(LogKeys.MAX_MEMORY_SIZE, Utils.bytesToString(effectiveBudget))} exceeds the " +
       log"configured ${MDC(LogKeys.CONFIG, STREAMING_SHUFFLE_WRITER_MAX_MEMORY.key)}=" +
