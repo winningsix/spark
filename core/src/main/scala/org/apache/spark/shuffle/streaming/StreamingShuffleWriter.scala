@@ -237,6 +237,8 @@ class StreamingShuffleWriter[K, V](
             sendCompletionExecutor.execute(() => shards(readerId).replayTo(client))
           },
         (readerId, _) => shards(readerId).creditAvailable(),
+        (readerId, client, lastObservedSequence) =>
+          shards(readerId).replayFromObserved(client, lastObservedSequence),
         expectedReaderRoutes))
 
   private val memoryConsumer = new MemoryConsumer(
@@ -1344,6 +1346,31 @@ class StreamingShuffleWriter[K, V](
 
     private[streaming] def isReplayPending(target: TransportClient): Boolean = synchronized {
       replayPendingClients.contains(target)
+    }
+
+    /**
+     * Reconcile local submission with the reader-visible cursor after an idle-period repair.
+     *
+     * TCP completion is only a local ownership fence. A frame can still be dropped while an
+     * executor-level route is being installed or replaced, so the reader's contiguous sequence
+     * is the authoritative replay boundary. The normal replay fence keeps later shard actions
+     * behind this repair and makes repeated idle requests idempotent.
+     */
+    private[streaming] def replayFromObserved(
+        target: TransportClient,
+        lastObservedSequence: Long): Unit = synchronized {
+      if (outboundClosed || terminationAckedClients.contains(target)) return
+      val localCursor = lastEnqueuedByClient.getOrElse(target, -1L)
+      if (lastObservedSequence < localCursor) {
+        lastEnqueuedByClient.update(target, lastObservedSequence)
+      }
+      if (!replayPendingClients.contains(target)) {
+        replayHistory.lastOption.foreach { tail =>
+          replayPendingClients += target
+          outboundActions.prepend(ReplayAction(target, tail.sequenceNum))
+        }
+      }
+      scheduleOutboundDrainLocked()
     }
 
     /** Release replay entries already enqueued for all currently connected clients. */

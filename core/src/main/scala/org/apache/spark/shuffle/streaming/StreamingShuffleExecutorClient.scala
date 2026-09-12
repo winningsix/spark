@@ -460,7 +460,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     val byClient = new java.util.IdentityHashMap[
       TransportClient, mutable.ArrayBuffer[PendingCredit]]()
     routes.foreach { case (client, handler) =>
-      handler.prepareMultiplexedCreditRepair().foreach { message =>
+      val repairs = handler.prepareMultiplexedCreditRepair().toSeq ++
+        handler.prepareMultiplexedReplayRepair().toSeq
+      repairs.foreach { message =>
         var credits = byClient.get(client)
         if (credits == null) {
           credits = new mutable.ArrayBuffer[PendingCredit]()

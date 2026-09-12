@@ -184,6 +184,15 @@ class StreamingShuffleClientHandler(
     }
   }
 
+  /** Ask the writer to reconcile its local send cursor with the last reader-visible sequence. */
+  private[streaming] def prepareMultiplexedReplayRepair(): Option[CreditControlMessage] = {
+    if (terminationReceived || lastSeqNum < 0) return None
+    val message = new CreditControlMessage(
+      shuffleId, shuffleWriterId, shuffleReaderId, Int.MinValue)
+    message.setSeqNum(lastSeqNum)
+    Some(message)
+  }
+
   /** Surface a failed executor-level credit batch through this route's normal error path. */
   private[streaming] def creditBatchSendFailed(
       client: TransportClient,
@@ -199,6 +208,8 @@ class StreamingShuffleClientHandler(
   /** Repair route discovery or repeat the latest cumulative release watermark. */
   private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
     prepareMultiplexedCreditRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
+    prepareMultiplexedReplayRepair().foreach(message =>
       sendCreditControlMessage(client, message))
   }
 

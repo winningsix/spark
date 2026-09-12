@@ -80,13 +80,15 @@ class StreamingShuffleWriterSuite
     withSpark(new SparkContext("local", "cumulative-credit-repair", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
       var wakeups = 0
+      var replayRequest = Option.empty[Long]
       val handler = new StreamingShuffleServerHandler(
         (_, _) => (),
         shuffleId = 0,
         numReaders = 1,
         context = context,
         errorNotifier = new ErrorNotifier(),
-        onCreditAvailable = (_, _) => wakeups += 1)
+        onCreditAvailable = (_, _) => wakeups += 1,
+        onReplayRequested = (_, _, sequence) => replayRequest = Some(sequence))
       val client = mock[TransportClient]
       try {
         handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
@@ -109,6 +111,36 @@ class StreamingShuffleWriterSuite
         handler.handleMessage(client, released70)
         handler.availableDataCredit(0, client) shouldBe 100L
         wakeups shouldBe 4
+
+        val replay = new CreditControlMessage(0, 0, 0, Int.MinValue)
+        replay.setSeqNum(17L)
+        handler.handleMessage(client, replay)
+        replayRequest shouldBe Some(17L)
+        handler.availableDataCredit(0, client) shouldBe 100L
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("idle sequence repair replays a locally submitted terminal") {
+    withSpark(new SparkContext("local", "reader-visible-sequence-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
+        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+        data.serializationStream.get.writeKey(1).writeValue(1).flush()
+        writer.shards(0).send(data)
+        writer.shards(0).close()
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+
+        // The writer submitted sequence 1, while the reader only observed data sequence 0.
+        writer.shards(0).replayFromObserved(client, 0L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
       } finally {
         context.markTaskCompleted(None)
       }

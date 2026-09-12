@@ -60,6 +60,7 @@ class StreamingShuffleServerHandler(
     onTerminationAckReceivedWithClient: (Int, Long, TransportClient) => Unit = (_, _, _) => (),
     onClientConnected: (Int, TransportClient) => Unit = (_, _) => (),
     onCreditAvailable: (Int, TransportClient) => Unit = (_, _) => (),
+    onReplayRequested: (Int, TransportClient, Long) => Unit = (_, _, _) => (),
     expectedClientsPerReader: Array[Int] = null)
     extends RpcHandler with TaskContextAwareLogging {
 
@@ -229,6 +230,13 @@ class StreamingShuffleServerHandler(
         // late sibling with an empty stream once the producer has already emitted its data.
         // addIfAbsent also makes repeated credit messages on the same connection idempotent.
         val encodedCredit = creditControlMessage.numMessages.toLong
+        // A zero-credit watermark repairs byte admission. Int.MinValue is reserved for the
+        // complementary sequence repair sent by an idle reader: local Netty submission can
+        // advance the writer cursor even when a final frame never becomes reader-visible.
+        if (creditControlMessage.numMessages == Int.MinValue) {
+          onReplayRequested(readerId, client, creditControlMessage.getSeqNum)
+          return
+        }
         val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
         val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
         val state = if (enablesCreditFlow) {
