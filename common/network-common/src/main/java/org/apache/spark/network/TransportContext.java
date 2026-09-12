@@ -228,8 +228,7 @@ public class TransportContext implements Closeable {
 
       pipeline
         .addLast("encoder", sslEncryptionEnabled()? SSL_ENCODER : ENCODER)
-        .addLast(TransportFrameDecoder.HANDLER_NAME, NettyUtils.createFrameDecoder(
-          conf.getModuleName() != null && conf.getModuleName().startsWith("streaming-shuffle")))
+        .addLast(TransportFrameDecoder.HANDLER_NAME, NettyUtils.createFrameDecoder())
         .addLast("decoder", getDecoder())
         .addLast("idleStateHandler",
           new IdleStateHandler(0, 0, conf.connectionTimeoutMs() / 1000))

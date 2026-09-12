@@ -23,7 +23,6 @@ import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import org.junit.jupiter.api.AfterAll;
@@ -114,37 +113,6 @@ public class TransportFrameDecoderSuite {
       }
       assertEquals(numMessages, retained.size());
       assertEquals(targetBytes * numMessages, totalBytesGot);
-    }
-  }
-
-  @Test
-  public void testStreamingFrameConsolidatesOnlyFragmentedTail() throws Exception {
-    TransportFrameDecoder decoder = new TransportFrameDecoder(8, true);
-    ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
-    List<ByteBuf> retained = new ArrayList<>();
-    when(ctx.fireChannelRead(any())).thenAnswer(in -> {
-      retained.add((ByteBuf) in.getArguments()[0]);
-      return null;
-    });
-
-    try {
-      decoder.channelRead(ctx, Unpooled.copyLong(28));
-      for (int i = 0; i < 5; i++) {
-        decoder.channelRead(ctx, Unpooled.buffer(4).writeInt(i));
-      }
-
-      assertEquals(1, retained.size());
-      assertInstanceOf(CompositeByteBuf.class, retained.get(0));
-      CompositeByteBuf frame = (CompositeByteBuf) retained.get(0);
-      assertEquals(2, frame.numComponents());
-      for (int i = 0; i < 5; i++) {
-        assertEquals(i, frame.readInt());
-      }
-    } finally {
-      for (ByteBuf buf : retained) {
-        release(buf);
-      }
-      decoder.channelInactive(ctx);
     }
   }
 
