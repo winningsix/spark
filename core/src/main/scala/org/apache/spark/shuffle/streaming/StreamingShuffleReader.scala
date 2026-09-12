@@ -18,13 +18,14 @@
 package org.apache.spark.shuffle.streaming
 
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.ByteBufInputStream
+import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 
 import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
@@ -114,6 +115,43 @@ class StreamingShuffleReaderIteratorFactory {
   }
 }
 
+/**
+ * Presents a possibly scattered compressed frame as one NIO buffer for LZ4.
+ *
+ * Cross-route transport batching deliberately preserves Netty components to avoid a copy on the
+ * network thread. Calling `nioBuffer()` on a frame that spans several of those components makes
+ * `CompositeByteBuf` allocate and fill a new heap byte array for every message. Keep that copy on
+ * the consuming task and reuse one pooled direct scratch buffer instead. The common one-component
+ * case remains zero-copy.
+ */
+private[streaming] final class StreamingShuffleDecompressionInput {
+  private var scratch: ByteBuf = _
+
+  def prepare(source: ByteBuf, length: Int): ByteBuffer = {
+    val components = source.nioBuffers(source.readerIndex(), length)
+    if (components.length == 1) {
+      components(0)
+    } else {
+      if (scratch == null || scratch.capacity() < length) {
+        if (scratch != null) scratch.release()
+        scratch = source.alloc().directBuffer(length, length)
+      }
+      scratch.clear()
+      scratch.writeBytes(source, source.readerIndex(), length)
+      scratch.nioBuffer(0, length)
+    }
+  }
+
+  private[streaming] def scratchCapacity: Int = if (scratch == null) 0 else scratch.capacity()
+
+  def close(): Unit = {
+    if (scratch != null) {
+      scratch.release()
+      scratch = null
+    }
+  }
+}
+
 class StreamingShuffleReader[K, C](
     handle: ShuffleHandle,
     val context: TaskContext,
@@ -194,6 +232,7 @@ class StreamingShuffleReader[K, C](
   } else {
     None
   }
+  private val decompressionInput = new StreamingShuffleDecompressionInput
 
   // The set of shuffle writers that this reader has successfully received
   // termination ack messages from.  This is used to make sure all term ack messages
@@ -285,6 +324,9 @@ class StreamingShuffleReader[K, C](
         currentDataMessage.release()
         currentDataMessage = null
       }
+    }
+    Utils.tryLogNonFatalError {
+      decompressionInput.close()
     }
     val inboxStats = receiveInbox.map(_.close()).getOrElse {
       val list = new java.util.ArrayList[StreamingShuffleMessage]()
@@ -631,7 +673,7 @@ class StreamingShuffleReader[K, C](
           dataMessage.uncompressedSize, dataMessage.uncompressedSize)
         try {
           val compressed = dataMessage.getRecordData()
-          val source = compressed.nioBuffer(compressed.readerIndex(), dataMessage.dataSize)
+          val source = decompressionInput.prepare(compressed, dataMessage.dataSize)
           val destination = decompressedBuffer.nioBuffer(0, dataMessage.uncompressedSize)
           val uncompressedBytes = decompressor.decompress(
             source, source.position(), dataMessage.dataSize,

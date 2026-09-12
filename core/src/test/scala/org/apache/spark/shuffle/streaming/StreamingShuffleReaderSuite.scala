@@ -74,6 +74,48 @@ class StreamingShuffleReaderSuite
   // them so the reader's consumer-loop control flow can be verified without Netty or a SparkEnv.
   private val factory = new StreamingShuffleReaderIteratorFactory()
 
+  test("decompression input reuses direct scratch for a scattered transport frame") {
+    val input = new StreamingShuffleDecompressionInput
+    val contiguous = Unpooled.directBuffer(3).writeBytes(Array[Byte](11, 12, 13))
+    try {
+      input.prepare(contiguous, contiguous.readableBytes()).isDirect shouldBe true
+      input.scratchCapacity shouldBe 0
+    } finally {
+      contiguous.release()
+    }
+
+    val first = Unpooled.directBuffer(3).writeBytes(Array[Byte](1, 2, 3))
+    val second = Unpooled.directBuffer(3).writeBytes(Array[Byte](4, 5, 6))
+    val scattered = Unpooled.compositeBuffer()
+      .addComponent(true, first)
+      .addComponent(true, second)
+    try {
+      val prepared = input.prepare(scattered, scattered.readableBytes())
+      prepared.isDirect shouldBe true
+      val bytes = new Array[Byte](prepared.remaining())
+      prepared.get(bytes)
+      bytes should contain theSameElementsInOrderAs Array[Byte](1, 2, 3, 4, 5, 6)
+      input.scratchCapacity shouldBe 6
+
+      val smallerFirst = Unpooled.directBuffer(2).writeBytes(Array[Byte](7, 8))
+      val smallerSecond = Unpooled.directBuffer(2).writeBytes(Array[Byte](9, 10))
+      val smaller = Unpooled.compositeBuffer()
+        .addComponent(true, smallerFirst)
+        .addComponent(true, smallerSecond)
+      try {
+        input.prepare(smaller, smaller.readableBytes()).isDirect shouldBe true
+        input.scratchCapacity shouldBe 6
+      } finally {
+        smaller.release()
+      }
+    } finally {
+      input.close()
+      input.close()
+      scattered.release()
+    }
+    input.scratchCapacity shouldBe 0
+  }
+
   test("iterator emits all rows from data messages then stops on termination") {
     val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
     queue.put(emptyDataMessage())
