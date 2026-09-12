@@ -232,6 +232,8 @@ private[spark] class TaskSchedulerImpl(
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
   private val elasticProducerSoleStageMaxTasks =
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
+  private val preparedReaderDiagonalAssignment =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_DIAGONAL_ASSIGNMENT_ENABLED)
   private val inboxReadyRevivePending = new AtomicBoolean(false)
 
   private lazy val streamingTrackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
@@ -270,7 +272,8 @@ private[spark] class TaskSchedulerImpl(
             val key = PreTaskReaderKey(
               taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
             if (!preTaskReaderAssignments.contains(key)) {
-              val executorId = receiveExecutors(taskIndex % receiveExecutors.size)
+              val executorId = receiveExecutors(TaskSchedulerImpl.preparedReaderExecutorIndex(
+                taskIndex, receiveExecutors.size, preparedReaderDiagonalAssignment))
               val partitionId = taskSet.tasks(taskIndex).partitionId
               val nextOrdinalByShuffle = new HashMap[Int, Int]
               val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
@@ -1491,6 +1494,20 @@ private[spark] object TaskSchedulerImpl {
 
   val SCHEDULER_MODE_PROPERTY = SCHEDULER_MODE.key
   private val INBOX_READY_REVIVE_COALESCE_MS = 10L
+
+  private[scheduler] def preparedReaderExecutorIndex(
+      taskIndex: Int,
+      executorCount: Int,
+      diagonalAssignment: Boolean): Int = {
+    require(taskIndex >= 0, s"taskIndex must be non-negative: $taskIndex")
+    require(executorCount > 0, s"executorCount must be positive: $executorCount")
+    val column = taskIndex % executorCount
+    if (diagonalAssignment) {
+      (column + taskIndex / executorCount) % executorCount
+    } else {
+      column
+    }
+  }
 
   /**
    * Calculate the max available task slots given the `availableCpus` and `availableResources`

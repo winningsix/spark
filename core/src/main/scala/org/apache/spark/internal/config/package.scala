@@ -2270,6 +2270,18 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_DIAGONAL_ASSIGNMENT_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.diagonalAssignment.enabled")
+      .doc("Whether prepared streaming-shuffle reader partitions rotate their executor " +
+        "assignment after each executor-width block. The rotation preserves an even task count " +
+        "while mixing partition-index residue classes across executors, reducing persistent " +
+        "executor skew when adjacent shuffle partitions have periodic cost patterns.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")
       .doc("Number of threads used by a task-owned pipelined shuffle reader to create its " +

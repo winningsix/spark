@@ -87,6 +87,22 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     super.afterEach()
   }
 
+  test("prepared reader diagonal assignment mixes partition residue classes evenly") {
+    val executors = 4
+    val tasks = 12
+    val legacy = (0 until tasks).map { index =>
+      TaskSchedulerImpl.preparedReaderExecutorIndex(index, executors, diagonalAssignment = false)
+    }
+    val diagonal = (0 until tasks).map { index =>
+      TaskSchedulerImpl.preparedReaderExecutorIndex(index, executors, diagonalAssignment = true)
+    }
+
+    assert(legacy === Seq(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3))
+    assert(diagonal === Seq(0, 1, 2, 3, 1, 2, 3, 0, 2, 3, 0, 1))
+    assert(diagonal.groupBy(identity).view.mapValues(_.size).toMap ===
+      Map(0 -> 3, 1 -> 3, 2 -> 3, 3 -> 3))
+  }
+
   def setupScheduler(confs: (String, String)*): TaskSchedulerImpl = {
     setupSchedulerWithMaster("local", confs: _*)
   }
