@@ -541,6 +541,14 @@ class StreamingShuffleWriter[K, V](
     private var outboundDrainScheduled = false
     private var connectionListenerInstalled = false
     private var outboundClosed = false
+    // Compression is independent across reducer shards.  On the executor-scoped transport path,
+    // move it off the producer task and onto the existing fixed-size outbound dispatcher.  Each
+    // shard keeps one completion chain so message admission, sequence assignment, replay-history
+    // insertion, and termination remain ordered even though different shards compress in
+    // parallel. Raw-buffer permits bound the amount of work that can be queued here.
+    private val asyncCompression = compressionCodec.isDefined && sharedExecutorServer.isDefined
+    private var admissionTail: CompletableFuture[Unit] = CompletableFuture.completedFuture(())
+    private val unadmittedBuffers = new mutable.ArrayBuffer[TimestampedBuffer]()
     private val deferredReplayBuffers = new mutable.ArrayBuffer[ByteBuf]()
     private val lastEnqueuedByClient = new mutable.HashMap[TransportClient, Long]()
     // Fence a newly registered physical route until its replay prefix has been enqueued. This is
@@ -1475,10 +1483,56 @@ class StreamingShuffleWriter[K, V](
     // The public form flushes a partial batch for low-level callers and tests; the write loop uses
     // enqueue() so full buffers can be coalesced before the next transport write.
     def send(timestampedBuffer: TimestampedBuffer): Unit =
-      sendTimestampedBuffer(timestampedBuffer, flushBatch = true)
+      admitTimestampedBuffer(timestampedBuffer, flushBatch = true)
 
     private[streaming] def enqueue(timestampedBuffer: TimestampedBuffer): Unit =
-      sendTimestampedBuffer(timestampedBuffer, flushBatch = false)
+      admitTimestampedBuffer(timestampedBuffer, flushBatch = false)
+
+    /** Release a detached buffer that never reached DataMessage ownership. */
+    private def releaseUnadmittedBuffer(timestampedBuffer: TimestampedBuffer): Unit = {
+      Utils.tryLogNonFatalError {
+        timestampedBuffer.serializationStream.foreach(_.close())
+      }
+      releaseRawBuffer(timestampedBuffer.buffer)
+      if (WRITER_BACKPRESSURE_ENABLED) {
+        allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+      }
+    }
+
+    /** Append producer work to this shard's ordered admission chain. */
+    private def appendAdmission(action: () => Unit): Unit = synchronized {
+      admissionTail = admissionTail.thenApplyAsync[Unit]((_: Unit) => action(),
+        sendCompletionExecutor)
+    }
+
+    private def admitTimestampedBuffer(
+        timestampedBuffer: TimestampedBuffer,
+        flushBatch: Boolean): Unit = {
+      if (!asyncCompression) {
+        sendTimestampedBufferNow(timestampedBuffer, flushBatch)
+        return
+      }
+      synchronized {
+        unadmittedBuffers += timestampedBuffer
+        appendAdmission(() => synchronized {
+          if (outboundClosed || errorNotifier.getError().nonEmpty) {
+            val index = unadmittedBuffers.indexWhere(_ eq timestampedBuffer)
+            if (index >= 0) {
+              unadmittedBuffers.remove(index)
+              releaseUnadmittedBuffer(timestampedBuffer)
+            }
+          } else {
+            try {
+              sendTimestampedBufferNow(timestampedBuffer, flushBatch)
+              val index = unadmittedBuffers.indexWhere(_ eq timestampedBuffer)
+              if (index >= 0) unadmittedBuffers.remove(index)
+            } catch {
+              case error: Throwable => errorNotifier.markError(error)
+            }
+          }
+        })
+      }
+    }
 
     /** Return a raw input buffer after its network send no longer needs it. */
     private[streaming] def releaseRawBuffer(rawBuffer: ByteBuf): Unit = {
@@ -1533,7 +1587,7 @@ class StreamingShuffleWriter[K, V](
       }
     }
 
-    private def sendTimestampedBuffer(
+    private def sendTimestampedBufferNow(
         timestampedBuffer: TimestampedBuffer,
         flushBatch: Boolean): Unit = synchronized {
       timestampedBuffer.serializationStream.foreach(_.close())
@@ -1634,10 +1688,21 @@ class StreamingShuffleWriter[K, V](
     }
 
     // Consume the current buffer, if it exists, and send it as a DataMessage.
-    def send(): Unit = synchronized {
+    def send(): Unit = {
       val b = takeBuffer()
-      if (b != null) enqueue(b)
-      flushPendingBatch()
+      if (b != null) {
+        admitTimestampedBuffer(b, flushBatch = true)
+      } else if (asyncCompression) {
+        synchronized {
+          if (pendingBatch.nonEmpty || !admissionTail.isDone) {
+            appendAdmission(() => synchronized {
+              if (!outboundClosed) flushPendingBatch()
+            })
+          }
+        }
+      } else {
+        synchronized { flushPendingBatch() }
+      }
     }
 
     def takeBuffer(): TimestampedBuffer = buffer.getAndSet(null)
@@ -1645,8 +1710,20 @@ class StreamingShuffleWriter[K, V](
     def putBuffer(b: TimestampedBuffer): Unit = assert(buffer.getAndSet(b) == null)
 
     def close(): Unit = {
-      send()
-      send(new TerminationControlMessage(streamingShuffleHandle.shuffleId, shuffleWriterId, id))
+      val b = takeBuffer()
+      if (b != null) admitTimestampedBuffer(b, flushBatch = false)
+      if (asyncCompression) {
+        appendAdmission(() => synchronized {
+          if (!outboundClosed && errorNotifier.getError().isEmpty) {
+            flushPendingBatch()
+            send(new TerminationControlMessage(
+              streamingShuffleHandle.shuffleId, shuffleWriterId, id))
+          }
+        })
+      } else {
+        flushPendingBatch()
+        send(new TerminationControlMessage(streamingShuffleHandle.shuffleId, shuffleWriterId, id))
+      }
     }
 
     def cancel(): Unit = {
@@ -1670,6 +1747,14 @@ class StreamingShuffleWriter[K, V](
         } finally {
           try entry.complete() catch { case _: Throwable => }
         }
+      }
+      val unadmitted = synchronized {
+        val buffers = unadmittedBuffers.toSeq
+        unadmittedBuffers.clear()
+        buffers
+      }
+      unadmitted.foreach { pending =>
+        try releaseUnadmittedBuffer(pending) catch { case _: Throwable => }
       }
       transportServerHandler.futureClients(id).completeExceptionally(error)
       client.foreach(_.completeExceptionally(error))
@@ -1888,7 +1973,7 @@ class StreamingShuffleWriter[K, V](
      * the termination message, so the returned future covers the complete shard stream.
      */
     def registrationAndEnqueueFuture: CompletableFuture[TransportClient] = synchronized {
-      if (expectedReaderRoutes(id) == 0) {
+      val registered = if (expectedReaderRoutes(id) == 0) {
         CompletableFuture.completedFuture(null)
       } else {
         client match {
@@ -1896,6 +1981,7 @@ class StreamingShuffleWriter[K, V](
           case Right(future) => future
         }
       }
+      admissionTail.thenCombine(registered, (_: Unit, connected: TransportClient) => connected)
     }
   }
 
