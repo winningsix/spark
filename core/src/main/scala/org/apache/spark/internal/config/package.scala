@@ -2257,6 +2257,19 @@ package object config {
       .checkValue(_ >= 1, "must be at least one")
       .createOptional
 
+  private[spark] val STREAMING_SHUFFLE_PRODUCER_UNION_AFFINITY_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.producerUnionAffinity.enabled")
+      .doc("Whether a pure streaming-shuffle producer whose input is an explicitly repeated, " +
+        "equal-shaped UnionRDD should group matching parent partitions on the same executor. " +
+        "This opt-in scheduling policy lets executor-scoped input caches and in-flight reads be " +
+        "reused across repeated scans. It applies only when every task has no existing locality " +
+        "preference and all union parents expose the same partition-index set.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")
       .doc("Number of threads used by a task-owned pipelined shuffle reader to create its " +

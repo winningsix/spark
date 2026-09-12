@@ -45,7 +45,13 @@ import org.apache.spark.network.shuffle.{BlockStoreClient, MergeFinalizerListene
 import org.apache.spark.network.shuffle.protocol.MergeStatuses
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
-import org.apache.spark.rdd.{DeterministicLevel, RDD, RDDCheckpointData, ReliableRDDCheckpointData, ShuffleReducePartitionMapping}
+import org.apache.spark.rdd.{
+  DeterministicLevel,
+  RDD,
+  RDDCheckpointData,
+  ReliableRDDCheckpointData,
+  ShuffleReducePartitionMapping,
+  UnionPartition}
 import org.apache.spark.resource.{CpuAmount, ResourceProfile, TaskResourceProfile}
 import org.apache.spark.resource.ResourceProfile.{CPUS, DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
@@ -3122,7 +3128,7 @@ private[spark] class DAGScheduler(
         outputCommitCoordinator.stageStart(
           stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
     }
-    val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
+    val initialTaskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
       stage match {
         case s: ShuffleMapStage =>
           partitionsToCompute.map { id => (id, getPreferredLocs(stage.rdd, id))}.toMap
@@ -3141,6 +3147,32 @@ private[spark] class DAGScheduler(
         runningStages -= stage
         return
     }
+
+    val unionAffinityPlan = if (
+      isPipelinedProducer(stage) &&
+        sc.conf.get(config.STREAMING_SHUFFLE_PRODUCER_UNION_AFFINITY_ENABLED) &&
+        initialTaskIdToLocations.values.forall(_.isEmpty)) {
+      val executorLocations = blockManagerMaster.getMemoryStatus.keysIterator
+        .filter(_.executorId != SparkContext.DRIVER_IDENTIFIER)
+        .map(id => ExecutorCacheTaskLocation(id.host, id.executorId))
+        .toSeq
+        .sortBy(location => (location.host, location.executorId))
+      DAGScheduler.planUnionTaskAffinity(
+        partitionsToCompute, stage.rdd.partitions, executorLocations)
+    } else {
+      None
+    }
+    unionAffinityPlan.foreach { plan =>
+      logInfo(log"Applying repeated-union input affinity to ${MDC(STAGE, stage)}: " +
+        log"${MDC(NUM_TASKS, plan.orderedPartitionIds.size)} tasks across " +
+        log"${MDC(NUM_EXECUTORS, plan.executorLocations.size)} executors")
+    }
+    val orderedPartitionsToCompute = unionAffinityPlan
+      .map(_.orderedPartitionIds)
+      .getOrElse(partitionsToCompute)
+    val taskIdToLocations = unionAffinityPlan
+      .map(_.preferredLocations)
+      .getOrElse(initialTaskIdToLocations)
 
     stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
 
@@ -3208,7 +3240,7 @@ private[spark] class DAGScheduler(
       stage match {
         case stage: ShuffleMapStage =>
           stage.pendingPartitions.clear()
-          partitionsToCompute.map { id =>
+          orderedPartitionsToCompute.map { id =>
             val locs = taskIdToLocations(id)
             val part = partitions(id)
             stage.pendingPartitions += id
@@ -3219,7 +3251,7 @@ private[spark] class DAGScheduler(
           }
 
         case stage: ResultStage =>
-          partitionsToCompute.map { id =>
+          orderedPartitionsToCompute.map { id =>
             val p: Int = stage.partitions(id)
             val part = partitions(p)
             val locs = taskIdToLocations(id)
@@ -5252,6 +5284,65 @@ private[spark] object DAGScheduler {
   // this is a simplistic way to avoid resubmitting tasks in the non-fetchable map stage one by one
   // as more failure events come in
   val RESUBMIT_TIMEOUT = 200
+
+  private[scheduler] case class UnionTaskAffinityPlan(
+      orderedPartitionIds: Seq[Int],
+      preferredLocations: Map[Int, Seq[TaskLocation]],
+      executorLocations: Seq[ExecutorCacheTaskLocation])
+
+  /**
+   * Build an executor-affinity plan for an opt-in repeated UnionRDD scan. Matching partition
+   * indices from each union parent are assigned to one executor and placed next to one another in
+   * that executor's pending queue. The executor-scoped input layer can then share cached blocks and
+   * in-flight range requests between the repeated scans.
+   *
+   * Return None unless this is a complete, equal-shaped union. A partial retry, a non-union stage,
+   * or differing parent partition sets keeps Spark's original task order and locality behavior.
+   */
+  private[scheduler] def planUnionTaskAffinity(
+      partitionIds: Seq[Int],
+      partitions: Array[Partition],
+      executorLocations: Seq[ExecutorCacheTaskLocation]): Option[UnionTaskAffinityPlan] = {
+    if (executorLocations.isEmpty || partitionIds.toSet != partitions.indices.toSet) {
+      return None
+    }
+
+    val unionPartitions = partitionIds.flatMap { id =>
+      partitions(id) match {
+        case partition: UnionPartition[_] =>
+          Some((id, partition.parentRddIndex, partition.parentPartition.index))
+        case _ => None
+      }
+    }
+    if (unionPartitions.size != partitionIds.size) return None
+
+    val byParent = unionPartitions.groupBy(_._2)
+    if (byParent.size < 2) return None
+    val parentIndices = byParent.keys.toSeq.sorted
+    val baseIndices = byParent(parentIndices.head).map(_._3).sorted
+    if (baseIndices.isEmpty || byParent.values.exists { entries =>
+      entries.map(_._3).sorted != baseIndices || entries.map(_._3).distinct.size != entries.size
+    }) {
+      return None
+    }
+
+    val partitionIdByParentAndBase = unionPartitions.map { case (id, parent, base) =>
+      (parent, base) -> id
+    }.toMap
+    val executors = executorLocations.distinct
+    val orderedIds = baseIndices
+      .grouped(executors.size)
+      .flatMap { baseBatch =>
+        parentIndices.iterator.flatMap { parent =>
+          baseBatch.iterator.map(base => partitionIdByParentAndBase((parent, base)))
+        }
+      }
+      .toSeq
+    val preferredLocations = unionPartitions.iterator.map { case (id, _, base) =>
+      id -> Seq(executors(Math.floorMod(base, executors.size)))
+    }.toMap
+    Some(UnionTaskAffinityPlan(orderedIds, preferredLocations, executors))
+  }
 }
 
 /**

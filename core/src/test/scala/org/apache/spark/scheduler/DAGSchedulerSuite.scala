@@ -184,6 +184,37 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
   import DAGSchedulerSuite._
 
+  test("repeated union task affinity groups matching input partitions per executor") {
+    val parents = (0 until 3).map { parent =>
+      sc.parallelize((0 until 5).map(index => (parent, index)), 5)
+    }
+    val union = sc.union(parents)
+    val executors = Seq(
+      ExecutorCacheTaskLocation("host-a", "1"),
+      ExecutorCacheTaskLocation("host-b", "2"))
+
+    val plan = DAGScheduler.planUnionTaskAffinity(
+      union.partitions.indices, union.partitions, executors).get
+
+    assert(plan.orderedPartitionIds === Seq(
+      0, 1, 5, 6, 10, 11,
+      2, 3, 7, 8, 12, 13,
+      4, 9, 14))
+    assert(plan.preferredLocations(0) === Seq(executors(0)))
+    assert(plan.preferredLocations(5) === Seq(executors(0)))
+    assert(plan.preferredLocations(10) === Seq(executors(0)))
+    assert(plan.preferredLocations(1) === Seq(executors(1)))
+    assert(plan.preferredLocations(6) === Seq(executors(1)))
+  }
+
+  test("repeated union task affinity rejects a partial task set") {
+    val union = sc.union(Seq(sc.parallelize(0 until 2, 2), sc.parallelize(0 until 2, 2)))
+    val executors = Seq(ExecutorCacheTaskLocation("host-a", "1"))
+
+    assert(DAGScheduler.planUnionTaskAffinity(
+      union.partitions.indices.dropRight(1), union.partitions, executors).isEmpty)
+  }
+
   // Necessary to make ScalaTest 3.x interrupt a thread on the JVM like ScalaTest 2.2.x
   implicit val defaultSignaler: Signaler = ThreadSignaler
 
