@@ -243,8 +243,13 @@ class StreamingShuffleWriter[K, V](
             sendCompletionExecutor.execute(() => shards(readerId).replayTo(client))
           },
         (readerId, _) => shards(readerId).creditAvailable(),
-        (readerId, client, lastObservedSequence) =>
-          shards(readerId).replayFromObserved(client, lastObservedSequence),
+        (readerId, client, lastObservedSequence) => readerRouteLifecycleLock.synchronized {
+          // An explicit reader-visible cursor is also evidence that a logical reader has reused
+          // this physical lane. Reopen its lifecycle before a relaxed cleanup check can retire
+          // the writer using the previous reader's acknowledgment.
+          lastReaderRouteRegistrationNanos.set(System.nanoTime())
+          shards(readerId).replayFromObserved(client, lastObservedSequence)
+        },
         expectedReaderRoutes))
 
   private val memoryConsumer = new MemoryConsumer(
@@ -1368,7 +1373,11 @@ class StreamingShuffleWriter[K, V](
     private[streaming] def replayFromObserved(
         target: TransportClient,
         lastObservedSequence: Long): Unit = synchronized {
-      if (outboundClosed || terminationAckedClients.contains(target)) return
+      if (outboundClosed) return
+      // Executor receive service can replace a logical inbox while reusing its shared physical
+      // TransportClient. The old logical reader's termination ACK must not suppress the new
+      // reader's authoritative repair request on that lane.
+      if (terminationAckedClients.remove(target)) terminationAckReceived.set(false)
       val localCursor = lastEnqueuedByClient.getOrElse(target, -1L)
       if (lastObservedSequence < localCursor) {
         lastEnqueuedByClient.update(target, lastObservedSequence)

@@ -157,6 +157,32 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("sequence repair reopens a physical lane acknowledged by an earlier reader") {
+    withSpark(new SparkContext("local", "reused-reader-lane-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
+        writer.shards(0).close()
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
+
+        val firstAck = new TerminationAckMessage(0, 0, 0)
+        firstAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(client, firstAck)
+        writer.shards(0).allRegisteredClientsAcked shouldBe true
+
+        writer.shards(0).replayFromObserved(client, -1L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+        writer.shards(0).allRegisteredClientsAcked shouldBe false
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   test("writer linger waits for a replacement reader to acknowledge termination") {
     val conf = newConf()
       .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
