@@ -209,7 +209,7 @@ class StreamingShuffleWriterSuite
     client
   }
 
-  test("termination repair stays ordered without a write-completion fence") {
+  test("termination repair closes stale replay and write-completion fences") {
     withSpark(new SparkContext("local", "ordered-terminal-repair", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {
@@ -224,6 +224,9 @@ class StreamingShuffleWriterSuite
         writer.shards(0).send(new TerminationControlMessage(0, 0))
         eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
 
+        // Model a replay callback that installed its fence but lost the corresponding action.
+        // The repair must use the shard queue to preserve ordering and clear that stale fence.
+        writer.shards(0).beginReplay(client)
         writer.shards(0).retryUnackedTermination() shouldBe 1
         eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
       } finally {
