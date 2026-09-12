@@ -28,6 +28,7 @@ import io.netty.buffer.{ByteBuf, Unpooled}
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
+  STREAMING_SHUFFLE_COMPRESSION_THREADS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
@@ -154,6 +155,27 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     (outboundThreads, outboundSubmitted.get(), outboundCompleted.get(), outboundPeakQueued.get())
   }
 
+  // Compression is CPU-heavy while route drains are latency-sensitive. A separate small pool
+  // lets producers overlap codec work with scans without occupying every network dispatcher
+  // worker. The producer raw-buffer pool remains the admission and memory bound.
+  private val compressionThreads = math.max(1, math.min(
+    conf.get(EXECUTOR_CORES), conf.get(STREAMING_SHUFFLE_COMPRESSION_THREADS)))
+  private val compressionPool = ThreadUtils.newDaemonFixedThreadPool(
+    compressionThreads, "streaming-shuffle-compression")
+  private val compressionSubmitted = new AtomicLong(0L)
+  private val compressionCompleted = new AtomicLong(0L)
+  private val compressionPeakQueued = new AtomicLong(0L)
+
+  private[streaming] val compressionExecutor: Executor = (command: Runnable) => {
+    compressionSubmitted.incrementAndGet()
+    val queued = compressionPool.getQueue.size().toLong + 1L
+    compressionPeakQueued.accumulateAndGet(queued, Math.max)
+    compressionPool.execute(() => {
+      try command.run()
+      finally compressionCompleted.incrementAndGet()
+    })
+  }
+
   // All writers on this executor send through the same physical reader connection when shared
   // connections are enabled. Keep one batcher at that scope so bodies from different map tasks
   // can be coalesced; a writer-specific batcher can only combine that writer's own routes.
@@ -208,6 +230,11 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     logInfo(
       s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
         s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
+    logInfo(
+      s"Closing executor streaming-shuffle compression pool: threads=$compressionThreads " +
+        s"submitted=${compressionSubmitted.get()} completed=${compressionCompleted.get()} " +
+        s"peakQueued=${compressionPeakQueued.get()}")
+    compressionPool.shutdownNow()
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
     pendingCredits.clear()

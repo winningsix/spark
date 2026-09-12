@@ -2157,6 +2157,18 @@ package object config {
         "spark.shuffle.streaming.sharedWriterServerThreads must be positive.")
       .createWithDefault(16)
 
+  private[spark] val STREAMING_SHUFFLE_COMPRESSION_THREADS =
+    ConfigBuilder("spark.shuffle.streaming.compressionThreads")
+      .doc("Number of executor-scoped workers used to compress streaming shuffle frames. " +
+        "Keeping compression separate from the outbound dispatcher prevents CPU-heavy codec " +
+        "work from delaying replay, credit, control, and network publication.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "spark.shuffle.streaming.compressionThreads must be positive.")
+      .createWithDefault(2)
+
   private[spark] val STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.sharedConnections.enabled")
       .doc("When true, streaming shuffle readers multiplex their logical writer streams over " +

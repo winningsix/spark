@@ -225,6 +225,9 @@ class StreamingShuffleWriter[K, V](
   private val sendCompletionExecutor: Executor = sharedExecutorServer
     .map(_.outboundExecutor)
     .getOrElse(ForkJoinPool.commonPool())
+  private val compressionExecutor: Executor = sharedExecutorServer
+    .map(_.compressionExecutor)
+    .getOrElse(sendCompletionExecutor)
 
   // Exposed for testing
   private[streaming] val transportServerHandler: StreamingShuffleServerHandler =
@@ -1502,7 +1505,7 @@ class StreamingShuffleWriter[K, V](
     /** Append producer work to this shard's ordered admission chain. */
     private def appendAdmission(action: () => Unit): Unit = synchronized {
       admissionTail = admissionTail.thenApplyAsync[Unit]((_: Unit) => action(),
-        sendCompletionExecutor)
+        compressionExecutor)
     }
 
     private def admitTimestampedBuffer(
