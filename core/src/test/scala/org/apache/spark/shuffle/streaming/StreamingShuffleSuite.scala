@@ -677,6 +677,13 @@ class StreamingShuffleSuite
     }
     handler.useMultiplexedChannel()
 
+    // A route that has not observed its first frame still needs explicit replay. The -1 cursor
+    // tells the writer to replay from sequence zero and restores credit consumed by a frame that
+    // disappeared before becoming reader-visible.
+    val replayFromStart = handler.prepareMultiplexedReplayRepair()
+    replayFromStart should not be empty
+    replayFromStart.get.getSeqNum should be(-1L)
+
     def encodeData(sequenceNumber: Long): ByteBuffer = {
       val payload = Unpooled.wrappedBuffer(Array[Byte](1, 2, 3))
       val dataMessage = new DataMessage(shuffleId, 0, 0, payload.readableBytes(), payload, 0L)

@@ -190,7 +190,7 @@ class StreamingShuffleClientHandler(
 
   /** Ask the writer to reconcile its local send cursor with the last reader-visible sequence. */
   private[streaming] def prepareMultiplexedReplayRepair(): Option[CreditControlMessage] = {
-    if (terminationReceived || lastSeqNum < 0) return None
+    if (terminationReceived) return None
     replayRepairActive.set(true)
     val message = new CreditControlMessage(
       shuffleId, shuffleWriterId, shuffleReaderId, Int.MinValue)
