@@ -17,7 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, Semaphore}
+import java.util.concurrent.{CompletableFuture, CompletionException, ConcurrentHashMap, ExecutionException, Semaphore}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.collection.mutable
@@ -84,10 +84,13 @@ private[streaming] final class StreamingShuffleReceiveSession(
       s"Streaming shuffle discovered too many writer locations for $shuffleId: " +
         s"known=${clientFutures.keySet()} fresh=${fresh.keys} expected=$numWriters")
     val pending = connect(fresh)
-    clientFutures.putAll(pending.asJava)
-    pending.values.toSeq.distinct.foreach(_.whenComplete { (_, error) =>
-      if (error != null) failDiscovery(Option(error.getCause).getOrElse(error))
-    })
+    // Wait on error publication too, so a get() wrapper cannot hide the original failure.
+    val observed = pending.values.toSeq.distinct.map { future =>
+      future -> future.whenComplete { (_, error) =>
+        if (error != null) failDiscovery(error)
+      }
+    }.toMap
+    clientFutures.putAll(pending.map { case (id, future) => id -> observed(future) }.asJava)
     if (clientFutures.size() == numWriters) finishDiscovery()
   }
 
@@ -138,13 +141,17 @@ private[streaming] final class StreamingShuffleReceiveSession(
       s"${terminationAckControlMessageSet.size()}, missingHandlerWriter:lastSeq=[$missing]"
   }
 
-  def failDiscovery(error: Throwable): Unit = {
-    finishDiscovery()
-    if (!isClosed) {
-      logError(s"Receive discovery failed for shuffle $shuffleId", error)
-      errorNotifier.markError(error)
-      onDrainReady()
-    }
+  def failDiscovery(error: Throwable): Unit = error match {
+    case wrapped @ (_: CompletionException | _: ExecutionException)
+        if wrapped.getCause != null =>
+      failDiscovery(wrapped.getCause)
+    case _ =>
+      finishDiscovery()
+      if (!isClosed) {
+        logError(s"Receive discovery failed for shuffle $shuffleId", error)
+        errorNotifier.markError(error)
+        onDrainReady()
+      }
   }
 
   def close(): Unit = {

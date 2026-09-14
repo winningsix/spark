@@ -18,7 +18,10 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.zip.CRC32C
+
+import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.{ByteBuf, Unpooled}
 import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
@@ -41,7 +44,8 @@ import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage,
-  StreamingShuffleMessage, TerminationAckMessage, TerminationControlMessage}
+  StreamingShuffleMessage, StreamingShuffleMessageType, TerminationAckMessage,
+  TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -133,26 +137,56 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("idle sequence repair replays a locally submitted terminal") {
-    withSpark(new SparkContext("local", "reader-visible-sequence-repair", newConf())) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        val writer = newWriter(sc, context)
-        val sends = new java.util.concurrent.atomic.AtomicInteger()
-        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
-        writer.transportServerHandler.handleMessage(
-          client, new CreditControlMessage(0, 0, 0, 1))
-        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
-        data.serializationStream.get.writeKey(1).writeValue(1).flush()
-        writer.shards(0).send(data)
-        writer.shards(0).close()
-        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+  Seq(false, true).foreach { coalesced =>
+    test(s"idle sequence repair replays a locally submitted terminal (coalesced=$coalesced)") {
+      withSpark(new SparkContext("local", "reader-visible-sequence-repair", newConf())) { sc =>
+        val context = createTaskContext(sc.conf, 0)
+        try {
+          val writer = newWriter(sc, context)
+          val writes = new ConcurrentLinkedQueue[Vector[(StreamingShuffleMessageType, Long)]]()
+          val client = bindMockClient(writer, 0) { sent =>
+            val view = sent.duplicate()
+            val frames = Vector.newBuilder[(StreamingShuffleMessageType, Long)]
+            while (view.isReadable) {
+              val offset = view.readerIndex()
+              frames += StreamingShuffleMessageType.decode(view.getInt(offset)) ->
+                view.getLong(offset + 4)
+              view.skipBytes(StreamingShuffleUtils.frameLength(view))
+            }
+            writes.add(frames.result())
+          }
+          val dataFrame = StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW -> 0L
+          val terminalFrame = StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE -> 1L
+          val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+          data.serializationStream.get.writeKey(1).writeValue(1).flush()
+          writer.shards(0).synchronized {
+            writer.transportServerHandler.handleMessage(
+              client, new CreditControlMessage(0, 0, 0, 1))
+            writer.shards(0).send(data)
+            // Hold off the initial replay walk until both frames can share one transport body.
+            if (coalesced) writer.shards(0).close()
+          }
+          if (!coalesced) {
+            eventually(Timeout(10.seconds)) {
+              writes.asScala.toVector shouldBe Vector(Vector(dataFrame))
+            }
+            writer.shards(0).close()
+          }
+          val initial = if (coalesced) {
+            Vector(Vector(dataFrame, terminalFrame))
+          } else {
+            Vector(Vector(dataFrame), Vector(terminalFrame))
+          }
+          eventually(Timeout(10.seconds)) { writes.asScala.toVector shouldBe initial }
 
-        // The writer submitted sequence 1, while the reader only observed data sequence 0.
-        writer.shards(0).replayFromObserved(client, 0L)
-        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
-      } finally {
-        context.markTaskCompleted(None)
+          // The writer submitted sequence 1, while the reader only observed data sequence 0.
+          writer.shards(0).replayFromObserved(client, 0L)
+          eventually(Timeout(10.seconds)) {
+            writes.asScala.toVector shouldBe (initial :+ Vector(terminalFrame))
+          }
+        } finally {
+          context.markTaskCompleted(None)
+        }
       }
     }
   }

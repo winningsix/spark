@@ -18,7 +18,8 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue}
+import java.util.concurrent.{Callable, CompletableFuture, CompletionException, CountDownLatch, ExecutionException, Executors, LinkedBlockingQueue, TimeoutException, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
 import io.netty.buffer.Unpooled
 import org.scalatest.matchers.should.Matchers
@@ -200,6 +201,77 @@ class StreamingShuffleReaderSuite
         connection.completeExceptionally(error)
         notifier.getError() shouldBe (if (closed) None else Some(error))
         ready shouldBe (if (closed) 0 else 1)
+      } finally {
+        session.close()
+      }
+    }
+  }
+
+  test("receive session publishes connection failure before releasing connection waiters") {
+    val publicationStarted = new CountDownLatch(1)
+    val allowPublication = new CountDownLatch(1)
+    val publications = new AtomicInteger()
+    val error = new SparkException("connection failed", new IllegalStateException("root cause"))
+    val notifier = new ErrorNotifier() {
+      override def markError(failure: Throwable): Unit = {
+        publications.incrementAndGet()
+        publicationStarted.countDown()
+        assert(allowPublication.await(10, TimeUnit.SECONDS))
+        super.markError(failure)
+      }
+    }
+    val session = new StreamingShuffleReceiveSession(7, notifier, (_, _, _) => ())
+    val connection = new CompletableFuture[Void]()
+    val executor = Executors.newFixedThreadPool(2)
+    try {
+      // Prepared discovery can share one connection future across multiple writers.
+      session.onWriterSnapshot(
+          ShuffleLocationResponse(Map(1L -> location(0), 2L -> location(1)), 2), _ => ()) {
+        _ => Map(1L -> connection, 2L -> connection)
+      }
+      val completion = executor.submit(new Runnable {
+        override def run(): Unit = {
+          connection.completeExceptionally(new CompletionException(error))
+        }
+      })
+      assert(publicationStarted.await(10, TimeUnit.SECONDS))
+      val waiter = executor.submit(new Callable[ExecutionException] {
+        override def call(): ExecutionException = {
+          intercept[ExecutionException] { session.awaitConnections() }
+        }
+      })
+      // A failed raw future is not enough: its original error must be visible first.
+      intercept[TimeoutException] { waiter.get(1, TimeUnit.SECONDS) }
+      notifier.getError() shouldBe None
+      allowPublication.countDown()
+      val wrapper = waiter.get(10, TimeUnit.SECONDS)
+      completion.get(10, TimeUnit.SECONDS)
+      publications.get() shouldBe 1
+      notifier.getError() shouldBe Some(error)
+      session.failDiscovery(wrapper)
+      notifier.getError() shouldBe Some(error)
+      error.getSuppressed shouldBe empty
+    } finally {
+      allowPublication.countDown()
+      executor.shutdownNow()
+      assert(executor.awaitTermination(10, TimeUnit.SECONDS))
+      session.close()
+    }
+  }
+
+  test("receive session unwraps only future exceptions and preserves the domain error") {
+    val error = new SparkException("connection failed", new IllegalStateException("root cause"))
+    val causeLessWrapper = new CompletionException(null: Throwable)
+    Seq(
+      error -> error,
+      new CompletionException(error) -> error,
+      new ExecutionException(new CompletionException(error)) -> error,
+      causeLessWrapper -> causeLessWrapper).foreach { case (failure, expected) =>
+      val notifier = new ErrorNotifier()
+      val session = new StreamingShuffleReceiveSession(7, notifier, (_, _, _) => ())
+      try {
+        session.failDiscovery(failure)
+        notifier.getError() shouldBe Some(expected)
       } finally {
         session.close()
       }
