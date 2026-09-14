@@ -283,10 +283,6 @@ private[spark] class StreamingShuffleManager
     true
   }
 
-  private[streaming] def activeReceiveInboxCount: Int = {
-    if (receiveService == null) 0 else receiveService.activeInboxCount
-  }
-
   override def stop(): Unit = synchronized {
     if (receiveServiceEndpoint != null) {
       SparkEnv.get.rpcEnv.stop(receiveServiceEndpoint)

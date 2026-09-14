@@ -192,8 +192,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       case join: ShuffledHashJoinExec => join
     }
     if (memoryRetainingJoins.nonEmpty && supportsUnmaterializedRegularBoundary) {
-      val pipelineNestedProbes = supportsUnmaterializedRegularBoundary &&
-        conf.getConf(SQLConf.PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED)
+      val pipelineNestedProbes = conf.getConf(SQLConf.PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED)
       // A durable exchange cuts the consumer's build dependency. Exchanges below that cut
       // belong to another execution segment and need not all be materialized. Still protect
       // every join's own build frontier, including joins nested inside another build subtree.

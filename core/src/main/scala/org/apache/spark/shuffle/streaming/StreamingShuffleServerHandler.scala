@@ -83,9 +83,8 @@ class StreamingShuffleServerHandler(
   // the endpoint and replay history alive until each expected reader has registered at least one
   // route; otherwise all currently registered readers can ACK, cleanup can close the writer, and
   // a late reader will wait forever for the termination message that was sent before it connected.
-  private val allReadersConnected = CompletableFuture.allOf(futureClients: _*)
-  // Unlike allReadersConnected, this future includes every physical sibling route expected for
-  // each reducer and is already complete for a reducer with no downstream task.
+  // This future includes every physical sibling route expected for each reducer and is already
+  // complete for a reducer with no downstream task.
   private val expectedClientsConnected: Array[CompletableFuture[Void]] =
     Array.tabulate(numReaders) { readerId =>
       if (expectedClientCounts(readerId) == 0) {
@@ -132,10 +131,6 @@ class StreamingShuffleServerHandler(
 
   private[streaming] def isCreditControlled(readerId: Int, client: TransportClient): Boolean = {
     creditFlowControlEnabled && creditState(readerId, client) != null
-  }
-
-  private[streaming] def allReadersConnectedFuture: CompletableFuture[Void] = {
-    allReadersConnected
   }
 
   private[streaming] def allExpectedReadersConnectedFuture: CompletableFuture[Void] = {
@@ -336,7 +331,7 @@ class StreamingShuffleServerHandler(
   }
 
   override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
-    if (isConnectionClose(cause) &&
+    if (StreamingShuffleUtils.isConnectionClose(cause) &&
         (terminationAckedClients.contains(client) || context.isInterrupted() ||
           context.isFailed() || context.isCompleted())) {
       logDebug(log"Ignoring expected streaming shuffle connection close.", cause)
@@ -344,15 +339,6 @@ class StreamingShuffleServerHandler(
       logError(log"Streaming shuffle server handler caught exception.", cause)
       errorNotifier.markError(cause)
     }
-  }
-
-  private def isConnectionClose(cause: Throwable): Boolean = {
-    val className = cause.getClass.getName
-    val message = Option(cause.getMessage).getOrElse("").toLowerCase(java.util.Locale.ROOT)
-    className.contains("ClosedChannel") ||
-      message.contains("broken pipe") ||
-      message.contains("connection reset") ||
-      Option(cause.getCause).exists(isConnectionClose)
   }
 
   // not needed for streaming shuffle

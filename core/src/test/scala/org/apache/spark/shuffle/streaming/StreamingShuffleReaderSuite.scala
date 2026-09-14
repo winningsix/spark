@@ -18,7 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue}
 
 import io.netty.buffer.Unpooled
 import org.scalatest.matchers.should.Matchers
@@ -29,8 +29,10 @@ import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.SHUFFLE_MANAGER_INCREMENTAL
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
+import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
+import org.apache.spark.util.ErrorNotifier
 
 /**
  * Reader-side unit tests that do not require a shuffle writer. End-to-end writer <-> reader
@@ -73,6 +75,136 @@ class StreamingShuffleReaderSuite
   // The iterator factory drives four collaborators; these tests supply in-memory fakes for all of
   // them so the reader's consumer-loop control flow can be verified without Netty or a SparkEnv.
   private val factory = new StreamingShuffleReaderIteratorFactory()
+
+  private def location(mapIndex: Int): StreamingShuffleTaskLocation =
+    StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, mapIndex)
+
+  test("receive session discovers each logical writer once across incremental snapshots") {
+    var initialized = 0
+    var discoveriesFinished = 0
+    var connected = Set.empty[Long]
+    val session = new StreamingShuffleReceiveSession(
+      7, new ErrorNotifier(), (_, _, _) => (), () => discoveriesFinished += 1)
+    def discover(locations: Map[Long, StreamingShuffleTaskLocation]): Unit = {
+      session.onWriterSnapshot(ShuffleLocationResponse(locations, 2), _ => initialized += 1) {
+        fresh => fresh.map { case (writerId, _) =>
+          connected += writerId
+          session.registerRoute(
+            writerId, mock[TransportClient], mock[StreamingShuffleClientHandler])
+          writerId -> CompletableFuture.completedFuture[Void](null)
+        }
+      }
+    }
+    try {
+      discover(Map(1L -> location(0)))
+      session.isDiscoveryFinished shouldBe false
+      discoveriesFinished shouldBe 0
+      discover(Map(2L -> location(0), 3L -> location(1)))
+      connected shouldBe Set(1L, 3L)
+      initialized shouldBe 1
+      discoveriesFinished shouldBe 1
+      session.isDiscoveryFinished shouldBe true
+      session.awaitConnections()
+      discover(Map(4L -> location(1)))
+      connected shouldBe Set(1L, 3L)
+    } finally {
+      session.close()
+    }
+    discoveriesFinished shouldBe 1
+  }
+
+  test("receive session rejects changed writer counts and excess logical writers") {
+    val session = new StreamingShuffleReceiveSession(7, new ErrorNotifier(), (_, _, _) => ())
+    try {
+      session.onWriterSnapshot(ShuffleLocationResponse(Map.empty, 2), _ => ())(_ => Map.empty)
+      intercept[IllegalArgumentException] {
+        session.onWriterSnapshot(ShuffleLocationResponse(Map.empty, 3), _ => ())(_ => Map.empty)
+      }.getMessage should include("Writer count changed")
+      intercept[IllegalArgumentException] {
+        session.onWriterSnapshot(ShuffleLocationResponse(
+          Map(1L -> location(0), 2L -> location(1), 3L -> location(2)), 2), _ => ()) { _ =>
+          fail("Excess writer locations must be rejected before opening connections")
+        }
+      }.getMessage should include("too many writer locations")
+    } finally {
+      session.close()
+    }
+  }
+
+  test("receive session requires all terminal ACKs before signaling drain readiness") {
+    var ready = 0
+    val session = new StreamingShuffleReceiveSession(
+      7, new ErrorNotifier(), (_, _, _) => (), onDrainReady = () => ready += 1)
+    try {
+      session.onWriterSnapshot(ShuffleLocationResponse(Map.empty, 2), _ => ())(_ => Map.empty)
+      session.onTerminationAck(1)
+      session.onTerminationAck(1)
+      ready shouldBe 0
+      session.allTermAcksSentNotice.tryAcquire() shouldBe false
+      session.onTerminationAck(2)
+      ready shouldBe 1
+      session.allTermAcksSentNotice.tryAcquire() shouldBe true
+      session.onTerminationAck(2)
+      session.allTermAcksSentNotice.tryAcquire() shouldBe false
+      ready shouldBe 1
+    } finally {
+      session.close()
+    }
+  }
+
+  test("receive session makes empty input drain-ready without terminal messages") {
+    var ready = 0
+    val session = new StreamingShuffleReceiveSession(
+      7, new ErrorNotifier(), (_, _, _) => (), onDrainReady = () => ready += 1)
+    try {
+      val empty = ShuffleLocationResponse(Map.empty, 0)
+      session.onWriterSnapshot(empty, _ => ())(_ => Map.empty)
+      session.onWriterSnapshot(empty, _ => ())(_ => Map.empty)
+      session.isDiscoveryFinished shouldBe true
+      session.awaitConnections()
+      ready shouldBe 1
+    } finally {
+      session.close()
+    }
+  }
+
+  test("receive session releases both installed and late routes exactly once on close") {
+    var released = Vector.empty[Long]
+    val session = new StreamingShuffleReceiveSession(
+      7, new ErrorNotifier(), (writerId, _, _) => released :+= writerId)
+    session.registerRoute(1L, mock[TransportClient], mock[StreamingShuffleClientHandler])
+    session.close()
+    session.registerRoute(2L, mock[TransportClient], mock[StreamingShuffleClientHandler])
+    session.close()
+    released shouldBe Vector(1L, 2L)
+    session.clients.isEmpty shouldBe true
+    session.routes shouldBe empty
+  }
+
+  Seq(false, true).foreach { closed =>
+    test(s"receive session handles connection failure after discovery (closed=$closed)") {
+      var ready = 0
+      val notifier = new ErrorNotifier()
+      val session = new StreamingShuffleReceiveSession(
+        7, notifier, (_, _, _) => (), onDrainReady = () => ready += 1)
+      val connection = new CompletableFuture[Void]()
+      val error = new IllegalStateException("connection failed")
+      try {
+        session.onWriterSnapshot(
+          ShuffleLocationResponse(Map(1L -> location(0)), 1), _ => ()) { _ =>
+          Map(1L -> connection)
+        }
+        session.isDiscoveryFinished shouldBe true
+        ready shouldBe 0
+        if (closed) session.close()
+        connection.completeExceptionally(error)
+        notifier.getError() shouldBe (if (closed) None else Some(error))
+        ready shouldBe (if (closed) 0 else 1)
+      } finally {
+        session.close()
+      }
+    }
+  }
 
   test("decompression input reuses direct scratch for a scattered transport frame") {
     val input = new StreamingShuffleDecompressionInput

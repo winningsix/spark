@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, CompositeByteBuf}
+import io.netty.buffer.ByteBuf
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkContext, SparkEnv}
@@ -149,32 +149,6 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
   }
 
-  private def nextMessageLength(buf: ByteBuf): Int = {
-    val index = buf.readerIndex()
-    val readable = buf.readableBytes()
-    if (readable < 12) {
-      throw new IllegalArgumentException(
-        s"Streaming shuffle message is too short: $readable bytes")
-    }
-    StreamingShuffleMessageType.decode(buf.getInt(index)) match {
-      case StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW =>
-        val dataHeaderLength = 40
-        if (readable < dataHeaderLength) {
-          throw new IllegalArgumentException(
-            s"Truncated streaming DataMessage header: $readable bytes")
-        }
-        val dataSize = buf.getInt(index + 24)
-        if (dataSize < 0 || dataSize > readable - dataHeaderLength) {
-          throw new IllegalArgumentException(
-            s"Invalid streaming DataMessage size $dataSize with $readable bytes available")
-        }
-        dataHeaderLength + dataSize
-      case StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE => 24
-      case StreamingShuffleMessageType.CREDIT_CONTROL_MESSAGE |
-          StreamingShuffleMessageType.TERMINATION_ACK_MESSAGE => 28
-    }
-  }
-
   /**
    * Routes a body containing complete frames, preserving contiguous frame batches for each
    * logical route. A normal one-route body therefore still reaches the reader in one call, while
@@ -195,7 +169,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     while (view.isReadable) {
       val frameStart = view.readerIndex()
       val route = decodeRoute(view)
-      val messageLength = nextMessageLength(view)
+      val messageLength = StreamingShuffleUtils.frameLength(view)
       view.skipBytes(messageLength)
       if (currentRoute == null) {
         currentRoute = route
@@ -346,29 +320,21 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     val client = installed.head.registration.client
     require(installed.forall(_.registration.client eq client),
       "Initial credit batch must use one physical client")
-    var buf: CompositeByteBuf = null
-    try {
-      val messages = installed.zipWithIndex.map { case (entry, index) =>
-        entry.registration.handler.prepareMultiplexedInitialCredit(
-          client, configureSocket = index == 0)
-      }
-      val encodedBytes = messages.foldLeft(0)(_ + _.headerLength())
-      buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
-      messages.foreach(_.encode(buf))
-      val handlers = installed.map(_.registration.handler)
-      client.send(buf.retain()).addListener(
-        new GenericFutureListener[Future[Void]] {
-          override def operationComplete(future: Future[Void]): Unit = {
-            if (!future.isSuccess) {
-              val cause = Option(future.cause()).getOrElse(
-                new RuntimeException("Unknown initial credit batch send failure"))
-              handlers.foreach(_.initialCreditBatchSendFailed(cause))
-            }
-          }
-        })
-    } finally {
-      if (buf != null) buf.release()
+    val messages = installed.zipWithIndex.map { case (entry, index) =>
+      entry.registration.handler.prepareMultiplexedInitialCredit(
+        client, configureSocket = index == 0)
     }
+    val handlers = installed.map(_.registration.handler)
+    StreamingShuffleUtils.sendControlMessages(client, messages).addListener(
+      new GenericFutureListener[Future[Void]] {
+        override def operationComplete(future: Future[Void]): Unit = {
+          if (!future.isSuccess) {
+            val cause = Option(future.cause()).getOrElse(
+              new RuntimeException("Unknown initial credit batch send failure"))
+            handlers.foreach(_.initialCreditBatchSendFailed(cause))
+          }
+        }
+      })
   }
 
   /** Send a body containing the latest credit watermark for each selected logical route. */
@@ -376,12 +342,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       credits: Seq[PendingCredit],
       client: TransportClient): Unit = {
     if (credits.isEmpty) return
-    var buf: CompositeByteBuf = null
     try {
-      val encodedBytes = credits.foldLeft(0)(_ + _.message.headerLength())
-      buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
-      credits.foreach(_.message.encode(buf))
-      client.send(buf.retain()).addListener(
+      StreamingShuffleUtils.sendControlMessages(client, credits.map(_.message)).addListener(
         new GenericFutureListener[Future[Void]] {
           override def operationComplete(future: Future[Void]): Unit = {
             if (!future.isSuccess) {
@@ -393,8 +355,6 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         })
     } catch {
       case error: Throwable => credits.foreach(_.handler.creditBatchSendFailed(client, error))
-    } finally {
-      if (buf != null) buf.release()
     }
   }
 
@@ -588,7 +548,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       scheduledCumulativeCreditClients.clear()
     }
     activeRegistrations
-      .filterNot(_.laneShared).map(_.client).toSeq.distinct.foreach(_.close())
+      .filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
     registrations.clear()
     laneClients.values().asScala.toSeq.distinct.foreach(_.close())
     laneClients.clear()

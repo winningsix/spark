@@ -337,6 +337,14 @@ class StreamingShuffleWriterSuite
         writer.shards(0).beginReplay(client)
         writer.shards(0).retryUnackedTermination() shouldBe 1
         eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+
+        // Finishing the replay action must clear its retry fence even without a write callback.
+        eventually(Timeout(10.seconds)) {
+          writer.shards(0).retryUnackedTermination() shouldBe 1
+        }
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
+        writer.shards(0).markTerminationAck(client)
+        writer.shards(0).retryUnackedTermination() shouldBe 0
       } finally {
         context.markTaskCompleted(None)
       }

@@ -358,9 +358,6 @@ private[streaming] final class StreamingShuffleMessageQueue
     snapshot.iterator()
   }
 
-  /** Visible to focused tests to verify that body batching is actually used. */
-  private[streaming] def numQueuedBatches: Int = batches.size()
-
   private[streaming] def queuedMemoryBytesCount: Long = queuedMemoryBytes.get()
 
   private[streaming] def spilledBytesCount: Long = spilledBytes.get()

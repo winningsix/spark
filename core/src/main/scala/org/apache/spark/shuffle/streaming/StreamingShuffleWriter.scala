@@ -523,14 +523,22 @@ class StreamingShuffleWriter[K, V](
         }
       }
     }
-    private sealed trait OutboundAction
-    private case class DataAction(entries: Seq[PendingSend]) extends OutboundAction
+    private sealed trait OutboundAction {
+      def maxSequenceNum: Long
+    }
+    private case class DataAction(entries: Seq[PendingSend]) extends OutboundAction {
+      override def maxSequenceNum: Long = entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
+    }
     private case class ControlAction(sequenceNum: Long, buf: CompositeByteBuf)
-      extends OutboundAction
-    private case class ReplayAction(target: TransportClient, maxSequenceNum: Long)
-      extends OutboundAction
-    private case class RetryTerminalAction(target: TransportClient, terminal: ReplayEntry)
-      extends OutboundAction
+      extends OutboundAction {
+      override def maxSequenceNum: Long = sequenceNum
+    }
+    // Terminal retries use the same ordered replay path. Once its suffix is exhausted, only a
+    // retry resends the retained terminal to solicit a missing application ACK.
+    private case class ReplayAction(
+        target: TransportClient,
+        maxSequenceNum: Long,
+        retryTerminal: Option[ReplayEntry] = None) extends OutboundAction
     private val pendingBatch = new mutable.ArrayBuffer[PendingSend]()
     private var pendingBatchBytes = 0
     // State changes (sequence numbers, replay cursors, and the action queue) stay serialized on
@@ -746,28 +754,6 @@ class StreamingShuffleWriter[K, V](
       }
     }
 
-    /** Check credit against the frame that will actually be sent to each target. */
-    private def dataCreditAvailableForAction(
-        connected: TransportClient,
-        maxSequenceNum: Long): Boolean = {
-      connectedTargets(connected).forall { target =>
-        if (!transportServerHandler.isCreditControlled(id, target)) {
-          true
-        } else {
-          nextReplayEntry(target, maxSequenceNum).forall(replayEntryHasCredit(target, _))
-        }
-      }
-    }
-
-    /** Consume credit for the exact frame selected for each controlled route. */
-    private def consumeDataCreditForAction(
-        connected: TransportClient,
-        maxSequenceNum: Long): Unit = {
-      connectedTargets(connected).foreach { target =>
-        nextReplayEntry(target, maxSequenceNum).foreach(consumeReplayEntryCredit(target, _))
-      }
-    }
-
     /** Check the per-logical-reader credit for a data body. */
     private def dataCreditAvailable(
         connected: TransportClient,
@@ -861,18 +847,11 @@ class StreamingShuffleWriter[K, V](
         target: TransportClient,
         cause: Throwable): Boolean = {
       val taskCancelled = context.isInterrupted() || context.isFailed() || context.isCompleted()
-      def isConnectionClose(t: Throwable): Boolean = {
-        val className = t.getClass.getName
-        val message = Option(t.getMessage).getOrElse("").toLowerCase(java.util.Locale.ROOT)
-        className.contains("ClosedChannel") ||
-          message.contains("broken pipe") ||
-          message.contains("connection reset") ||
-          Option(t.getCause).exists(isConnectionClose)
-      }
       // A bounded result may close a reducer socket while the producer is still completing an
       // in-flight frame. The reader side reports a genuine pre-termination writer disconnect;
       // the producer must not abort the whole group merely because this peer went away.
-      isConnectionClose(cause) && (!target.getChannel.isActive || taskCancelled)
+      StreamingShuffleUtils.isConnectionClose(cause) &&
+        (!target.getChannel.isActive || taskCancelled)
     }
 
     private def scheduleDrainTaskLocked(): Unit = {
@@ -893,14 +872,13 @@ class StreamingShuffleWriter[K, V](
           buf.release()
           pendingSends.decrementAndGet()
           maybeCompleteDeliveryBarrier()
-        case ReplayAction(_, _) =>
-        case RetryTerminalAction(target, _) => synchronized {
-          terminalRetryPendingClients -= target
+        case ReplayAction(target, _, terminal) => synchronized {
+          if (terminal.isDefined) terminalRetryPendingClients -= target
         }
       }
     }
 
-    private def failOutboundActionsLocked(error: Throwable): Seq[OutboundAction] = {
+    private def failOutboundActionsLocked(): Seq[OutboundAction] = {
       outboundClosed = true
       val actions = outboundActions.toSeq
       outboundActions.clear()
@@ -921,7 +899,7 @@ class StreamingShuffleWriter[K, V](
                 scheduleDrainTaskLocked()
                 Nil
               } else {
-                failOutboundActionsLocked(error)
+                failOutboundActionsLocked()
               }
             }
             failed.foreach(action => failAction(action, error))
@@ -961,19 +939,10 @@ class StreamingShuffleWriter[K, V](
                 case DataAction(entries) => estimatedNetworkBytes(entries)
                 case _ => 0L
               }
-              val maxSequenceNum = action match {
-                case DataAction(entries) => entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
-                case ReplayAction(_, maxSeq) => maxSeq
-                case RetryTerminalAction(_, terminal) => terminal.sequenceNum
-                case _ => -1L
-              }
               val creditReady = action match {
                 case DataAction(entries) => dataCreditAvailable(connected, entries)
-                case ReplayAction(target, maxSeq) =>
+                case ReplayAction(target, maxSeq, _) =>
                   nextReplayEntry(target, maxSeq).forall(replayEntryHasCredit(target, _))
-                case RetryTerminalAction(target, terminal) =>
-                  nextReplayEntry(target, terminal.sequenceNum)
-                    .forall(replayEntryHasCredit(target, _))
                 case _ => true
               }
               if (!creditReady) {
@@ -991,14 +960,10 @@ class StreamingShuffleWriter[K, V](
                 None
               } else {
                 action match {
-                case DataAction(entries) => consumeDataCredit(connected, entries)
-                case ReplayAction(target, maxSeq) =>
-                  nextReplayEntry(target, maxSeq).foreach(
-                    consumeReplayEntryCredit(target, _))
-                case RetryTerminalAction(target, terminal) =>
-                  nextReplayEntry(target, terminal.sequenceNum).foreach(
-                    consumeReplayEntryCredit(target, _))
-                case _ =>
+                  case DataAction(entries) => consumeDataCredit(connected, entries)
+                  case ReplayAction(target, maxSeq, _) =>
+                    nextReplayEntry(target, maxSeq).foreach(consumeReplayEntryCredit(target, _))
+                  case _ =>
                 }
                 inFlightNetworkBytes += reservedBytes
                 // Remove the original action only after every admission check succeeds. When a
@@ -1042,15 +1007,15 @@ class StreamingShuffleWriter[K, V](
         only: Option[TransportClient] = None,
         batchControlledRoute: Boolean = false): Seq[(TransportClient, Seq[ReplayEntry])] =
       synchronized {
-        val candidates = only.toSeq ++ {
-          if (only.isDefined) Seq.empty
-          else (Seq(client) ++ transportServerHandler.clientsFor(id)).distinct
-        }
         // ReplayAction is the only action allowed to target a fenced client. All ordinary
         // broadcast actions wait until that client's prefix has been submitted.
-        val clients = candidates.distinct.filter(target =>
-          only.isDefined || !replayPendingClients.contains(target))
-        clients.distinct.flatMap { target =>
+        val clients = only match {
+          case Some(target) => Seq(target)
+          case None =>
+            (client +: transportServerHandler.clientsFor(id)).distinct
+              .filterNot(replayPendingClients.contains)
+        }
+        clients.flatMap { target =>
           val lastEnqueued = lastEnqueuedByClient.getOrElse(target, -1L)
           val pending = replayAfter(lastEnqueued, maxSequenceNum)
           // A replacement route always starts its sequence check at zero.  Detect a missing
@@ -1103,20 +1068,15 @@ class StreamingShuffleWriter[K, V](
         client: TransportClient,
         action: OutboundAction,
         reservedNetworkBytes: Long): Unit = {
-      val maxSequenceNum = action match {
-        case DataAction(entries) => entries.lastOption.map(_.sequenceNum).getOrElse(-1L)
-        case ControlAction(sequenceNum, _) => sequenceNum
-        case ReplayAction(_, maxSequenceNum) => maxSequenceNum
-        case RetryTerminalAction(_, terminal) => terminal.sequenceNum
-      }
+      val maxSequenceNum = action.maxSequenceNum
       val sends = action match {
-        case ReplayAction(target, _) => clientsAndReplay(client, maxSequenceNum, Some(target))
-        case RetryTerminalAction(target, terminal) =>
-          if (nextReplayEntry(target, maxSequenceNum).nonEmpty) {
-            clientsAndReplay(client, maxSequenceNum, Some(target))
+        case ReplayAction(target, _, terminal) =>
+          if (terminal.isDefined && nextReplayEntry(target, maxSequenceNum).isEmpty) {
+            val entries = terminal.toSeq
+            pinReplayEntries(entries)
+            Seq(target -> entries)
           } else {
-            synchronized { pinReplayEntries(Seq(terminal)) }
-            Seq(target -> Seq(terminal))
+            clientsAndReplay(client, maxSequenceNum, Some(target))
           }
         case DataAction(_) => clientsAndReplay(
           client, maxSequenceNum, batchControlledRoute = true)
@@ -1137,7 +1097,7 @@ class StreamingShuffleWriter[K, V](
             pendingSends.decrementAndGet()
             maybeCompleteDeliveryBarrier()
           }
-        case ReplayAction(_, _) | RetryTerminalAction(_, _) => () => ()
+        case _: ReplayAction => () => ()
       }
       val remaining = new AtomicInteger(sends.size)
       def completeBroadcast(): Unit = {
@@ -1169,20 +1129,17 @@ class StreamingShuffleWriter[K, V](
       // A controlled route is intentionally advanced by one frame per action. Requeue its
       // remaining replay suffix at the front so the next frame waits for returned credit and
       // cannot be overtaken by a later DataAction.
-      val replayContinuations: Seq[(TransportClient, OutboundAction)] = sends.collect {
+      val replayContinuations = sends.collect {
         case (target, batchEntries) if transportServerHandler.isCreditControlled(id, target) &&
             batchEntries.nonEmpty &&
             nextReplayEntry(target, maxSequenceNum).nonEmpty =>
-          val continuation = action match {
-            case RetryTerminalAction(_, terminal) => RetryTerminalAction(target, terminal)
+          action match {
+            case replay: ReplayAction => replay.copy(target = target)
             case _ => ReplayAction(target, maxSequenceNum)
           }
-          target -> continuation
       }
       if (replayContinuations.nonEmpty) synchronized {
-        replayContinuations.reverse.foreach { case (_, continuation) =>
-          outboundActions.prepend(continuation)
-        }
+        replayContinuations.reverse.foreach(outboundActions.prepend)
         scheduleDrainTaskLocked()
       }
       // A client-registration callback installs its replay fence synchronously and walks replay
@@ -1205,21 +1162,16 @@ class StreamingShuffleWriter[K, V](
         scheduleDrainTaskLocked()
       }
       action match {
-        case ReplayAction(target, _) if !replayContinuations.exists(_._1 == target) =>
-          synchronized {
-            replayPendingClients -= target
-            scheduleDrainTaskLocked()
-          }
-        case RetryTerminalAction(target, _)
-            if !replayContinuations.exists(_._1 == target) => synchronized {
-          terminalRetryPendingClients -= target
+        case ReplayAction(target, _, terminal)
+            if !replayContinuations.exists(_.target == target) => synchronized {
+          if (terminal.isDefined) terminalRetryPendingClients -= target
           replayPendingClients -= target
           scheduleDrainTaskLocked()
         }
         case _ =>
       }
       action match {
-        case ControlAction(_, _) | ReplayAction(_, _) | RetryTerminalAction(_, _) =>
+        case _: ControlAction | _: ReplayAction =>
           sends.map(_._1).distinct.foreach(target => crossRouteBatcher.foreach(_.flush(target)))
         case _ =>
       }
@@ -1368,10 +1320,6 @@ class StreamingShuffleWriter[K, V](
       if (!outboundClosed) replayPendingClients += target
     }
 
-    private[streaming] def isReplayPending(target: TransportClient): Boolean = synchronized {
-      replayPendingClients.contains(target)
-    }
-
     /**
      * Reconcile local submission with the reader-visible cursor after an idle-period repair.
      *
@@ -1453,7 +1401,7 @@ class StreamingShuffleWriter[K, V](
               !terminalRetryPendingClients.contains(target)
           }.map { target =>
             terminalRetryPendingClients += target
-            outboundActions.append(RetryTerminalAction(target, terminal))
+            outboundActions.append(ReplayAction(target, terminal.sequenceNum, Some(terminal)))
             target
           }
         }

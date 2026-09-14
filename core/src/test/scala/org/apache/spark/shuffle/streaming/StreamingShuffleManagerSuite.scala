@@ -256,7 +256,7 @@ class StreamingShuffleManagerSuite
         ready.get() shouldBe sessions.size
       }
       polls.get() shouldBe 1
-      sessions.foreach(_.totalNumShuffleWriters.get() shouldBe 0)
+      sessions.foreach(_.receiveSession.totalNumShuffleWriters.get() shouldBe 0)
       val (active, peak, _, deliveries) = discovery.stats
       active shouldBe 0
       peak shouldBe sessions.size

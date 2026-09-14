@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.Properties
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
+import java.util.concurrent.{BlockingQueue, CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.language.reflectiveCalls
@@ -595,42 +595,44 @@ class StreamingShuffleSuite
     error.get.getMessage should include("closed before termination")
   }
 
-  test("client handler records no error when the connection closes after termination") {
-    // The mirror of the premature-disconnect test: once a TerminationControlMessage has been
-    // received, the subsequent channelInactive (a clean end-of-stream close) must NOT be treated
-    // as a failure. Driven deterministically at the handler level -- feeding receive() a real
-    // termination message sets terminationReceived through the production code path -- so there is
-    // no reliance on Netty event-loop timing.
-    val errorNotifier = new ErrorNotifier()
-    val queue = new StreamingShuffleMessageQueue()
-    var ackObservedPublishedTerminal = false
-    val handler = new StreamingShuffleClientHandler(
-      0, 0, queue, shuffleId, Long.MaxValue,
-      context = null, errorNotifier = errorNotifier) {
-      // The reader would normally send an ACK over the network here. Observe the queue instead so
-      // the test proves the terminal becomes reader-visible before the writer can see that ACK.
-      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
-        ackObservedPublishedTerminal = queue.peek().isInstanceOf[TerminationControlMessage]
+  Seq(false, true).foreach { batched =>
+    test(s"client handler publishes termination before ACK and clean close (batched=$batched)") {
+      val errorNotifier = new ErrorNotifier()
+      val queue: BlockingQueue[StreamingShuffleMessage] = if (batched) {
+        new StreamingShuffleMessageQueue()
+      } else {
+        new LinkedBlockingQueue[StreamingShuffleMessage]()
       }
+      var acknowledgements = 0
+      val handler = new StreamingShuffleClientHandler(
+        0, 0, queue, shuffleId, Long.MaxValue,
+        context = null, errorNotifier = errorNotifier) {
+        override def sendTerminationAckMessage(client: TransportClient, writerId: Int): Unit = {
+          // The terminal must be reader-visible before the writer can see its ACK.
+          queue.peek().isInstanceOf[TerminationControlMessage] should be(true)
+          acknowledgements += 1
+        }
+      }
+
+      val encoded = ByteBuffer.allocate(24)
+      encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
+      encoded.putLong(0L)
+      encoded.putInt(shuffleId)
+      encoded.putInt(0) // shuffleWriterId
+      encoded.putInt(0) // shuffleReaderId
+      encoded.flip()
+      handler.receive(null, encoded, null)
+      acknowledgements should be(1)
+
+      // A terminal retry is acknowledged again, but must not publish a duplicate terminal.
+      encoded.rewind()
+      handler.receive(null, encoded, null)
+      acknowledgements should be(2)
+      queue.size() should be(1)
+
+      handler.channelInactive(null)
+      errorNotifier.getError() should be(None)
     }
-
-    // Encode a TerminationControlMessage on the wire and hand it to receive(), exactly as a real
-    // writer would. The header is: message-type id (int), sequence number (long), shuffle id
-    // (int), writer id (int), reader id (int); the sequence number must be 0 since the handler
-    // expects a gapless sequence starting at 0.
-    val encoded = ByteBuffer.allocate(24)
-    encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
-    encoded.putLong(0L)
-    encoded.putInt(shuffleId)
-    encoded.putInt(0) // shuffleWriterId
-    encoded.putInt(0) // shuffleReaderId
-    encoded.flip()
-    handler.receive(null, encoded, null)
-    ackObservedPublishedTerminal should be(true)
-
-    // A clean close after termination: the handler must record no error.
-    handler.channelInactive(null)
-    errorNotifier.getError() should be(None)
   }
 
   test("reader catches out of order message sequence number from writer - duplicate") {

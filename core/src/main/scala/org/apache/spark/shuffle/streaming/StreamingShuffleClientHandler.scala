@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable.ArrayBuffer
 
-import io.netty.buffer.{ByteBuf, CompositeByteBuf, Unpooled}
+import io.netty.buffer.{ByteBuf, Unpooled}
 import io.netty.channel.{Channel, ChannelOption}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
@@ -84,7 +84,10 @@ class StreamingShuffleClientHandler(
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
   private val messageBatchingEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
-  private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
+  private val batchQueue = queue match {
+    case batched: StreamingShuffleMessageQueue if messageBatchingEnabled => Some(batched)
+    case _ => None
+  }
   @volatile private var perStreamAutoReadEnabled = true
   @volatile private var multiplexedCreditSender:
       (TransportClient, StreamingShuffleClientHandler) => Unit = _
@@ -149,7 +152,7 @@ class StreamingShuffleClientHandler(
 
   override def channelActive(client: TransportClient): Unit = {
     bindChannel(client, configureSocket = true)
-    sendCreditControlMessage(client, shuffleWriterId, initialCreditAmount)
+    sendCreditControlMessage(client, initialCreditAmount)
   }
 
   /** Bind one logical route and return its discovery frame for an executor-level batch send. */
@@ -220,8 +223,8 @@ class StreamingShuffleClientHandler(
 
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
-  private def updateQuota(bytes: Long): Long = synchronized {
-    if (!backpressureEnabled) return byteLimit
+  private def updateQuota(bytes: Long): Unit = synchronized {
+    if (!backpressureEnabled) return
     remainingBytesQuota -= bytes
     if (perStreamAutoReadEnabled) {
       val autoRead = remainingBytesQuota > 0
@@ -229,27 +232,13 @@ class StreamingShuffleClientHandler(
         channel.config.setAutoRead(autoRead)
         if (autoRead) {
           channel.read()
-        } else {
-          autoReadDisabledTimestamp = System.nanoTime()
         }
       }
     }
-    clampedAvailableReceiveBytes
-  }
-
-  private def clampedAvailableReceiveBytes: Long = {
-    math.max(0L, math.min(byteLimit, remainingBytesQuota))
   }
 
   private def availableReceiveBytes: Long = synchronized {
-    clampedAvailableReceiveBytes
-  }
-
-  private def sendAvailableCreditFloor(client: TransportClient, available: Long): Unit = {
-    val advertised = math.min(available, Int.MaxValue.toLong).toInt
-    if (advertised > 0) {
-      sendCreditControlMessage(client, shuffleWriterId, -advertised)
-    }
+    math.max(0L, math.min(byteLimit, remainingBytesQuota))
   }
 
   protected def sendCumulativeCreditAck(
@@ -265,11 +254,7 @@ class StreamingShuffleClientHandler(
     }
   }
 
-  protected def sendCreditControlMessage(
-      client: TransportClient,
-      shuffleWriterId: Int,
-      credit: Int
-  ): Unit = {
+  protected def sendCreditControlMessage(client: TransportClient, credit: Int): Unit = {
     sendCreditControlMessage(
       client, new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit))
   }
@@ -277,47 +262,27 @@ class StreamingShuffleClientHandler(
   private def sendCreditControlMessage(
       client: TransportClient,
       creditControlMessage: CreditControlMessage): Unit = {
-    var buf: CompositeByteBuf = null
     try {
-      buf = client.getChannel().alloc().compositeBuffer()
-        .capacity(creditControlMessage.headerLength())
-      creditControlMessage.encode(buf)
-
-      // send() will release the buffer, so retain to avoid double free in finally clause
-      client
-        .send(buf.retain())
+      StreamingShuffleUtils.sendControlMessages(client, Seq(creditControlMessage))
         .addListener(
           getResponseHandler(
-            buf,
             s"Error sending credit control message to shuffle writer ${shuffleWriterId}",
             isExpectedFailure = ex => terminationAckFailureIsExpected(ex, client)))
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler sendCreditControlMessage failed", ex)
         errorNotifier.markError(ex)
-    } finally {
-      if (buf != null) {
-        buf.release()
-      }
     }
   }
 
   protected def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
-    var buf: CompositeByteBuf = null
     try {
       val terminationAckMessage =
         new TerminationAckMessage(shuffleId, shuffleWriterId, shuffleReaderId)
       terminationAckMessage.setSeqNum(lastSeqNum)
-      buf = client.getChannel().alloc().compositeBuffer()
-        .capacity(terminationAckMessage.headerLength())
-      terminationAckMessage.encode(buf)
-
-      // send() will release the buffer, so retain to avoid double free in finally clause
-      client
-        .send(buf.retain())
+      StreamingShuffleUtils.sendControlMessages(client, Seq(terminationAckMessage))
         .addListener(
           getResponseHandler(
-            buf,
             s"Error sending termination acknowledgment to shuffle writer ${shuffleWriterId}",
             () => { onTermAckResponse(shuffleWriterId) },
             ex => terminationAckFailureIsExpected(ex, client)
@@ -333,10 +298,6 @@ class StreamingShuffleClientHandler(
           logError(log"Streaming shuffle client handler sendTerminationAckMessage failed", ex)
           errorNotifier.markError(ex)
         }
-    } finally {
-      if (buf != null) {
-        buf.release()
-      }
     }
   }
 
@@ -344,7 +305,7 @@ class StreamingShuffleClientHandler(
       client: TransportClient,
       message: ByteBuffer,
       callback: RpcResponseCallback): Unit = {
-    receiveMessage(client, message, None)
+    receiveMessage(client, message)
   }
 
   override def receive(client: TransportClient, message: ManagedBuffer): Unit = {
@@ -364,43 +325,7 @@ class StreamingShuffleClientHandler(
     receiveMessage(client, message, Some(managedBody))
   }
 
-  /**
-   * Return the length of the next streaming-shuffle message in a transport body.
-   *
-   * The Spark transport frame contains one OneWayMessage body, but a writer may concatenate several
-   * streaming frames in that body to amortize transport writes. DataMessage.decode intentionally
-   * requires an exact frame, so callers must slice each frame before decoding it.
-   */
-  private def nextMessageLength(buf: ByteBuf): Int = {
-    val index = buf.readerIndex()
-    val readable = buf.readableBytes()
-    if (readable < 12) {
-      throw new IllegalArgumentException(
-        s"Streaming shuffle message is too short: $readable bytes")
-    }
-    StreamingShuffleMessageType.decode(buf.getInt(index)) match {
-      case StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW =>
-        val dataHeaderLength = 40 // common header (12) + DataMessage header (28)
-        if (readable < dataHeaderLength) {
-          throw new IllegalArgumentException(
-            s"Truncated streaming DataMessage header: $readable bytes")
-        }
-        val dataSize = buf.getInt(index + 24)
-        if (dataSize < 0 || dataSize > readable - dataHeaderLength) {
-          throw new IllegalArgumentException(
-            s"Invalid streaming DataMessage size $dataSize with $readable bytes available")
-        }
-        dataHeaderLength + dataSize
-      case StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE => 24
-      case StreamingShuffleMessageType.CREDIT_CONTROL_MESSAGE |
-          StreamingShuffleMessageType.TERMINATION_ACK_MESSAGE => 28
-    }
-  }
-
-  private def receiveMessage(
-      client: TransportClient,
-      message: ByteBuffer,
-      managedBody: Option[ManagedBuffer]): Unit = {
+  private def receiveMessage(client: TransportClient, message: ByteBuffer): Unit = {
     val buf = Unpooled.wrappedBuffer(message).copy()
     receiveMessage(client, buf, managedBody = None)
   }
@@ -420,13 +345,19 @@ class StreamingShuffleClientHandler(
     val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
     val pendingTerminationAcks = new ArrayBuffer[Int]()
     var publishedMessage = false
+    // Both queue modes acknowledge only after ownership has transferred to the consumer.
+    def messagesPublished(): Unit = {
+      publishedMessage = true
+      pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+      pendingTerminationAcks.clear()
+    }
     try {
       // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
       // DataMessage processing is asynchronous, so retain that buffer and release it with the
       // decoded message. The direct ByteBuffer entry point has already made its private copy.
       buf = message.duplicate()
       while (buf.isReadable) {
-        val messageSize = nextMessageLength(buf)
+        val messageSize = StreamingShuffleUtils.frameLength(buf)
         val frame = buf.readSlice(messageSize)
         shuffleMessage = StreamingShuffleMessage.decode(frame)
         // End-of-stream is a reliable control frame. A writer may retransmit it until its ACK is
@@ -454,7 +385,7 @@ class StreamingShuffleClientHandler(
             // so replay cannot consume credit permanently.
             if (backpressureEnabled) {
               if (perStreamAutoReadEnabled) {
-                sendCreditControlMessage(client, shuffleWriterId, messageSize)
+                sendCreditControlMessage(client, messageSize)
               } else {
                 val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
                 sendCumulativeCreditAck(client, released)
@@ -465,14 +396,13 @@ class StreamingShuffleClientHandler(
             val retainedBody = managedBody.map(_.retain())
             dataMessage.setReleaseCallback(() => {
               try {
-                val available = updateQuota(-messageSize)
+                updateQuota(-messageSize)
                 if (backpressureEnabled && !terminationReceived) {
                   if (perStreamAutoReadEnabled) {
                     // Dedicated channels retain the original additive-credit protocol; their
                     // channel-level autoRead is the primary admission boundary.
                     sendCreditControlMessage(
                       client,
-                      shuffleWriterId,
                       math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
                   } else {
                     val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
@@ -505,53 +435,22 @@ class StreamingShuffleClientHandler(
         }
         if (duplicateTermination || duplicateReplayData) {
           shuffleMessage.release()
-        } else if (messageBatchingEnabled && queue.isInstanceOf[StreamingShuffleMessageQueue]) {
+        } else if (batchQueue.isDefined) {
           decodedMessages += shuffleMessage
         } else {
           // Preserve the original streaming behavior when batching is disabled: publish each
           // decoded frame immediately so a reader can start consuming before this body is fully
           // parsed.
           queue.put(shuffleMessage)
-          publishedMessage = true
-          pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
-          pendingTerminationAcks.clear()
+          messagesPublished()
         }
         shuffleMessage = null
       }
-      if (decodedMessages.nonEmpty) {
-        queue match {
-          case batchedQueue: StreamingShuffleMessageQueue if messageBatchingEnabled =>
-            batchedQueue.putBatch(decodedMessages.toArray)
-            decodedMessages.clear()
-            publishedMessage = true
-            pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
-            pendingTerminationAcks.clear()
-          case _ =>
-            // Keep ownership tracking precise if an interrupt happens while putting into a
-            // legacy queue. Messages whose put already succeeded belong to the queue; release
-            // only the suffix that was not enqueued.
-            val messages = decodedMessages.toArray
-            decodedMessages.clear()
-            var enqueued = 0
-            try {
-              while (enqueued < messages.length) {
-                val enqueuedMessage = messages(enqueued)
-                queue.put(enqueuedMessage)
-                enqueued += 1
-                publishedMessage = true
-                enqueuedMessage match {
-                  case controlMessage: TerminationControlMessage =>
-                    sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
-                  case _ =>
-                }
-              }
-              pendingTerminationAcks.clear()
-            } finally {
-              while (enqueued < messages.length) {
-                messages(enqueued).release()
-                enqueued += 1
-              }
-            }
+      batchQueue.foreach { batched =>
+        if (decodedMessages.nonEmpty) {
+          batched.putBatch(decodedMessages.toArray)
+          decodedMessages.clear()
+          messagesPublished()
         }
       }
       if (publishedMessage) {
@@ -613,7 +512,6 @@ class StreamingShuffleClientHandler(
   override def getStreamManager: StreamManager = null
 
   private def getResponseHandler(
-      buf: ByteBuf,
       errorMsg: String,
       onSuccessFunc: () => Unit = () => {},
       isExpectedFailure: Throwable => Boolean = _ => false)
@@ -658,15 +556,7 @@ class StreamingShuffleClientHandler(
     if (!terminationReceived && client.getChannel.isActive) {
       false
     } else {
-      def hasClosedEndpoint(t: Throwable): Boolean = {
-        val className = t.getClass.getName
-        val message = Option(t.getMessage).getOrElse("").toLowerCase(java.util.Locale.ROOT)
-        className.contains("ClosedChannel") ||
-          message.contains("broken pipe") ||
-          message.contains("connection reset") ||
-          Option(t.getCause).exists(hasClosedEndpoint)
-      }
-      hasClosedEndpoint(ex)
+      StreamingShuffleUtils.isConnectionClose(ex)
     }
   }
 }

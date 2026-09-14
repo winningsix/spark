@@ -17,23 +17,16 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.File
 import java.nio.ByteBuffer
-import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
-
-import scala.collection.mutable
-import scala.jdk.CollectionConverters._
+import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentLinkedQueue, TimeUnit}
 
 import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 
-import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
+import org.apache.spark.{SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
   STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS, STREAMING_SHUFFLE_READER_MAX_MEMORY,
-  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
-  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
@@ -167,10 +160,7 @@ class StreamingShuffleReader[K, C](
 
   private val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, _, C]]
   setShuffleIdForLogging(streamingShuffleHandle.shuffleId)
-  // a mapping of mapId and client
-  private[spark] val clientMap = new ConcurrentHashMap[Long, TransportClient]()
-  private val logicalClientHandlers =
-    new ConcurrentHashMap[Long, StreamingShuffleClientHandler]()
+  private[spark] def clientMap = receiveSession.clients
   // Standalone readers used by low-level tests own their factories. Readers constructed by the
   // shuffle manager use its executor-scoped shared factory instead, so this queue stays empty.
   private val clientFactories = new ConcurrentLinkedQueue[TransportClientFactory]()
@@ -180,22 +170,20 @@ class StreamingShuffleReader[K, C](
     if (SparkContext.isDriver(id)) "driver" else "executor"
   }
 
-  private val clientConf = SparkTransportConf.fromSparkConf(
+  private lazy val clientConf = SparkTransportConf.fromSparkConf(
     conf,
     s"streaming-shuffle-reader-${streamingShuffleHandle.shuffleId}-${context.partitionId()}",
     1, // a client should only need to use 1 thread
     role)
 
-  private[spark] val taskDiscoveryExecutor =
+  private[spark] lazy val taskDiscoveryExecutor =
     ThreadUtils.newDaemonSingleThreadExecutor(
       s"streaming-shuffle-task-discovery-thread-" +
         s"${streamingShuffleHandle.shuffleId}-${context.partitionId()}")
 
   private val preparedSession = receiveInbox.flatMap(_.preparedSession)
-  private val activeErrorNotifier = preparedSession.map(_.errorNotifier).getOrElse(errorNotifier)
-  private val totalNumShuffleWriters: AtomicInteger = preparedSession
-    .map(_.totalNumShuffleWriters)
-    .getOrElse(new AtomicInteger(-1))
+  private def activeErrorNotifier = receiveSession.errorNotifier
+  private def totalNumShuffleWriters = receiveSession.totalNumShuffleWriters
   private var perWriterByteLimit: Long = 1
 
   // We might need to revisit if the size limit is enough. If not, there should be a way to tie it
@@ -203,19 +191,9 @@ class StreamingShuffleReader[K, C](
   private val MAX_MEMORY = conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY)
   private val READER_BACKPRESSURE_ENABLED =
     conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
-  private val READER_QUEUE_MAX_MEMORY = conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
   // Data and termination messages from all writers are put into this queue.
   private[spark] val messageQueue: BlockingQueue[StreamingShuffleMessage] =
-    receiveInbox.map(_.queue).getOrElse(if (
-      conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)) {
-      new StreamingShuffleMessageQueue(
-        READER_QUEUE_MAX_MEMORY,
-        Some(new File(Utils.getLocalDir(conf))))
-    } else {
-      // Keep the disabled setting as the original one-message-per-queue-operation path for
-      // apples-to-apples performance comparisons.
-      new LinkedBlockingQueue[StreamingShuffleMessage]()
-    })
+    receiveInbox.map(_.queue).getOrElse(StreamingShuffleReceiveService.createQueue(conf))
 
   private val memoryConsumer =
     new MemoryConsumer(context.taskMemoryManager(), MemoryMode.OFF_HEAP) {
@@ -234,26 +212,27 @@ class StreamingShuffleReader[K, C](
   }
   private val decompressionInput = new StreamingShuffleDecompressionInput
 
-  // The set of shuffle writers that this reader has successfully received
-  // termination ack messages from.  This is used to make sure all term ack messages
-  // are successfully sent before exiting.
-  private[spark] val terminationAckControlMessageSet = preparedSession
-    .map(_.terminationAckControlMessageSet)
-    .getOrElse(ConcurrentHashMap.newKeySet[Long]())
-
-  private val allTermAcksSentNotice = preparedSession
-    .map(_.allTermAcksSentNotice)
-    .getOrElse(new Semaphore(0))
+  private[spark] def terminationAckControlMessageSet =
+    receiveSession.terminationAckControlMessageSet
+  private def allTermAcksSentNotice = receiveSession.allTermAcksSentNotice
 
   // thread pool used to perform client creation in parallel
-  private[spark] val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
+  private[spark] lazy val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
     conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
     s"streaming-shuffle-async-client-creation-${context.partitionId()}")
 
-  // Signals to other threads that task discovery should stop. For example, we may receive all
-  // the termination messages before we actually put the clients in the client map. In that
-  // scenario we can just exit without checking the client map for whether all the clients were
-  // created.
+  private val receiveSession = preparedSession.map(_.receiveSession).getOrElse {
+    new StreamingShuffleReceiveSession(
+      streamingShuffleHandle.shuffleId,
+      errorNotifier,
+      (writerId, client, handler) => sharedExecutorClient match {
+        case Some(executorClient) => executorClient.unregister(
+          streamingShuffleHandle.shuffleId, Math.toIntExact(writerId), context.partitionId(),
+          handler)
+        case None => client.close()
+      })
+  }
+
   @volatile private var taskDiscoveryShouldStop = false
 
   private var currentDataMessage: StreamingShuffleMessage = _
@@ -294,30 +273,15 @@ class StreamingShuffleReader[K, C](
   private[streaming] def cleanupResources(): Unit = {
     val cleanupStartTime = System.currentTimeMillis()
 
-    Utils.tryLogNonFatalError {
-      stopTaskDiscovery()
-    }
-    Utils.tryLogNonFatalError {
-      shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
-    }
-    sharedExecutorClient match {
-      case Some(executorClient) =>
-        Utils.tryLogNonFatalError {
-          logicalClientHandlers.forEach((writerId, handler) =>
-            executorClient.unregister(
-              streamingShuffleHandle.shuffleId,
-              Math.toIntExact(writerId),
-              context.partitionId(),
-              handler))
-        }
-      case None =>
-        Utils.tryLogNonFatalError {
-          clientMap.forEach((_, client) => client.close())
-        }
-    }
-    logicalClientHandlers.clear()
-    Utils.tryLogNonFatalError {
-      clientFactories.forEach(factory => factory.close())
+    if (preparedSession.isEmpty) {
+      // Close the session before waiting for background work: a late connection must be released,
+      // not installed after the reader's queue has been drained.
+      Utils.tryLogNonFatalError { receiveSession.close() }
+      Utils.tryLogNonFatalError { stopTaskDiscovery() }
+      Utils.tryLogNonFatalError {
+        shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
+      }
+      Utils.tryLogNonFatalError { clientFactories.forEach(_.close()) }
     }
     Utils.tryLogNonFatalError {
       if (currentDataMessage != null) {
@@ -329,18 +293,7 @@ class StreamingShuffleReader[K, C](
       decompressionInput.close()
     }
     val inboxStats = receiveInbox.map(_.close()).getOrElse {
-      val list = new java.util.ArrayList[StreamingShuffleMessage]()
-      messageQueue.drainTo(list)
-      list.forEach(_.release())
-      messageQueue match {
-        case queue: StreamingShuffleMessageQueue =>
-          val stats = StreamingShuffleReceiveInboxStats(
-            queue.spilledBytesCount, queue.spilledMessagesCount)
-          queue.close()
-          stats
-        case _ =>
-          StreamingShuffleReceiveInboxStats(0L, 0L)
-      }
+      StreamingShuffleReceiveService.closeQueue(messageQueue)
     }
     logDebug(
       log"Streaming reader queue spilled ${MDC(LogKeys.NUM_BYTES, inboxStats.spilledBytes)} " +
@@ -361,182 +314,38 @@ class StreamingShuffleReader[K, C](
 
   if (preparedSession.isEmpty) {
     taskDiscoveryExecutor.execute(() => {
-    val startTime = System.currentTimeMillis()
-    try {
-      logDebug(log"Task discovery thread started.")
-      // a mapping of mapId and client creation future.  Used for parallel client creation
-      val clientFutureMap = new ConcurrentHashMap[Long, CompletableFuture[Void]]()
-      // A replayable/internal-consumer shuffle can publish another writer task for the same
-      // logical map index while locations are discovered incrementally. The logical map index,
-      // rather than the transient map task id, is the stable identity for a reader; otherwise a
-      // second publication is counted as an extra writer and discovery fails.
-      val clientMapIndexes = mutable.HashMap.empty[Long, Int]
-
-      var isDone = false
-
-      def shouldStop(): Boolean = {
-        (
-          // Got all locations for shuffle writers
-          // and started creating the clients to communicate with them.
-          isDone
-          // signal from main thread that task discovery should terminate.
-          // For example, we got all the term messages from all clients
-          || taskDiscoveryShouldStop
-          // task has failed or been interrupted.
-          || context.isFailed()
-          || context.isInterrupted()
-          )
-      }
-
-      while (!shouldStop()) {
-        val shuffleLocationResponseOption =
+      def shouldStop: Boolean = taskDiscoveryShouldStop || receiveSession.isClosed ||
+        context.isFailed() || context.isInterrupted()
+      try {
+        while (!receiveSession.isDiscoveryFinished && !shouldStop) {
           tracker.getAvailableShuffleWriterTaskLocations(streamingShuffleHandle.shuffleId)
-
-        var retryCount = 0
-        shuffleLocationResponseOption.foreach {
-          case ShuffleLocationResponse(shuffleWriterLocations, numShuffleWriters) =>
-            if (!totalNumShuffleWriters.compareAndSet(-1, numShuffleWriters)) {
-              val expected = totalNumShuffleWriters.get()
-              require(expected == numShuffleWriters,
-                s"Streaming shuffle writer count changed while discovering locations: " +
-                  s"first=$expected current=$numShuffleWriters " +
-                  s"locations=${shuffleWriterLocations.toSeq.sortBy(_._1)}")
-            } else {
-              perWriterByteLimit = Math.max(MAX_MEMORY / math.max(1, numShuffleWriters), 1)
-              if (READER_BACKPRESSURE_ENABLED) {
-                memoryConsumer.acquireMemory(MAX_MEMORY)
+            .foreach { snapshot =>
+              receiveSession.onWriterSnapshot(snapshot, numWriters => {
+                perWriterByteLimit = math.max(MAX_MEMORY / math.max(1, numWriters), 1L)
+                if (READER_BACKPRESSURE_ENABLED) memoryConsumer.acquireMemory(MAX_MEMORY)
+              }) { locations =>
+                locations.map { case (writerId, location) =>
+                  writerId -> CompletableFuture.runAsync(() => {
+                    createClient(writerId.toInt, location.host, location.port)
+                    ()
+                  }, clientCreationExecutor)
+                }
               }
             }
-            shuffleWriterLocations
-              .foreach {
-                case (mapId, location) =>
-                  val duplicateLogicalWriter = location.mapIndex >= 0 && clientMapIndexes.values
-                    .exists(_ == location.mapIndex)
-                  if (!clientFutureMap.containsKey(mapId) && !duplicateLogicalWriter) {
-                    clientMapIndexes.put(mapId, location.mapIndex)
-                    val future = createClientAsync(mapId.toInt, location.host, location.port)
-                      .thenAccept((shuffleClient: TransportClient) => {
-                        clientMap.put(mapId, shuffleClient)
-                        logDebug(
-                          log"Created shuffle client to shuffle " +
-                            log"writer with id ${MDC(LogKeys.MAP_ID, mapId)} and location ${MDC(
-                              LogKeys.TASK_LOCATION, location)}. ${MDC(
-                              LogKeys.NUM_CONNECTED_SHUFFLE_WRITERS, clientMap.size)} / ${MDC(
-                              LogKeys.NUM_SHUFFLE_WRITERS, numShuffleWriters)} shuffle writer " +
-                            log"tasks connected.")
-                      }).exceptionally(th => {
-                        val errorMsg = s"Error creating transport client to shuffle writer" +
-                          s" with id ${mapId} and location ${location}."
-                        // The real exception is likely wrapped in CompletionException
-                        logError(errorMsg, th.getCause)
-                        activeErrorNotifier.markError(th.getCause)
-                        throw new RuntimeException(errorMsg)
-                      })
-                    clientFutureMap.put(mapId, future)
-                  }
-              }
-
-            val numClients = clientFutureMap.size()
-            // A location response may be an incremental snapshot.  Its writer count describes
-            // that snapshot, while clientFutureMap retains map ids discovered in earlier
-            // snapshots; compare against the stable total captured above instead of the current
-            // response count.
-            val expectedNumShuffleWriters = totalNumShuffleWriters.get()
-            if (numClients > expectedNumShuffleWriters) {
-              val discoveredMapIds = clientFutureMap.keySet().asScala.toSeq.sorted
-              val discoveredMapIndexes = shuffleWriterLocations.toSeq.sortBy(_._1).map {
-                case (id, location) => s"$id:${location.mapIndex}"
-              }.mkString("[", ",", "]")
-              logWarning(log"Streaming shuffle discovered more writer locations than expected: " +
-                log"${MDC(LogKeys.NUM_CONNECTED_SHUFFLE_WRITERS, numClients)} / " +
-                log"${MDC(LogKeys.NUM_SHUFFLE_WRITERS, expectedNumShuffleWriters)}; " +
-                log"map ids=${MDC(LogKeys.MAP_ID, discoveredMapIds)}" +
-                log" map indexes=${MDC(LogKeys.MAP_ID, discoveredMapIndexes)}")
-            }
-            require(numClients <= expectedNumShuffleWriters,
-              s"Streaming shuffle discovered too many writer locations: " +
-                s"actual=$numClients expected=$expectedNumShuffleWriters " +
-                s"clientMapIds=${clientFutureMap.keySet().asScala.toSeq.sorted} " +
-                s"locations=${shuffleWriterLocations.toSeq.sortBy(_._1)}")
-            if (numClients != expectedNumShuffleWriters) {
-              // TODO also implement timeout
-              Thread.sleep(10)
-              retryCount += 1
-              if (retryCount % 100 == 0) {
-                logDebug(log"Still attempting to get shuffle writer locations." +
-                  log" Got the location of ${MDC(LogKeys.NUM_CONNECTED_SHUFFLE_WRITERS,
-                    clientFutureMap.size)} / ${MDC(LogKeys.NUM_SHUFFLE_WRITERS,
-                    numShuffleWriters)} shuffle writers")
-              }
-            } else {
-              // we have received all shuffle writer locations
-              // and are in the process of creating clients to connect to them
-              isDone = true
-            }
+          if (!receiveSession.isDiscoveryFinished && !shouldStop) Thread.sleep(10)
         }
+        if (!shouldStop) receiveSession.awaitConnections()
+      } catch {
+        case error: Throwable => receiveSession.failDiscovery(error)
+      } finally {
+        clientCreationExecutor.shutdown()
       }
-
-      if (isDone && !taskDiscoveryShouldStop && !context.isFailed() && !context.isInterrupted()) {
-        // wait for all futures to finish
-        CompletableFuture.allOf(clientFutureMap.values().asScala.toSeq: _*).get()
-        require(
-          clientMap.size() == totalNumShuffleWriters.get(),
-          s"actual num of clients: ${clientMap.size()} " +
-            s"expected num clients: ${totalNumShuffleWriters.get()} " +
-            s"clientMapIds=${clientMap.keySet().asScala.toSeq.sorted} " +
-            s"clientFutureMapIds=${clientFutureMap.keySet().asScala.toSeq.sorted}"
-        )
-      }
-    } catch {
-      case th: Throwable =>
-        logError(log"Task discovery thread failed.", th)
-        activeErrorNotifier.markError(th)
-    } finally {
-      clientCreationExecutor.shutdown()
-      logDebug(log"Task discovery thread exited. Took ${MDC(LogKeys.DURATION,
-        System.currentTimeMillis() - startTime)} ms")
-    }
     })
-  } else {
-    taskDiscoveryExecutor.shutdown()
-    clientCreationExecutor.shutdown()
   }
 
   private def stopTaskDiscovery(): Unit = {
     taskDiscoveryShouldStop = true
     shutdownExecutorService(taskDiscoveryExecutor, "Task Discovery Executor")
-  }
-
-  private def createClientAsync(
-      mapId: Int,
-      remoteHost: String,
-      remotePort: Int): CompletableFuture[TransportClient] = {
-    val future = new CompletableFuture[TransportClient]()
-    clientCreationExecutor.execute(() => {
-      try {
-        val shuffleClient = createClient(mapId, remoteHost, remotePort)
-        future.complete(shuffleClient)
-      } catch {
-        case th: Throwable =>
-          future.completeExceptionally(th)
-      }
-    })
-    future
-  }
-
-  protected def onTermAckResponse(shuffleWriterId: Int): Unit = {
-    terminationAckControlMessageSet.add(shuffleWriterId.toLong)
-    val curSent = terminationAckControlMessageSet.size()
-    val totalSentNeeded = totalNumShuffleWriters.get()
-    logDebug(log"Termination ack message sent successfully to shuffle writer " +
-      log"${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}." +
-      log" ${MDC(LogKeys.NUM_TERMINATION_ACKS, curSent)} / " +
-      log"${MDC(LogKeys.NUM_SHUFFLE_WRITERS, totalSentNeeded)} sent successfully.")
-
-    // if we have sent all term acks successfully
-    if (totalSentNeeded > 0 && curSent == totalSentNeeded) {
-      allTermAcksSentNotice.release()
-    }
   }
 
   /**
@@ -574,18 +383,16 @@ class StreamingShuffleReader[K, C](
       context,
       activeErrorNotifier
     ))
-    handler.setOnTermAckResponseHandler(onTermAckResponse)
-    sharedExecutorClient match {
+    handler.setOnTermAckResponseHandler(receiveSession.onTerminationAck)
+    val client = sharedExecutorClient match {
       case Some(executorClient) =>
-        val client = executorClient.register(
+        executorClient.register(
           streamingShuffleHandle.shuffleId,
           mapId,
           context.partitionId(),
           remoteHost,
           remotePort,
           handler)
-        logicalClientHandlers.put(mapId.toLong, handler)
-        client
       case None =>
         sharedClientFactory match {
           case Some(factory) =>
@@ -597,6 +404,8 @@ class StreamingShuffleReader[K, C](
             factory.createClient(remoteHost, remotePort)
         }
     }
+    receiveSession.registerRoute(mapId.toLong, client, handler)
+    client
   }
 
   private def checkTaskFailure(): Unit = {
@@ -746,9 +555,10 @@ class StreamingShuffleReader[K, C](
             lastIdleDiagnosticsNanos = now
           }
         case None =>
-          logicalClientHandlers.forEach { (writerId, handler) =>
-            val client = clientMap.get(writerId)
-            if (client != null) handler.repairCreditWindow(client)
+          if (sharedExecutorClient.isDefined) {
+            receiveSession.routes.foreach { case (client, handler) =>
+              handler.repairCreditWindow(client)
+            }
           }
       },
       recordQueueWaitNanos

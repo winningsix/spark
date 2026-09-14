@@ -64,8 +64,6 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   private val maxPermits = Math.toIntExact(
     (maxInFlightBytes + permitUnitBytes - 1) / permitUnitBytes)
   private val inFlightPermits = new Semaphore(maxPermits)
-  private val inFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
-  private val peakInFlightBytes = new java.util.concurrent.atomic.AtomicLong(0L)
 
   private case class PendingBody(
       body: ByteBuf,
@@ -90,15 +88,10 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   private def acquire(bytes: Int): Int = {
     val permits = permitsFor(bytes)
     inFlightPermits.acquire(permits)
-    val current = inFlightBytes.addAndGet(bytes.toLong)
-    peakInFlightBytes.accumulateAndGet(current, Math.max)
     permits
   }
 
-  private def release(bytes: Int, permits: Int): Unit = {
-    inFlightBytes.addAndGet(-bytes.toLong)
-    inFlightPermits.release(permits)
-  }
+  private def release(permits: Int): Unit = inFlightPermits.release(permits)
 
   /** Takes ownership of body and queues it for client. */
   def submit(client: TransportClient, body: ByteBuf, onComplete: () => Unit): Unit = {
@@ -204,11 +197,9 @@ private[streaming] final class StreamingShuffleTransportBatcher(
 
     var outbound: ByteBuf = null
     var addedBodies = 0
-    var admittedBytes = 0
     var admittedPermits = 0
     try {
-      admittedBytes = batch.bytes
-      admittedPermits = acquire(admittedBytes)
+      admittedPermits = acquire(batch.bytes)
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
@@ -224,7 +215,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       // by the synchronous-failure path after send() returns.
       outbound = null
       future.addListener((future: ChannelFuture) => {
-        release(admittedBytes, admittedPermits)
+        release(admittedPermits)
         val error = if (future.isSuccess) null else future.cause()
         complete(batch, if (isExpectedConnectionClose(client, error)) null else error)
       })
@@ -234,7 +225,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
         // Components already added to the aggregate were released above. Bodies after the
         // failing component still own their original reference.
         batch.bodies.drop(addedBodies).foreach(_.body.release())
-        if (admittedPermits > 0) release(admittedBytes, admittedPermits)
+        if (admittedPermits > 0) release(admittedPermits)
         if (!isExpectedConnectionClose(client, e)) {
           errorNotifier.markError(e)
         }
@@ -245,16 +236,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   private def isExpectedConnectionClose(
       client: TransportClient,
       cause: Throwable): Boolean = {
-    if (cause == null || client.getChannel.isActive) return false
-    def isConnectionClose(t: Throwable): Boolean = {
-      val className = t.getClass.getName
-      val message = Option(t.getMessage).getOrElse("").toLowerCase(java.util.Locale.ROOT)
-      className.contains("ClosedChannel") ||
-        message.contains("broken pipe") ||
-        message.contains("connection reset") ||
-        Option(t.getCause).exists(isConnectionClose)
-    }
-    isConnectionClose(cause)
+    cause != null && !client.getChannel.isActive && StreamingShuffleUtils.isConnectionClose(cause)
   }
 
   /**
@@ -285,7 +267,4 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
     }
   }
-
-  /** Exposed for executor diagnostics and tests; this is a transport in-flight high-water mark. */
-  private[streaming] def peakInFlightBytesForTest: Long = peakInFlightBytes.get()
 }
