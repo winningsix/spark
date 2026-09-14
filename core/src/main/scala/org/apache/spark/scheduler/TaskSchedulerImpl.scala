@@ -20,7 +20,7 @@ package org.apache.spark.scheduler
 import java.nio.ByteBuffer
 import java.util.{Properties, TimerTask}
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
@@ -40,7 +40,8 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.shuffle.streaming.StreamingShuffleReceiveInboxId
+import org.apache.spark.shuffle.streaming.{StreamingShuffleReceiveInboxId,
+  StreamingShuffleTaskResources}
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
@@ -202,8 +203,6 @@ private[spark] class TaskSchedulerImpl(
 
   protected val executorIdToHost = new HashMap[String, String]
 
-  private val executorIdToResourceProfileId = new HashMap[String, Int]
-
   private val abortTimer = ThreadUtils.newDaemonSingleThreadScheduledExecutor("task-abort-timer")
   // Exposed for testing
   val unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, Long]
@@ -219,28 +218,182 @@ private[spark] class TaskSchedulerImpl(
   // default scheduler is FIFO
   val schedulingMode: SchedulingMode = conf.get(SCHEDULER_MODE)
 
-  private val pipelinedShuffleTaskCoordinator =
-    new PipelinedShuffleTaskCoordinator(conf, abortTimer, () => backend.reviveOffers())
+  private case class PreTaskReaderKey(stageId: Int, stageAttemptId: Int, taskIndex: Int)
+  private case class PreTaskReaderAssignment(
+      executorId: String,
+      inboxes: Seq[StreamingShuffleReceiveInboxId])
+  private val preTaskReaderAssignments =
+    new HashMap[PreTaskReaderKey, PreTaskReaderAssignment]
+  private val offerReadyPreTaskReaderIndices =
+    new HashMap[(Int, Int, String), HashSet[Int]]
+  private val executorReceiveServiceEnabled =
+    conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+  private val elasticProducerMaxTasksPerStage =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
+  private val elasticProducerSoleStageMaxTasks =
+    conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
+  private val preparedReaderDiagonalAssignment =
+    conf.get(STREAMING_SHUFFLE_PREPARED_READER_DIAGONAL_ASSIGNMENT_ENABLED)
+  private val inboxReadyRevivePending = new AtomicBoolean(false)
 
-  private[scheduler] def requiredPreTaskReaderInboxes(
-      taskSet: TaskSet,
-      inboxes: Seq[StreamingShuffleReceiveInboxId]): Seq[StreamingShuffleReceiveInboxId] = {
-    pipelinedShuffleTaskCoordinator.requiredReaderInboxes(taskSet, inboxes)
+  private lazy val streamingTrackerMaster: Option[StreamingShuffleOutputTrackerMaster] = {
+    SparkEnv.get.streamingShuffleOutputTracker.collect {
+      case tracker: StreamingShuffleOutputTrackerMaster => tracker
+    }
   }
 
-  private[scheduler] def producerReaderFrontierRoutable(
-      taskSet: TaskSetManager): Boolean = {
-    pipelinedShuffleTaskCoordinator.readerFrontierRoutable(
-      taskSet, rootPool.getSortedTaskSetQueue)
+  private def requestInboxReadyRevive(): Unit = {
+    if (inboxReadyRevivePending.compareAndSet(false, true)) {
+      abortTimer.schedule(
+        new Runnable {
+          override def run(): Unit = {
+            inboxReadyRevivePending.set(false)
+            backend.reviveOffers()
+          }
+        },
+        TaskSchedulerImpl.INBOX_READY_REVIVE_COALESCE_MS,
+        TimeUnit.MILLISECONDS)
+    }
   }
 
-  private[scheduler] def taskCpusForTaskSet(
-      taskSet: TaskSet,
-      profileTaskCpus: BigDecimal,
-      activePureProducerStages: Int = 0,
-      feedsMultiInputReader: Boolean = false): BigDecimal = {
-    pipelinedShuffleTaskCoordinator.taskCpus(
-      taskSet, profileTaskCpus, activePureProducerStages, feedsMultiInputReader)
+  private def preparePipelinedReaderInboxes(
+      taskSets: Iterable[TaskSetManager]): Unit = {
+    if (!executorReceiveServiceEnabled) return
+    streamingTrackerMaster.foreach { tracker =>
+      val activeExecutors = executorIdToRunningTaskIds.keySet.toSet
+      val receiveExecutors = tracker.receiveExecutorIds.filter(activeExecutors.contains).sorted
+      if (activeExecutors.nonEmpty && receiveExecutors.size == activeExecutors.size) {
+        val pendingAssignments = new ArrayBuffer[(PreTaskReaderKey, PreTaskReaderAssignment)]
+        taskSets.iterator.filter { taskSet =>
+          !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+            taskSet.taskSet.pipelinedReaderShuffleIds.nonEmpty
+        }.foreach { taskSet =>
+          taskSet.tasks.indices.foreach { taskIndex =>
+            val key = PreTaskReaderKey(
+              taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
+            if (!preTaskReaderAssignments.contains(key)) {
+              val executorId = receiveExecutors(TaskSchedulerImpl.preparedReaderExecutorIndex(
+                taskIndex, receiveExecutors.size, preparedReaderDiagonalAssignment))
+              val partitionId = taskSet.tasks(taskIndex).partitionId
+              val nextOrdinalByShuffle = new HashMap[Int, Int]
+              val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
+                val readerOrdinal = nextOrdinalByShuffle.getOrElse(shuffleId, 0)
+                nextOrdinalByShuffle.update(shuffleId, readerOrdinal + 1)
+                StreamingShuffleReceiveInboxId(
+                  shuffleId,
+                  taskSet.stageId,
+                  taskSet.taskSet.stageAttemptId,
+                  partitionId,
+                  -1L,
+                  readerOrdinal)
+              }
+              pendingAssignments +=
+                key -> PreTaskReaderAssignment(executorId, inboxes)
+            }
+          }
+        }
+        // Preparing each reduce partition with one synchronous driver -> executor RPC serializes
+        // the resource-offer path (p52 with two inputs means at least 104 round trips). Send one
+        // batch to each executor, then publish assignments only after that executor acknowledged
+        // every inbox in the batch.
+        pendingAssignments.groupBy(_._2.executorId).foreach { case (executorId, assignments) =>
+          if (tracker.prepareReceiveInboxes(
+              executorId, assignments.flatMap(_._2.inboxes).toSeq)) {
+            assignments.foreach { case (key, assignment) =>
+              preTaskReaderAssignments.put(key, assignment)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private def rebuildOfferReadyPreTaskReaderIndices(
+      taskSets: Iterable[TaskSetManager]): Unit = {
+    offerReadyPreTaskReaderIndices.clear()
+    if (!executorReceiveServiceEnabled) return
+    val managersByStage = taskSets.iterator.map { manager =>
+      (manager.stageId, manager.taskSet.stageAttemptId) -> manager
+    }.toMap
+    streamingTrackerMaster.foreach { tracker =>
+      preTaskReaderAssignments.foreach { case (key, assignment) =>
+        managersByStage.get((key.stageId, key.stageAttemptId)).foreach { manager =>
+          if (manager.isTaskPendingForOffer(key.taskIndex) && assignment.inboxes.forall {
+              tracker.isReceiveInboxDrainReady(assignment.executorId, _)
+            }) {
+            offerReadyPreTaskReaderIndices.getOrElseUpdate(
+              (key.stageId, key.stageAttemptId, assignment.executorId), new HashSet[Int]) +=
+              key.taskIndex
+          }
+        }
+      }
+    }
+  }
+
+  private def preTaskReaderIndexAllowed(
+      taskSet: TaskSetManager,
+      executorId: String,
+      taskIndex: Int): Boolean = {
+    if (!executorReceiveServiceEnabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      offerReadyPreTaskReaderIndices.get(
+        (taskSet.stageId, taskSet.taskSet.stageAttemptId, executorId))
+        .exists(_.contains(taskIndex))
+    }
+  }
+
+  private def preTaskReaderTaskSetReady(taskSet: TaskSetManager): Boolean = {
+    if (!executorReceiveServiceEnabled || !taskSet.taskSet.isPipelinedShuffleReader) {
+      true
+    } else {
+      offerReadyPreTaskReaderIndices.keysIterator.exists { case (stageId, attemptId, _) =>
+        stageId == taskSet.stageId && attemptId == taskSet.taskSet.stageAttemptId
+      }
+    }
+  }
+
+  private def isOfferReadyPipelinedReader(taskSet: TaskSetManager): Boolean = {
+    taskSet.taskSet.isPipelinedShuffleReader && preTaskReaderTaskSetReady(taskSet)
+  }
+
+  private def isActivePurePipelinedProducer(taskSet: TaskSetManager): Boolean = {
+    !taskSet.isZombie && taskSet.tasksSuccessful < taskSet.numTasks &&
+      taskSet.taskSet.isPipelinedShuffleProducer &&
+      !taskSet.taskSet.isPipelinedShuffleReader
+  }
+
+  private def readerFrontierStartedForProducer(
+      producer: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): Boolean = {
+    producer.taskSet.shuffleId.exists { shuffleId =>
+      val directReaders = taskSets.iterator.filter { taskSet =>
+        !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
+          taskSet.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
+      }.toSeq
+      // submitTasks(producer) can trigger a resource offer before DAGScheduler has submitted the
+      // direct consumer. Treat that transient absence as NOT started; otherwise this race lets the
+      // producer consume the entire sole-stage window and recreates a producer-then-consumer
+      // boundary. Ready readers are ordered first in the same offer pass, so the condition becomes
+      // true immediately after every submitted direct reader launches.
+      directReaders.nonEmpty && directReaders.forall { reader =>
+        reader.runningTasks > 0 || reader.tasksSuccessful > 0
+      }
+    }
+  }
+
+  private def elasticProducerLaunchAllowed(
+      taskSet: TaskSetManager,
+      soleActivePureProducer: Boolean): Boolean = {
+    val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
+      !taskSet.taskSet.isPipelinedShuffleReader
+    val taskLimit = if (soleActivePureProducer) {
+      elasticProducerSoleStageMaxTasks.orElse(elasticProducerMaxTasksPerStage)
+    } else {
+      elasticProducerMaxTasksPerStage
+    }
+    !executorReceiveServiceEnabled || !pureProducer ||
+      taskLimit.forall(taskSet.runningTasks < _)
   }
 
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
@@ -269,7 +422,9 @@ private[spark] class TaskSchedulerImpl(
 
   def initialize(backend: SchedulerBackend): Unit = {
     this.backend = backend
-    pipelinedShuffleTaskCoordinator.initialize()
+    if (executorReceiveServiceEnabled) {
+      streamingTrackerMaster.foreach(_.setInboxReadyCallback(() => requestInboxReadyRevive()))
+    }
     schedulableBuilder = {
       schedulingMode match {
         case SchedulingMode.FIFO =>
@@ -439,7 +594,16 @@ private[spark] class TaskSchedulerImpl(
         taskSetsByStageIdAndAttempt -= manager.taskSet.stageId
       }
     }
-    pipelinedShuffleTaskCoordinator.removeTaskSet(manager)
+    preTaskReaderAssignments.keysIterator.filter { key =>
+      key.stageId == manager.taskSet.stageId &&
+        key.stageAttemptId == manager.taskSet.stageAttemptId
+    }.toSeq.foreach { key =>
+      preTaskReaderAssignments.remove(key).foreach { assignment =>
+        streamingTrackerMaster.foreach { tracker =>
+          assignment.inboxes.foreach(tracker.releaseReceiveInbox(assignment.executorId, _))
+        }
+      }
+    }
     noRejectsSinceLastReset -= manager.taskSet
     manager.parent.removeSchedulable(manager)
     logInfo(log"Removed TaskSet " + manager.taskSet.logId +
@@ -468,15 +632,9 @@ private[spark] class TaskSchedulerImpl(
       availableCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
-      activePureProducerStages: Int,
-      readerFrontierRoutable: Boolean,
-      readerFrontierStarted: Boolean,
-      fairProducerTaskLimit: Option[Int],
-      upstreamReaderProducers: Seq[TaskSetManager],
-      activeTaskSets: Iterable[TaskSetManager],
-      readerCpuReservations: Map[(Option[String], String), BigDecimal])
+      soleActivePureProducer: Boolean)
     : (Boolean, Option[TaskLocality]) = {
-    if (!pipelinedShuffleTaskCoordinator.taskSetReady(taskSet)) return (true, None)
+    if (!preTaskReaderTaskSetReady(taskSet)) return (true, None)
     var noDelayScheduleRejects = true
     var minLaunchedLocality: Option[TaskLocality] = None
     // Resolve the task cpus once per (task set, locality) round; the per-offer probes below
@@ -484,11 +642,8 @@ private[spark] class TaskSchedulerImpl(
     val taskSetProf = sc.resourceProfileManager
       .resourceProfileFromId(taskSet.taskSet.resourceProfileId)
     val profileTaskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
-    val taskCpus = taskCpusForTaskSet(
-      taskSet.taskSet,
-      profileTaskCpus,
-      activePureProducerStages,
-      pipelinedShuffleTaskCoordinator.feedsMultiInputReader(taskSet.taskSet, activeTaskSets))
+    val taskCpus = StreamingShuffleTaskResources.taskCpus(
+      conf, taskSet.taskSet, profileTaskCpus)
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
     for (i <- shuffledOffers.indices) {
@@ -497,27 +652,10 @@ private[spark] class TaskSchedulerImpl(
       val taskSetRpID = taskSet.taskSet.resourceProfileId
 
       // check whether the task can be scheduled to the executor base on resource profile.
-      if (pipelinedShuffleTaskCoordinator.producerLaunchAllowed(
-          taskSet, activePureProducerStages, readerFrontierRoutable, readerFrontierStarted,
-          fairProducerTaskLimit) &&
-          pipelinedShuffleTaskCoordinator.readerLaunchAllowed(
-            taskSet, execId, activeTaskSets, upstreamReaderProducers) &&
-          sc.resourceProfileManager.canBeScheduled(
-            taskSetRpID, shuffledOffers(i).resourceProfileId)) {
-        val pureProducer = taskSet.taskSet.isPipelinedShuffleProducer &&
-          !taskSet.taskSet.isPipelinedShuffleReader
-        val taskSetRunEpoch = Option(taskSet.taskSet.properties).flatMap { properties =>
-          Option(properties.getProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH))
-        }
-        val readerCpuReservation =
-          readerCpuReservations.getOrElse(taskSetRunEpoch -> execId, BigDecimal(0))
-        val cpusAvailableForTask = if (pureProducer) {
-          (availableCpus(i) - readerCpuReservation).max(BigDecimal(0))
-        } else {
-          availableCpus(i)
-        }
+      if (elasticProducerLaunchAllowed(taskSet, soleActivePureProducer) && sc.resourceProfileManager
+        .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
-          cpusAvailableForTask, availableResources(i))
+          availableCpus(i), availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
           try {
             val (taskDescOption, didReject, index) =
@@ -527,10 +665,10 @@ private[spark] class TaskSchedulerImpl(
                 maxLocality,
                 taskCpus,
                 taskResAssignments,
-                taskIndex => pipelinedShuffleTaskCoordinator.taskIndexAllowed(
-                  taskSet, execId, taskIndex))
+                taskIndex => preTaskReaderIndexAllowed(taskSet, execId, taskIndex))
             if (taskDescOption.isDefined && index >= 0) {
-              pipelinedShuffleTaskCoordinator.taskLaunched(taskSet, execId, index)
+              offerReadyPreTaskReaderIndices.get(
+                (taskSet.stageId, taskSet.taskSet.stageAttemptId, execId)).foreach(_ -= index)
             }
             noDelayScheduleRejects &= !didReject
             for (task <- taskDescOption) {
@@ -597,25 +735,6 @@ private[spark] class TaskSchedulerImpl(
     availWorkerResources.assignAddressesCustomResources(taskSetProf)
   }
 
-  private def pipelinedReaderPlacementCandidates(
-      taskSet: TaskSetManager,
-      taskIndex: Int,
-      activeExecutors: Set[String]): Seq[String] = {
-    activeExecutors.iterator.filter { executorId =>
-      (for {
-        host <- executorIdToHost.get(executorId)
-        executorResourceProfileId <- executorIdToResourceProfileId.get(executorId)
-      } yield {
-        val applicationAllows = healthTrackerOpt.forall { healthTracker =>
-          !healthTracker.isNodeExcluded(host) && !healthTracker.isExecutorExcluded(executorId)
-        }
-        applicationAllows && sc.resourceProfileManager.canBeScheduled(
-          taskSet.taskSet.resourceProfileId, executorResourceProfileId) &&
-          taskSet.isExecutorAllowedForTask(taskIndex, executorId, host)
-      }).contains(true)
-    }.toSeq.sorted
-  }
-
   private def minTaskLocality(
       l1: Option[TaskLocality],
       l2: Option[TaskLocality]) : Option[TaskLocality] = {
@@ -642,7 +761,6 @@ private[spark] class TaskSchedulerImpl(
     // Also track if new executor is added
     var newExecAvail = false
     for (o <- offers) {
-      executorIdToResourceProfileId(o.executorId) = o.resourceProfileId
       if (!hostToExecutors.contains(o.host)) {
         hostToExecutors(o.host) = new HashSet[String]()
       }
@@ -685,69 +803,19 @@ private[spark] class TaskSchedulerImpl(
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
-    val activePureProducerTaskSets =
-      sortedTaskSets.filter(pipelinedShuffleTaskCoordinator.isActivePureProducer)
-    def pipelinedRunEpoch(taskSet: TaskSetManager): Option[String] = {
-      Option(taskSet.taskSet.properties).flatMap { properties =>
-        Option(properties.getProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH))
-      }
+    val activePureProducerTaskSets = sortedTaskSets.filter(isActivePurePipelinedProducer)
+    val solePureProducer = if (activePureProducerTaskSets.size == 1) {
+      activePureProducerTaskSets.headOption
+    } else {
+      None
     }
-    val activePureProducerStagesByRunEpoch =
-      activePureProducerTaskSets.groupBy(pipelinedRunEpoch).view.mapValues(_.size).toMap
-    val indexedTaskSets = sortedTaskSets.zipWithIndex
-    val firstTaskSetIndexByRunEpoch = indexedTaskSets.groupMapReduce {
-      case (taskSet, _) => pipelinedRunEpoch(taskSet)
-    }(_._2)(math.min)
-    val readerDepthByTaskSet = sortedTaskSets.groupBy(pipelinedRunEpoch).valuesIterator.flatMap {
-      sameEpochTaskSets => pipelinedShuffleTaskCoordinator.readerDepths(sameEpochTaskSets)
-    }.toMap
-    // CoarseGrainedSchedulerBackend stops offering a decommissioning executor, but TaskScheduler
-    // retains it until executorLost so its running tasks can finish. Do not prepare a reader inbox
-    // there: the assignment would never receive an offer and could strand an otherwise runnable
-    // pipelined stage while healthy executors sit idle.
-    val activePipelinedExecutors = executorIdToRunningTaskIds.keysIterator
-      .filterNot(isExecutorDecommissioned)
-      .toSet
-    pipelinedShuffleTaskCoordinator.prepareForOffers(
-      sortedTaskSets,
-      activePipelinedExecutors,
-      (taskSet, taskIndex) =>
-        pipelinedReaderPlacementCandidates(taskSet, taskIndex, activePipelinedExecutors))
-    val readerCpuReservations =
-      pipelinedShuffleTaskCoordinator.readerCpuReservations(sortedTaskSets)
-    // Distribute pure-producer slots across every active input stage in its run epoch. Filling the
-    // first stage to its expanded cap can exhaust bounded transport buffers while sibling inputs
-    // are still needed by the reader, even after reader compute has started.
-    // Add already-running producers to the currently free offer capacity so this fair share stays
-    // stable across subsequent reviveOffers passes.
-    val freeCpuSlots = shuffledOffers.iterator.map(_.cores).sum.toInt
-    val runningPureProducersByRunEpoch =
-      activePureProducerTaskSets.groupBy(pipelinedRunEpoch).view.mapValues { taskSets =>
-        taskSets.iterator.map(_.runningTasks).sum
-      }.toMap
-    val fairProducerTaskLimitByRunEpoch =
-      activePureProducerStagesByRunEpoch.collect { case (runEpoch, activeStages)
-          if activeStages > 1 =>
-        val reservedExecutors = readerCpuReservations.keysIterator.count(_._1 == runEpoch)
-        val producerSlots = math.max(
-          activeStages, freeCpuSlots +
-            runningPureProducersByRunEpoch.getOrElse(runEpoch, 0) - reservedExecutors)
-        runEpoch -> math.max(1, producerSlots / activeStages)
-      }
-    // Once an executor-owned startup inbox reaches its compute-ready byte threshold (or EOS),
-    // launch its attached reader before more producers. Inbox preparation separately opens the
-    // producer routing frontier without consuming a compute slot. Within one run epoch, attach
-    // upstream readers before deeper consumers: otherwise a downstream join that is ready on only
-    // one input can consume the executor-wide reader cap and strand the join that produces its
-    // other input. Preserve the pool's run-epoch order and use its original position as the stable
-    // tie-breaker.
-    val offerTaskSets = indexedTaskSets.sortBy { case (taskSet, index) =>
-      if (pipelinedShuffleTaskCoordinator.isReadyReader(taskSet)) {
-        (0, firstTaskSetIndexByRunEpoch(pipelinedRunEpoch(taskSet)),
-          readerDepthByTaskSet.getOrElse(taskSet, 0), index)
-      } else {
-        (1, index, 0, index)
-      }
+    preparePipelinedReaderInboxes(sortedTaskSets)
+    rebuildOfferReadyPreTaskReaderIndices(sortedTaskSets)
+    // Once an executor-owned inbox receives its first payload (or EOS), launch its attached
+    // reader before more producers. This closes the backpressure loop without reserving idle task
+    // slots for every reader in the group. The original pool order remains the stable tie-breaker.
+    val offerTaskSets = sortedTaskSets.zipWithIndex.sortBy { case (taskSet, index) =>
+      (if (isOfferReadyPipelinedReader(taskSet)) 0 else 1, index)
     }.map(_._1)
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
@@ -783,29 +851,16 @@ private[spark] class TaskSchedulerImpl(
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
-        // Compute this once per task set and offer pass. Compute-ready readers were moved ahead of
-        // their producers above, so their freshly-launched runningTasks are already visible here;
-        // inbox preparation may independently make a producer's routing frontier safe.
-        val producerReaderFrontierRoutable =
-          pipelinedShuffleTaskCoordinator.readerFrontierRoutable(taskSet, sortedTaskSets)
-        val producerReaderFrontierStarted =
-          pipelinedShuffleTaskCoordinator.readerFrontierStarted(taskSet, sortedTaskSets)
-        val upstreamReaderProducers =
-          pipelinedShuffleTaskCoordinator.upstreamReaderProducers(taskSet, sortedTaskSets)
-        val activePureProducerStages =
-          activePureProducerStagesByRunEpoch.getOrElse(pipelinedRunEpoch(taskSet), 0)
-        val fairProducerTaskLimit =
-          fairProducerTaskLimitByRunEpoch.get(pipelinedRunEpoch(taskSet))
+        // Compute this once per task set and offer pass. Ready readers were moved ahead of their
+        // producers above, so their freshly-launched runningTasks are already visible here.
+        val useSoleProducerWindow = solePureProducer.contains(taskSet) &&
+          readerFrontierStartedForProducer(taskSet, sortedTaskSets)
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks, activePureProducerStages,
-              producerReaderFrontierRoutable,
-              producerReaderFrontierStarted, fairProducerTaskLimit,
-              upstreamReaderProducers, sortedTaskSets,
-              readerCpuReservations)
+              availableResources, tasks, useSoleProducerWindow)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
@@ -1049,14 +1104,10 @@ private[spark] class TaskSchedulerImpl(
       accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
       blockManagerId: BlockManagerId,
       executorUpdates: mutable.Map[(Int, Int), ExecutorMetrics]): Boolean = {
-    var reviveForPreparedReaderExpansion = false
     // (taskId, stageId, stageAttemptId, accumUpdates)
     val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = {
       accumUpdates.flatMap { case (id, updates) =>
         Option(taskIdToTaskSetManager.get(id)).map { taskSetMgr =>
-          if (taskSetMgr.updatePreparedReaderRunningMemorySample(id, updates)) {
-            reviveForPreparedReaderExpansion = true
-          }
           val (accInfos, taskProcessRate) = getTaskAccumulableInfosAndProcessRate(updates)
           if (efficientTaskCalcualtionEnabled && taskProcessRate > 0.0) {
             taskSetMgr.taskProcessRateCalculator.foreach {
@@ -1067,10 +1118,8 @@ private[spark] class TaskSchedulerImpl(
         }
       }
     }
-    val blockManagerAlive = dagScheduler.executorHeartbeatReceived(
-      execId, accumUpdatesWithTaskIds, blockManagerId, executorUpdates)
-    if (reviveForPreparedReaderExpansion) backend.reviveOffers()
-    blockManagerAlive
+    dagScheduler.executorHeartbeatReceived(execId, accumUpdatesWithTaskIds, blockManagerId,
+      executorUpdates)
   }
 
  private def getTaskAccumulableInfosAndProcessRate(
@@ -1114,17 +1163,7 @@ private[spark] class TaskSchedulerImpl(
       taskSetManager: TaskSetManager,
       tid: Long,
       taskResult: DirectTaskResult[_]): Unit = synchronized {
-    val readerCapBefore = taskSetManager.preparedReaderMaxTasksPerExecutor
     taskSetManager.handleSuccessfulTask(tid, taskResult)
-    val readerCapAfter = taskSetManager.preparedReaderMaxTasksPerExecutor
-    // A completed retained-memory task can replace a conservative live heartbeat estimate with
-    // its final peak.  Heavy SHJ stages never satisfy preparedReaderCanExpand, but their sampled
-    // byte-budget cap can still increase (for example, from two to three tasks per executor).
-    // Revive all outstanding offers whenever completion relaxes that cap so idle executor slots
-    // do not remain stranded until another task happens to finish.
-    if (readerCapBefore > 0 && (readerCapAfter == 0 || readerCapAfter > readerCapBefore)) {
-      backend.reviveOffers()
-    }
   }
 
   def handleFailedTask(
@@ -1132,10 +1171,8 @@ private[spark] class TaskSchedulerImpl(
       tid: Long,
       taskState: TaskState,
       reason: TaskFailedReason): Unit = synchronized {
-    val taskIndex = taskSetManager.taskInfos(tid).index
     taskSetManager.handleFailedTask(tid, taskState, reason)
     if (!taskSetManager.isZombie && !taskSetManager.someAttemptSucceeded(tid)) {
-      pipelinedShuffleTaskCoordinator.taskFailed(taskSetManager, taskIndex)
       // Need to revive offers again now that the task set manager state has been updated to
       // reflect failed tasks that need to be re-run.
       backend.reviveOffers()
@@ -1239,7 +1276,10 @@ private[spark] class TaskSchedulerImpl(
     var failedExecutor: Option[String] = None
 
     synchronized {
-      pipelinedShuffleTaskCoordinator.removeExecutor(executorId)
+      preTaskReaderAssignments.filterInPlace { case (_, assignment) =>
+        assignment.executorId != executorId
+      }
+      streamingTrackerMaster.foreach(_.removeReceiveExecutor(executorId))
       if (executorIdToRunningTaskIds.contains(executorId)) {
         val host = executorIdToHost(executorId)
         logExecutorLoss(executorId, host, reason)
@@ -1327,7 +1367,6 @@ private[spark] class TaskSchedulerImpl(
       // happen below in the rootPool.executorLost() call.
       taskIds.foreach(cleanupTaskState)
     }
-    executorIdToResourceProfileId -= executorId
 
     val host = executorIdToHost(executorId)
     val execs = hostToExecutors.getOrElse(host, new HashSet)
@@ -1454,6 +1493,21 @@ private[spark] class TaskSchedulerImpl(
 private[spark] object TaskSchedulerImpl {
 
   val SCHEDULER_MODE_PROPERTY = SCHEDULER_MODE.key
+  private val INBOX_READY_REVIVE_COALESCE_MS = 10L
+
+  private[scheduler] def preparedReaderExecutorIndex(
+      taskIndex: Int,
+      executorCount: Int,
+      diagonalAssignment: Boolean): Int = {
+    require(taskIndex >= 0, s"taskIndex must be non-negative: $taskIndex")
+    require(executorCount > 0, s"executorCount must be positive: $executorCount")
+    val column = taskIndex % executorCount
+    if (diagonalAssignment) {
+      (column + taskIndex / executorCount) % executorCount
+    } else {
+      column
+    }
+  }
 
   /**
    * Calculate the max available task slots given the `availableCpus` and `availableResources`

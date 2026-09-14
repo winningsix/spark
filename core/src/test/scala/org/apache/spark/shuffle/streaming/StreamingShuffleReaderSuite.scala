@@ -18,11 +18,9 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, Semaphore}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.LinkedBlockingQueue
 
 import io.netty.buffer.Unpooled
-import org.mockito.Mockito.when
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 
@@ -33,7 +31,6 @@ import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
-import org.apache.spark.util.ErrorNotifier
 
 /**
  * Reader-side unit tests that do not require a shuffle writer. End-to-end writer <-> reader
@@ -44,82 +41,6 @@ class StreamingShuffleReaderSuite
   with LocalSparkContext
   with Matchers
   with MockitoSugar {
-
-  test("transport body compactor detaches an exact direct route group") {
-    val source = _root_.io.netty.buffer.Unpooled.directBuffer(8192, 8192)
-    source.writeZero(8192)
-    source.setInt(1024, 0x12345678)
-    val compactor = new StreamingShuffleTransportBodyCompactor()
-    val detached = compactor.copy(source, 1024, 2048)
-    try {
-      assert(detached.isDirect)
-      assert(detached.capacity() === 2048)
-      assert(detached.readableBytes() === 2048)
-      assert(detached.getInt(0) === 0x12345678)
-      source.release()
-      assert(detached.getInt(0) === 0x12345678)
-      assert(compactor.stats === ((1L, 2048L, 0L, 0L)))
-    } finally {
-      if (source.refCnt() > 0) source.release()
-      detached.release()
-    }
-  }
-
-  test("transport body compactor falls back to exact heap storage at direct limit") {
-    val directOomConstructor =
-      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
-        .getDeclaredConstructor(classOf[String])
-    directOomConstructor.setAccessible(true)
-    val compactor = new StreamingShuffleTransportBodyCompactor(
-      _ => throw directOomConstructor.newInstance("test direct limit"),
-      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
-    val source = _root_.io.netty.buffer.Unpooled.buffer(4096, 4096).writeZero(4096)
-    val detached = compactor.copy(source, 512, 1024)
-    try {
-      assert(!detached.isDirect)
-      assert(detached.capacity() === 1024)
-      assert(compactor.stats === ((0L, 0L, 1L, 1024L)))
-    } finally {
-      source.release()
-      detached.release()
-    }
-  }
-
-  test("decompression buffer falls back to heap at the JVM direct limit") {
-    val directOomConstructor =
-      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
-        .getDeclaredConstructor(classOf[String])
-    directOomConstructor.setAccessible(true)
-    val scratch = new StreamingShuffleDecompressionBuffer(
-      _ => throw directOomConstructor.newInstance("test direct limit"),
-      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
-    val buffer = scratch.acquire(4096)
-    try {
-      assert(!buffer.isDirect && buffer.capacity() === 4096)
-    } finally {
-      scratch.close()
-    }
-  }
-
-  test("decompression buffer reuses task-local direct storage and grows only when required") {
-    var allocations = 0
-    val scratch = new StreamingShuffleDecompressionBuffer(
-      size => {
-        allocations += 1
-        _root_.io.netty.buffer.Unpooled.directBuffer(size, size)
-      },
-      size => _root_.io.netty.buffer.Unpooled.buffer(size, size))
-    try {
-      val first = scratch.acquire(4096)
-      scratch.acquire(2048) should be theSameInstanceAs first
-      val grown = scratch.acquire(8192)
-      grown should not be theSameInstanceAs(first)
-      allocations should be(2)
-    } finally {
-      scratch.close()
-      scratch.close()
-    }
-  }
 
   private def newConf(): SparkConf =
     // StreamingShuffleManager is pipelined, so it belongs in the incremental slot (the default
@@ -152,6 +73,48 @@ class StreamingShuffleReaderSuite
   // The iterator factory drives four collaborators; these tests supply in-memory fakes for all of
   // them so the reader's consumer-loop control flow can be verified without Netty or a SparkEnv.
   private val factory = new StreamingShuffleReaderIteratorFactory()
+
+  test("decompression input reuses direct scratch for a scattered transport frame") {
+    val input = new StreamingShuffleDecompressionInput
+    val contiguous = Unpooled.directBuffer(3).writeBytes(Array[Byte](11, 12, 13))
+    try {
+      input.prepare(contiguous, contiguous.readableBytes()).isDirect shouldBe true
+      input.scratchCapacity shouldBe 0
+    } finally {
+      contiguous.release()
+    }
+
+    val first = Unpooled.directBuffer(3).writeBytes(Array[Byte](1, 2, 3))
+    val second = Unpooled.directBuffer(3).writeBytes(Array[Byte](4, 5, 6))
+    val scattered = Unpooled.compositeBuffer()
+      .addComponent(true, first)
+      .addComponent(true, second)
+    try {
+      val prepared = input.prepare(scattered, scattered.readableBytes())
+      prepared.isDirect shouldBe true
+      val bytes = new Array[Byte](prepared.remaining())
+      prepared.get(bytes)
+      bytes should contain theSameElementsInOrderAs Array[Byte](1, 2, 3, 4, 5, 6)
+      input.scratchCapacity shouldBe 6
+
+      val smallerFirst = Unpooled.directBuffer(2).writeBytes(Array[Byte](7, 8))
+      val smallerSecond = Unpooled.directBuffer(2).writeBytes(Array[Byte](9, 10))
+      val smaller = Unpooled.compositeBuffer()
+        .addComponent(true, smallerFirst)
+        .addComponent(true, smallerSecond)
+      try {
+        input.prepare(smaller, smaller.readableBytes()).isDirect shouldBe true
+        input.scratchCapacity shouldBe 6
+      } finally {
+        smaller.release()
+      }
+    } finally {
+      input.close()
+      input.close()
+      scattered.release()
+    }
+    input.scratchCapacity shouldBe 0
+  }
 
   test("iterator emits all rows from data messages then stops on termination") {
     val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
@@ -259,262 +222,5 @@ class StreamingShuffleReaderSuite
         context.markTaskCompleted(None)
       }
     }
-  }
-
-  test("prepared reader does not create task-owned discovery or client executors") {
-    withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
-      val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-      val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
-      val context = createTaskContext(sc.conf, 0)
-      val session = mock[StreamingShufflePreparedReceiveSession]
-      when(session.errorNotifier).thenReturn(new ErrorNotifier())
-      when(session.totalNumShuffleWriters).thenReturn(new AtomicInteger(0))
-      when(session.terminationAckControlMessageSet)
-        .thenReturn(ConcurrentHashMap.newKeySet[Long]())
-      when(session.allTermAcksSentNotice).thenReturn(new Semaphore(0))
-      val inbox = new StreamingShuffleReceiveInbox(
-        StreamingShuffleReceiveInboxId(0, 0, 0, 0, -1L),
-        new LinkedBlockingQueue[StreamingShuffleMessage]())
-      inbox.startPreparedSession(session)
-      val lease = new StreamingShuffleReceiveInboxLease(inbox, () => inbox.close())
-      try {
-        val reader = new StreamingShuffleReader[Int, Int](
-          new StreamingShuffleHandle(0, dep),
-          context,
-          sharedExecutorClient = Some(mock[StreamingShuffleExecutorClient]),
-          receiveInbox = Some(lease))
-        reader.taskOwnedExecutorsCreated shouldBe (false, false)
-      } finally {
-        context.markTaskCompleted(None)
-        lease.close()
-      }
-    }
-  }
-
-  test("prepared reader reports inbox queue spill in task metrics") {
-    withTempDir { spillDir =>
-      withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
-        val context = createTaskContext(sc.conf, 0)
-        val session = mock[StreamingShufflePreparedReceiveSession]
-        when(session.errorNotifier).thenReturn(new ErrorNotifier())
-        when(session.totalNumShuffleWriters).thenReturn(new AtomicInteger(0))
-        when(session.terminationAckControlMessageSet)
-          .thenReturn(ConcurrentHashMap.newKeySet[Long]())
-        when(session.allTermAcksSentNotice).thenReturn(new Semaphore(0))
-        val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
-        val inbox = new StreamingShuffleReceiveInbox(
-          StreamingShuffleReceiveInboxId(0, 0, 0, 0, -1L), queue)
-        inbox.startPreparedSession(session)
-        val lease = new StreamingShuffleReceiveInboxLease(inbox, () => inbox.close())
-        val bytes = Array.fill[Byte](128)(1)
-        val buffer = Unpooled.wrappedBuffer(bytes)
-        queue.put(new DataMessage(0, 0, bytes.length, buffer, 0L))
-        buffer.release()
-
-        val reader = new StreamingShuffleReader[Int, Int](
-          new StreamingShuffleHandle(0, dep),
-          context,
-          sharedExecutorClient = Some(mock[StreamingShuffleExecutorClient]),
-          receiveInbox = Some(lease))
-        context.markTaskCompleted(None)
-
-        context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
-        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe bytes.length.toLong
-        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe 0L
-        reader.cleanupResources()
-        context.taskMetrics.diskBytesSpilled shouldBe bytes.length.toLong
-        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe bytes.length.toLong
-      }
-    }
-  }
-
-  test("spilled inbox data releases payload ownership but defers producer credit") {
-    withTempDir { spillDir =>
-      val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
-      val payloadReleases = new AtomicInteger(0)
-      val creditReleases = new AtomicInteger(0)
-      val bytes = Array.fill[Byte](128)(1)
-      val buffer = Unpooled.wrappedBuffer(bytes)
-      val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
-      buffer.release()
-      data.setResourceReleaseCallback(() => payloadReleases.incrementAndGet())
-      data.setReleaseCallback(() => creditReleases.incrementAndGet())
-
-      queue.put(data)
-
-      queue.spilledBytesCount shouldBe bytes.length.toLong
-      payloadReleases.get() shouldBe 1
-      creditReleases.get() shouldBe 0
-
-      val materialized = queue.take()
-      creditReleases.get() shouldBe 0
-      materialized.release()
-      creditReleases.get() shouldBe 1
-      queue.close()
-    }
-  }
-
-  test("unattached prepared inbox returns credit after durably spilling") {
-    withTempDir { spillDir =>
-      val queue = new StreamingShuffleMessageQueue(
-        256L,
-        Some(spillDir),
-        stageDataBeforeConsumerAttach = true)
-      val payloadReleases = new AtomicInteger(0)
-      val creditReleases = new AtomicInteger(0)
-
-      def dataMessage(fill: Byte): DataMessage = {
-        val bytes = Array.fill[Byte](128)(fill)
-        val buffer = Unpooled.wrappedBuffer(bytes)
-        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
-        buffer.release()
-        data.setResourceReleaseCallback(() => payloadReleases.incrementAndGet())
-        data.setReleaseCallback(() => creditReleases.incrementAndGet())
-        data
-      }
-
-      try {
-        queue.put(dataMessage(1))
-        queue.put(dataMessage(2))
-        queue.put(dataMessage(3))
-        queue.queuedMemoryBytesCount shouldBe 256L
-        queue.receivedDataBytesCount shouldBe 384L
-        queue.spilledBytesCount shouldBe 128L
-        payloadReleases.get() shouldBe 1
-        creditReleases.get() shouldBe 3
-
-        queue.take().release()
-        queue.take().release()
-        queue.take().release()
-        queue.queuedMemoryBytesCount shouldBe 0L
-        queue.receivedDataBytesCount shouldBe 128L
-        queue.spilledBytesCount shouldBe 128L
-        payloadReleases.get() shouldBe 3
-        creditReleases.get() shouldBe 3
-
-        queue.markConsumerAttached()
-        queue.put(dataMessage(4))
-        queue.queuedMemoryBytesCount shouldBe 128L
-        queue.spilledBytesCount shouldBe 128L
-        payloadReleases.get() shouldBe 3
-        creditReleases.get() shouldBe 3
-        queue.take().release()
-        payloadReleases.get() shouldBe 4
-        creditReleases.get() shouldBe 4
-      } finally {
-        val messages = new java.util.ArrayList[StreamingShuffleMessage]()
-        queue.drainTo(messages)
-        messages.forEach(_.release())
-        queue.close()
-      }
-    }
-  }
-
-  test("prepared inbox queues share an executor memory budget") {
-    withTempDir { spillDir =>
-      val budget = new StreamingShuffleReaderMemoryBudget(128L)
-      val first = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(budget))
-      val second = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(budget))
-
-      def dataMessage(fill: Byte): DataMessage = {
-        val bytes = Array.fill[Byte](96)(fill)
-        val buffer = Unpooled.wrappedBuffer(bytes)
-        val message = new DataMessage(0, 0, bytes.length, buffer, 0L)
-        buffer.release()
-        message
-      }
-
-      try {
-        first.put(dataMessage(1))
-        second.put(dataMessage(2))
-
-        first.queuedMemoryBytesCount shouldBe 96L
-        second.queuedMemoryBytesCount shouldBe 0L
-        second.spilledBytesCount shouldBe 96L
-        budget.usedBytesCount shouldBe 96L
-
-        first.take().release()
-        budget.usedBytesCount shouldBe 0L
-
-        second.put(dataMessage(3))
-        second.queuedMemoryBytesCount shouldBe 96L
-        budget.usedBytesCount shouldBe 96L
-      } finally {
-        Seq(first, second).foreach { queue =>
-          val messages = new java.util.ArrayList[StreamingShuffleMessage]()
-          queue.drainTo(messages)
-          messages.forEach(_.release())
-          queue.close()
-        }
-      }
-      budget.usedBytesCount shouldBe 0L
-    }
-  }
-
-  test("prepared route credit is divided across all lifetime writers") {
-    StreamingShuffleReceiveService.routeByteLimit(1024L, 32) shouldBe 32L
-    StreamingShuffleReceiveService.routeByteLimit(1024L, 1900) shouldBe 1L
-    StreamingShuffleReceiveService.routeByteLimit(1024L, 0) shouldBe 1024L
-
-    // A large per-writer queue allowance must not let one short route retain the inbox's complete
-    // owner share. The receive turn is capped at one normal data frame so sibling routes rotate.
-    StreamingShuffleReceiveService.routeReservationBytes(4096L, 1024) shouldBe 1064L
-    StreamingShuffleReceiveService.routeReservationBytes(512L, 1024) shouldBe 512L
-  }
-
-  test("executor receive credit leases are bounded and work conserving") {
-    val budget = new StreamingShuffleReceiveCreditBudget(100L)
-    val grants = new AtomicInteger(0)
-    val first = budget.acquire(60L, () => grants.incrementAndGet())
-    val second = budget.acquire(40L, () => grants.incrementAndGet())
-    val blockedLarge = budget.acquire(70L, () => grants.addAndGet(10))
-    val blockedSmall = budget.acquire(30L, () => grants.incrementAndGet())
-
-    first.isGranted shouldBe true
-    second.isGranted shouldBe true
-    blockedLarge.isGranted shouldBe false
-    blockedSmall.isGranted shouldBe false
-    budget.usedBytesCount shouldBe 100L
-    budget.pendingLeaseCount shouldBe 2
-
-    // Releasing forty bytes cannot fit the oldest 70-byte request, but must not strand the
-    // 30-byte request behind it.
-    second.close()
-    blockedLarge.isGranted shouldBe false
-    blockedSmall.isGranted shouldBe true
-    grants.get() shouldBe 1
-    budget.usedBytesCount shouldBe 90L
-
-    first.close()
-    blockedLarge.isGranted shouldBe true
-    grants.get() shouldBe 11
-    budget.usedBytesCount shouldBe 100L
-
-    Seq(first, second, blockedLarge, blockedSmall).foreach(_.close())
-    budget.usedBytesCount shouldBe 0L
-    budget.pendingLeaseCount shouldBe 0
-  }
-
-  test("executor receive credit reserves a fair window for every prepared inbox") {
-    val budget = new StreamingShuffleReceiveCreditBudget(120L)
-    budget.registerOwners(Seq("left-input", "right-input"))
-
-    val leftFirst = budget.acquire("left-input", 120L, _ => ())
-    val leftSecond = budget.acquire("left-input", 120L, _ => ())
-    val rightFirst = budget.acquire("right-input", 120L, _ => ())
-
-    leftFirst.bytes shouldBe 60L
-    leftFirst.isGranted shouldBe true
-    leftSecond.isGranted shouldBe false
-    rightFirst.bytes shouldBe 60L
-    rightFirst.isGranted shouldBe true
-    budget.usedBytesCount shouldBe 120L
-
-    leftFirst.close()
-    leftSecond.isGranted shouldBe true
-    Seq(leftSecond, rightFirst).foreach(_.close())
-    budget.usedBytesCount shouldBe 0L
   }
 }

@@ -19,14 +19,9 @@ package org.apache.spark.sql.execution.exchange
 
 import java.util.concurrent.{Executors, TimeUnit}
 
-import scala.collection.mutable
-
-import org.apache.spark.{PipelinedShuffleDependency, SparkFunSuite}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
-import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
-import org.apache.spark.sql.functions.sum
 
 /**
  * End-to-end SQL coverage of the pipelined channel path: a batch query whose hash
@@ -42,7 +37,9 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     withPipelinedSession("pipelined-shuffle-sql", aqe = false)(body)
 
   private def withDistributedPipelinedSession(
-      adaptive: Boolean = true)(body: SparkSession => Unit): Unit = {
+      adaptive: Boolean = true,
+      networkBufferWaitMs: Long = 50,
+      taskCpus: String = "1")(body: SparkSession => Unit): Unit = {
     SparkSession.getActiveSession.orElse(SparkSession.getDefaultSession).foreach(_.stop())
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
@@ -58,6 +55,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
       .config("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
       .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
+      .config("spark.shuffle.streaming.networkBufferMaxWaitTimeMs", networkBufferWaitMs.toString)
+      .config("spark.task.cpus", taskCpus)
       .config("spark.sql.adaptive.enabled", adaptive.toString)
       .config("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled", "true")
       .config("spark.sql.shuffle.localPipelined.enabled", "true")
@@ -204,27 +203,6 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
-  test("distributed prepared receive executes a limit's hidden shuffle as pipelined") {
-    withDistributedPipelinedSession(adaptive = false) { spark =>
-      import spark.implicits._
-      withTempDir { dir =>
-        val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 20))
-          .groupBy($"k").count().orderBy($"count".desc).limit(5)
-        val visibleExchanges = collect(df.queryExecution.executedPlan) {
-          case exchange: ShuffleExchangeExec => exchange
-        }
-        assert(visibleExchanges.nonEmpty && visibleExchanges.forall(_.pipelined),
-          s"all visible exchanges must be pipelined:\n${df.queryExecution.executedPlan}")
-
-        // DataFrameWriter calls TakeOrderedAndProjectExec.doExecute, which builds the hidden
-        // SinglePartition dependency rather than using the driver's executeCollect fast path.
-        val output = new java.io.File(dir, "hidden-limit-output").getAbsolutePath
-        df.write.parquet(output)
-        assert(spark.read.parquet(output).count() === 5L)
-      }
-    }
-  }
-
   test("distributed range replay uses one sampling pass for skewed hash input") {
     withDistributedPipelinedSession() { spark =>
       import spark.implicits._
@@ -314,19 +292,6 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       assert(exchanges.length >= 2 && exchanges.forall(_.pipelined),
         s"both join inputs should be pipelined; plan:\n${joined.queryExecution.executedPlan}")
 
-      val pending = mutable.ArrayDeque[RDD[_]](joined.queryExecution.toRdd)
-      val visited = mutable.HashSet.empty[Int]
-      var markedMemoryGrowing = false
-      while (pending.nonEmpty && !markedMemoryGrowing) {
-        val current = pending.removeHead()
-        if (visited.add(current.id)) {
-          markedMemoryGrowing = current.pipelinedMemoryMayGrow
-          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
-        }
-      }
-      assert(markedMemoryGrowing,
-        "sort-merge join stages must require completed memory samples before reader expansion")
-
       // Ground truth: an equi-join on k over the two relations.
       val l = (0L until 200L).map(i => (i % 10, i))
       val r = (0L until 120L).map(i => (i % 6, i))
@@ -335,135 +300,120 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
-  test("shuffled hash join marks only its build input as startup-critical") {
-    // The in-process channel admits the whole connected group, so it can safely exercise the
-    // build-before-probe metadata path. Prepared distributed receive is covered separately below.
-    withPipelinedSession { spark =>
-      import spark.implicits._
-      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-      // This testing-only config chooses SHJ without adding a SQL hint, matching the production
-      // requirement that BSP and RTM use the same unmodified SQL text and operator plan.
-      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
-      val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
-      val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
-      val joined = left.join(right, $"leftKey" === $"rightKey")
-      val plan = joined.queryExecution.executedPlan
-      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
-      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
-      assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
-      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined),
-        s"both shuffled hash join inputs must be pipelined; plan:\n$plan")
-
-      val executionRDD = joined.queryExecution.toRdd
-      val visited = mutable.HashSet.empty[Int]
-      val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
-      val startupInputs = mutable.ArrayBuffer.empty[RDD[_]]
-      var markedMemoryGrowing = false
-      var retainedMemoryBuildCount = 0
-      while (pending.nonEmpty) {
-        val current = pending.removeHead()
-        if (visited.add(current.id)) {
-          startupInputs ++= current.pipelinedStartupInputs
-          markedMemoryGrowing = markedMemoryGrowing || current.pipelinedMemoryMayGrow
-          retainedMemoryBuildCount += current.retainedMemoryBuildCount
-          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
-        }
-      }
-      assert(startupInputs.nonEmpty,
-        s"whole-stage output did not retain shuffled hash join startup metadata; plan:\n$plan")
-      val buildInputRDD = hashJoins.head.pipelinedBuildInputRDD()
-      assert(startupInputs.forall(_ eq buildInputRDD),
-        "the shuffled hash join build input must be the only startup-critical RDD")
-      assert(startupInputs.exists(_.dependencies.exists(
-        _.isInstanceOf[PipelinedShuffleDependency[_, _, _]])),
-        "the shuffled hash join build input must resolve to a pipelined shuffle")
-      assert(!markedMemoryGrowing,
-        "shuffled hash joins have an explicit build-complete memory stability fence")
-      assert(retainedMemoryBuildCount === 1,
-        "the reader task must report one completed retained hash build")
-
-      assert(executionRDD.collect().length === 5)
-    }
-  }
-
-  test("prepared receive materializes the shuffled hash build and pipelines its probe side") {
-    withDistributedPipelinedSession(adaptive = false) { spark =>
-      import spark.implicits._
-      withTempDir { dir =>
-        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-        spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
-        val left = spark.range(0, 20, 1, 2).select($"id".as("leftKey"))
-        val right = spark.range(0, 5, 1, 2).select($"id".as("rightKey"))
-        val joined = left.join(right, $"leftKey" === $"rightKey")
-          .orderBy($"leftKey").limit(3)
-        val plan = joined.queryExecution.executedPlan
-        val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
-        val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
-
-        assert(hashJoins.size === 1, s"expected one shuffled hash join; plan:\n$plan")
-        assert(exchanges.size === 2 && exchanges.count(_.pipelined) === 1,
-          s"SHJ must have one regular build and one pipelined probe exchange; plan:\n$plan")
-
-        val executionRDDs = mutable.ArrayDeque[RDD[_]](joined.queryExecution.toRdd)
-        val visitedRDDs = mutable.HashSet.empty[Int]
-        var retainedBuildMarker = false
-        while (executionRDDs.nonEmpty && !retainedBuildMarker) {
-          val current = executionRDDs.removeHead()
-          if (visitedRDDs.add(current.id)) {
-            retainedBuildMarker = current.pipelinedStartupInputs.nonEmpty
-            current.dependencies.foreach(dependency => executionRDDs.append(dependency.rdd))
-          }
-        }
-        assert(retainedBuildMarker,
-          "regular shuffled-hash execution must preserve its retained-memory admission marker")
-
-        // A write invokes TakeOrderedAndProjectExec.doExecute and creates its hidden regular
-        // shuffle above the asymmetric SHJ pipeline. Prepared receive supports that boundary.
-        val output = new java.io.File(dir, "shj-limit-output").getAbsolutePath
-        joined.write.parquet(output)
-        assert(spark.read.parquet(output).count() === 3L)
-      }
-    }
-  }
-
-  test("prepared receive preserves asymmetric boundaries across nested shuffled hash joins") {
-    withDistributedPipelinedSession(adaptive = false) { spark =>
+  test("distributed shuffled hash join materializes build and pipelines probe") {
+    withDistributedPipelinedSession() { spark =>
       import spark.implicits._
       spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
       spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
-      val left = spark.range(0, 40, 1, 2).select($"id".as("leftKey"))
-      val middle = spark.range(0, 20, 1, 2).select($"id".as("middleKey"))
-      val right = spark.range(0, 10, 1, 2).select($"id".as("rightKey"))
-      val joined = left
-        .join(middle, $"leftKey" === $"middleKey")
-        .join(right, $"leftKey" === $"rightKey")
-      val plan = joined.queryExecution.executedPlan
-      val hashJoins = collect(plan) { case join: ShuffledHashJoinExec => join }
-      val exchanges = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+      val left = spark.range(0, 200, 1, 2).withColumn("k", $"id" % 10)
+      val right = spark.range(0, 120, 1, 2).withColumn("k", $"id" % 6)
+      val joined = left.join(right, "k")
 
-      assert(hashJoins.size === 2, s"expected two shuffled hash joins; plan:\n$plan")
-      // The inner join already preserves the outer join's partitioning, so the two joins share
-      // one pipelined probe spine rather than inserting a redundant fourth exchange.
-      assert(exchanges.size === 3, s"expected three join exchanges; plan:\n$plan")
-      assert(exchanges.count(exchange => !exchange.pipelined) === hashJoins.size,
-        s"each SHJ must retain one regular build boundary; plan:\n$plan")
+      assert(joined.count() === 2400L)
+      val exchanges = collect(joined.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
       assert(exchanges.count(_.pipelined) === 1,
-        s"the nested joins must share one pipelined probe spine; plan:\n$plan")
+        s"the probe exchange must be pipelined; plan:\n${joined.queryExecution.executedPlan}")
+      assert(exchanges.count(exchange => !exchange.pipelined) === 1,
+        s"the build exchange must be regular; plan:\n${joined.queryExecution.executedPlan}")
+    }
+  }
 
-      val executionRDD = joined.queryExecution.toRdd
-      val visited = mutable.HashSet.empty[Int]
-      val pending = mutable.ArrayDeque[RDD[_]](executionRDD)
-      var retainedMemoryBuildCount = 0
-      while (pending.nonEmpty) {
-        val current = pending.removeHead()
-        if (visited.add(current.id)) {
-          retainedMemoryBuildCount += current.retainedMemoryBuildCount
-          current.dependencies.foreach(dependency => pending.append(dependency.rdd))
+  for (adaptive <- Seq(false, true); emptyBuild <- Seq(false, true)) {
+    test(s"prepared receive pipelines nested probes AQE=$adaptive emptyBuild=$emptyBuild") {
+      // The compact transport uses one task CPU charge for readers and producers. Leave
+      // producer capacity beside four resident readers on the four-slot local cluster.
+      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+        import spark.implicits._
+        spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        spark.conf.set("spark.sql.shuffle.partitions", "4")
+        // Different join keys force an exchange between the joins, matching a general
+        // dimension/fact chain. More input tasks than executor slots exercises admission.
+        // Duplicate customer keys verify full join multiplicity, not just a top-N result.
+        val customers = spark.range(0, 12, 1, 6)
+          .filter(if (emptyBuild) $"id" < 0 else $"id" >= 0)
+          .select(($"id" % 3).as("customerKey"))
+          .hint("SHUFFLE_HASH")
+        val orders = spark.range(0, 20000, 1, 8)
+          .select($"id".as("orderKey"), ($"id" % 5).as("orderCustomer"))
+        val first = customers.join(orders, $"customerKey" === $"orderCustomer")
+          .select($"orderKey").hint("SHUFFLE_HASH")
+        val lines = spark.range(0, 40000, 1, 10).select(($"id" / 2).cast("long").as("lineKey"))
+        val joined = first.join(lines, $"orderKey" === $"lineKey").select($"orderKey")
+        val actual = joined.as[Long].collect().toSeq.sorted
+        val expected = if (emptyBuild) Seq.empty[Long] else {
+          (0L until 20000L).filter(_ % 5 < 3).flatMap(k => Seq.fill(8)(k))
+        }
+        assert(actual === expected)
+        val exchanges = collect(joined.queryExecution.executedPlan) {
+          case exchange: ShuffleExchangeExec => exchange
+        }.groupBy(_.pipelinedReuseKey).values.map(_.head).toSeq
+        assert(exchanges.size === 4)
+        assert(exchanges.count(_.pipelined) === 2,
+          s"both probe exchanges must pipeline: ${joined.queryExecution.executedPlan}")
+        assert(exchanges.count(!_.pipelined) === 2,
+          "both immediate build boundaries must remain durable")
+      }
+    }
+  }
+
+  for (adaptive <- Seq(false, true)) {
+    test(s"prepared receive nested probes preserve Q3 results against BSP AQE=$adaptive") {
+      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+        spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        spark.conf.set("spark.sql.shuffle.partitions", "4")
+        spark.range(0, 96, 1, 6).selectExpr(
+          "id as c_custkey",
+          "if(id % 3 = 0, 'BUILDING', 'OTHER') as c_mktsegment")
+          .createOrReplaceTempView("customer")
+        spark.range(0, 20000, 1, 8).selectExpr(
+          "id as o_orderkey", "id % 96 as o_custkey",
+          "date_add(date '1995-03-01', cast(id % 30 as int)) as o_orderdate",
+          "cast(id % 5 as int) as o_shippriority")
+          .createOrReplaceTempView("orders")
+        spark.range(0, 40000, 1, 10).selectExpr(
+          "cast(id / 2 as long) as l_orderkey",
+          "cast(id + 100 as decimal(15, 2)) as l_extendedprice",
+          "cast(0.05 as decimal(15, 2)) as l_discount",
+          "date_add(date '1995-03-10', cast(id % 20 as int)) as l_shipdate")
+          .createOrReplaceTempView("lineitem")
+        // Same join hints, predicates, aggregation, and top-N as the AWS Q3 workload.
+        // Compare the complete aggregate too, so LIMIT cannot hide missing lower-ranked rows.
+        val query = """
+          |select /*+ SHUFFLE_HASH(co) */
+          |  l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue,
+          |  o_orderdate, o_shippriority
+          |from (
+          |  select /*+ SHUFFLE_HASH(c) */ o_orderkey, o_orderdate, o_shippriority
+          |  from customer c join orders o on c_custkey = o_custkey
+          |  where c_mktsegment = 'BUILDING' and o_orderdate < date '1995-03-15'
+          |) co join lineitem l on l_orderkey = o_orderkey
+          |where l_shipdate > date '1995-03-15'
+          |group by l_orderkey, o_orderdate, o_shippriority
+          |order by revenue desc, o_orderdate
+          |""".stripMargin
+        for (suffix <- Seq("", " limit 10")) {
+          spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "false")
+          val bsp = spark.sql(query + suffix).collect().toSeq
+          assert(bsp.nonEmpty)
+          spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "true")
+          val rtm = spark.sql(query + suffix)
+          assert(rtm.collect().toSeq === bsp)
+          val exchanges = collect(rtm.queryExecution.executedPlan) {
+            case exchange: ShuffleExchangeExec => exchange
+          }.groupBy(_.pipelinedReuseKey).values.map(_.head).toSeq
+          // Sorting the complete result adds a range exchange; Q3's top-N does not.
+          val rangeExchanges = exchanges.filter(_.outputPartitioning.isInstanceOf[
+            org.apache.spark.sql.catalyst.plans.physical.RangePartitioning])
+          assert(rangeExchanges.size === (if (suffix.isEmpty) 1 else 0))
+          assert(rangeExchanges.forall(_.pipelined))
+          assert(exchanges.count(_.pipelined) === 2 + rangeExchanges.size)
+          assert(exchanges.count(!_.pipelined) === 2)
         }
       }
-      assert(retainedMemoryBuildCount === hashJoins.size,
-        "the nested reader task must wait for every retained hash-build fence")
-      assert(executionRDD.collect().length === 10)
     }
   }
 
@@ -484,36 +434,6 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
           org.apache.spark.sql.catalyst.plans.physical.SinglePartition),
         s"expected a SinglePartition exchange; plan:\n${df.queryExecution.executedPlan}")
       assert(result.toSeq === Seq((0L until 1000L).sum))
-    }
-  }
-
-  test("only blocking operators with input-sized state mark pipelined memory as growing") {
-    withPipelinedSession { spark =>
-      import spark.implicits._
-
-      def memoryMayGrow(df: DataFrame): Boolean = {
-        val pending = mutable.ArrayDeque[RDD[_]](df.queryExecution.toRdd)
-        val visited = mutable.HashSet.empty[Int]
-        var result = false
-        while (pending.nonEmpty && !result) {
-          val current = pending.removeHead()
-          if (visited.add(current.id)) {
-            result = current.pipelinedMemoryMayGrow
-            current.dependencies.foreach(dependency => pending.append(dependency.rdd))
-          }
-        }
-        result
-      }
-
-      val global = spark.range(0, 1000, 1, 2).agg(sum($"id"))
-      val grouped = spark.range(0, 1000, 1, 2)
-        .groupBy($"id" % 17)
-        .agg(sum($"id"))
-
-      assert(!memoryMayGrow(global),
-        "an ungrouped aggregate retains a fixed-size buffer regardless of input size")
-      assert(memoryMayGrow(grouped),
-        "a grouped hash aggregate can retain one state entry per input key")
     }
   }
 

@@ -151,44 +151,6 @@ abstract class RDD[T: ClassTag](
   /** A friendly name for this RDD */
   @transient var name: String = _
 
-  // Driver-only execution metadata for a pipelined-shuffle consumer. Operators that must consume
-  // one input before they can make progress on the others (for example, ShuffledHashJoin's build
-  // side) attach those input roots here. DAGScheduler translates the roots to shuffle ids before
-  // task serialization; the field is transient so it never changes executor-side RDD behavior.
-  @transient private var _pipelinedStartupInputs: Seq[RDD[_]] = Seq.empty
-
-  // Driver-only marker for a pipelined consumer whose execution memory may grow for as long as
-  // input keeps arriving (for example an external sort or hash aggregate). A temporarily stable
-  // heartbeat is not evidence that such a task is lightweight; DAGScheduler carries this marker
-  // to TaskSet so reader admission waits for completed memory samples instead.
-  @transient private var _pipelinedMemoryMayGrow = false
-
-  // Number of build-before-probe operators in this RDD wrapper. Executors report the matching
-  // completed count after each retained build finishes, allowing admission to use a live memory
-  // sample without waiting for the whole probe task to complete.
-  @transient private var _retainedMemoryBuildCount = 0
-
-  private[spark] def setPipelinedStartupInputs(inputs: Seq[RDD[_]]): this.type = {
-    _pipelinedStartupInputs = inputs
-    this
-  }
-
-  private[spark] def pipelinedStartupInputs: Seq[RDD[_]] = _pipelinedStartupInputs
-
-  private[spark] def setPipelinedMemoryMayGrow(value: Boolean = true): this.type = {
-    _pipelinedMemoryMayGrow = value
-    this
-  }
-
-  private[spark] def pipelinedMemoryMayGrow: Boolean = _pipelinedMemoryMayGrow
-
-  private[spark] def setRetainedMemoryBuildCount(value: Int): this.type = {
-    _retainedMemoryBuildCount = value
-    this
-  }
-
-  private[spark] def retainedMemoryBuildCount: Int = _retainedMemoryBuildCount
-
   /** Assign a name to this RDD */
   def setName(_name: String): this.type = {
     name = _name

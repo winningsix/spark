@@ -46,26 +46,7 @@ private[spark] class TaskSet(
     val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty,
     // True when this stage writes a pipelined shuffle. A reader that also writes one is a combined
     // stage; only a pure producer is governed by the elastic producer launch window.
-    val isPipelinedShuffleProducer: Boolean = false,
-    // Shuffle inputs that must be ready before this stage can make useful progress. Empty means
-    // all reader inputs are required, preserving the conservative default for operators such as
-    // SortMergeJoin. A fully-pipelined ShuffledHashJoin identifies its build-side shuffle(s); an
-    // asymmetric SHJ has an empty set because its startup/build input is regular.
-    val pipelinedReaderStartupShuffleIds: Set[Int] = Set.empty,
-    // True when an operator in this reader stage can keep growing execution memory as streamed
-    // input arrives. Its early heartbeat samples cannot safely lift reader admission limits.
-    val pipelinedReaderMemoryMayGrow: Boolean = false,
-    // Largest number of producer tasks behind any direct pipelined input. The scheduler uses this
-    // to distinguish a long producer backlog, where overlapping every memory-growing reader can
-    // force execution-memory spill, from a short input that should finish at full concurrency.
-    val pipelinedReaderMaxProducerTasks: Int = 0,
-    // True when tasks in this stage retain substantial execution memory until task completion.
-    // This is independent of shuffle transport: a shuffled hash join needs the same sampled,
-    // executor-wide admission after its inputs fall back to regular materialized exchanges.
-    val retainsExecutionMemory: Boolean = false,
-    // Number of build-before-probe operators that must report completion before a running task's
-    // execution-memory peak is a stable admission sample.
-    val retainedMemoryBuildCount: Int = 0) {
+    val isPipelinedShuffleProducer: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

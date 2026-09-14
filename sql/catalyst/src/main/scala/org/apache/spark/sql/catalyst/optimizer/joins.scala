@@ -32,6 +32,7 @@ import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.util.UnsafeRowUtils
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.Utils
 
 /**
  * Reorder the joins and push all the conditions into join, so that the bottom ones have at least
@@ -519,8 +520,7 @@ trait JoinSelectionHelper extends Logging {
    * dynamic.
    */
   private def canBuildLocalHashMapBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
-    plan.stats.sizeInBytes <
-      BigInt(conf.shuffledHashJoinLocalMapThreshold) * conf.numShufflePartitions
+    plan.stats.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
   }
 
   /**
@@ -535,8 +535,12 @@ trait JoinSelectionHelper extends Logging {
     a.stats.sizeInBytes * conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR) <= b.stats.sizeInBytes
   }
 
-  /** Returns whether a shuffled hash join should be force applied. */
+  /**
+   * Returns whether a shuffled hash join should be force applied.
+   * The config key is hard-coded because it's testing only and should not be exposed.
+   */
   private def forceApplyShuffledHashJoin(conf: SQLConf): Boolean = {
-    conf.getConf(SQLConf.FORCE_APPLY_SHUFFLED_HASH_JOIN)
+    Utils.isTesting &&
+      conf.getConfString("spark.sql.join.forceApplyShuffledHashJoin", "false") == "true"
   }
 }

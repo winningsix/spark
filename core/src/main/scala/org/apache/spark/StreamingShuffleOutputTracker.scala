@@ -17,11 +17,8 @@
 
 package org.apache.spark
 
-import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ScheduledExecutorService,
-  ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
@@ -32,8 +29,8 @@ import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREAD
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
   PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
-  StreamingShuffleReceiveInboxId, StreamingShuffleWriterLocationsAvailable}
-import org.apache.spark.util.{RpcUtils, ThreadUtils}
+  StreamingShuffleReceiveInboxId}
+import org.apache.spark.util.ThreadUtils
 
 /**
  * The driver-side registry for a shuffle's output. A regular shuffle is served by the
@@ -78,9 +75,6 @@ private[spark] case class GetAllStreamingShuffleTaskLocations(shuffleId: Int)
 private[spark] case class GetAvailableStreamingShuffleTaskLocations(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
-private[spark] case class GetAvailableStreamingShuffleTaskLocationsBatch(shuffleIds: Seq[Int])
-  extends StreamingShuffleTaskLocationTrackerMessage
-
 private[spark] case class IsStreamingShuffleRegistered(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
@@ -92,11 +86,6 @@ private[spark] case class RegisterStreamingShuffleReceiveEndpoint(
 private[spark] case class StreamingShuffleInboxDrainReady(
     executorId: String,
     id: StreamingShuffleReceiveInboxId)
-  extends StreamingShuffleTaskLocationTrackerMessage
-
-private[spark] case class StreamingShuffleInboxesDrainReady(
-    executorId: String,
-    ids: Seq[StreamingShuffleReceiveInboxId])
   extends StreamingShuffleTaskLocationTrackerMessage
 
 private[spark] case object StopStreamingShuffleOutputTracker
@@ -118,11 +107,6 @@ private[spark] case class GetAllStreamingShuffleTaskLocationsMasterMessage(
 
 private[spark] case class GetAvailableStreamingShuffleTaskLocationsMasterMessage(
   shuffleId: Int,
-  context: RpcCallContext)
-  extends StreamingShuffleTaskLocationTrackerMasterMessage
-
-private[spark] case class GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(
-  shuffleIds: Seq[Int],
   context: RpcCallContext)
   extends StreamingShuffleTaskLocationTrackerMasterMessage
 
@@ -154,10 +138,6 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
 
     case GetAvailableStreamingShuffleTaskLocations(shuffleId) =>
       tracker.post(GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context))
-
-    case GetAvailableStreamingShuffleTaskLocationsBatch(shuffleIds) =>
-      tracker.post(
-        GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(shuffleIds, context))
 
     case IsStreamingShuffleRegistered(shuffleId) =>
       tracker.post(IsStreamingShuffleRegisteredMasterMessage(shuffleId, context))
@@ -193,9 +173,6 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
 
     case StreamingShuffleInboxDrainReady(executorId, id) =>
       tracker.markInboxDrainReady(executorId, id)
-
-    case StreamingShuffleInboxesDrainReady(executorId, ids) =>
-      tracker.markInboxesDrainReady(executorId, ids)
   }
 }
 
@@ -294,37 +271,17 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
    */
   def getAvailableShuffleWriterTaskLocations(shuffleId: Int): Option[ShuffleLocationResponse]
 
-  /** Get the currently available writer locations for several active shuffles in one request. */
-  def getAvailableShuffleWriterTaskLocationsBatch(
-      shuffleIds: Seq[Int]): Map[Int, ShuffleLocationResponse] = {
-    shuffleIds.distinct.flatMap { shuffleId =>
-      getAvailableShuffleWriterTaskLocations(shuffleId).map(shuffleId -> _)
-    }.toMap
-  }
-
-  /** Drop worker-side snapshots after the driver reports a new writer publication. */
-  def invalidateAvailableShuffleWriterTaskLocations(shuffleIds: Seq[Int]): Unit = {}
-
   /** Whether the driver still owns the shuffle's lifecycle state. */
   def containsShuffle(shuffleId: Int): Boolean
 
   def registerReceiveEndpoint(executorId: String, endpoint: RpcEndpointRef): Boolean
 
   def markInboxDrainReady(executorId: String, id: StreamingShuffleReceiveInboxId): Unit
-
-  def markInboxesDrainReady(
-      executorId: String,
-      ids: Seq[StreamingShuffleReceiveInboxId]): Unit = {
-    ids.foreach(markInboxDrainReady(executorId, _))
-  }
 }
 
 private[spark] case class StreamingShuffleInfo(numMaps: Int, numReduces: Int, jobId: Int)
 
-private[spark] class StreamingShuffleOutputTrackerMaster(
-    conf: SparkConf,
-    writerLocationNotificationDelayMs: Long =
-      StreamingShuffleOutputTrackerMaster.WRITER_LOCATION_NOTIFICATION_DELAY_MS)
+private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   extends StreamingShuffleOutputTracker(conf) with ShuffleOutputTrackerMaster {
 
   // map that stores task location information organized in the following fashion
@@ -334,27 +291,9 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
 
   private val shuffleInfos = new ConcurrentHashMap[Int, StreamingShuffleInfo]()
   private val receiveEndpoints = new ConcurrentHashMap[String, RpcEndpointRef]()
-  private val receiveInboxStateLock = new Object
-  private val preparedReceiveInboxes =
-    ConcurrentHashMap.newKeySet[(String, StreamingShuffleReceiveInboxId)]()
   private val drainReadyInboxes =
     ConcurrentHashMap.newKeySet[(String, StreamingShuffleReceiveInboxId)]()
   @volatile private var inboxReadyCallback: () => Unit = () => ()
-
-  // Writer tasks publish independently, but all publications in one launch wave target the same
-  // small set of executors with prepared inboxes. Notify each executor once per short window and
-  // let it fetch the authoritative batched snapshot; do not broadcast the location payload once
-  // per reducer inbox.
-  private val writerLocationNotificationLock = new Object
-  private val pendingWriterLocationNotifications =
-    mutable.HashMap.empty[String, mutable.HashSet[Int]]
-  private val writerLocationNotificationExecutor: ScheduledExecutorService =
-    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
-      "streaming-shuffle-writer-location-notifier")
-  private var writerLocationNotificationScheduled = false
-  private var writerLocationNotifierStopped = false
-  private var writerLocationNotificationShuffles = 0L
-  private var writerLocationNotificationMessages = 0L
 
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
@@ -370,57 +309,6 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
     }
     pool
   }
-
-  private def queueWriterLocationNotification(shuffleId: Int): Unit = {
-    val executorIds = receiveInboxStateLock.synchronized {
-      preparedReceiveInboxes.asScala.iterator.collect {
-        case (executorId, id) if id.shuffleId == shuffleId => executorId
-      }.toSet
-    }
-    if (executorIds.nonEmpty) writerLocationNotificationLock.synchronized {
-      if (!writerLocationNotifierStopped) {
-        executorIds.foreach { executorId =>
-          pendingWriterLocationNotifications
-            .getOrElseUpdate(executorId, mutable.HashSet.empty) += shuffleId
-        }
-        if (!writerLocationNotificationScheduled) {
-          writerLocationNotificationScheduled = true
-          writerLocationNotificationExecutor.schedule(
-            new Runnable {
-              override def run(): Unit = flushPendingWriterLocationNotifications()
-            },
-            writerLocationNotificationDelayMs,
-            TimeUnit.MILLISECONDS)
-        }
-      }
-    }
-  }
-
-  private[spark] def flushPendingWriterLocationNotifications(): Unit = {
-    val notifications = writerLocationNotificationLock.synchronized {
-      writerLocationNotificationScheduled = false
-      val ready = pendingWriterLocationNotifications.iterator.map { case (executorId, shuffleIds) =>
-        executorId -> shuffleIds.toSeq.sorted
-      }.toSeq
-      pendingWriterLocationNotifications.clear()
-      ready
-    }
-    notifications.foreach { case (executorId, shuffleIds) =>
-      Option(receiveEndpoints.get(executorId)).foreach { endpoint =>
-        endpoint.send(StreamingShuffleWriterLocationsAvailable(shuffleIds))
-        writerLocationNotificationLock.synchronized {
-          writerLocationNotificationShuffles += shuffleIds.size
-          writerLocationNotificationMessages += 1L
-        }
-      }
-    }
-  }
-
-  private[spark] def writerLocationNotificationStats: (Long, Long) =
-    writerLocationNotificationLock.synchronized {
-      writerLocationNotificationShuffles -> writerLocationNotificationMessages
-    }
-
   override def registerShuffle(shuffleId: Int, numMaps: Int, numReduces: Int, jobId: Int): Unit = {
     logInfo(log"Registering shuffleId ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} with ${
       MDC(LogKeys.NUM_MAPPERS, numMaps)} mappers and ${
@@ -464,10 +352,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
     // Either way, no orphan remains. See registerShuffleWriterTask.
     shuffleInfos.remove(shuffleId)
     taskLocations.remove(shuffleId)
-    receiveInboxStateLock.synchronized {
-      preparedReceiveInboxes.removeIf { case (_, id) => id.shuffleId == shuffleId }
-      drainReadyInboxes.removeIf { case (_, id) => id.shuffleId == shuffleId }
-    }
+    drainReadyInboxes.removeIf { case (_, id) => id.shuffleId == shuffleId }
   }
 
   override def registerReceiveEndpoint(
@@ -481,20 +366,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
   override def markInboxDrainReady(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Unit = {
-    markInboxesDrainReady(executorId, Seq(id))
-  }
-
-  override def markInboxesDrainReady(
-      executorId: String,
-      ids: Seq[StreamingShuffleReceiveInboxId]): Unit = {
-    var added = false
-    receiveInboxStateLock.synchronized {
-      ids.distinct.foreach { id =>
-        val key = executorId -> id
-        if (preparedReceiveInboxes.contains(key) && drainReadyInboxes.add(key)) added = true
-      }
-    }
-    if (added) inboxReadyCallback()
+    if (drainReadyInboxes.add((executorId, id))) inboxReadyCallback()
   }
 
   private[spark] def setInboxReadyCallback(callback: () => Unit): Unit = {
@@ -507,21 +379,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Boolean = {
     val endpoint = receiveEndpoints.get(executorId)
-    if (endpoint == null) {
-      false
-    } else {
-      val key = executorId -> id
-      val newlyPrepared = activateReceiveInboxes(executorId, Seq(id)).nonEmpty
-      try {
-        val prepared = endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInbox(id))
-        if (!prepared && newlyPrepared) rollbackPreparedReceiveInboxes(Seq(key))
-        prepared
-      } catch {
-        case NonFatal(e) =>
-          if (newlyPrepared) rollbackPreparedReceiveInboxes(Seq(key))
-          throw e
-      }
-    }
+    endpoint != null && endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInbox(id))
   }
 
   private[spark] def prepareReceiveInboxes(
@@ -531,104 +389,30 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
       true
     } else {
       val endpoint = receiveEndpoints.get(executorId)
-      if (endpoint == null) {
-        false
-      } else {
-        val newlyPrepared = activateReceiveInboxes(executorId, ids)
-        try {
-          val prepared = endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
-          if (!prepared) rollbackPreparedReceiveInboxes(newlyPrepared)
-          prepared
-        } catch {
-          case NonFatal(e) =>
-            rollbackPreparedReceiveInboxes(newlyPrepared)
-            throw e
-        }
-      }
+      endpoint != null &&
+        endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
     }
-  }
-
-  private def activateReceiveInboxes(
-      executorId: String,
-      ids: Seq[StreamingShuffleReceiveInboxId])
-      : Seq[(String, StreamingShuffleReceiveInboxId)] = {
-    receiveInboxStateLock.synchronized {
-      ids.distinct.map(executorId -> _).filter(preparedReceiveInboxes.add)
-    }
-  }
-
-  private def rollbackPreparedReceiveInboxes(
-      keys: Seq[(String, StreamingShuffleReceiveInboxId)]): Unit = {
-    receiveInboxStateLock.synchronized {
-      keys.foreach { key =>
-        preparedReceiveInboxes.remove(key)
-        drainReadyInboxes.remove(key)
-      }
-    }
-  }
-
-  /**
-   * Prepare one inbox batch per executor concurrently. The task scheduler calls this while making
-   * resource offers, so serial `askSync` calls would add one full RPC round trip per executor to
-   * the first reader launch of every pipelined group.
-   */
-  private[spark] def prepareReceiveInboxesByExecutor(
-      idsByExecutor: Map[String, Seq[StreamingShuffleReceiveInboxId]]): Set[String] = {
-    implicit val executionContext: ExecutionContext = ThreadUtils.sameThread
-    val requests = idsByExecutor.toSeq.map { case (executorId, ids) =>
-      val endpoint = receiveEndpoints.get(executorId)
-      if (ids.isEmpty) {
-        Future.successful(executorId -> true)
-      } else if (endpoint == null) {
-        Future.successful(executorId -> false)
-      } else {
-        val newlyPrepared = activateReceiveInboxes(executorId, ids)
-        endpoint.ask[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
-          .map { prepared =>
-            if (!prepared) rollbackPreparedReceiveInboxes(newlyPrepared)
-            executorId -> prepared
-          }.recoverWith { case NonFatal(e) =>
-            rollbackPreparedReceiveInboxes(newlyPrepared)
-            Future.failed(e)
-          }
-      }
-    }
-    ThreadUtils.awaitResult(
-      Future.sequence(requests), RpcUtils.askRpcTimeout(conf).duration).collect {
-      case (executorId, true) => executorId
-    }.toSet
   }
 
   private[spark] def releaseReceiveInbox(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Unit = {
-    val key = executorId -> id
-    receiveInboxStateLock.synchronized {
-      preparedReceiveInboxes.remove(key)
-      drainReadyInboxes.remove(key)
-    }
+    drainReadyInboxes.remove((executorId, id))
     Option(receiveEndpoints.get(executorId)).foreach(
       _.send(ReleaseStreamingShuffleReceiveInbox(id)))
   }
 
   private[spark] def removeReceiveExecutor(executorId: String): Unit = {
     receiveEndpoints.remove(executorId)
-    receiveInboxStateLock.synchronized {
-      preparedReceiveInboxes.removeIf { case (preparedExecutorId, _) =>
-        preparedExecutorId == executorId
-      }
-      drainReadyInboxes.removeIf { case (readyExecutorId, _) =>
-        readyExecutorId == executorId
-      }
+    drainReadyInboxes.removeIf { case (readyExecutorId, _) =>
+      readyExecutorId == executorId
     }
   }
 
   private[spark] def isReceiveInboxDrainReady(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Boolean = {
-    receiveInboxStateLock.synchronized {
-      drainReadyInboxes.contains((executorId, id))
-    }
+    drainReadyInboxes.contains((executorId, id))
   }
 
   def post(message: StreamingShuffleTaskLocationTrackerMasterMessage): Unit = {
@@ -657,11 +441,6 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
               case GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context) =>
                 val ret = getAvailableShuffleWriterTaskLocations(shuffleId)
                 context.reply(ret)
-
-              case GetAvailableStreamingShuffleTaskLocationsBatchMasterMessage(
-                    shuffleIds,
-                    context) =>
-                context.reply(getAvailableShuffleWriterTaskLocationsBatch(shuffleIds))
 
               case IsStreamingShuffleRegisteredMasterMessage(shuffleId, context) =>
                 context.reply(containsShuffle(shuffleId))
@@ -740,7 +519,6 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
         log"Shuffle ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} was unregistered " +
           log"during registration of writer task ${MDC(LogKeys.MAP_ID, mapId)}")
     }
-    if (registered) queueWriterLocationNotification(shuffleId)
     registered
   }
 
@@ -767,22 +545,6 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
   }
 
   override def stop(): Unit = {
-    val stopWriterLocationNotifier = writerLocationNotificationLock.synchronized {
-      if (writerLocationNotifierStopped) {
-        false
-      } else {
-        writerLocationNotifierStopped = true
-        true
-      }
-    }
-    if (stopWriterLocationNotifier) {
-      flushPendingWriterLocationNotifications()
-      writerLocationNotificationExecutor.shutdownNow()
-      writerLocationNotificationExecutor.awaitTermination(10, TimeUnit.SECONDS)
-      val (shuffles, messages) = writerLocationNotificationStats
-      logInfo(log"Sent ${MDC(LogKeys.COUNT, messages)} executor messages carrying " +
-        log"${MDC(LogKeys.SHUFFLE_IDS, shuffles)} streaming shuffle location notifications")
-    }
     trackerMasterMessages.offer(PoisonPill)
     threadpool.shutdown()
     if (trackerEndpoint != null) {
@@ -815,10 +577,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(
   }
 }
 
-private[spark] class StreamingShuffleOutputTrackerWorker(
-    conf: SparkConf,
-    inboxDrainReadyAckDelayMs: Long =
-      StreamingShuffleOutputTrackerWorker.INBOX_DRAIN_READY_ACK_DELAY_MS)
+private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
   extends StreamingShuffleOutputTracker(conf) {
 
   private case class CachedAvailableLocations(
@@ -828,58 +587,6 @@ private[spark] class StreamingShuffleOutputTrackerWorker(
   private val availableLocationRefreshLocks = new ConcurrentHashMap[Int, Object]()
   private val locationRefreshNanos = TimeUnit.MILLISECONDS.toNanos(
     conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL))
-
-  // A prepared reader group can make tens or hundreds of inboxes ready nearly together. Sending
-  // one RPC message per inbox serializes that fan-in through the executor and driver endpoint even
-  // though the scheduler only needs a new resource offer after the group of updates. Coalesce the
-  // acknowledgements for a short executor-local window. IDs remain explicit and idempotent, so a
-  // delayed duplicate or a close race cannot make a different inbox ready.
-  private val inboxDrainReadyAckLock = new Object
-  private val pendingInboxDrainReadyAcks =
-    mutable.LinkedHashSet.empty[(String, StreamingShuffleReceiveInboxId)]
-  private val inboxDrainReadyAckExecutor: ScheduledExecutorService =
-    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
-      "streaming-shuffle-inbox-ready-ack")
-  private var inboxDrainReadyAckFlushScheduled = false
-  private var inboxDrainReadyAckStopped = false
-  private var inboxDrainReadyAckIds = 0L
-  private var inboxDrainReadyAckBatches = 0L
-
-  private def scheduleInboxDrainReadyAckFlush(): Unit = {
-    if (!inboxDrainReadyAckFlushScheduled) {
-      inboxDrainReadyAckFlushScheduled = true
-      inboxDrainReadyAckExecutor.schedule(
-        new Runnable {
-          override def run(): Unit = flushPendingInboxDrainReadyAcks()
-        },
-        inboxDrainReadyAckDelayMs,
-        TimeUnit.MILLISECONDS)
-    }
-  }
-
-  private[spark] def flushPendingInboxDrainReadyAcks(): Unit = {
-    val readyByExecutor = inboxDrainReadyAckLock.synchronized {
-      inboxDrainReadyAckFlushScheduled = false
-      val ready = pendingInboxDrainReadyAcks.toSeq
-      pendingInboxDrainReadyAcks.clear()
-      ready.groupMap(_._1)(_._2)
-    }
-    val endpoint = trackerEndpoint
-    if (endpoint != null) {
-      readyByExecutor.foreach { case (executorId, ids) =>
-        endpoint.send(StreamingShuffleInboxesDrainReady(executorId, ids))
-      }
-      inboxDrainReadyAckLock.synchronized {
-        inboxDrainReadyAckIds += readyByExecutor.valuesIterator.map(_.size).sum
-        inboxDrainReadyAckBatches += readyByExecutor.size
-      }
-    }
-  }
-
-  private[spark] def inboxDrainReadyAckStats: (Long, Long) =
-    inboxDrainReadyAckLock.synchronized {
-      inboxDrainReadyAckIds -> inboxDrainReadyAckBatches
-    }
 
   private def freshCachedLocations(
       shuffleId: Int,
@@ -927,60 +634,6 @@ private[spark] class StreamingShuffleOutputTrackerWorker(
     }
   }
 
-  override def getAvailableShuffleWriterTaskLocationsBatch(
-      shuffleIds: Seq[Int]): Map[Int, ShuffleLocationResponse] = {
-    val distinctShuffleIds = shuffleIds.distinct.sorted
-    val initialNow = System.nanoTime()
-    val initiallyFresh = distinctShuffleIds.flatMap { shuffleId =>
-      freshCachedLocations(shuffleId, initialNow).map(shuffleId -> _)
-    }.toMap
-    val initiallyStale = distinctShuffleIds.filterNot(initiallyFresh.contains)
-
-    def refreshUnderLocks(remainingLocks: List[Object]): Unit = remainingLocks match {
-      case lock :: tail => lock.synchronized(refreshUnderLocks(tail))
-      case Nil =>
-        val lockedNow = System.nanoTime()
-        val stale = initiallyStale.filter(
-          freshCachedLocations(_, lockedNow).isEmpty)
-        if (stale.nonEmpty) {
-          val responses = askTracker[Map[Int, ShuffleLocationResponse]](
-            GetAvailableStreamingShuffleTaskLocationsBatch(stale))
-          val refreshedAt = System.nanoTime()
-          stale.foreach { shuffleId =>
-            availableLocationCache.put(
-              shuffleId, CachedAvailableLocations(responses.get(shuffleId), refreshedAt))
-          }
-        }
-    }
-
-    if (initiallyStale.nonEmpty) {
-      // A task-owned reader can refresh one shuffle concurrently with the prepared discovery's
-      // batch. Acquire the same per-shuffle locks in shuffle-id order so the batch neither races a
-      // stale cache overwrite nor deadlocks with another overlapping batch.
-      val locks = initiallyStale.sorted.map { shuffleId =>
-        availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
-      }.toList
-      refreshUnderLocks(locks)
-    }
-    distinctShuffleIds.flatMap { shuffleId =>
-      Option(availableLocationCache.get(shuffleId)).flatMap(_.response).map(shuffleId -> _)
-    }.toMap
-  }
-
-  override def invalidateAvailableShuffleWriterTaskLocations(shuffleIds: Seq[Int]): Unit = {
-    val distinctShuffleIds = shuffleIds.distinct.sorted
-
-    def invalidateUnderLocks(remainingLocks: List[Object]): Unit = remainingLocks match {
-      case lock :: tail => lock.synchronized(invalidateUnderLocks(tail))
-      case Nil => distinctShuffleIds.foreach(availableLocationCache.remove)
-    }
-
-    val locks = distinctShuffleIds.map { shuffleId =>
-      availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
-    }.toList
-    invalidateUnderLocks(locks)
-  }
-
   override def containsShuffle(shuffleId: Int): Boolean = {
     askTracker[Boolean](IsStreamingShuffleRegistered(shuffleId))
   }
@@ -994,41 +647,8 @@ private[spark] class StreamingShuffleOutputTrackerWorker(
   override def markInboxDrainReady(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Unit = {
-    inboxDrainReadyAckLock.synchronized {
-      if (!inboxDrainReadyAckStopped && pendingInboxDrainReadyAcks.add((executorId, id))) {
-        scheduleInboxDrainReadyAckFlush()
-      }
-    }
+    trackerEndpoint.send(StreamingShuffleInboxDrainReady(executorId, id))
   }
-
-  override def stop(): Unit = {
-    val shouldStop = inboxDrainReadyAckLock.synchronized {
-      if (inboxDrainReadyAckStopped) {
-        false
-      } else {
-        inboxDrainReadyAckStopped = true
-        true
-      }
-    }
-    if (shouldStop) {
-      // Do not lose the final readiness transition when SparkEnv stops the tracker before the
-      // shuffle manager and RpcEnv.
-      flushPendingInboxDrainReadyAcks()
-      inboxDrainReadyAckExecutor.shutdownNow()
-      inboxDrainReadyAckExecutor.awaitTermination(10, TimeUnit.SECONDS)
-      val (ids, batches) = inboxDrainReadyAckStats
-      logInfo(log"Sent ${MDC(LogKeys.NUM_TASKS, ids)} streaming shuffle inbox ready " +
-        log"acknowledgements in ${MDC(LogKeys.COUNT, batches)} batches")
-    }
-  }
-}
-
-private[spark] object StreamingShuffleOutputTrackerWorker {
-  private[spark] val INBOX_DRAIN_READY_ACK_DELAY_MS = 1L
-}
-
-private[spark] object StreamingShuffleOutputTrackerMaster {
-  private[spark] val WRITER_LOCATION_NOTIFICATION_DELAY_MS = 1L
 }
 
 private[spark] object StreamingShuffleOutputTracker extends Logging {

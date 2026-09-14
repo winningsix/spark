@@ -54,13 +54,11 @@ class StreamingShuffleClientHandler(
     byteLimit: Long,
     val context: TaskContext,
     errorNotifier: ErrorNotifier,
-    onMessageAvailable: () => Unit = () => (),
-    onReceiveWindowExhausted: () => Unit = () => ())
-  extends RpcHandler with TaskContextAwareLogging {
+    onMessageAvailable: () => Unit = () => ()) extends RpcHandler with TaskContextAwareLogging {
   private val RECVBUF_SIZE: Integer = Option(SparkEnv.get)
     .map(env => Integer.valueOf(env.conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)))
     .getOrElse(Integer.valueOf(32 << 10))
-  private val DEDICATED_CONTROL_SENDBUF_SIZE = 512
+  private val SENDBUF_SIZE: Integer = 512
 
   @volatile private var lastSeqNum = -1L  // The most recent sequence number we have seen.
   // Set once this writer's TerminationControlMessage has been received, so that channelInactive
@@ -68,36 +66,28 @@ class StreamingShuffleClientHandler(
   // died before terminating). @volatile because it is written on the Netty event-loop thread in
   // receive() and read in channelInactive().
   @volatile private var terminationReceived = false
+
+  private[streaming] def terminationReceivedForDiagnostics: Boolean = terminationReceived
+
+  private[streaming] def lastSequenceNumberForDiagnostics: Long = lastSeqNum
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
-  private var activeReceiveWindowBytes: Long = byteLimit
-  private var activeReceiveWindowExhausted = false
-  private val receiveCreditLeaseClosed = new AtomicBoolean(false)
-  private val receiveCreditWindowOpened = new AtomicBoolean(true)
-  @volatile private var receiveCreditBudget: Option[StreamingShuffleReceiveCreditBudget] = None
-  @volatile private var receiveCreditOwner: Any = _
-  @volatile private var routeReservationBytes: Long = 0L
-  @volatile private var receiveCreditLease: StreamingShuffleReceiveCreditLease = _
-  // Total encoded data bytes released by the task on this connection. Multiplexed routes send
-  // this as an absolute acknowledgement watermark, so an idle retry is idempotent.
+  // Multiplexed routes acknowledge an absolute released-byte watermark. This makes an idle
+  // retry idempotent and lets the executor collapse many frame releases into one control body.
   private val cumulativeReleasedBytes = new AtomicLong(0L)
+  // Set before publishing a reader-visible sequence repair. TCP preserves order, but the repair
+  // request can cross newer normal frames already in flight; duplicates are legal only while this
+  // explicit replay window is active.
+  private val replayRepairActive = new AtomicBoolean(false)
   private val backpressureEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
   private val messageBatchingEnabled =
     Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
   private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
   @volatile private var perStreamAutoReadEnabled = true
-  // A shared executor lane must not emit one Spark transport write for every released data
-  // frame. The cumulative watermark is idempotent, so the executor client can retain only the
-  // newest watermark for this logical route and publish many routes in one control body.
   @volatile private var multiplexedCreditSender:
       (TransportClient, StreamingShuffleClientHandler) => Unit = _
-  // Terminal frames can arrive for many logical routes in one executor-lane body. Defer their
-  // ACK writes to the executor client so that body produces one ACK body, not one transport write
-  // per writer/reader route.
-  @volatile private var multiplexedTerminationAckSender:
-      (TransportClient, StreamingShuffleClientHandler, Int, Long) => Unit = _
 
   setShuffleIdForLogging(shuffleId)
 
@@ -125,19 +115,6 @@ class StreamingShuffleClientHandler(
     perStreamAutoReadEnabled = false
   }
 
-  private[streaming] def useExecutorReceiveCreditBudget(
-      budget: StreamingShuffleReceiveCreditBudget,
-      reservationBytes: Long,
-      owner: Any = StreamingShuffleReceiveCreditBudget.LegacyOwner): Unit = synchronized {
-    require(receiveCreditLease == null, "Receive credit budget was installed after registration")
-    require(receiveCreditBudget.isEmpty, "Receive credit budget was installed more than once")
-    require(reservationBytes > 0L, "Receive credit reservation must be positive")
-    receiveCreditBudget = Some(budget)
-    receiveCreditOwner = owner
-    routeReservationBytes = reservationBytes
-    receiveCreditWindowOpened.set(false)
-  }
-
   private[streaming] def setMultiplexedCreditSender(
       sender: (TransportClient, StreamingShuffleClientHandler) => Unit): Unit = {
     multiplexedCreditSender = sender
@@ -147,65 +124,15 @@ class StreamingShuffleClientHandler(
     multiplexedCreditSender = null
   }
 
-  private[streaming] def setMultiplexedTerminationAckSender(
-      sender: (TransportClient, StreamingShuffleClientHandler, Int, Long) => Unit): Unit = {
-    multiplexedTerminationAckSender = sender
-  }
-
-  private[streaming] def clearMultiplexedTerminationAckSender(): Unit = {
-    multiplexedTerminationAckSender = null
-  }
-
-  private[streaming] def prepareMultiplexedTerminationAck(
-      writerId: Int,
-      sequenceNumber: Long): TerminationAckMessage = {
-    val message = new TerminationAckMessage(shuffleId, writerId, shuffleReaderId)
-    message.setSeqNum(sequenceNumber)
-    message
-  }
-
-  private[streaming] def terminationAckBatchSendSucceeded(writerId: Int): Unit = {
-    onTermAckResponse(writerId)
-  }
-
-  private[streaming] def terminationAckBatchSendFailed(
-      client: TransportClient,
-      writerId: Int,
-      cause: Throwable): Unit = {
-    if (terminationAckFailureIsExpected(cause, client)) {
-      logWarning(log"Ignoring batched termination acknowledgment failure after the writer " +
-        log"has already closed its endpoint for shuffle writer ${MDC(
-          LogKeys.SHUFFLE_WRITER_ID, writerId)}", cause)
-    } else {
-      val error = new RuntimeException(
-        s"Error sending batched termination acknowledgment to shuffle writer $writerId", cause)
-      logError(log"Streaming shuffle batched termination acknowledgment failed", error)
-      errorNotifier.markError(error)
-    }
-  }
-
-  /**
-   * A dedicated reader connection sends only one route's credit and terminal ACK frames, for
-   * which the historical 512-byte socket buffer is sufficient.  An executor lane multiplexes
-   * thousands of routes, though, so retaining that per-route setting serializes late discovery
-   * credits behind the complete ACK backlog of the earlier writers.  Use the configured data
-   * socket buffer as the aggregate control-plane window for a multiplexed lane.
-   */
-  private[streaming] def configuredSendBufferSize: Int = {
-    if (perStreamAutoReadEnabled) DEDICATED_CONTROL_SENDBUF_SIZE
-    else math.max(DEDICATED_CONTROL_SENDBUF_SIZE, RECVBUF_SIZE.intValue())
-  }
-
   private def bindChannel(client: TransportClient, configureSocket: Boolean): Unit = {
     channel = client.getChannel
     if (configureSocket) {
       channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
-      channel.config.setOption(
-        ChannelOption.SO_SNDBUF, Integer.valueOf(configuredSendBufferSize))
+      channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
     }
   }
 
-  private def boundedCreditAmount(windowOpened: Boolean): Int = {
+  private def initialCreditAmount: Int = {
     // The first credit both discovers the route and opens its bounded receive window. On a
     // multiplexed channel this is the logical replacement for toggling channel-wide autoRead;
     // each route gets an independent writer-side byte budget even though the physical channel is
@@ -213,11 +140,7 @@ class StreamingShuffleClientHandler(
     if (backpressureEnabled && !perStreamAutoReadEnabled) {
       // A negative first credit opts this logical stream into writer-side byte admission. Positive
       // credits retain the historical connection-discovery-only protocol for dedicated channels.
-      val grantedBytes = synchronized {
-        if (receiveCreditLease == null) byteLimit else receiveCreditLease.bytes
-      }
-      if (windowOpened) -math.min(grantedBytes, Int.MaxValue.toLong).toInt
-      else StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT
+      -math.min(byteLimit, Int.MaxValue.toLong).toInt
     } else {
       // Preserve the original connection-discovery marker when reader backpressure is disabled.
       1
@@ -226,130 +149,7 @@ class StreamingShuffleClientHandler(
 
   override def channelActive(client: TransportClient): Unit = {
     bindChannel(client, configureSocket = true)
-    sendCreditControlMessage(client, shuffleWriterId, boundedCreditAmount(windowOpened = true))
-  }
-
-  private def acquireReceiveCredit(client: TransportClient): Boolean = {
-    if (receiveCreditLeaseClosed.get()) return false
-    receiveCreditBudget match {
-      case None => true
-      case Some(budget) => synchronized {
-        if (receiveCreditLeaseClosed.get()) {
-          false
-        } else {
-          if (receiveCreditLease == null) {
-            val requested = if (routeReservationBytes > 0L) routeReservationBytes else byteLimit
-            receiveCreditLease = budget.acquire(
-              receiveCreditOwner, requested, openDeferredReceiveWindow(client, _))
-          }
-          val granted = receiveCreditLease.isGranted
-          if (granted) {
-            activeReceiveWindowBytes = receiveCreditLease.bytes
-            remainingBytesQuota = activeReceiveWindowBytes
-            activeReceiveWindowExhausted = false
-            receiveCreditWindowOpened.set(true)
-          }
-          granted
-        }
-      }
-    }
-  }
-
-  private def openDeferredReceiveWindow(
-      client: TransportClient,
-      grantedLease: StreamingShuffleReceiveCreditLease): Unit = {
-    val granted = synchronized {
-      if (receiveCreditLeaseClosed.get()) {
-        None
-      } else {
-        if (receiveCreditLease == null) receiveCreditLease = grantedLease
-        if ((receiveCreditLease ne grantedLease) ||
-            !receiveCreditWindowOpened.compareAndSet(false, true)) {
-          None
-        } else {
-          activeReceiveWindowBytes = grantedLease.bytes
-          remainingBytesQuota = grantedLease.bytes
-          activeReceiveWindowExhausted = false
-          Some(grantedLease.bytes)
-        }
-      }
-    }
-    granted.foreach { bytes =>
-      if (lastSeqNum < 0L) {
-        sendAvailableCreditFloor(client, bytes)
-      } else {
-        sendCumulativeCreditAck(client, cumulativeReleasedBytes.get())
-      }
-    }
-  }
-
-  /**
-   * Yield a fully consumed logical receive window and queue this route for another fair turn.
-   * The executor budget is shared by every prepared inbox, so retaining a lease for the complete
-   * writer lifetime lets one join input occupy all windows while its sibling is the input the
-   * operator is currently trying to consume.
-   */
-  private def rotateReceiveCreditLease(
-      client: TransportClient,
-      releasedBytes: Long): Boolean = {
-    val budget = receiveCreditBudget.orNull
-    if (budget == null || receiveCreditLeaseClosed.get()) return false
-
-    val previous = synchronized {
-      if (receiveCreditLeaseClosed.get()) return false
-      if (!activeReceiveWindowExhausted) return false
-      if (remainingBytesQuota < activeReceiveWindowBytes) return true
-      receiveCreditWindowOpened.set(false)
-      val lease = receiveCreditLease
-      receiveCreditLease = null
-      lease
-    }
-    if (previous != null) previous.close()
-
-    val requested = if (routeReservationBytes > 0L) routeReservationBytes else byteLimit
-    val next = budget.acquire(
-      receiveCreditOwner, requested, openDeferredReceiveWindow(client, _))
-    val (retained, sendAckNow) = synchronized {
-      if (receiveCreditLeaseClosed.get()) {
-        (false, false)
-      } else {
-        if (receiveCreditLease == null) receiveCreditLease = next
-        require(receiveCreditLease eq next, "A different receive credit lease was granted")
-        val openedHere = next.isGranted &&
-          receiveCreditWindowOpened.compareAndSet(false, true)
-        if (next.isGranted) {
-          activeReceiveWindowBytes = next.bytes
-          remainingBytesQuota = next.bytes
-          activeReceiveWindowExhausted = false
-        }
-        (true, openedHere)
-      }
-    }
-    if (!retained) {
-      next.close()
-    } else if (sendAckNow) {
-      sendCumulativeCreditAck(client, releasedBytes)
-    }
-    true
-  }
-
-  private def maybeReleaseReceiveCredit(): Unit = {
-    val releasable = synchronized {
-      terminationReceived && remainingBytesQuota >= activeReceiveWindowBytes
-    }
-    if (releasable) closeReceiveCreditLease()
-  }
-
-  private[streaming] def closeReceiveCreditLease(): Unit = {
-    if (receiveCreditLeaseClosed.compareAndSet(false, true)) {
-      receiveCreditWindowOpened.set(false)
-      val lease = synchronized {
-        val current = receiveCreditLease
-        receiveCreditLease = null
-        current
-      }
-      if (lease != null) lease.close()
-    }
+    sendCreditControlMessage(client, shuffleWriterId, initialCreditAmount)
   }
 
   /** Bind one logical route and return its discovery frame for an executor-level batch send. */
@@ -358,9 +158,8 @@ class StreamingShuffleClientHandler(
       configureSocket: Boolean): CreditControlMessage = {
     useMultiplexedChannel()
     bindChannel(client, configureSocket)
-    val windowOpened = acquireReceiveCredit(client)
     new CreditControlMessage(
-      shuffleId, shuffleWriterId, shuffleReaderId, boundedCreditAmount(windowOpened))
+      shuffleId, shuffleWriterId, shuffleReaderId, initialCreditAmount)
   }
 
   /** Surface a failed executor-level discovery batch through this route's normal error path. */
@@ -371,50 +170,52 @@ class StreamingShuffleClientHandler(
     errorNotifier.markError(error)
   }
 
-  /** Repair initial route discovery or repeat the latest idempotent release acknowledgement. */
-  private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
-    if (backpressureEnabled && !perStreamAutoReadEnabled && !terminationReceived) {
-      if (lastSeqNum < 0) {
-        val available = availableReceiveBytes
-        if (available > 0) sendAvailableCreditFloor(client, available)
+  /** Build the latest idempotent discovery or cumulative-credit repair frame. */
+  private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
+    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
+    if (lastSeqNum < 0) {
+      val advertised = math.min(availableReceiveBytes, Int.MaxValue.toLong).toInt
+      if (advertised > 0) {
+        Some(new CreditControlMessage(
+          shuffleId, shuffleWriterId, shuffleReaderId, -advertised))
       } else {
-        sendCumulativeCreditAck(client, cumulativeReleasedBytes.get())
+        None
       }
+    } else {
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(cumulativeReleasedBytes.get())
+      Some(message)
     }
   }
 
-  /** Build one repair frame so an executor lane can batch many logical-route probes. */
-  private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
-    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
-    val message = if (lastSeqNum < 0) {
-      val available = availableReceiveBytes
-      val advertised = math.min(available, Int.MaxValue.toLong).toInt
-      if (advertised <= 0) return None
-      new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, -advertised)
-    } else {
-      val cumulative = new CreditControlMessage(
-        shuffleId, shuffleWriterId, shuffleReaderId, 0)
-      cumulative.setSeqNum(cumulativeReleasedBytes.get())
-      cumulative
-    }
+  /** Ask the writer to reconcile its local send cursor with the last reader-visible sequence. */
+  private[streaming] def prepareMultiplexedReplayRepair(): Option[CreditControlMessage] = {
+    if (terminationReceived) return None
+    replayRepairActive.set(true)
+    val message = new CreditControlMessage(
+      shuffleId, shuffleWriterId, shuffleReaderId, Int.MinValue)
+    message.setSeqNum(lastSeqNum)
     Some(message)
   }
 
-  /** Surface a failed batched repair through the logical route's normal error path. */
-  private[streaming] def creditRepairBatchSendFailed(
+  /** Surface a failed executor-level credit batch through this route's normal error path. */
+  private[streaming] def creditBatchSendFailed(
       client: TransportClient,
       cause: Throwable): Unit = {
     if (!terminationAckFailureIsExpected(cause, client)) {
       val error = new RuntimeException(
-        s"Error sending batched credit repair to shuffle writer $shuffleWriterId", cause)
-      logError(log"Streaming shuffle batched credit repair failed", error)
+        s"Error sending batched credit to shuffle writer $shuffleWriterId", cause)
+      logError(log"Streaming shuffle batched credit failed", error)
       errorNotifier.markError(error)
     }
   }
 
-  /** Snapshot one logical route without mutating its liveness protocol. */
-  private[streaming] def routeProgressForDiagnostics: (Long, Boolean, Long) = {
-    (lastSeqNum, terminationReceived, cumulativeReleasedBytes.get())
+  /** Repair route discovery or repeat the latest cumulative release watermark. */
+  private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
+    prepareMultiplexedCreditRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
+    prepareMultiplexedReplayRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
   }
 
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
@@ -422,7 +223,6 @@ class StreamingShuffleClientHandler(
   private def updateQuota(bytes: Long): Long = synchronized {
     if (!backpressureEnabled) return byteLimit
     remainingBytesQuota -= bytes
-    if (bytes > 0L && remainingBytesQuota <= 0L) activeReceiveWindowExhausted = true
     if (perStreamAutoReadEnabled) {
       val autoRead = remainingBytesQuota > 0
       if (channel.config.isAutoRead != autoRead) {
@@ -438,8 +238,7 @@ class StreamingShuffleClientHandler(
   }
 
   private def clampedAvailableReceiveBytes: Long = {
-    if (receiveCreditBudget.isDefined && !receiveCreditWindowOpened.get()) 0L
-    else math.max(0L, math.min(activeReceiveWindowBytes, remainingBytesQuota))
+    math.max(0L, math.min(byteLimit, remainingBytesQuota))
   }
 
   private def availableReceiveBytes: Long = synchronized {
@@ -458,12 +257,11 @@ class StreamingShuffleClientHandler(
       releasedBytes: Long): Unit = {
     val sender = multiplexedCreditSender
     if (!perStreamAutoReadEnabled && sender != null) {
-      // releasedBytes has already been committed to cumulativeReleasedBytes. The batcher reads
-      // that atomic watermark immediately before encoding, so several releases collapse to the
-      // newest value without losing credit.
       sender(client, this)
     } else {
-      sendCreditControlMessage(client, shuffleWriterId, 0, releasedBytes)
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(releasedBytes)
+      sendCreditControlMessage(client, message)
     }
   }
 
@@ -472,20 +270,15 @@ class StreamingShuffleClientHandler(
       shuffleWriterId: Int,
       credit: Int
   ): Unit = {
-    sendCreditControlMessage(client, shuffleWriterId, credit, 0L)
+    sendCreditControlMessage(
+      client, new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit))
   }
 
   private def sendCreditControlMessage(
       client: TransportClient,
-      shuffleWriterId: Int,
-      credit: Int,
-      sequenceNumber: Long
-  ): Unit = {
+      creditControlMessage: CreditControlMessage): Unit = {
     var buf: CompositeByteBuf = null
     try {
-      val creditControlMessage =
-        new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit)
-      creditControlMessage.setSeqNum(sequenceNumber)
       buf = client.getChannel().alloc().compositeBuffer()
         .capacity(creditControlMessage.headerLength())
       creditControlMessage.encode(buf)
@@ -510,11 +303,6 @@ class StreamingShuffleClientHandler(
   }
 
   protected def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
-    val sender = multiplexedTerminationAckSender
-    if (!perStreamAutoReadEnabled && sender != null) {
-      sender(client, this, shuffleWriterId, lastSeqNum)
-      return
-    }
     var buf: CompositeByteBuf = null
     try {
       val terminationAckMessage =
@@ -632,7 +420,6 @@ class StreamingShuffleClientHandler(
     val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
     val pendingTerminationAcks = new ArrayBuffer[Int]()
     var publishedMessage = false
-    var receiveWindowExhausted = false
     try {
       // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
       // DataMessage processing is asynchronous, so retain that buffer and release it with the
@@ -652,57 +439,71 @@ class StreamingShuffleClientHandler(
             terminationReceived && shuffleMessage.getSeqNum == lastSeqNum
           case _ => false
         }
-        if (!duplicateTermination) {
+        val duplicateReplayData = shuffleMessage match {
+          case _: DataMessage =>
+            replayRepairActive.get() && shuffleMessage.getSeqNum <= lastSeqNum
+          case _ => false
+        }
+        if (!duplicateTermination && !duplicateReplayData) {
           updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
         }
         shuffleMessage match {
+          case _: DataMessage if duplicateReplayData =>
+            // The writer charged this retransmission to the logical receive window. Drop the
+            // already-published record bytes, but advance the cumulative released-byte watermark
+            // so replay cannot consume credit permanently.
+            if (backpressureEnabled) {
+              if (perStreamAutoReadEnabled) {
+                sendCreditControlMessage(client, shuffleWriterId, messageSize)
+              } else {
+                val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                sendCumulativeCreditAck(client, released)
+              }
+            }
           case dataMessage: DataMessage =>
-            receiveWindowExhausted |= updateQuota(messageSize) == 0L
+            updateQuota(messageSize)
             val retainedBody = managedBody.map(_.retain())
-            // Transport-body ownership is independent of receive-window ownership. A spillable
-            // inbox may release the copied payload immediately, but credit must remain outstanding
-            // until the downstream task consumes or cancels the spilled entry.
-            dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
-              updateQuota(-messageSize)
-              if (backpressureEnabled && !terminationReceived) {
-                if (perStreamAutoReadEnabled) {
-                  // Dedicated channels retain the original additive-credit protocol; their
-                  // channel-level autoRead is the primary admission boundary.
-                  sendCreditControlMessage(
-                    client,
-                    shuffleWriterId,
-                    math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
-                } else {
-                  // Carry an absolute released-byte watermark. Repeating it after an idle
-                  // interval repairs a delayed final wake-up without adding the same credit
-                  // twice or advertising receive capacity that may still be in flight.
-                  val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
-                  if (!rotateReceiveCreditLease(client, released)) {
+              try {
+                val available = updateQuota(-messageSize)
+                if (backpressureEnabled && !terminationReceived) {
+                  if (perStreamAutoReadEnabled) {
+                    // Dedicated channels retain the original additive-credit protocol; their
+                    // channel-level autoRead is the primary admission boundary.
+                    sendCreditControlMessage(
+                      client,
+                      shuffleWriterId,
+                      math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                  } else {
+                    val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
                     sendCumulativeCreditAck(client, released)
                   }
                 }
+              } finally {
+                retainedBody.foreach(_.release())
               }
-              maybeReleaseReceiveCredit()
             })
             // We can only release the frame after all rows in the buffer have been decoded. The
             // release callback returns the exact encoded frame size to the writer, so a shared
             // physical channel cannot continue filling this logical route while its queue is
             // waiting behind another sibling input.
           case controlMessage: TerminationControlMessage =>
-            // Mark the route terminated immediately so a later channelInactive is classified
-            // correctly, but do not ACK until this body has been published to the inbox queue.
-            // The ACK is the writer's cleanup fence; sending it after decode but before queue
-            // ownership allowed a relaxed writer to discard its endpoint while the task-visible
-            // terminal was still in this callback.
+            // Record receipt before publishing so a connection close cannot be mistaken for a
+            // premature disconnect. Do not ACK a new terminal until it is safely visible in the
+            // reader queue: the writer may release this route as soon as the ACK arrives.
             terminationReceived = true
-            maybeReleaseReceiveCredit()
-            pendingTerminationAcks += controlMessage.shuffleWriterId
+            if (duplicateTermination) {
+              // The original terminal was published before its ACK. A retransmission only means
+              // that ACK was lost, so acknowledge it again without adding a duplicate terminal.
+              sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+            } else {
+              pendingTerminationAcks += controlMessage.shuffleWriterId
+            }
           case _ =>
             throw new IllegalArgumentException(
               s"Unexpected message type in ShuffleClientHandler: ${shuffleMessage.messageType()}")
         }
-        if (duplicateTermination) {
+        if (duplicateTermination || duplicateReplayData) {
           shuffleMessage.release()
         } else if (messageBatchingEnabled && queue.isInstanceOf[StreamingShuffleMessageQueue]) {
           decodedMessages += shuffleMessage
@@ -712,6 +513,8 @@ class StreamingShuffleClientHandler(
           // parsed.
           queue.put(shuffleMessage)
           publishedMessage = true
+          pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+          pendingTerminationAcks.clear()
         }
         shuffleMessage = null
       }
@@ -721,6 +524,8 @@ class StreamingShuffleClientHandler(
             batchedQueue.putBatch(decodedMessages.toArray)
             decodedMessages.clear()
             publishedMessage = true
+            pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+            pendingTerminationAcks.clear()
           case _ =>
             // Keep ownership tracking precise if an interrupt happens while putting into a
             // legacy queue. Messages whose put already succeeded belong to the queue; release
@@ -730,10 +535,17 @@ class StreamingShuffleClientHandler(
             var enqueued = 0
             try {
               while (enqueued < messages.length) {
-                queue.put(messages(enqueued))
+                val enqueuedMessage = messages(enqueued)
+                queue.put(enqueuedMessage)
                 enqueued += 1
                 publishedMessage = true
+                enqueuedMessage match {
+                  case controlMessage: TerminationControlMessage =>
+                    sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+                  case _ =>
+                }
               }
+              pendingTerminationAcks.clear()
             } finally {
               while (enqueued < messages.length) {
                 messages(enqueued).release()
@@ -744,15 +556,7 @@ class StreamingShuffleClientHandler(
       }
       if (publishedMessage) {
         onMessageAvailable()
-        // A credit-controlled writer cannot publish another data frame after its receive window
-        // reaches zero. Wake a prepared reader even when its configured byte threshold is higher
-        // than the initial credit reachable by the currently admitted producer wave; otherwise
-        // both sides wait forever and the writer's queued terminal can never reach this inbox.
-        if (receiveWindowExhausted) onReceiveWindowExhausted()
       }
-      // Queue publication is the end-to-end delivery point for a prepared inbox. Duplicate
-      // terminals are not republished, but are ACKed again here so a lost ACK remains repairable.
-      pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)
@@ -865,10 +669,4 @@ class StreamingShuffleClientHandler(
       hasClosedEndpoint(ex)
     }
   }
-}
-
-private[streaming] object StreamingShuffleClientHandler {
-  // Negative values opt a route into bounded credit mode. Int.MinValue is reserved for discovery
-  // without opening a data window; it cannot collide with a valid positive Int-sized byte grant.
-  val ZERO_WINDOW_CREDIT: Int = Int.MinValue
 }

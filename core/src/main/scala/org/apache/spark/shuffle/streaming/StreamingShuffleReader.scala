@@ -18,15 +18,14 @@
 package org.apache.spark.shuffle.streaming
 
 import java.io.File
-import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
-  ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.nio.ByteBuffer
+import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, ByteBufInputStream, Unpooled}
-import io.netty.util.internal.OutOfDirectMemoryError
+import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 
 import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
@@ -116,33 +115,39 @@ class StreamingShuffleReaderIteratorFactory {
   }
 }
 
-private[streaming] final class StreamingShuffleDecompressionBuffer(
-    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
-    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
-  private var reusable: ByteBuf = _
+/**
+ * Presents a possibly scattered compressed frame as one NIO buffer for LZ4.
+ *
+ * Cross-route transport batching deliberately preserves Netty components to avoid a copy on the
+ * network thread. Calling `nioBuffer()` on a frame that spans several of those components makes
+ * `CompositeByteBuf` allocate and fill a new heap byte array for every message. Keep that copy on
+ * the consuming task and reuse one pooled direct scratch buffer instead. The common one-component
+ * case remains zero-copy.
+ */
+private[streaming] final class StreamingShuffleDecompressionInput {
+  private var scratch: ByteBuf = _
 
-  def acquire(size: Int): ByteBuf = {
-    require(size > 0, "decompression buffer size must be positive")
-    if (reusable == null || reusable.capacity() < size) {
-      if (reusable != null) {
-        reusable.release()
-        reusable = null
+  def prepare(source: ByteBuf, length: Int): ByteBuffer = {
+    val components = source.nioBuffers(source.readerIndex(), length)
+    if (components.length == 1) {
+      components(0)
+    } else {
+      if (scratch == null || scratch.capacity() < length) {
+        if (scratch != null) scratch.release()
+        scratch = source.alloc().directBuffer(length, length)
       }
-      reusable = try allocateDirect(size)
-      catch {
-        // This task-local scratch buffer is reusable, so a heap fallback is bounded by the active
-        // consumer count and does not put transport/control allocations behind an OOM cliff.
-        case _: OutOfDirectMemoryError => allocateHeap(size)
-      }
+      scratch.clear()
+      scratch.writeBytes(source, source.readerIndex(), length)
+      scratch.nioBuffer(0, length)
     }
-    reusable.clear()
-    reusable
   }
 
+  private[streaming] def scratchCapacity: Int = if (scratch == null) 0 else scratch.capacity()
+
   def close(): Unit = {
-    if (reusable != null) {
-      reusable.release()
-      reusable = null
+    if (scratch != null) {
+      scratch.release()
+      scratch = null
     }
   }
 }
@@ -181,17 +186,12 @@ class StreamingShuffleReader[K, C](
     1, // a client should only need to use 1 thread
     role)
 
-  private val preparedSession = receiveInbox.flatMap(_.preparedSession)
-  @volatile private var taskDiscoveryExecutorCreated = false
-  @volatile private var clientCreationExecutorCreated = false
-
-  private[spark] lazy val taskDiscoveryExecutor = {
-    taskDiscoveryExecutorCreated = true
+  private[spark] val taskDiscoveryExecutor =
     ThreadUtils.newDaemonSingleThreadExecutor(
       s"streaming-shuffle-task-discovery-thread-" +
         s"${streamingShuffleHandle.shuffleId}-${context.partitionId()}")
-  }
 
+  private val preparedSession = receiveInbox.flatMap(_.preparedSession)
   private val activeErrorNotifier = preparedSession.map(_.errorNotifier).getOrElse(errorNotifier)
   private val totalNumShuffleWriters: AtomicInteger = preparedSession
     .map(_.totalNumShuffleWriters)
@@ -232,6 +232,7 @@ class StreamingShuffleReader[K, C](
   } else {
     None
   }
+  private val decompressionInput = new StreamingShuffleDecompressionInput
 
   // The set of shuffle writers that this reader has successfully received
   // termination ack messages from.  This is used to make sure all term ack messages
@@ -244,17 +245,10 @@ class StreamingShuffleReader[K, C](
     .map(_.allTermAcksSentNotice)
     .getOrElse(new Semaphore(0))
 
-  // Only task-owned readers need these executors. A prepared reader attaches to the executor-owned
-  // session after it has already performed writer discovery and route registration.
-  private[spark] lazy val clientCreationExecutor = {
-    clientCreationExecutorCreated = true
-    ThreadUtils.newDaemonFixedThreadPool(
-      conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
-      s"streaming-shuffle-async-client-creation-${context.partitionId()}")
-  }
-
-  private[streaming] def taskOwnedExecutorsCreated: (Boolean, Boolean) =
-    (taskDiscoveryExecutorCreated, clientCreationExecutorCreated)
+  // thread pool used to perform client creation in parallel
+  private[spark] val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
+    conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
+    s"streaming-shuffle-async-client-creation-${context.partitionId()}")
 
   // Signals to other threads that task discovery should stop. For example, we may receive all
   // the termination messages before we actually put the clients in the client map. In that
@@ -263,9 +257,7 @@ class StreamingShuffleReader[K, C](
   @volatile private var taskDiscoveryShouldStop = false
 
   private var currentDataMessage: StreamingShuffleMessage = _
-  private val decompressionScratch = new StreamingShuffleDecompressionBuffer()
   private var queueWaitNanosRemainder = 0L
-  private val reportedInboxSpilledBytes = new AtomicLong(0L)
 
   private def recordQueueWaitNanos(waitNanos: Long): Unit = {
     val totalNanos = queueWaitNanosRemainder + waitNanos
@@ -303,12 +295,10 @@ class StreamingShuffleReader[K, C](
     val cleanupStartTime = System.currentTimeMillis()
 
     Utils.tryLogNonFatalError {
-      if (preparedSession.isEmpty) stopTaskDiscovery()
+      stopTaskDiscovery()
     }
     Utils.tryLogNonFatalError {
-      if (preparedSession.isEmpty) {
-        shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
-      }
+      shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
     }
     sharedExecutorClient match {
       case Some(executorClient) =>
@@ -336,7 +326,7 @@ class StreamingShuffleReader[K, C](
       }
     }
     Utils.tryLogNonFatalError {
-      decompressionScratch.close()
+      decompressionInput.close()
     }
     val inboxStats = receiveInbox.map(_.close()).getOrElse {
       val list = new java.util.ArrayList[StreamingShuffleMessage]()
@@ -352,27 +342,9 @@ class StreamingShuffleReader[K, C](
           StreamingShuffleReceiveInboxStats(0L, 0L)
       }
     }
-    // Reader-queue spill is part of this task's disk footprint. Report it through TaskMetrics so
-    // event logs do not describe an executor-local RTM spill file as a spill-free shuffle.
-    val previouslyReported = reportedInboxSpilledBytes.getAndSet(inboxStats.spilledBytes)
-    if (inboxStats.spilledBytes > previouslyReported) {
-      val newlySpilled = inboxStats.spilledBytes - previouslyReported
-      context.taskMetrics().incDiskBytesSpilled(newlySpilled)
-      context.taskMetrics().incStreamingShuffleReaderQueueBytesSpilled(newlySpilled)
-    }
-    if (inboxStats.spilledBytes > 0L) {
-      val (queuePeakBytes, maxMessageBytes) = messageQueue match {
-        case queue: StreamingShuffleMessageQueue =>
-          (queue.peakQueuedMemoryBytesCount, queue.maxDataMessageBytesCount)
-        case _ => (0L, 0L)
-      }
-      logInfo(
-        s"Streaming reader queue spilled ${inboxStats.spilledBytes} bytes in " +
-          s"${inboxStats.spilledMessages} messages: " +
-          s"inbox=${receiveInbox.map(_.id)} expectedWriters=${totalNumShuffleWriters.get()} " +
-          s"queuePeakBytes=$queuePeakBytes queueLimitBytes=$READER_QUEUE_MAX_MEMORY " +
-          s"maxMessageBytes=$maxMessageBytes")
-    }
+    logDebug(
+      log"Streaming reader queue spilled ${MDC(LogKeys.NUM_BYTES, inboxStats.spilledBytes)} " +
+        log"bytes in ${MDC(LogKeys.COUNT, inboxStats.spilledMessages)} messages")
     Utils.tryLogNonFatalError {
       memoryConsumer.freeMemory(memoryConsumer.getUsed())
     }
@@ -525,6 +497,9 @@ class StreamingShuffleReader[K, C](
         System.currentTimeMillis() - startTime)} ms")
     }
     })
+  } else {
+    taskDiscoveryExecutor.shutdown()
+    clientCreationExecutor.shutdown()
   }
 
   private def stopTaskDiscovery(): Unit = {
@@ -646,6 +621,7 @@ class StreamingShuffleReader[K, C](
     // that we will not receive any future messages, and the reader can be closed. When a data
     // message is read, the actual data (UnsafeRow) is extracted and emitted through the iterator.
     val terminationControlMessageSet = collection.mutable.Set[Long]()
+    var lastIdleDiagnosticsNanos = 0L
 
     /**
      * Returns true if the reader should stop after handling the termination message, which means
@@ -693,10 +669,11 @@ class StreamingShuffleReader[K, C](
       } else {
         val decompressor = compressionCodec.getOrElse(throw new IllegalStateException(
           "Received a compressed streaming shuffle message while spark.shuffle.compress=false"))
-        decompressedBuffer = decompressionScratch.acquire(dataMessage.uncompressedSize)
+        decompressedBuffer = dataMessage.data.alloc().directBuffer(
+          dataMessage.uncompressedSize, dataMessage.uncompressedSize)
         try {
           val compressed = dataMessage.getRecordData()
-          val source = compressed.nioBuffer(compressed.readerIndex(), dataMessage.dataSize)
+          val source = decompressionInput.prepare(compressed, dataMessage.dataSize)
           val destination = decompressedBuffer.nioBuffer(0, dataMessage.uncompressedSize)
           val uncompressedBytes = decompressor.decompress(
             source, source.position(), dataMessage.dataSize,
@@ -710,6 +687,7 @@ class StreamingShuffleReader[K, C](
           decompressedBuffer
         } catch {
           case t: Throwable =>
+            decompressedBuffer.release()
             decompressedBuffer = null
             throw t
         }
@@ -742,7 +720,10 @@ class StreamingShuffleReader[K, C](
           }
         }
         override def close(): Unit = {
-          decompressedBuffer = null
+          if (decompressedBuffer != null) {
+            decompressedBuffer.release()
+            decompressedBuffer = null
+          }
           dataMessage.release()
           currentDataMessage = null
         }
@@ -756,7 +737,14 @@ class StreamingShuffleReader[K, C](
       checkTaskFailure,
       () => totalNumShuffleWriters.get() == 0,
       () => preparedSession match {
-        case Some(session) => session.repairIdleCreditWindows()
+        case Some(session) =>
+          session.repairIdleCreditWindows()
+          val now = System.nanoTime()
+          if (now - lastIdleDiagnosticsNanos >= TimeUnit.SECONDS.toNanos(30L)) {
+            logWarning(s"Streaming shuffle reader remains idle: " +
+              session.idleDiagnostics(terminationControlMessageSet.toSet))
+            lastIdleDiagnosticsNanos = now
+          }
         case None =>
           logicalClientHandlers.forEach { (writerId, handler) =>
             val client = clientMap.get(writerId)

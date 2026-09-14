@@ -18,7 +18,6 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.zip.CRC32C
 
 import io.netty.buffer.{ByteBuf, Unpooled}
@@ -35,21 +34,14 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
-  STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
-  STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
-  STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
-  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
-  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
-  STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY,
-  STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED,
-  STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
+  STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage,
-  StreamingShuffleMessage, TerminationControlMessage}
+  StreamingShuffleMessage, TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -86,49 +78,145 @@ class StreamingShuffleWriterSuite
       cpuAmount = 1)
   }
 
-  test("terminal cannot overtake a timer-detached shard buffer") {
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+  test("cumulative route credit repairs are bounded and idempotent") {
+    withSpark(new SparkContext("local", "cumulative-credit-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      var wakeups = 0
+      var replayRequest = Option.empty[Long]
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (),
+        shuffleId = 0,
+        numReaders = 1,
+        context = context,
+        errorNotifier = new ErrorNotifier(),
+        onCreditAvailable = (_, _) => wakeups += 1,
+        onReplayRequested = (_, _, sequence) => replayRequest = Some(sequence))
+      val client = mock[TransportClient]
+      try {
+        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        handler.consumeDataCredit(0, client, 40L)
+        handler.availableDataCredit(0, client) shouldBe 60L
+        val released40 = new CreditControlMessage(0, 0, 0, 0)
+        released40.setSeqNum(40L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        // A repeated or older absolute watermark wakes a stranded dispatcher without granting
+        // the same bytes twice or exceeding the original receive window.
+        handler.consumeDataCredit(0, client, 30L)
+        handler.handleMessage(client, released40)
+        handler.availableDataCredit(0, client) shouldBe 70L
+        val released70 = new CreditControlMessage(0, 0, 0, 0)
+        released70.setSeqNum(70L)
+        handler.handleMessage(client, released70)
+        handler.availableDataCredit(0, client) shouldBe 100L
+        wakeups shouldBe 4
+
+        // Local submission can consume the complete route window even when no frame becomes
+        // reader-visible. A sequence repair must restore one bounded window or the requested
+        // replay remains queued forever behind the lost frame's zero-credit state.
+        handler.consumeDataCredit(0, client, 100L)
+        handler.availableDataCredit(0, client) shouldBe 0L
+        val replay = new CreditControlMessage(0, 0, 0, Int.MinValue)
+        replay.setSeqNum(17L)
+        handler.handleMessage(client, replay)
+        replayRequest shouldBe Some(17L)
+        handler.availableDataCredit(0, client) shouldBe 100L
+
+        handler.handleMessage(client, replay)
+        handler.availableDataCredit(0, client) shouldBe 100L
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("idle sequence repair replays a locally submitted terminal") {
+    withSpark(new SparkContext("local", "reader-visible-sequence-repair", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {
         val writer = newWriter(sc, context)
-        val shard = writer.shards(0)
-        val pending = writer.TimestampedBuffer(Unpooled.buffer(1024, 1024), 1024)
-        pending.buffer.writeInt(1)
-        pending.updateChecksum()
-        shard.putBuffer(pending)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
+        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+        data.serializationStream.get.writeKey(1).writeValue(1).flush()
+        writer.shards(0).send(data)
+        writer.shards(0).close()
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
 
-        val bufferDetached = new CountDownLatch(1)
-        val allowDataPublication = new CountDownLatch(1)
-        val closeStarted = new CountDownLatch(1)
-        val timerThread = new Thread(() => shard.withSendSequenceLock {
-          val detached = shard.takeBuffer()
-          bufferDetached.countDown()
-          allowDataPublication.await()
-          shard.enqueue(detached)
-        })
-        val closeThread = new Thread(() => {
-          closeStarted.countDown()
-          shard.close()
-        })
+        // The writer submitted sequence 1, while the reader only observed data sequence 0.
+        writer.shards(0).replayFromObserved(client, 0L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
 
-        timerThread.start()
-        try {
-          assert(bufferDetached.await(10, TimeUnit.SECONDS))
-          closeThread.start()
-          assert(closeStarted.await(10, TimeUnit.SECONDS))
-          closeThread.join(100L)
-          closeThread.isAlive shouldBe true
-          shard.lastSentSequenceNum.get() shouldBe -1L
-        } finally {
-          allowDataPublication.countDown()
-          timerThread.join(TimeUnit.SECONDS.toMillis(10L))
-          if (closeThread.getState != Thread.State.NEW) {
-            closeThread.join(TimeUnit.SECONDS.toMillis(10L))
-          }
-        }
-        timerThread.isAlive shouldBe false
-        closeThread.isAlive shouldBe false
-        shard.lastSentSequenceNum.get() shouldBe 1L
+  test("sequence repair reopens a physical lane acknowledged by an earlier reader") {
+    withSpark(new SparkContext("local", "reused-reader-lane-repair", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
+        writer.shards(0).close()
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
+
+        val firstAck = new TerminationAckMessage(0, 0, 0)
+        firstAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(client, firstAck)
+        writer.shards(0).allRegisteredClientsAcked shouldBe true
+
+        writer.shards(0).replayFromObserved(client, -1L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+        writer.shards(0).allRegisteredClientsAcked shouldBe false
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("writer linger waits for a replacement reader to acknowledge termination") {
+    val conf = newConf()
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+      .set(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS, 50L)
+    withSpark(new SparkContext("local", "replacement-reader-linger", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val first = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          first, new CreditControlMessage(0, 0, 0, 1))
+        writer.write(Iterator.empty)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
+
+        val firstAck = new TerminationAckMessage(0, 0, 0)
+        firstAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(first, firstAck)
+        context.markTaskCompleted(None)
+
+        // Register a replacement before the first route's quiet period expires. Its missing ACK
+        // must postpone cleanup beyond the original fixed deadline.
+        val replacement = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        writer.transportServerHandler.handleMessage(
+          replacement, new CreditControlMessage(0, 0, 0, 1))
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
+        Thread.sleep(150L)
+
+        writer.shards(0).replayFromObserved(replacement, -1L)
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 3 }
+
+        val replacementAck = new TerminationAckMessage(0, 0, 0)
+        replacementAck.setSeqNum(0L)
+        writer.transportServerHandler.handleMessage(replacement, replacementAck)
       } finally {
         context.markTaskCompleted(None)
       }
@@ -177,618 +265,20 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("executor raw pool accounts oversized buffers by exact capacity") {
-    val pool = new StreamingShuffleRawBufferPool(bufferSize = 128, maxMemoryBytes = 512)
-    val oversized = pool.tryBorrow(minCapacity = 384)
-    try {
-      assert(oversized != null && oversized.capacity() === 384)
-      assert(pool.stats === (384L, 384L, 512L))
-      assert(pool.tryBorrow(minCapacity = 256) == null,
-        "384 allocated bytes must leave only 128 bytes, not another count-based buffer slot")
-    } finally {
-      pool.recycle(oversized)
-    }
-
-    val afterRelease = pool.tryBorrow(minCapacity = 256)
-    try {
-      assert(afterRelease != null && afterRelease.capacity() === 256)
-      assert(pool.stats === (256L, 384L, 512L))
-    } finally {
-      pool.recycle(afterRelease)
-      pool.close()
-    }
-  }
-
-  test("executor raw pool falls back to its bounded heap budget at the JVM direct limit") {
-    val directOomConstructor =
-      classOf[_root_.io.netty.util.internal.OutOfDirectMemoryError]
-        .getDeclaredConstructor(classOf[String])
-    directOomConstructor.setAccessible(true)
-    val pool = new StreamingShuffleRawBufferPool(
-      bufferSize = 128,
-      maxMemoryBytes = 256,
-      allocateDirect = _ => throw directOomConstructor.newInstance("test direct limit"))
-
-    val fallback = pool.tryBorrow()
-    try {
-      assert(fallback != null && !fallback.isDirect && fallback.capacity() === 128)
-      assert(pool.stats === (128L, 128L, 256L))
-      assert(pool.heapFallbackStats === (1L, 128L))
-    } finally {
-      pool.recycle(fallback)
-      pool.close()
-    }
-  }
-
-  test("executor raw pool preserves the active-writer progress frontier") {
-    val pool = new StreamingShuffleRawBufferPool(bufferSize = 128, maxMemoryBytes = 512)
-    val first = pool.tryBorrow()
-    val second = pool.tryBorrow()
-    val third = pool.tryBorrow()
-    var firstReturned = false
-    try {
-      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 128) shouldBe false
-      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 256) shouldBe true
-      pool.recycle(first)
-      firstReturned = true
-      pool.shouldPreserveProgressReserve(minCapacity = 128, reserveBytes = 256) shouldBe false
-    } finally {
-      if (!firstReturned) pool.discard(first)
-      pool.discard(second)
-      pool.discard(third)
-      pool.close()
-    }
-  }
-
-  test("writer does not spill a live transport frame before its reader connects") {
-    val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        val writer = newWriter(sc, context)
-        val bytes = Array.fill[Byte](128)(1)
-        val buffer = Unpooled.wrappedBuffer(bytes)
-        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
-        buffer.release()
-
-        writer.shards(0).send(data)
-        writer.stop(success = true)
-        val firstReportedBytes = context.taskMetrics.diskBytesSpilled
-        firstReportedBytes shouldBe 0L
-
-        writer.stop(success = true)
-        context.taskMetrics.diskBytesSpilled shouldBe firstReportedBytes
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("prepared inbox delivery retires replay without spilling") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        val writer = newWriter(sc, context)
-        bindMockClient(writer, 0)(_ => ())
-        val bytes = Array.fill[Byte](128)(1)
-        val buffer = Unpooled.wrappedBuffer(bytes)
-        val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
-        buffer.release()
-
-        writer.shards(0).send(data)
-        writer.stop(success = true)
-
-        context.taskMetrics.diskBytesSpilled shouldBe 0L
-        writer.errorNotifier.getError() shouldBe empty
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("writer replay spill has an independent task metric") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
-      .set(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, true)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        dep.markReplayLeaseAvailable()
-        val writer = new StreamingShuffleWriter[Int, Int](
-          new StreamingShuffleHandle(0, dep), 0, context)
-        val client = bindMockClient(writer, 0)(_ => ())
-        writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
-          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
-
-        def sendFrame(): Unit = {
-          val bytes = Array.fill[Byte](128)(1)
-          val buffer = Unpooled.wrappedBuffer(bytes)
-          val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
-          buffer.release()
-          writer.shards(0).send(data)
-        }
-
-        sendFrame()
-        sendFrame()
-        writer.shards(0).spillOnePendingData() shouldBe true
-        writer.stop(success = true)
-
-        val replaySpilled = context.taskMetrics.streamingShuffleWriterReplayBytesSpilled
-        replaySpilled should be > 0L
-        context.taskMetrics.diskBytesSpilled shouldBe replaySpilled
-        context.taskMetrics.streamingShuffleReaderQueueBytesSpilled shouldBe 0L
-        writer.stop(success = true)
-        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe replaySpilled
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("submitted replay reclamation consumes each candidate once") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        dep.markReplayLeaseAvailable()
-        val writer = new StreamingShuffleWriter[Int, Int](
-          new StreamingShuffleHandle(0, dep), 0, context)
-        bindMockClient(writer, 0)(_ => ())
-
-        (0 until 3).foreach { value =>
-          val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](128)(value.toByte))
-          val data = new DataMessage(0, 0, buffer.readableBytes(), buffer, 0L)
-          buffer.release()
-          writer.shards(0).send(data)
-        }
-
-        (0 until 3).foreach { _ =>
-          eventually(Timeout(10.seconds)) {
-            writer.shards(0).spillOneSubmittedReplayData() shouldBe true
-          }
-        }
-        writer.shards(0).spillOneSubmittedReplayData() shouldBe false
-        writer.stop(success = true)
-        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("relaxed writer uses its raw buffer instead of waiting for executor wire memory") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 40L << 10)
-      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        dep.markReplayLeaseAvailable()
-        val handle = new StreamingShuffleHandle(0, dep)
-        val writer = new StreamingShuffleManager()
-          .getWriter[Int, Int](handle, 0, context, null)
-          .asInstanceOf[StreamingShuffleWriter[Int, Int]]
-        val reserved = writer.allocateWireBuffer(40 << 10)
-        try {
-          reserved._1 should not be null
-          reserved._2 shouldBe (40 << 10)
-          writer.allocateWireBuffer(40 << 10) shouldBe (null, 0)
-        } finally {
-          reserved._1.release()
-          writer.releaseWireReservation(reserved._2)
-        }
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        context.markTaskFailed(cleanupError)
-        context.markTaskCompleted(Some(cleanupError))
-      }
-    }
-  }
-
-  test("wire budget pressure flushes a partial network batch") {
-    val reservationSize = 32 << 10
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1 << 20)
-      .set(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY, 48L << 10)
-      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, true)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "wire-pressure-partial-batch", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      val server = new StreamingShuffleExecutorServer()
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
-        val writer = new StreamingShuffleWriter[Int, Int](
-          new StreamingShuffleHandle(0, dep), 0, context,
-          sharedExecutorServer = Some(server))
-        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
-        bindMockClient(writer, 0)(_ => sends.incrementAndGet())
-
-        // Model a compressed frame whose direct reservation is retained by a partial batch. The
-        // next same-sized allocation cannot fit until publishing that partial batch lets its
-        // network completion return the first reservation.
-        val first = writer.allocateWireBuffer(reservationSize)
-        first._1.writeZero(128)
-        val data = new DataMessage(0, 0, 128, first._1, 0L)
-        first._1.release()
-        writer.shards(0).send(
-          data, () => (), () => (), () => (), () => writer.releaseWireReservation(first._2))
-        server.wireBufferBudget.stats._1 shouldBe reservationSize.toLong
-
-        val second = writer.allocateWireBuffer(
-          reservationSize, () => writer.shards(0).send())
-        second._1 should not be null
-        eventually(Timeout(10.seconds)) {
-          sends.get() should be >= 1
-        }
-        second._1.release()
-        writer.releaseWireReservation(second._2)
-        writer.stop(success = true)
-        writer.errorNotifier.getError() shouldBe empty
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        context.markTaskFailed(cleanupError)
-        context.markTaskCompleted(Some(cleanupError))
-        server.close()
-      }
-    }
-  }
-
-  test("relaxed writer returns raw-backed data after replay and network completion") {
-    val conf = newConf()
-      .set(SHUFFLE_COMPRESS, false)
-      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 65536L)
-      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        val handle = new StreamingShuffleHandle(0, dep)
-        val server = new StreamingShuffleExecutorServer()
-        val writer = new StreamingShuffleWriter[Int, Int](
-          handle, 0, context, sharedExecutorServer = Some(server))
-        try {
-          val client = bindMockClient(writer, 0)(_ => ())
-          writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
-            0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
-          writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
-            0, 0, 0, 32768))
-          val raw = server.rawBufferPool.tryBorrow()
-          val pending = writer.TimestampedBuffer(raw, raw.capacity())
-          pending.buffer.writeZero(1024)
-          writer.shards(0).send(pending)
-          writer.stop(success = true)
-          context.taskMetrics.streamingShuffleWriterReplayBytesSpilled shouldBe 0L
-          var recycled: ByteBuf = null
-          eventually(Timeout(10.seconds)) {
-            recycled = server.rawBufferPool.tryBorrow()
-            recycled should not be null
-          }
-          server.rawBufferPool.recycle(recycled)
-        } finally {
-          server.close()
-        }
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        context.markTaskFailed(cleanupError)
-        context.markTaskCompleted(Some(cleanupError))
-      }
-    }
-  }
-
-  test("relaxed writer pre-spills a raw frame only at executor-pool pressure") {
-    val conf = newConf()
-      .set(SHUFFLE_COMPRESS, false)
-      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 32768L)
-      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      val server = new StreamingShuffleExecutorServer()
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        val writer = new StreamingShuffleWriter[Int, Int](
-          new StreamingShuffleHandle(0, dep), 0, context,
-          sharedExecutorServer = Some(server))
-        val client = bindMockClient(writer, 0)(_ => ())
-        writer.transportServerHandler.handleMessage(client, new CreditControlMessage(
-          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
-
-        val held = writer.newBuffer()
-        held.buffer.writeZero(1024)
-        writer.shards(0).send(held)
-        writer.stop(success = true)
-        context.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
-        val recycled = server.rawBufferPool.tryBorrow()
-        recycled should not be null
-        server.rawBufferPool.recycle(recycled)
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        context.markTaskFailed(cleanupError)
-        context.markTaskCompleted(Some(cleanupError))
-        server.close()
-      }
-    }
-  }
-
-  test("relaxed writer reclaims a raw buffer from a sibling writer") {
-    val conf = newConf()
-      .set(SHUFFLE_COMPRESS, false)
-      .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-      .set(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY, 65536L)
-      .set(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED, false)
-      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L << 30)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
-      val firstContext = createTaskContext(sc.conf, 0)
-      val secondContext = createTaskContext(sc.conf, 1)
-      val server = new StreamingShuffleExecutorServer()
-      try {
-        SparkEnv.get.streamingShuffleOutputTracker.get
-          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-          .registerShuffle(shuffleId = 0, numMaps = 2, numReduces = 1, jobId = 0)
-        val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-        val dep = new PipelinedShuffleDependency[Int, Int, Int](
-          rdd, new HashPartitioner(1))
-        val handle = new StreamingShuffleHandle(0, dep)
-        val first = new StreamingShuffleWriter[Int, Int](
-          handle, 0, firstContext, sharedExecutorServer = Some(server))
-        val second = new StreamingShuffleWriter[Int, Int](
-          handle, 1, secondContext, sharedExecutorServer = Some(server))
-
-        val client = bindMockClient(first, 0)(_ => ())
-        first.transportServerHandler.handleMessage(client, new CreditControlMessage(
-          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
-        val held = first.newBuffer()
-        held.buffer.writeZero(1024)
-        first.shards(0).send(held)
-        val blocker = server.rawBufferPool.tryBorrow()
-        blocker should not be null
-
-        val reclaimed = second.newBuffer()
-        try {
-          reclaimed.buffer should not be null
-          first.stop(success = true)
-          firstContext.taskMetrics.streamingShuffleWriterReplayBytesSpilled should be > 0L
-        } finally {
-          server.rawBufferPool.recycle(reclaimed.buffer)
-          server.rawBufferPool.recycle(blocker)
-        }
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        firstContext.markTaskFailed(cleanupError)
-        firstContext.markTaskCompleted(Some(cleanupError))
-        secondContext.markTaskFailed(cleanupError)
-        secondContext.markTaskCompleted(Some(cleanupError))
-        server.close()
-      }
-    }
-  }
-
-  test("server handler uses credit-map presence as the route control marker") {
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      var creditWakeups = 0
-      val handler = new StreamingShuffleServerHandler(
-        (_, _) => (),
-        shuffleId = 0,
-        numReaders = 1,
-        context = context,
-        errorNotifier = new ErrorNotifier(),
-        onCreditAvailable = (_, _) => creditWakeups += 1)
-      val client = mock[TransportClient]
-
-      try {
-        // A positive grant before the initial negative window is still an unbounded legacy route.
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, 25))
-        handler.isCreditControlled(0, client) shouldBe false
-        handler.availableDataCredit(0, client) shouldBe Long.MaxValue
-
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
-        handler.isCreditControlled(0, client) shouldBe true
-        handler.availableDataCredit(0, client) shouldBe 100L
-        // Retrying discovery before any data is sent is an idempotent no-op.
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
-        handler.availableDataCredit(0, client) shouldBe 100L
-
-        handler.consumeDataCredit(0, client, 40L)
-        handler.availableDataCredit(0, client) shouldBe 60L
-        // An absolute initial-window retry cannot manufacture credit after data is in flight.
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -100))
-        handler.availableDataCredit(0, client) shouldBe 60L
-
-        val released40 = new CreditControlMessage(0, 0, 0, 0)
-        released40.setSeqNum(40L)
-        handler.handleMessage(client, released40)
-        handler.availableDataCredit(0, client) shouldBe 100L
-        val wakeupsBeforeRepair = creditWakeups
-        // Repeating the cumulative acknowledgement does not grant the same bytes twice.
-        handler.handleMessage(client, released40)
-        handler.availableDataCredit(0, client) shouldBe 100L
-        creditWakeups shouldBe (wakeupsBeforeRepair + 1)
-
-        handler.consumeDataCredit(0, client, 30L)
-        handler.handleMessage(client, released40)
-        handler.availableDataCredit(0, client) shouldBe 70L
-        val released70 = new CreditControlMessage(0, 0, 0, 0)
-        released70.setSeqNum(70L)
-        handler.handleMessage(client, released70)
-        handler.availableDataCredit(0, client) shouldBe 100L
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("zero-window discovery registers a bounded route without admitting data") {
-    withSpark(new SparkContext("local", "zero-window-route", newConf())) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      val handler = new StreamingShuffleServerHandler(
-        (_, _) => (),
-        shuffleId = 0,
-        numReaders = 1,
-        context = context,
-        errorNotifier = new ErrorNotifier())
-      val client = mock[TransportClient]
-      try {
-        handler.handleMessage(client, new CreditControlMessage(
-          0, 0, 0, StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT))
-        handler.isCreditControlled(0, client) shouldBe true
-        handler.availableDataCredit(0, client) shouldBe 0L
-        handler.hasDataCredit(0, client, 128L) shouldBe false
-
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -64))
-        handler.availableDataCredit(0, client) shouldBe 64L
-        handler.hasDataCredit(0, client, 128L) shouldBe true
-      } finally {
-        context.markTaskCompleted(None)
-      }
-    }
-  }
-
-  test("registration replay does not consume data credit twice") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_NETWORK_BATCH_SIZE, 1 << 20)
-      .set(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED, true)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-    withSpark(new SparkContext("local", "registration-replay-credit", conf)) { sc =>
-      val context = createTaskContext(sc.conf, 0)
-      val errorNotifier = new ErrorNotifier()
-      val handler = new StreamingShuffleServerHandler(
-        (_, _) => (),
-        shuffleId = 0,
-        numReaders = 1,
-        context = context,
-        errorNotifier = errorNotifier)
-      try {
-        val writer = newWriter(sc, context, errorNotifier, Some(handler))
-        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
-        val sentBytes = new java.util.concurrent.atomic.AtomicLong(0L)
-        val client = bindMockClient(writer, 0) { body =>
-          sends.incrementAndGet()
-          sentBytes.addAndGet(body.readableBytes().toLong)
-        }
-        handler.handleMessage(client, new CreditControlMessage(0, 0, 0, -1))
-
-        val dataActionCompleted = new CountDownLatch(3)
-        def enqueueFrame(value: Byte): Unit = {
-          val payload = Unpooled.wrappedBuffer(Array.fill[Byte](128)(value))
-          val data = new DataMessage(0, 0, payload.readableBytes(), payload, 0L)
-          payload.release()
-          writer.shards(0).send(data, () => dataActionCompleted.countDown())
-        }
-        enqueueFrame(1)
-        enqueueFrame(2)
-
-        // Registration replay snapshots the frames while they are still in pendingBatch. Its
-        // ReplayAction is therefore ordered before the DataAction that later owns completion of
-        // those frames. Add one more frame after that snapshot so the stale DataAction prefix is
-        // skipped without charging it, while the new suffix still consumes one window.
-        writer.shards(0).beginReplay(client)
-        writer.shards(0).replayTo(client)
-        enqueueFrame(3)
-        writer.shards(0).send()
-        eventually(Timeout(10.seconds)) {
-          sends.get() shouldBe 1
-          handler.availableDataCredit(0, client) shouldBe 0L
-        }
-
-        def releaseSentBytes(): Unit = {
-          val released = new CreditControlMessage(0, 0, 0, 0)
-          released.setSeqNum(sentBytes.get())
-          handler.handleMessage(client, released)
-          writer.shards(0).creditAvailable(client)
-        }
-        releaseSentBytes()
-        eventually(Timeout(10.seconds)) {
-          sends.get() shouldBe 2
-          handler.availableDataCredit(0, client) shouldBe 0L
-        }
-        releaseSentBytes()
-        eventually(Timeout(10.seconds)) {
-          sends.get() shouldBe 3
-          handler.availableDataCredit(0, client) shouldBe 0L
-        }
-
-        assert(dataActionCompleted.await(10, TimeUnit.SECONDS))
-        releaseSentBytes()
-        sends.get() shouldBe 3
-        handler.availableDataCredit(0, client) shouldBe 1L
-        errorNotifier.getError() shouldBe empty
-      } finally {
-        val cleanupError = new RuntimeException("test cleanup")
-        context.markTaskFailed(cleanupError)
-        context.markTaskCompleted(Some(cleanupError))
-      }
-    }
-  }
-
   // Builds a single-partition writer against a freshly registered shuffle. The caller must run
   // this inside a withSpark block and must eventually call context.markTaskCompleted(None) to
   // tear down the Netty server the writer starts in its constructor.
   private def newWriter(
       sc: SparkContext,
       context: TaskContext,
-      errorNotifier: ErrorNotifier = new ErrorNotifier(),
-      serverHandler: Option[StreamingShuffleServerHandler] = None)
-      : StreamingShuffleWriter[Int, Int] = {
+      errorNotifier: ErrorNotifier = new ErrorNotifier()): StreamingShuffleWriter[Int, Int] = {
     SparkEnv.get.streamingShuffleOutputTracker.get
       .asInstanceOf[StreamingShuffleOutputTrackerMaster]
       .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
     val rdd = sc.parallelize(1 to 4).map(x => (x, x))
     val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
     val handle = new StreamingShuffleHandle(0, dep)
-    new StreamingShuffleWriter[Int, Int](
-      handle, 0, context, serverHandler = serverHandler, errorNotifier = errorNotifier)
+    new StreamingShuffleWriter[Int, Int](handle, 0, context, errorNotifier = errorNotifier)
   }
 
   // A mock TransportClient whose send(ByteBuf) invokes `onSend` and then completes the write
@@ -797,7 +287,8 @@ class StreamingShuffleWriterSuite
   // send directly to this mock instead of over the network.
   private def bindMockClient(
       writer: StreamingShuffleWriter[Int, Int],
-      shardId: Int)(onSend: ByteBuf => Unit): TransportClient = {
+      shardId: Int,
+      completeWrites: Boolean = true)(onSend: ByteBuf => Unit): TransportClient = {
     val client = mock[TransportClient]
     val channel = mock[Channel]
     val channelConfig = mock[ChannelConfig]
@@ -807,8 +298,10 @@ class StreamingShuffleWriterSuite
     when(succeededFuture.isSuccess).thenReturn(true)
     when(succeededFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
       .thenAnswer { invocation =>
-        invocation.getArgument[GenericFutureListener[ChannelFuture]](0)
-          .operationComplete(succeededFuture)
+        if (completeWrites) {
+          invocation.getArgument[GenericFutureListener[ChannelFuture]](0)
+            .operationComplete(succeededFuture)
+        }
         succeededFuture
       }
     when(client.send(any[ByteBuf])).thenAnswer { invocation =>
@@ -824,27 +317,26 @@ class StreamingShuffleWriterSuite
     client
   }
 
-  test("an idle route probe immediately retransmits an unacknowledged terminal") {
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
+  test("termination repair closes stale replay and write-completion fences") {
+    withSpark(new SparkContext("local", "ordered-terminal-repair", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {
         val writer = newWriter(sc, context)
-        val sends = new java.util.concurrent.atomic.AtomicInteger(0)
-        val client = bindMockClient(writer, 0) { _ => sends.incrementAndGet() }
+        val sends = new java.util.concurrent.atomic.AtomicInteger()
+        val client = bindMockClient(writer, 0, completeWrites = false) {
+          _ => sends.incrementAndGet()
+        }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, 1))
 
         writer.shards(0).send(new TerminationControlMessage(0, 0))
-        eventually(Timeout(10.seconds)) {
-          sends.get() shouldBe 1
-        }
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 1 }
 
-        // The transport write completed, but no TerminationAckMessage was returned. A duplicate
-        // cumulative credit frame for this physical route must actively repair the terminal
-        // instead of merely waking an already-empty outbound action queue.
-        writer.shards(0).creditAvailable(client)
-        eventually(Timeout(10.seconds)) {
-          sends.get() shouldBe 2
-        }
-        writer.errorNotifier.getError() shouldBe empty
+        // Model a replay callback that installed its fence but lost the corresponding action.
+        // The repair must use the shard queue to preserve ordering and clear that stale fence.
+        writer.shards(0).beginReplay(client)
+        writer.shards(0).retryUnackedTermination() shouldBe 1
+        eventually(Timeout(10.seconds)) { sends.get() shouldBe 2 }
       } finally {
         context.markTaskCompleted(None)
       }
@@ -939,31 +431,19 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("compressed input releases its writer buffer permit exactly once") {
-    val conf = newConf()
-      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 128 << 10)
-      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
-      .set(SHUFFLE_COMPRESS, true)
-    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+  test("a retained raw buffer is not returned to the writer pool") {
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)
+      val writer = newWriter(sc, context)
+      val buffer = Unpooled.directBuffer(
+        sc.conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE))
+      val retained = buffer.retainedDuplicate()
       try {
-        val writer = newWriter(sc, context)
-        bindMockClient(writer, 0)(_ => ())
-        val (_, permitLimit) = writer.writerBufferPermitStats
-
-        // A run of identical Java-serialized values produces an independent compressed wire
-        // buffer. The producer returns its raw input immediately, then the dispatcher invokes
-        // PendingSend.releaseInput() for the same envelope. Both callbacks must share one permit
-        // ownership fence.
-        writer.write(Iterator.fill(5000)((0, 0)))
-
-        eventually(Timeout(10.seconds)) {
-          val (rawBytes, wireBytes, messages) = writer.transferStats
-          messages should be > 0L
-          wireBytes should be < rawBytes
-          writer.writerBufferPermitStats shouldBe (permitLimit, permitLimit)
-        }
+        writer.shards(0).releaseRawBuffer(buffer)
+        writer.bufferPool shouldBe empty
+        retained.refCnt() shouldBe 1
       } finally {
+        retained.release()
         context.markTaskCompleted(None)
       }
     }
@@ -988,8 +468,10 @@ class StreamingShuffleWriterSuite
         // Serialize a record through the writer's own buffer/checksum path and send it.
         val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
         val serializationStream = tsBuffer.serializationStream.get
-        serializationStream.writeKey(1.asInstanceOf[Any])
-        serializationStream.writeValue(2.asInstanceOf[Any])
+        (0 until 1000).foreach { value =>
+          serializationStream.writeKey(value.asInstanceOf[Any])
+          serializationStream.writeValue((value * 2).asInstanceOf[Any])
+        }
         serializationStream.flush()
         writer.shards(0).send(tsBuffer)
 

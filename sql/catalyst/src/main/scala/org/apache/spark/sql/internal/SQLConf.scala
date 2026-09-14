@@ -1067,16 +1067,6 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
-  val FORCE_APPLY_SHUFFLED_HASH_JOIN =
-    buildConf("spark.sql.join.forceApplyShuffledHashJoin")
-      .internal()
-      .doc("When true, prefer a shuffled hash join whenever the join type has a valid hash " +
-        "build side, without applying the normal size-based cost checks. This is intended for " +
-        "controlled plan-shape experiments and is disabled by default.")
-      .version("4.3.0")
-      .booleanConf
-      .createWithDefault(false)
-
   val SPLIT_STREAMED_SIDE_JOIN_CONDITION =
     buildConf("spark.sql.join.splitStreamedSideJoinCondition")
       .internal()
@@ -1154,19 +1144,6 @@ object SQLConf {
     .version("1.1.0")
     .bytesConf(ByteUnit.BYTE)
     .createWithDefaultString("10MB")
-
-  val SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD =
-    buildConf("spark.sql.shuffledHashJoin.localMapThreshold")
-      .doc("Configures the maximum estimated size in bytes per shuffle partition for the build " +
-        "side of a statically planned shuffled hash join. Spark estimates this by comparing the " +
-        "build side's total logical-plan size with this threshold multiplied by " +
-        "`spark.sql.shuffle.partitions`. This setting is independent of " +
-        s"`${AUTO_BROADCASTJOIN_THRESHOLD.key}`, so broadcast joins can be disabled without " +
-        "also disabling shuffled hash join selection. A negative value disables size-based " +
-        "static shuffled hash join selection. When unset, it falls back to " +
-        s"`${AUTO_BROADCASTJOIN_THRESHOLD.key}` to preserve the existing behavior.")
-      .version("4.3.0")
-      .fallbackConf(AUTO_BROADCASTJOIN_THRESHOLD)
 
   val SHUFFLE_HASH_JOIN_FACTOR =
     buildConfFromConfigFile[Int]("spark.sql.shuffledHashJoinFactor")
@@ -1294,8 +1271,19 @@ object SQLConf {
       .internal()
       .doc("When true, AQE marks every safe visible shuffle exchange pipelined before creating " +
         "query stages. This preserves the selected physical operators but deliberately gives up " +
-        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs " +
-        "with the same join and partitioning configuration.")
+        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs with " +
+        "the same join and partitioning configuration.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED =
+    buildConf("spark.sql.shuffle.pipelined.nestedProbe.enabled")
+      .internal()
+      .doc("When true, keep the immediate build exchanges of shuffled hash joins regular, " +
+        "but allow probe exchanges below those boundaries to pipeline. Requires a transport " +
+        "supporting unmaterialized regular boundaries. Experimental; disabled by default.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -1585,21 +1573,6 @@ object SQLConf {
       .withBindingPolicy(ConfigBindingPolicy.SESSION)
       .booleanConf
       .createWithDefault(false)
-
-  val ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_FORCE_BUILD_SIDE =
-    buildConf("spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.forceBuildSide")
-      .internal()
-      .doc("Diagnostic override for the adaptive sort merge join to shuffled hash join " +
-        "conversion. When set to left or right, converts every eligible non-skew sort merge " +
-        "join using that build side without requiring materialized shuffle statistics. A join " +
-        "that cannot legally build the requested side remains a sort merge join. This may build " +
-        "an arbitrarily large non-spillable hash map and should only be used for controlled " +
-        "plan-parity experiments.")
-      .version("4.3.0")
-      .withBindingPolicy(ConfigBindingPolicy.SESSION)
-      .stringConf
-      .checkValues(Set("none", "left", "right"))
-      .createWithDefault("none")
 
   val ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_MIN_WIDENING_FACTOR =
     buildConf("spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.minWideningFactor")
@@ -8737,9 +8710,6 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def convertSortMergeJoinToShuffledHashJoinLookThroughOperatorsEnabled: Boolean =
     getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_LOOK_THROUGH_OPERATORS_ENABLED)
 
-  def convertSortMergeJoinToShuffledHashJoinForceBuildSide: String =
-    getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_FORCE_BUILD_SIDE)
-
   def convertSortMergeJoinToShuffledHashJoinMinWideningFactor: Double =
     getConf(ADAPTIVE_CONVERT_SORT_MERGE_JOIN_TO_SHUFFLED_HASH_JOIN_MIN_WIDENING_FACTOR)
 
@@ -8982,9 +8952,6 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
     getConf(SUBEXPRESSION_ELIMINATION_FILTER_EXEC_ENABLED)
 
   def autoBroadcastJoinThreshold: Long = getConf(AUTO_BROADCASTJOIN_THRESHOLD)
-
-  def shuffledHashJoinLocalMapThreshold: Long =
-    getConf(SHUFFLED_HASH_JOIN_LOCAL_MAP_THRESHOLD)
 
   def limitInitialNumPartitions: Int = getConf(LIMIT_INITIAL_NUM_PARTITIONS)
 

@@ -1952,9 +1952,9 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.writerMaxMemory")
       .doc("Best-effort memory limit in bytes for in-flight data buffers in a streaming " +
         "shuffle writer task. Includes TCP send/receive buffers. The writer back-pressures " +
-        "the upstream iterator when this limit is reached. Serializers that expose an exact " +
-        "record size reserve buffers by byte capacity before serialization; serializers without " +
-        "a size hint conservatively reserve the full per-writer buffer budget.")
+        "the upstream iterator when this limit is reached. This is a best-effort bound: " +
+        "back-pressure is accounted per network buffer, so an individual serialized row that " +
+        "exceeds the network buffer size can push actual in-flight memory above this limit.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
@@ -1964,10 +1964,9 @@ package object config {
 
   private[spark] val STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.readerBackpressure.enabled")
-      .doc("Whether streaming shuffle readers apply bounded per-route byte windows. Dedicated " +
-        "connections use Netty auto-read; multiplexed prepared readers use writer-side credit " +
-        "that is shared fairly across inboxes and rotated after consumption so one join input " +
-        "cannot block progress on its siblings.")
+      .doc("Whether streaming shuffle readers apply the per-writer byte quota by toggling " +
+        "Netty auto-read. Disabling this lets chained pipelined readers drain all incoming " +
+        "streams without a quota-induced cross-input cycle; executor memory is then the bound.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
@@ -1988,160 +1987,19 @@ package object config {
         "spark.shuffle.streaming.readerQueueMaxMemory must be non-negative.")
       .createWithDefault(0L)
 
-  private[spark] val STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY =
-    ConfigBuilder("spark.shuffle.streaming.readerTotalQueueMaxMemory")
-      .doc("Maximum aggregate bytes of streaming shuffle data retained by all prepared reader " +
-        "queues in one executor. The same bound limits aggregate prepared-route receive windows: " +
-        "all routes remain discoverable, but routes without executor budget advertise a " +
-        "zero-byte " +
-        "window until capacity is released. The queue reservation remains a final safety net for " +
-        "oversized frames. This prevents prepared inboxes from multiplying the per-reader limit.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(_ > 0,
-        "spark.shuffle.streaming.readerTotalQueueMaxMemory must be positive.")
-      .createWithDefaultString("4g")
-
   private[spark] val STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES =
     ConfigBuilder("spark.shuffle.streaming.preparedInbox.readyBytes")
-      .doc("Minimum queued data bytes before an executor-prepared shuffle inbox wakes its " +
-        "compute task. The executor-owned inbox can receive data without a resident task, so a " +
-        "positive threshold avoids spending scheduler CPU capacity on readers that would only " +
-        "wait for producers. An inbox still becomes ready after every writer has terminated or " +
-        "after a full receive window stops making progress, so small partitions and bounded " +
-        "producer waves cannot hang. Zero attaches after the first writer route is registered, " +
-        "so bounded pre-attachment credit cannot strand a multi-input reader before its first " +
-        "message.")
+      .doc("Optional minimum queued data bytes before an executor-prepared shuffle inbox wakes " +
+        "its compute task. Zero wakes the task after the first data or termination frame, which " +
+        "proves that endpoint preparation and producer routing are operational without imposing " +
+        "a size barrier on small or sparse inputs. Positive values are experimental and an inbox " +
+        "still becomes ready after every writer has terminated so empty partitions cannot hang.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
       .checkValue(_ >= 0, "prepared inbox ready bytes must be non-negative")
-      .createWithDefaultString("1m")
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_INBOX_READY_IDLE_TIMEOUT =
-    ConfigBuilder("spark.shuffle.streaming.preparedInbox.readyIdleTimeout")
-      .doc("Maximum time a prepared shuffle inbox waits after a writer exhausts its bounded " +
-        "receive window without any new message arriving. When this idle timeout expires, the " +
-        "compute task is attached even if readyBytes has not been reached, allowing consumption " +
-        "to return credit and unblock the producer's queued data and terminal frame.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .timeConf(TimeUnit.MILLISECONDS)
-      .checkValue(_ > 0, "prepared inbox ready idle timeout must be positive")
-      .createWithDefaultString("100ms")
-
-  private[spark] val STREAMING_SHUFFLE_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.maxTotalTasksPerExecutor")
-      .doc("Maximum number of attached streaming-shuffle reader compute tasks from all active " +
-        "stages on one executor. Prepared receive inboxes do not count toward this limit, so " +
-        "network readiness and producer routing remain independent from the memory-sensitive " +
-        "compute attach window. A value of zero disables the cap.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 0, "prepared reader total task cap must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val STREAMING_SHUFFLE_EXPANDED_MAX_TOTAL_READER_TASKS_PER_EXECUTOR =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.expandedMaxTotalTasksPerExecutor")
-      .doc("Executor-wide streaming-reader compute attach cap after the candidate stage has " +
-        "reported enough stable lightweight execution-memory samples or a stable retained-memory " +
-        "estimate that can be enforced by the executor byte budget. Unsampled or memory-spilling " +
-        "stages retain maxTotalTasksPerExecutor. Zero disables expansion. This is a safety " +
-        "ceiling; prepared inbox readiness and the executor byte budgets remain the primary " +
-        "work-conserving flow-control signals.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 0, "expanded prepared reader total task cap must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.initialMaxTasksPerExecutor")
-      .doc("Initial per-executor compute attach cap for a streaming-shuffle reader or a " +
-        "memory-retaining consumer behind a regular-shuffle fallback. After enough stable " +
-        "lightweight samples the cap is lifted; an explicitly completed retained build may " +
-        "instead derive a larger byte-budgeted cap. Stages with spill retain the initial cap. " +
-        "A value of zero disables sampled attach admission.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 0, "prepared reader initial task cap must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.memorySampleTasks")
-      .doc("Number of stable streaming-reader task samples required before lifting the initial " +
-        "per-executor attach cap for a lightweight stage. Operators whose execution memory may " +
-        "grow with streamed input use completed tasks rather than running heartbeat samples. A " +
-        "build-before-probe operator may use running samples only after every retained build in " +
-        "that task has reported completion.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 1, "prepared reader memory sample count must be positive")
-      .createWithDefault(4)
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.heavyTaskPeakExecutionMemory")
-      .doc("Peak execution-memory threshold that keeps a streaming reader at its initial " +
-        "per-executor compute attach cap. This limits concurrent operator hash maps without " +
-        "reducing prepared inbox or producer-route concurrency.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(_ > 0, "prepared reader heavy-task memory threshold must be positive")
-      .createWithDefaultString("4g")
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY =
-    ConfigBuilder("spark.shuffle.streaming.preparedReader.maxRetainedExecutionMemoryPerExecutor")
-      .doc("Executor-wide budget for execution memory retained by attached streaming-shuffle " +
-        "readers and regular-shuffle memory-retaining consumers. After a stage has enough " +
-        "completed task samples, or running samples fenced by explicit retained-build " +
-        "completion, " +
-        "its per-executor attach cap is derived from the largest observed task peak and this " +
-        "budget. The scheduler accounts all such active stages against the same budget. An " +
-        "unsampled consumer conservatively reserves the full budget. Zero disables byte-based " +
-        "admission.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(_ >= 0, "prepared reader retained execution-memory budget must be non-negative")
-      .createWithDefaultString("0")
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_CLIENT_CREATION_THREADS =
-    ConfigBuilder("spark.shuffle.streaming.preparedInbox.clientCreationThreads")
-      .doc("Maximum executor-scoped threads used to install prepared reader routes and create " +
-        "their physical shuffle lanes. Keeping this below executor cores bounds the distributed " +
-        "connection frontier when many reader inboxes become ready together.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 1, "prepared inbox client creation threads must be at least one")
-      .createWithDefault(4)
-
-  private[spark] val STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT =
-    ConfigBuilder("spark.shuffle.streaming.preparedInbox.routeRegistrationTimeout")
-      .doc("Maximum time a prepared reader route may remain queued or blocked during physical " +
-        "lane creation. A timeout fails the reader through its normal task error path instead of " +
-        "allowing an undiscoverable route to wait forever.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .timeConf(TimeUnit.MILLISECONDS)
-      .checkValue(_ >= 1L, "prepared route registration timeout must be positive")
-      .createWithDefaultString("30s")
+      .createWithDefaultString("0b")
 
   private[spark] val STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.streaming.dataSocketBufferSize")
@@ -2221,23 +2079,6 @@ package object config {
       .bytesConf(ByteUnit.BYTE)
       .checkValue(_ > 0,
         "spark.shuffle.streaming.rawBufferPoolMaxMemory must be positive.")
-      .createWithDefault(4L << 30) // 4 GB
-
-  private[spark] val STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY =
-    ConfigBuilder("spark.shuffle.streaming.wireBufferMaxMemory")
-      .doc("Maximum executor-wide direct bytes reserved for compressed streaming-shuffle wire " +
-        "payloads. When this budget is full, a relaxed writer sends its raw buffer instead of " +
-        "waiting for a second direct allocation. The raw-buffer pool and the replay/network " +
-        "completion lease continue to bound and retire that buffer. " +
-        "This prevents per-task replay limits and Netty arena chunks from multiplying to the " +
-        "executor direct memory limit without turning a fixed writer-task count into the primary " +
-        "flow control.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(_ > 0,
-        "spark.shuffle.streaming.wireBufferMaxMemory must be positive.")
       .createWithDefault(4L << 30) // 4 GB
 
   private[spark] val STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED =
@@ -2416,64 +2257,30 @@ package object config {
       .checkValue(_ >= 1, "must be at least one")
       .createOptional
 
-  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MAX_TASKS_PER_STAGE =
-    ConfigBuilder("spark.shuffle.streaming.elasticProducers.expandedMaxTasksPerStage")
-      .doc("Maximum running tasks for each pure producer stage while the number of active pure " +
-        "producer stages reaches expandedMinActiveStages and every partition of the producer's " +
-        "direct reader frontier has acknowledged its executor-owned inbox. This route-ready " +
-        "gate is independent from reader compute attachment, so a join waiting for another " +
-        "input does not strand producer CPU. When unset, maxTasksPerStage remains the limit " +
-        "until only one pure producer remains.")
+  private[spark] val STREAMING_SHUFFLE_PRODUCER_UNION_AFFINITY_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.producerUnionAffinity.enabled")
+      .doc("Whether a pure streaming-shuffle producer whose input is an explicitly repeated, " +
+        "equal-shaped UnionRDD should group matching parent partitions on the same executor. " +
+        "This opt-in scheduling policy lets executor-scoped input caches and in-flight reads be " +
+        "reused across repeated scans. It applies only when every task has no existing locality " +
+        "preference and all union parents expose the same partition-index set.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 1, "must be at least one")
-      .createOptional
+      .booleanConf
+      .createWithDefault(false)
 
-  private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_EXPANDED_MIN_ACTIVE_STAGES =
-    ConfigBuilder("spark.shuffle.streaming.elasticProducers.expandedMinActiveStages")
-      .doc("Minimum number of simultaneously active pure producer stages required to use " +
-        "expandedMaxTasksPerStage. A value of zero disables topology-sensitive producer " +
-        "expansion.")
+  private[spark] val STREAMING_SHUFFLE_PREPARED_READER_DIAGONAL_ASSIGNMENT_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.preparedReader.diagonalAssignment.enabled")
+      .doc("Whether prepared streaming-shuffle reader partitions rotate their executor " +
+        "assignment after each executor-width block. The rotation preserves an even task count " +
+        "while mixing partition-index residue classes across executors, reducing persistent " +
+        "executor skew when adjacent shuffle partitions have periodic cost patterns.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 0, "must be non-negative")
-      .createWithDefault(0)
-
-  private[spark] val STREAMING_SHUFFLE_READER_TASK_CPUS =
-    ConfigBuilder("spark.shuffle.streaming.reader.taskCpus")
-      .doc("Optional CPU amount charged to a task that only consumes pipelined shuffles. This " +
-        "changes scheduler slot accounting, not the task's physical CPU affinity. Fractional " +
-        "values let blocked readers overlap producers without changing shuffle partitioning.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .decimalConf
-      .checkValue(v => v >= CpuAmount.MIN_AMOUNT && v <= CpuAmount.MAX_AMOUNT,
-        "Pipelined reader task CPUs must be a positive representable CPU amount.")
-      .checkValue(CpuAmount.stripTrailingZeros(_).scale <= CpuAmount.SCALE,
-        s"Pipelined reader task CPUs support at most ${CpuAmount.SCALE} decimal places.")
-      .transform(CpuAmount.normalize)
-      .createOptional
-
-  private[spark] val STREAMING_SHUFFLE_READER_PRODUCER_TASK_CPUS =
-    ConfigBuilder("spark.shuffle.streaming.readerProducer.taskCpus")
-      .doc("Optional CPU amount charged to a task that both consumes and produces a pipelined " +
-        "shuffle. This role is configured independently from reader-only tasks because it can " +
-        "perform substantial operator and serialization work while its inputs are available.")
-      .version("4.3.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .decimalConf
-      .checkValue(v => v >= CpuAmount.MIN_AMOUNT && v <= CpuAmount.MAX_AMOUNT,
-        "Pipelined reader-producer task CPUs must be a positive representable CPU amount.")
-      .checkValue(CpuAmount.stripTrailingZeros(_).scale <= CpuAmount.SCALE,
-        s"Pipelined reader-producer task CPUs support at most ${CpuAmount.SCALE} decimal places.")
-      .transform(CpuAmount.normalize)
-      .createOptional
+      .booleanConf
+      .createWithDefault(false)
 
   private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
     ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")

@@ -20,13 +20,12 @@ package org.apache.spark.shuffle.streaming
 import java.nio.ByteBuffer
 import java.util.Properties
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
-import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator, Unpooled}
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future => NettyFuture}
 import org.scalatest.Assertions.intercept
@@ -42,8 +41,7 @@ import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
-  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY,
-  STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY}
+  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
@@ -597,16 +595,6 @@ class StreamingShuffleSuite
     error.get.getMessage should include("closed before termination")
   }
 
-  test("multiplexed client lane scales its control socket send buffer") {
-    val handler = new StreamingShuffleClientHandler(
-      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
-      context = null, errorNotifier = new ErrorNotifier())
-
-    handler.configuredSendBufferSize shouldBe 512
-    handler.useMultiplexedChannel()
-    handler.configuredSendBufferSize shouldBe (32 << 10)
-  }
-
   test("client handler records no error when the connection closes after termination") {
     // The mirror of the premature-disconnect test: once a TerminationControlMessage has been
     // received, the subsequent channelInactive (a clean end-of-stream close) must NOT be treated
@@ -614,13 +602,16 @@ class StreamingShuffleSuite
     // termination message sets terminationReceived through the production code path -- so there is
     // no reliance on Netty event-loop timing.
     val errorNotifier = new ErrorNotifier()
+    val queue = new StreamingShuffleMessageQueue()
+    var ackObservedPublishedTerminal = false
     val handler = new StreamingShuffleClientHandler(
-      0, 0, new LinkedBlockingQueue[StreamingShuffleMessage](), shuffleId, Long.MaxValue,
+      0, 0, queue, shuffleId, Long.MaxValue,
       context = null, errorNotifier = errorNotifier) {
-      // The reader would normally send an ack over the network here; suppress it since this test
-      // has no client/channel. terminationReceived is set in receive() before this is called.
-      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit =
-        ()
+      // The reader would normally send an ACK over the network here. Observe the queue instead so
+      // the test proves the terminal becomes reader-visible before the writer can see that ACK.
+      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
+        ackObservedPublishedTerminal = queue.peek().isInstanceOf[TerminationControlMessage]
+      }
     }
 
     // Encode a TerminationControlMessage on the wire and hand it to receive(), exactly as a real
@@ -635,36 +626,11 @@ class StreamingShuffleSuite
     encoded.putInt(0) // shuffleReaderId
     encoded.flip()
     handler.receive(null, encoded, null)
+    ackObservedPublishedTerminal should be(true)
 
     // A clean close after termination: the handler must record no error.
     handler.channelInactive(null)
     errorNotifier.getError() should be(None)
-  }
-
-  test("client handler acknowledges termination only after inbox publication") {
-    val errorNotifier = new ErrorNotifier()
-    val publishError = new RuntimeException("inbox publication failed")
-    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]() {
-      override def put(message: StreamingShuffleMessage): Unit = throw publishError
-    }
-    val acknowledgements = new AtomicInteger(0)
-    val handler = new StreamingShuffleClientHandler(
-      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errorNotifier) {
-      override def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit =
-        acknowledgements.incrementAndGet()
-    }
-    val encoded = ByteBuffer.allocate(24)
-    encoded.putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id())
-    encoded.putLong(0L)
-    encoded.putInt(shuffleId)
-    encoded.putInt(0)
-    encoded.putInt(0)
-    encoded.flip()
-
-    handler.receive(null, encoded, null)
-
-    acknowledgements.get() shouldBe 0
-    errorNotifier.getError() shouldBe Some(publishError)
   }
 
   test("reader catches out of order message sequence number from writer - duplicate") {
@@ -695,6 +661,65 @@ class StreamingShuffleSuite
           "actSeqNum" -> "0")
       )
     }
+  }
+
+  test("reader drops stale data retransmitted by an active sequence repair") {
+    val errorNotifier = new ErrorNotifier()
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    var returnedCredit = 0L
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errorNotifier) {
+      override protected def sendCumulativeCreditAck(
+          client: TransportClient,
+          releasedBytes: Long): Unit = {
+        returnedCredit = releasedBytes
+      }
+    }
+    handler.useMultiplexedChannel()
+
+    // A route that has not observed its first frame still needs explicit replay. The -1 cursor
+    // tells the writer to replay from sequence zero and restores credit consumed by a frame that
+    // disappeared before becoming reader-visible.
+    val replayFromStart = handler.prepareMultiplexedReplayRepair()
+    replayFromStart should not be empty
+    replayFromStart.get.getSeqNum should be(-1L)
+
+    def encodeData(sequenceNumber: Long): ByteBuffer = {
+      val payload = Unpooled.wrappedBuffer(Array[Byte](1, 2, 3))
+      val dataMessage = new DataMessage(shuffleId, 0, 0, payload.readableBytes(), payload, 0L)
+      dataMessage.setSeqNum(sequenceNumber)
+      val encoded = Unpooled.compositeBuffer()
+      encoded.capacity(dataMessage.headerLength())
+      dataMessage.encode(encoded)
+      val bytes = new Array[Byte](encoded.readableBytes())
+      encoded.getBytes(encoded.readerIndex(), bytes)
+      encoded.release()
+      dataMessage.release()
+      payload.release()
+      ByteBuffer.wrap(bytes)
+    }
+
+    handler.receive(null, encodeData(0L), null)
+    queue.size() should be(1)
+    handler.lastSequenceNumberForDiagnostics should be(0L)
+
+    val repair = handler.prepareMultiplexedReplayRepair()
+    repair should not be empty
+    repair.get.getSeqNum should be(0L)
+
+    // The request above can cross sequence 1 already in flight. A replay of sequence 0 is then a
+    // harmless duplicate: return its receive credit without publishing its rows a second time.
+    handler.receive(null, encodeData(0L), null)
+    queue.size() should be(1)
+    handler.lastSequenceNumberForDiagnostics should be(0L)
+    returnedCredit should be(43L) // 40-byte DataMessage header plus the 3-byte payload.
+    errorNotifier.getError() should be(None)
+
+    // New data remains strictly sequenced after the duplicate is discarded.
+    handler.receive(null, encodeData(1L), null)
+    queue.size() should be(2)
+    handler.lastSequenceNumberForDiagnostics should be(1L)
+    Iterator.continually(queue.poll()).takeWhile(_ != null).foreach(_.release())
   }
 
   test("reader catches out of order message sequence number from writer - missing msg in between") {
@@ -851,9 +876,6 @@ class StreamingShuffleSuite
         // Keep the producer buffer as the network-send owner so this test isolates the writer
         // semaphore backpressure path. Compressed envelopes use replay spill as their bound.
         .set(SHUFFLE_COMPRESS, false)
-        // A one-byte replay cap would expose any attempt to bypass writer backpressure by moving
-        // a live frame to disk while the reader is deliberately not consuming.
-        .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 1L)
         .set(STREAMING_SHUFFLE_READER_MAX_MEMORY, 1))) { sc =>
       val g = new ShuffleGroup[Int](sc, 1, 1)
 
@@ -880,7 +902,6 @@ class StreamingShuffleSuite
         writeFinished.isCompleted shouldBe false
         it.isBlocking shouldBe true
       }
-      g.writers(0).context.taskMetrics().diskBytesSpilled shouldBe 0L
 
       // We are allowed to buffer 128KB on the writer including TCP buffers, 32KB in the reader TCP
       // buffer, and one block in the reader queue, for at least 3 messages of 64KB each to be sent.
@@ -1010,7 +1031,7 @@ class StreamingShuffleSuite
       val future = StreamingShuffleSuite.verifyBlockingCall { () =>
         // writer should enqueue a DataMessage and a termination message in the message queue
         // after which wait on the termination ack from the reader
-        writer.write(Iterator((1, 1)))
+        writer.write(Iterator((1, 1), (2, 2)))
       }
 
       eventually(Timeout(30.seconds)) {
@@ -1633,7 +1654,7 @@ class StreamingShuffleSuite
 
       // write() will block waiting for termination acks; run it asynchronously.
       val future = StreamingShuffleSuite.verifyBlockingCall { () =>
-        writer.write(Iterator((1, 1)))
+        writer.write(Iterator((1, 1), (2, 2)))
       }
 
       // Wait for the writer to send data and termination messages.

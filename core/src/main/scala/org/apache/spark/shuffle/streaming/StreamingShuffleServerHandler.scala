@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
-import java.util.concurrent.atomic.{AtomicLong, AtomicReferenceArray}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.jdk.CollectionConverters._
 
@@ -60,6 +60,7 @@ class StreamingShuffleServerHandler(
     onTerminationAckReceivedWithClient: (Int, Long, TransportClient) => Unit = (_, _, _) => (),
     onClientConnected: (Int, TransportClient) => Unit = (_, _) => (),
     onCreditAvailable: (Int, TransportClient) => Unit = (_, _) => (),
+    onReplayRequested: (Int, TransportClient, Long) => Unit = (_, _, _) => (),
     expectedClientsPerReader: Array[Int] = null)
     extends RpcHandler with TaskContextAwareLogging {
 
@@ -113,19 +114,14 @@ class StreamingShuffleServerHandler(
   // for a sibling whose operator had stopped consuming.  A byte window gives the writer a
   // transport-level admission boundary without coupling the reader task scheduler to Netty's
   // channel-wide autoRead setting.
-  // Presence in this map is also the credit-control marker. Each state keeps the bounded window,
-  // bytes submitted on this connection, and the largest cumulative reader release acknowledged.
-  // The cumulative value makes an idle retry idempotent: unlike a repeated additive grant, it
-  // cannot manufacture credit when the original grant was merely delayed rather than lost.
   private class RouteCreditState {
     val available = new AtomicLong(0L)
     val window = new AtomicLong(0L)
     val sent = new AtomicLong(0L)
     val released = new AtomicLong(0L)
   }
-
   private val creditByReaderAndClient =
-    new AtomicReferenceArray[ConcurrentHashMap[TransportClient, RouteCreditState]](numReaders)
+    Array.fill(numReaders)(new ConcurrentHashMap[TransportClient, RouteCreditState]())
   private val creditFlowControlEnabled = Option(SparkEnv.get).forall { env =>
     env.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   }
@@ -150,23 +146,14 @@ class StreamingShuffleServerHandler(
     expectedClientCounts(readerId)
   }
 
-  private def creditMap(readerId: Int): ConcurrentHashMap[TransportClient, RouteCreditState] = {
-    var map = creditByReaderAndClient.get(readerId)
-    if (map == null) {
-      val created = new ConcurrentHashMap[TransportClient, RouteCreditState]()
-      if (creditByReaderAndClient.compareAndSet(readerId, null, created)) map = created
-      else map = creditByReaderAndClient.get(readerId)
-    }
-    map
-  }
-
   private def creditState(readerId: Int, client: TransportClient): RouteCreditState = {
-    val map = creditByReaderAndClient.get(readerId)
-    if (map == null) null else map.get(client)
+    creditByReaderAndClient(readerId).get(client)
   }
 
-  private def enableCreditControl(readerId: Int, client: TransportClient): RouteCreditState = {
-    creditMap(readerId).computeIfAbsent(client, _ => new RouteCreditState())
+  private def enableCreditControl(
+      readerId: Int,
+      client: TransportClient): RouteCreditState = {
+    creditByReaderAndClient(readerId).computeIfAbsent(client, _ => new RouteCreditState())
   }
 
   /** True when this logical route may admit a body of the supplied encoded size. */
@@ -243,11 +230,26 @@ class StreamingShuffleServerHandler(
         // late sibling with an empty stream once the producer has already emitted its data.
         // addIfAbsent also makes repeated credit messages on the same connection idempotent.
         val encodedCredit = creditControlMessage.numMessages.toLong
+        // A zero-credit watermark repairs byte admission. Int.MinValue is reserved for the
+        // complementary sequence repair sent by an idle reader: local Netty submission can
+        // advance the writer cursor even when a final frame never becomes reader-visible.
+        if (creditControlMessage.numMessages == Int.MinValue) {
+          // The locally submitted suffix has already consumed this route's byte window. If that
+          // suffix disappeared before it became reader-visible, the reader cannot release its
+          // bytes and cursor repair alone leaves replay permanently blocked at zero credit.
+          // Reopen one bounded window along with the explicit sequence repair. Repeated repairs
+          // remain idempotent because available credit is set to, rather than added to, the
+          // negotiated window; a late original frame and its replay also cannot grow the window
+          // when their cumulative release watermarks arrive.
+          val repairState = creditState(readerId, client)
+          if (repairState != null) {
+            repairState.available.set(repairState.window.get())
+          }
+          onReplayRequested(readerId, client, creditControlMessage.getSeqNum)
+          return
+        }
         val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
-        val zeroWindowDiscovery =
-          creditControlMessage.numMessages == StreamingShuffleClientHandler.ZERO_WINDOW_CREDIT
-        val credit = if (zeroWindowDiscovery) 0L
-          else if (encodedCredit < 0) -encodedCredit else encodedCredit
+        val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
         val state = if (enablesCreditFlow) {
           enableCreditControl(readerId, client)
         } else {
@@ -257,21 +259,17 @@ class StreamingShuffleServerHandler(
         var repairWakeup = false
         if (state != null && encodedCredit < 0 && credit > 0) {
           state.window.accumulateAndGet(credit, Math.max)
-          // An absolute window is safe only as the initial discovery retry. Once the writer has
-          // submitted data, only cumulative release acknowledgements below may reopen the route.
+          // An initial absolute window is idempotent. Once data has been submitted, only the
+          // cumulative released-byte watermark below may reopen the bounded route.
           if (state.sent.get() == 0L) {
             val before = state.available.get()
             val after = state.available.accumulateAndGet(credit, Math.max)
             grantedCredit = math.max(0L, after - before)
           }
         } else if (state != null && encodedCredit == 0) {
-          // A repeated cumulative acknowledgement is also an idempotent liveness probe. The
-          // reader sends it only after its inbox has remained idle; wake a shard whose ordered
-          // data/terminal tail lost its dispatcher notification without granting any new bytes.
+          // A repeated cumulative watermark is both an idempotent credit repair and a dispatcher
+          // wakeup. Clamp it to bytes the writer actually submitted on this connection.
           repairWakeup = true
-          // Sequence number carries total bytes released by this reader on this connection. Clamp
-          // it to bytes actually sent and advance the watermark with CAS so duplicate or reordered
-          // repair frames are harmless.
           val acknowledged = math.max(0L, math.min(
             creditControlMessage.getSeqNum, state.sent.get()))
           var previous = state.released.get()
@@ -284,13 +282,10 @@ class StreamingShuffleServerHandler(
             val limit = state.window.get()
             state.available.updateAndGet(current =>
               math.min(limit, current + math.min(delta, limit)))
-            // Wake the dispatcher whenever the acknowledgement watermark advances. Deriving this
-            // from before/after credit is racy with a concurrent reservation: the writer could
-            // consume the newly granted bytes between those two observations and lose the wakeup.
             grantedCredit = delta
           }
         } else if (state != null && credit > 0) {
-          // Dedicated connections retain the historical additive-credit mode.
+          // Dedicated connections retain their historical additive-credit mode.
           val limit = state.window.get()
           val before = state.available.get()
           val after = if (limit > 0L) {
@@ -303,13 +298,16 @@ class StreamingShuffleServerHandler(
         // Fence the route before publishing it in clientsByReader. Otherwise a concurrent writer
         // drain can observe the new client and broadcast a queued termination frame before the
         // writer's replayTo callback has installed its replay fence.
-        clientsByReader(readerId).synchronized {
-          if (!clientsByReader(readerId).contains(client)) {
+        val newConnectionForReader = clientsByReader(readerId).synchronized {
+          if (clientsByReader(readerId).contains(client)) {
+            false
+          } else {
             onClientConnected(readerId, client)
             clientsByReader(readerId).add(client)
             if (clientsByReader(readerId).size >= expectedClientCounts(readerId)) {
               expectedClientsConnected(readerId).complete(null.asInstanceOf[Void])
             }
+            true
           }
         }
         futureClients(readerId).complete(client)

@@ -18,13 +18,12 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.ArrayDeque
-import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque}
+import java.util.concurrent.{ConcurrentHashMap, Executor, LinkedBlockingDeque, Semaphore}
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.jdk.CollectionConverters._
+
 import io.netty.buffer.{ByteBuf, Unpooled}
-import io.netty.channel.ChannelOption
-import io.netty.util.internal.OutOfDirectMemoryError
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
@@ -32,9 +31,8 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
-  STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY,
-  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS, STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY}
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_THREADS}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.netty.SparkTransportConf
@@ -45,81 +43,20 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
 
 /** Executor-scoped transport listener that multiplexes reader control messages to map writers. */
 private[streaming] class StreamingShuffleExecutorServer extends Logging {
-  private case class PendingCredit(client: TransportClient, message: CreditControlMessage)
-
   private val handlers = new ConcurrentHashMap[Long, StreamingShuffleServerHandler]()
-  // Raw buffers are owned by the executor pool but can remain pinned in a different writer's
-  // dormant route. Let a writer that cannot borrow ask its siblings to move one queued frame to
-  // replay storage. A task-local scan cannot reclaim buffers retained by completed map tasks.
-  private val rawBufferReclaimers = new ConcurrentHashMap[Long, () => Boolean]()
-  // A writer may need one partial serialization buffer per reducer before any of those buffers
-  // becomes full enough to dispatch. Preserve that aggregate active-writer frontier in the raw
-  // pool; otherwise concurrently submitted network bodies can consume every slot and leave all
-  // producers unable to reach their next dispatch point.
-  private val rawBufferProgressReservations = new ConcurrentHashMap[Long, java.lang.Long]()
-  private val rawBufferProgressReserveBytes = new AtomicLong(0L)
-  // Prepared inboxes advertise their receive windows before producer tasks are launched. The
-  // executor endpoint therefore has to retain discovery credits that race ahead of a writer's
-  // handler registration; dropping them turns a successful prepareInbox ACK into a route that is
-  // visible only on the reader side.
-  private val pendingCredits =
-    new ConcurrentHashMap[Long, ArrayDeque[PendingCredit]]()
-  // A retry credit can already be in the physical lane when the last terminal ACK retires a
-  // writer. Remember completed route identities so that late control frames are ignored rather
-  // than retained forever as if they belonged to a producer that has not launched yet.
-  private val retiredRoutes = ConcurrentHashMap.newKeySet[Long]()
-  // Registration and early-credit retention must be one atomic route transition. A concurrent
-  // queue alone is insufficient: register() can remove and finish draining the queue after a
-  // receiver has obtained its reference but before that receiver appends its credit, stranding the
-  // append in an object that is no longer reachable from pendingCredits. Striped locks keep the
-  // transition bounded without allocating one monitor for every map task.
-  private val routeLocks = Array.fill(256)(new Object)
-  private val controlBodies = new AtomicLong(0L)
-  private val controlFrames = new AtomicLong(0L)
+  private case class PendingCreditRoute(client: TransportClient, readerId: Int)
+  private val pendingCredits = new ConcurrentHashMap[
+    Long, ConcurrentHashMap[PendingCreditRoute, CreditControlMessage]]()
+  private val knownWriterRoutes = ConcurrentHashMap.newKeySet[Long]()
 
   private def key(shuffleId: Int, writerId: Int): Long =
     (shuffleId.toLong << 32) | (writerId.toLong & 0xffffffffL)
 
-  private def routeLock(routeKey: Long): Object = {
-    val mixed = routeKey ^ (routeKey >>> 32)
-    routeLocks(mixed.toInt & (routeLocks.length - 1))
-  }
-
-  /** Must be called while holding routeLock(routeKey). */
-  private def drainPendingCreditsLocked(
-      routeKey: Long,
-      handler: StreamingShuffleServerHandler): Unit = {
-    val pending = pendingCredits.remove(routeKey)
-    if (pending != null) {
-      var credit = pending.pollFirst()
-      while (credit != null) {
-        handler.handleMessage(credit.client, credit.message)
-        credit = pending.pollFirst()
-      }
-    }
-  }
-
-  private def handlerOrRetainEarlyCredit(
-      routeKey: Long,
-      client: TransportClient,
-      credit: CreditControlMessage): StreamingShuffleServerHandler = {
-    routeLock(routeKey).synchronized {
-      val registered = handlers.get(routeKey)
-      if (registered == null && !retiredRoutes.contains(routeKey)) {
-        pendingCredits.computeIfAbsent(routeKey, _ => new ArrayDeque[PendingCredit]())
-          .addLast(PendingCredit(client, credit))
-      }
-      registered
-    }
-  }
-
   private[streaming] def handleControlBody(client: TransportClient, buf: ByteBuf): Unit = {
     // One transport body may contain discovery frames for many logical map -> reduce routes.
     // Decoding only the first frame silently strands every later route in a batched body.
-    controlBodies.incrementAndGet()
     while (buf.isReadable) {
       val decoded = StreamingShuffleMessage.decode(buf)
-      controlFrames.incrementAndGet()
       val route = decoded match {
         case credit: CreditControlMessage => (credit.shuffleId, credit.shuffleWriterId)
         case ack: TerminationAckMessage => (ack.shuffleId, ack.shuffleWriterId)
@@ -128,39 +65,36 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
             s"Unexpected message type in shared shuffle server: ${other.messageType()}")
       }
       val routeKey = key(route._1, route._2)
-      decoded match {
-        case credit: CreditControlMessage =>
-          val handler = handlerOrRetainEarlyCredit(routeKey, client, credit)
-          if (handler != null) handler.handleMessage(client, credit)
-        case ack: TerminationAckMessage =>
-          val handler = handlers.get(routeKey)
-          if (handler == null) {
-            // A shared physical reader connection may flush a final ACK after the corresponding
-            // map task has already unregistered its writer. This is a normal cleanup race.
-            logDebug(
-              s"Ignoring late streaming shuffle termination ACK for shuffle ${route._1}, " +
-                s"writer ${route._2}")
-          } else {
-            handler.handleMessage(client, ack)
-          }
-        case _ =>
+      val handler = handlers.synchronized {
+        val current = handlers.get(routeKey)
+        decoded match {
+          case credit: CreditControlMessage
+              if current == null && !knownWriterRoutes.contains(routeKey) =>
+            // Prepared readers may publish their initial credit while the map task is between
+            // advertising its shared endpoint and registering this logical writer route. Keep
+            // the latest idempotent credit per physical reader route and apply it at register().
+            pendingCredits.computeIfAbsent(
+              routeKey,
+              _ => new ConcurrentHashMap[PendingCreditRoute, CreditControlMessage]())
+              .put(PendingCreditRoute(client, credit.shuffleReaderId), credit)
+          case _ =>
+        }
+        current
+      }
+      if (handler == null) {
+        // A shared physical reader connection may flush a final credit or termination ACK after
+        // the corresponding map task has already unregistered its writer. This is a normal
+        // late-message race during relaxed cleanup.
+        logDebug(
+          s"Ignoring late streaming shuffle control message for shuffle ${route._1}, " +
+            s"writer ${route._2}")
+      } else {
+        handler.handleMessage(client, decoded)
       }
     }
   }
 
   private val rpcHandler = new RpcHandler {
-    override def channelActive(client: TransportClient): Unit = {
-      // The community implementation used a 512-byte receive buffer because each map-to-reduce
-      // route had its own connection and only returned that route's credit/terminal ACKs.  The
-      // executor endpoint multiplexes thousands of those control streams on one physical lane;
-      // retaining the per-route buffer collapses the TCP advertised window (about 1152 bytes on
-      // Linux) and can leave a complete cumulative-credit batch permanently queued at the peer.
-      // Configure the aggregate lane once here, before any writer observes and reuses it.
-      val socketBufferSize = conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)
-      client.getChannel.config.setOption(ChannelOption.SO_SNDBUF, Int.box(socketBufferSize))
-      client.getChannel.config.setOption(ChannelOption.SO_RCVBUF, Int.box(socketBufferSize))
-    }
-
     override def receive(
         client: TransportClient,
         message: ByteBuffer,
@@ -239,329 +173,87 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
     conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE),
     conf.get(STREAMING_SHUFFLE_RAW_BUFFER_POOL_MAX_MEMORY))
 
-  // Compression destinations used to come from Netty's pooled allocator independently in every
-  // writer. Under a wide pipelined stage, requested 128 KiB buffers materialized and retained 4 MiB
-  // arena chunks until the JVM hit MaxDirectMemorySize. Reserve exact unpooled payloads at executor
-  // scope. Writers wait at this byte boundary when it is full instead of retaining thousands of
-  // uncompressed raw buffers in the transport backlog. A JVM direct-memory allocation failure
-  // falls back only for this already-reserved wire payload, keeping heap growth under the same cap.
-  private[streaming] val wireBufferBudget = new StreamingShuffleDirectBufferBudget(
-    conf.get(STREAMING_SHUFFLE_WIRE_BUFFER_MAX_MEMORY))
-
   val port: Int = server.getPort
-
-  private[streaming] def controlBodyStats: (Long, Long) =
-    (controlBodies.get(), controlFrames.get())
 
   def register(
       shuffleId: Int,
       writerId: Int,
       handler: StreamingShuffleServerHandler): Unit = {
-    register(shuffleId, writerId, handler, () => false, 0L)
-  }
-
-  def register(
-      shuffleId: Int,
-      writerId: Int,
-      handler: StreamingShuffleServerHandler,
-      reclaimRawBuffer: () => Boolean): Unit = {
-    register(shuffleId, writerId, handler, reclaimRawBuffer, 0L)
-  }
-
-  def register(
-      shuffleId: Int,
-      writerId: Int,
-      handler: StreamingShuffleServerHandler,
-      reclaimRawBuffer: () => Boolean,
-      rawProgressReserveBytes: Long): Unit = {
     val routeKey = key(shuffleId, writerId)
-    routeLock(routeKey).synchronized {
-      retiredRoutes.remove(routeKey)
+    val pending = handlers.synchronized {
       val existing = handlers.putIfAbsent(routeKey, handler)
       require(existing == null,
         s"Streaming shuffle $shuffleId writer $writerId is already active")
-      rawBufferReclaimers.put(routeKey, reclaimRawBuffer)
-      if (rawProgressReserveBytes > 0L) {
-        val previous = rawBufferProgressReservations.putIfAbsent(
-          routeKey, rawProgressReserveBytes)
-        require(previous == null,
-          s"Streaming shuffle $shuffleId writer $writerId already has a raw progress reserve")
-        rawBufferProgressReserveBytes.addAndGet(rawProgressReserveBytes)
+      knownWriterRoutes.add(routeKey)
+      Option(pendingCredits.remove(routeKey)).toSeq.flatMap(_.entrySet().asScala).map { entry =>
+        entry.getKey.client -> entry.getValue
       }
-      // Drain while holding the same route lock used by early-credit retention. When this returns,
-      // every credit that observed an absent handler is owned by this handler, and every later
-      // credit observes the installed handler directly.
-      drainPendingCreditsLocked(routeKey, handler)
     }
+    pending.foreach { case (client, credit) => handler.handleMessage(client, credit) }
   }
 
   def unregister(
       shuffleId: Int,
       writerId: Int,
       handler: StreamingShuffleServerHandler): Unit = {
-    val routeKey = key(shuffleId, writerId)
-    routeLock(routeKey).synchronized {
-      if (handlers.remove(routeKey, handler)) {
-        rawBufferReclaimers.remove(routeKey)
-        releaseRawProgressReservation(routeKey)
-        retiredRoutes.add(routeKey)
-      }
-    }
+    handlers.remove(key(shuffleId, writerId), handler)
   }
 
-  /** Spill one queued frame owned by any writer sharing this executor's raw-buffer pool. */
-  private[streaming] def reclaimOneRawBuffer(): Boolean = {
-    val reclaimers = rawBufferReclaimers.values().iterator()
-    while (reclaimers.hasNext) {
-      if (reclaimers.next()()) return true
-    }
-    false
-  }
-
-  private def releaseRawProgressReservation(routeKey: Long): Unit = {
-    val released = rawBufferProgressReservations.remove(routeKey)
-    if (released != null) {
-      val remaining = rawBufferProgressReserveBytes.addAndGet(-released.longValue())
-      require(remaining >= 0L, "raw progress reservation released more bytes than registered")
-    }
-  }
-
-  private[streaming] def releaseRawProgressReservation(
-      shuffleId: Int,
-      writerId: Int): Unit = releaseRawProgressReservation(key(shuffleId, writerId))
-
-  private[streaming] def shouldSpillRawBeforeDispatch(minCapacity: Int): Boolean = {
-    rawBufferPool.shouldPreserveProgressReserve(
-      minCapacity, rawBufferProgressReserveBytes.get())
+  private[streaming] def pendingCreditRouteCount: Int = {
+    pendingCredits.values().asScala.map(_.size()).sum
   }
 
   def close(): Unit = {
     val (_, submitted, completed, peakQueued) = outboundDispatcherStats
-    val (bodies, frames) = controlBodyStats
-    val (wireUsed, wirePeak, wireLimit, wireRawFallbacks, wireRawFallbackBytes) =
-      wireBufferBudget.stats
-    val (wireHeapFallbacks, wireHeapFallbackBytes) = wireBufferBudget.heapFallbackStats
-    val (batchBodies, batchWrites, transportedBodies, peakBodiesPerWrite) =
-      crossRouteBatcher.transportBatchStats
     logInfo(
       s"Closing executor streaming-shuffle outbound dispatcher: threads=$outboundThreads " +
-        s"submitted=$submitted completed=$completed peakQueued=$peakQueued " +
-        s"controlBodies=$bodies controlFrames=$frames " +
-        s"crossRouteSubmittedBodies=$batchBodies crossRouteTransportWrites=$batchWrites " +
-        s"crossRouteTransportedBodies=$transportedBodies " +
-        s"crossRoutePeakBodiesPerWrite=$peakBodiesPerWrite " +
-        s"wireDirectUsedBytes=$wireUsed wireDirectPeakBytes=$wirePeak " +
-        s"wireDirectLimitBytes=$wireLimit wireRawFallbacks=$wireRawFallbacks " +
-        s"wireRawFallbackBytes=$wireRawFallbackBytes " +
-        s"wireHeapFallbacks=$wireHeapFallbacks " +
-        s"wireHeapFallbackBytes=$wireHeapFallbackBytes")
+        s"submitted=$submitted completed=$completed peakQueued=$peakQueued")
     outboundPool.shutdownNow()
     crossRouteBatcher.discard()
-    rawBufferPool.close()
-    wireBufferBudget.close()
     pendingCredits.clear()
-    rawBufferReclaimers.clear()
-    rawBufferProgressReservations.clear()
-    rawBufferProgressReserveBytes.set(0L)
-    retiredRoutes.clear()
+    knownWriterRoutes.clear()
+    rawBufferPool.close()
     server.close()
-  }
-
-  private[streaming] def pendingCreditCount: Int =
-    pendingCredits.values().toArray(new Array[ArrayDeque[PendingCredit]](0))
-      .iterator.map(_.size()).sum
-}
-
-/** Executor-wide accounting for exact, unpooled direct wire payloads. */
-private[streaming] final class StreamingShuffleDirectBufferBudget(
-    maxMemoryBytes: Long,
-    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
-    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
-  require(maxMemoryBytes > 0L, "direct buffer budget must be positive")
-
-  private val usedBytes = new AtomicLong(0L)
-  private val peakBytes = new AtomicLong(0L)
-  private val rawFallbacks = new AtomicLong(0L)
-  private val rawFallbackBytes = new AtomicLong(0L)
-  private val heapFallbacks = new AtomicLong(0L)
-  private val heapFallbackBytes = new AtomicLong(0L)
-  @volatile private var closed = false
-
-  def tryAcquire(bytes: Int): Boolean = {
-    require(bytes > 0, "direct buffer reservation must be positive")
-    val requested = bytes.toLong
-    var acquired = false
-    while (!acquired && !closed) {
-      val current = usedBytes.get()
-      if (current + requested > maxMemoryBytes) return false
-      acquired = usedBytes.compareAndSet(current, current + requested)
-      if (acquired) peakBytes.accumulateAndGet(current + requested, Math.max)
-    }
-    acquired
-  }
-
-  def canReserve(bytes: Int): Boolean = bytes > 0 && bytes.toLong <= maxMemoryBytes
-
-  /**
-   * Reserves and allocates one wire buffer, returning null only while this budget is full. A JVM
-   * direct-memory failure can happen before this component's private limit because reader queues,
-   * raw buffers, replay, and transport arenas share MaxDirectMemorySize. In that case allocate an
-   * exact heap buffer while retaining the same byte reservation; this is a bounded pressure valve,
-   * not an untracked heap transport mode.
-   */
-  def tryAllocate(bytes: Int): ByteBuf = {
-    if (!tryAcquire(bytes)) {
-      return null
-    }
-    try allocateDirect(bytes)
-    catch {
-      case _: OutOfDirectMemoryError =>
-        try {
-          val buffer = allocateHeap(bytes)
-          heapFallbacks.incrementAndGet()
-          heapFallbackBytes.addAndGet(bytes.toLong)
-          buffer
-        } catch {
-          case error: Throwable =>
-            release(bytes)
-            throw error
-        }
-      case error: Throwable =>
-        release(bytes)
-        throw error
-    }
-  }
-
-  /** Wait briefly for a released reservation, then retry allocation. */
-  def awaitAllocate(bytes: Int, waitMillis: Long): ByteBuf = {
-    require(waitMillis > 0L, "wire-buffer wait must be positive")
-    this.synchronized { if (!closed) wait(waitMillis) }
-    tryAllocate(bytes)
-  }
-
-  def release(bytes: Int): Unit = {
-    require(bytes > 0, "direct buffer release must be positive")
-    val remaining = usedBytes.addAndGet(-bytes.toLong)
-    require(remaining >= 0L, "direct buffer budget released more bytes than it acquired")
-    this.synchronized { notifyAll() }
-  }
-
-  def recordRawFallback(bytes: Int): Unit = {
-    require(bytes > 0, "raw fallback size must be positive")
-    rawFallbacks.incrementAndGet()
-    rawFallbackBytes.addAndGet(bytes.toLong)
-  }
-
-  private[streaming] def stats: (Long, Long, Long, Long, Long) =
-    (usedBytes.get(), peakBytes.get(), maxMemoryBytes,
-      rawFallbacks.get(), rawFallbackBytes.get())
-
-  private[streaming] def heapFallbackStats: (Long, Long) =
-    (heapFallbacks.get(), heapFallbackBytes.get())
-
-  def close(): Unit = {
-    closed = true
-    this.synchronized { notifyAll() }
   }
 }
 
 /** Executor-wide reusable direct buffers for relaxed streaming writers. */
 private[streaming] final class StreamingShuffleRawBufferPool(
     bufferSize: Int,
-    maxMemoryBytes: Long,
-    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
-    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
+    maxMemoryBytes: Long) {
   require(bufferSize > 0, "bufferSize must be positive")
   require(maxMemoryBytes >= bufferSize,
     "raw buffer pool must admit at least one serialization buffer")
 
-  // Account exact allocated capacity, not buffer count. UnsafeRow can contain a value larger than
-  // the configured network buffer (for example a 1 MiB bloom-filter row). Counting such a grown
-  // buffer as one 128 KiB slot understated executor direct memory by 8x and let many writers
-  // bypass the raw in-flight budget simultaneously.
-  private val usedBytes = new AtomicLong(0L)
-  private val peakBytes = new AtomicLong(0L)
-  private val heapFallbacks = new AtomicLong(0L)
-  private val heapFallbackBytes = new AtomicLong(0L)
+  private val maxBuffers = math.min(
+    Int.MaxValue.toLong, math.max(1L, maxMemoryBytes / bufferSize)).toInt
+  // A permit represents an allocation slot not yet materialized. Once allocated, the slot moves
+  // between borrowers and the available deque until the pool closes or rejects an oversized buf.
+  private val unallocated = new Semaphore(maxBuffers)
   private val available = new LinkedBlockingDeque[ByteBuf]()
   @volatile private var closed = false
 
-  private def tryReserve(bytes: Int): Boolean = {
-    val requested = bytes.toLong
-    var acquired = false
-    while (!acquired && !closed) {
-      val current = usedBytes.get()
-      if (current + requested > maxMemoryBytes) return false
-      acquired = usedBytes.compareAndSet(current, current + requested)
-      if (acquired) peakBytes.accumulateAndGet(current + requested, Math.max)
-    }
-    acquired
-  }
-
-  private def allocate(capacity: Int): ByteBuf = {
-    if (!tryReserve(capacity)) return null
-    try allocateDirect(capacity)
-    catch {
-      case _: OutOfDirectMemoryError =>
-        try {
-          val buffer = allocateHeap(capacity)
-          heapFallbacks.incrementAndGet()
-          heapFallbackBytes.addAndGet(capacity.toLong)
-          buffer
-        } catch {
-          case error: Throwable =>
-            usedBytes.addAndGet(-capacity.toLong)
-            throw error
-        }
-      case error: Throwable =>
-        usedBytes.addAndGet(-capacity.toLong)
-        throw error
-    }
-  }
-
-  def tryBorrow(minCapacity: Int = bufferSize): ByteBuf = {
-    val capacity = math.max(bufferSize, minCapacity)
-    val cached = if (capacity == bufferSize) available.pollLast() else null
+  def tryBorrow(): ByteBuf = {
+    val cached = available.pollLast()
     if (cached != null) {
       cached.clear()
       cached
+    } else if (!closed && unallocated.tryAcquire()) {
+      try Unpooled.directBuffer(bufferSize)
+      catch {
+        case error: Throwable =>
+          unallocated.release()
+          throw error
+      }
     } else {
-      allocate(capacity)
-    }
-  }
-
-  def awaitBorrow(waitMillis: Long, minCapacity: Int = bufferSize): ByteBuf = {
-    val capacity = math.max(bufferSize, minCapacity)
-    val cached = if (capacity == bufferSize) {
-      available.pollLast(waitMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
-    } else {
-      // Oversized buffers are not cached. Wait for another oversized borrower to release exact
-      // capacity, then retry the CAS reservation; callers already loop with task-cancellation
-      // checks, so a short timed signal is sufficient and cannot strand a waiter.
-      this.synchronized { wait(waitMillis) }
       null
     }
-    if (cached != null) {
-      cached.clear()
-      cached
-    } else {
-      tryBorrow(capacity)
-    }
   }
 
-  /** True when another fixed-size borrower cannot make progress without a recycle or spill. */
-  def isExhausted(minCapacity: Int = bufferSize): Boolean = {
-    val capacity = math.max(bufferSize, minCapacity)
-    available.isEmpty && usedBytes.get() + capacity > maxMemoryBytes
-  }
-
-  /** Whether retaining the current frame would consume the active writers' progress frontier. */
-  def shouldPreserveProgressReserve(minCapacity: Int, reserveBytes: Long): Boolean = {
-    if (reserveBytes <= 0L) return isExhausted(minCapacity)
-    val unallocatedBytes = math.max(0L, maxMemoryBytes - usedBytes.get())
-    val cachedBytes = available.size().toLong * bufferSize.toLong
-    val boundedReserve = math.min(maxMemoryBytes, reserveBytes)
-    unallocatedBytes + cachedBytes < boundedReserve
+  def awaitBorrow(waitMillis: Long): ByteBuf = {
+    val cached = available.pollLast(waitMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    if (cached != null) cached.clear()
+    cached
   }
 
   def recycle(buffer: ByteBuf): Unit = {
@@ -584,21 +276,13 @@ private[streaming] final class StreamingShuffleRawBufferPool(
    * eventually leaving every writer blocked with an empty free list and zero permits.
    */
   def discard(buffer: ByteBuf): Unit = {
-    destroy(buffer)
+    buffer.release()
+    unallocated.release()
   }
 
-  private[streaming] def stats: (Long, Long, Long) =
-    (usedBytes.get(), peakBytes.get(), maxMemoryBytes)
-
-  private[streaming] def heapFallbackStats: (Long, Long) =
-    (heapFallbacks.get(), heapFallbackBytes.get())
-
   private def destroy(buffer: ByteBuf): Unit = {
-    val capacity = buffer.capacity()
     buffer.release()
-    val remaining = usedBytes.addAndGet(-capacity.toLong)
-    require(remaining >= 0L, "raw buffer pool released more bytes than it allocated")
-    this.synchronized { notifyAll() }
+    unallocated.release()
   }
 
   def close(): Unit = {
@@ -606,6 +290,5 @@ private[streaming] final class StreamingShuffleRawBufferPool(
     val buffers = new java.util.ArrayList[ByteBuf]()
     available.drainTo(buffers)
     buffers.forEach(buffer => { destroy(buffer); () })
-    this.synchronized { notifyAll() }
   }
 }

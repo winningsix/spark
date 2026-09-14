@@ -17,9 +17,10 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
 
@@ -34,15 +35,16 @@ import org.apache.spark.sql.internal.SQLConf
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
-  private val HIDDEN_SHUFFLE_DISABLED =
-    TreeNodeTag[Boolean]("pipelined_shuffle_hidden_shuffle_disabled")
+  // The flag/manager mismatch is a start-up misconfiguration, so warn once per JVM rather than on
+  // every query planned in the session.
+  private val mismatchWarned = new AtomicBoolean(false)
 
-  def supportsMemoryRetainingConsumer: Boolean = {
-    val manager = SparkEnv.get.pipelinedShuffleManager
-    manager != null && manager.supportsMemoryRetainingConsumer
-  }
-
-  private def enabled(conf: SQLConf, isLocal: Boolean): Boolean = {
+  /**
+   * Whether the configured pipelined transport may be used for `plan` at all, independent of plan
+   * shape. The manager declares whether it requires a single executor; distributed transports can
+   * therefore run in cluster mode without weakening the in-process channel's safety check.
+   */
+  def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
     if (!conf.localPipelinedShuffleEnabled) {
       return false
     }
@@ -52,51 +54,26 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
         "leaving the plan regular.")
       return false
     }
-    if (manager.requiresSingleExecutor && !isLocal) {
+    // Batch only. `IncrementalExecution.preparations` inherits QueryExecution's list, so without
+    // this gate a streaming plan would be rewritten here: every micro-batch exchange (the
+    // state-store shuffles, the static side of a stream-static join) would be flipped to pipelined
+    // BEFORE `MarkPipelinedShuffleForRealTimeMode` runs. That contradicts what the Real-Time Mode
+    // rule deliberately does -- it leaves the static side regular, because pulling it into the gang
+    // would demand slots for stages that must instead finish first, failing admission. Streaming
+    // marks its own pipelined boundaries; this opt-in batch path must not pre-empt that decision.
+    // (`logicalLink.exists(_.isStreaming)` is the same signal InsertAdaptiveSparkPlan uses to keep
+    // AQE off streaming plans.)
+    if (plan.exists(_.logicalLink.exists(_.isStreaming))) {
+      logDebug("Pipelined shuffle: the plan is a streaming plan; leaving it to the streaming " +
+        "engine's own pipelined-shuffle marking.")
+      return false
+    }
+    if (manager.requiresSingleExecutor &&
+        (plan.session == null || !plan.session.sparkContext.isLocal)) {
       logDebug("The configured pipelined shuffle manager requires a single executor; leaving " +
         "the cluster-mode plan regular.")
       return false
     }
     true
-  }
-
-  /**
-   * Whether the configured pipelined transport may be used for `plan` at all, independent of plan
-   * shape. The manager declares whether it requires a single executor; distributed transports can
-   * therefore run in cluster mode without weakening the in-process channel's safety check.
-   */
-  def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
-    // Batch only. IncrementalExecution inherits QueryExecution's preparation rules, while
-    // streaming marks its own safe boundaries for Real-Time Mode.
-    if (plan.exists(_.logicalLink.exists(_.isStreaming))) {
-      logDebug("Pipelined shuffle: leaving a streaming plan to Real-Time Mode boundary marking.")
-      return false
-    }
-    enabled(conf, plan.session != null && plan.session.sparkContext.isLocal)
-  }
-
-  /**
-   * Whether a shuffle dependency created inside an operator's `doExecute` may use the pipelined
-   * transport. Such a dependency is invisible to the physical-plan rules. Restrict this to the
-   * prepared-receive transport: it can admit the hidden producer/consumer boundary elastically,
-   * while the local channel still relies on conservative whole-plan shape checks.
-   */
-  def hiddenShuffleEnabled(
-      plan: SparkPlan,
-      conf: SQLConf,
-      isLocal: Boolean): Boolean = {
-    !plan.getTagValue(HIDDEN_SHUFFLE_DISABLED).contains(true) &&
-      enabled(conf, isLocal) &&
-      SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary
-  }
-
-  /**
-   * Propagate a whole-plan regular-shuffle fallback to dependencies built later inside
-   * `doExecute`. Those hidden dependencies are absent when [[EnablePipelinedShuffle]] runs, so
-   * rewriting visible exchanges alone would leave a regular plan with a pipelined limit/TopN
-   * boundary and DAGScheduler would reject the resulting mixed job.
-   */
-  def disableHiddenShuffles(plan: SparkPlan): Unit = {
-    plan.foreachWithSubqueries(_.setTagValue(HIDDEN_SHUFFLE_DISABLED, true))
   }
 }

@@ -17,14 +17,12 @@
 
 package org.apache.spark.shuffle.streaming
 
-import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkException,
-  SparkRuntimeException, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkException, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
-  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY,
-  STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
   STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.TransportClientFactory
@@ -97,7 +95,6 @@ private[spark] class StreamingShuffleManager
     conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED) &&
       conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED) &&
       conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY) > 0L &&
-      conf.get(STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY) > 0L &&
       conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED) &&
       conf.get(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
   }
@@ -138,14 +135,13 @@ private[spark] class StreamingShuffleManager
     service
   }
 
-  override def initializeExecutor(): Unit = synchronized {
+  private[spark] def initializeReceiveServiceEndpoint(): Unit = synchronized {
     val env = SparkEnv.get
     if (env.conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)) {
       require(preparedReceiveServiceConfigured,
         s"${STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key} requires " +
           s"${STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED.key}=true, a positive " +
           s"${STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY.key}, " +
-          s"${STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY.key}, " +
           s"${STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED.key}=true, and " +
           s"${STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED.key}=true")
     }

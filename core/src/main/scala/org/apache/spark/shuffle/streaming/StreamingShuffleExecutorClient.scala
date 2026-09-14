@@ -19,179 +19,26 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList, RejectedExecutionException,
-  ScheduledExecutorService, TimeoutException, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+  ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, CompositeByteBuf, Unpooled}
-import io.netty.util.internal.OutOfDirectMemoryError
+import io.netty.buffer.{ByteBuf, CompositeByteBuf}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
-  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
-  STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT}
+  STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.buffer.{ManagedBuffer, NettyManagedBuffer}
-import org.apache.spark.network.client.{RpcResponseCallback, TransportClient,
-  TransportClientFactory}
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
-import org.apache.spark.network.shuffle.streaming.{CreditControlMessage,
-  StreamingShuffleMessageType, TerminationAckMessage}
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, StreamingShuffleMessageType}
 import org.apache.spark.util.ThreadUtils
-
-private[streaming] object StreamingShuffleExecutorClient {
-  private case class PendingInitialCredit(
-      request: AnyRef,
-      owner: StreamingShuffleExecutorClient,
-      client: TransportClient,
-      handler: StreamingShuffleClientHandler,
-      claim: () => Boolean,
-      rollback: () => Unit)
-  private case class InitialCredit(
-      client: TransportClient,
-      handler: StreamingShuffleClientHandler,
-      claim: () => Boolean,
-      rollback: () => Unit)
-
-  private class InitialCreditBatchScope {
-    val pending = new mutable.ArrayBuffer[PendingInitialCredit]()
-    var currentRequest: AnyRef = _
-  }
-
-  private val currentInitialCreditBatch = new ThreadLocal[InitialCreditBatchScope]()
-
-  private def rollback(entries: Seq[PendingInitialCredit], cause: Throwable): Unit = {
-    entries.foreach { entry =>
-      try entry.rollback()
-      catch {
-        case rollbackError: Throwable => cause.addSuppressed(rollbackError)
-      }
-    }
-  }
-
-  /**
-   * Execute several independent prepared-route registrations on one worker and defer their
-   * initial discovery credits until every request has installed its handlers. Credits that share
-   * one physical client are then emitted as one transport body. A request that fails before the
-   * flush loses only its own deferred routes; a failed physical write fails and rolls back only
-   * the requests carried by that client.
-   */
-  private[streaming] def runBatchedRouteRegistrations(
-      requests: Seq[(AnyRef, () => Unit)]): Map[AnyRef, Throwable] = {
-    require(currentInitialCreditBatch.get() == null,
-      "Nested streaming shuffle initial-credit batches are not supported")
-    val scope = new InitialCreditBatchScope
-    val failures = new mutable.LinkedHashMap[AnyRef, Throwable]()
-    currentInitialCreditBatch.set(scope)
-    try {
-      requests.foreach { case (request, registration) =>
-        scope.currentRequest = request
-        try registration()
-        catch {
-          case error: Throwable =>
-            val requestEntries = scope.pending.filter(_.request eq request).toSeq
-            rollback(requestEntries, error)
-            scope.pending --= requestEntries
-            failures.put(request, error)
-        }
-      }
-    } finally {
-      scope.currentRequest = null
-      currentInitialCreditBatch.remove()
-    }
-
-    scope.pending.filter(_.claim()).groupBy { entry =>
-      (entry.owner, entry.client)
-    }.values.foreach { entries =>
-      try {
-        entries.head.owner.sendAndAwaitInitialCreditBatch(
-          entries.map(_.handler).toSeq, entries.head.client)
-      } catch {
-        case error: Throwable =>
-          rollback(entries.toSeq, error)
-          entries.foreach(entry => failures.getOrElseUpdate(entry.request, error))
-      }
-    }
-    failures.toMap
-  }
-
-  private def submitInitialCredits(
-      owner: StreamingShuffleExecutorClient,
-      entries: Seq[InitialCredit]): Unit = {
-    val scope = currentInitialCreditBatch.get()
-    if (scope == null) {
-      entries.filter(_.claim()).groupBy(_.client).values.foreach { clientEntries =>
-        owner.sendInitialCreditBatch(
-          clientEntries.map(_.handler).toSeq, clientEntries.head.client)
-      }
-    } else {
-      require(scope.currentRequest != null,
-        "Streaming shuffle initial credits have no owning route request")
-      entries.foreach { entry =>
-        scope.pending += PendingInitialCredit(
-          scope.currentRequest,
-          owner,
-          entry.client,
-          entry.handler,
-          entry.claim,
-          entry.rollback)
-      }
-    }
-  }
-}
-
-/**
- * Detaches queued route groups from Netty's pooled receive chunks.
- *
- * A multiplexed transport body can contain frames for many logical readers. Retaining a small
- * slice for one slow reader otherwise pins the entire pooled arena chunk even though reader
- * memory accounting charges only the slice's encoded bytes. Exact unpooled copies make physical
- * direct-memory ownership track that accounting; heap is only a last-resort fallback when the
- * JVM-wide direct limit is already exhausted.
- */
-private[streaming] final class StreamingShuffleTransportBodyCompactor(
-    allocateDirect: Int => ByteBuf = size => Unpooled.directBuffer(size, size),
-    allocateHeap: Int => ByteBuf = size => Unpooled.buffer(size, size)) {
-  private val directCopies = new AtomicLong(0L)
-  private val directBytes = new AtomicLong(0L)
-  private val heapFallbacks = new AtomicLong(0L)
-  private val heapFallbackBytes = new AtomicLong(0L)
-
-  def copy(source: ByteBuf, start: Int, length: Int): ByteBuf = {
-    require(length > 0, "transport route group must not be empty")
-    var result: ByteBuf = null
-    var direct = true
-    try {
-      result = try allocateDirect(length)
-      catch {
-        case _: OutOfDirectMemoryError =>
-          direct = false
-          allocateHeap(length)
-      }
-      result.writeBytes(source, start, length)
-      if (direct) {
-        directCopies.incrementAndGet()
-        directBytes.addAndGet(length.toLong)
-      } else {
-        heapFallbacks.incrementAndGet()
-        heapFallbackBytes.addAndGet(length.toLong)
-      }
-      result
-    } catch {
-      case error: Throwable =>
-        if (result != null) result.release()
-        throw error
-    }
-  }
-
-  private[streaming] def stats: (Long, Long, Long, Long) =
-    (directCopies.get(), directBytes.get(), heapFallbacks.get(), heapFallbackBytes.get())
-}
 
 /** Executor-scoped client that multiplexes logical reader/writer streams over pooled channels. */
 private[streaming] class StreamingShuffleExecutorClient extends Logging {
@@ -200,26 +47,18 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   private case class ConnectionLane(
       shuffleId: Int,
       remoteHost: String,
-      remotePort: Int,
-      consumerGeneration: Int)
+      remotePort: Int)
   private case class Registration(
       handler: StreamingShuffleClientHandler,
       client: TransportClient,
-      laneShared: Boolean,
-      initialCreditPending: AtomicBoolean)
+      laneShared: Boolean)
   private case class InstalledRegistration(
       route: Route,
       registration: Registration,
       routeRegistrations: CopyOnWriteArrayList[Registration])
-  private case class PendingCreditRepair(
+  private case class PendingCredit(
       handler: StreamingShuffleClientHandler,
       message: CreditControlMessage)
-  private case class PendingTerminationAck(
-      handler: StreamingShuffleClientHandler,
-      writerId: Int,
-      sequenceNumber: Long)
-
-  private val transportBodyCompactor = new StreamingShuffleTransportBodyCompactor()
 
   // A shuffle partition can be consumed by more than one downstream stage. Those logical readers
   // intentionally share one pooled transport connection and therefore have the same wire route.
@@ -228,41 +67,27 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   // of zero.
   private val registrations =
     new ConcurrentHashMap[Route, CopyOnWriteArrayList[Registration]]()
-  // A TransportClient is also the writer's replay-cursor identity. Reusing the same client for a
-  // later lifetime of one route would make the new consumer appear to have already consumed the
-  // stream. Assign successive registrations of each route to successive connection generations.
-  // Routes in the same consumer wave normally have the same generation and can still share one
-  // physical lane; this avoids opening one unmanaged connection per writer x reader route.
-  private val routeConsumerGenerations =
-    new ConcurrentHashMap[Route, AtomicInteger]()
-  // Pool one physical connection per (remote executor, shuffle, consumer generation), rather
-  // than per logical route. The generation preserves replay isolation for repeated consumers,
-  // while the shuffle dimension prevents a large sibling exchange from blocking an earlier
-  // stage's terminal frames behind unrelated traffic.
+  // A pooled TransportClient can outlive one logical reader route and be handed back to a later
+  // task after the earlier handler unregisters. The writer keys replay cursors by physical
+  // client, so reusing that client for a new logical consumer would make the new reader appear to
+  // have already consumed the old stream. Keep a route tombstone and use a fresh unmanaged
+  // connection on every subsequent registration; only the first consumer gets pooled sharing.
+  private val usedRoutes = ConcurrentHashMap.newKeySet[Route]()
+  // Pool one physical connection per (remote executor, shuffle), rather than per remote executor.
+  // A large sibling shuffle can otherwise fill the shared channel's FIFO and hold an earlier
+  // stage's last data/termination frames behind seconds of unrelated traffic. The shuffle lane
+  // keeps cross-route batching within one exchange while avoiding a connection per task/inbox.
   private val laneClients = new ConcurrentHashMap[ConnectionLane, TransportClient]()
-  private val initialCreditRegistrations = new AtomicLong(0L)
-  private val initialCreditWrites = new AtomicLong(0L)
-  private val creditRepairWrites = new AtomicLong(0L)
   private val cumulativeCreditReleases = new AtomicLong(0L)
   private val cumulativeCreditWrites = new AtomicLong(0L)
   private val cumulativeCreditFrames = new AtomicLong(0L)
-  private val terminationAckFrames = new AtomicLong(0L)
-  private val terminationAckWrites = new AtomicLong(0L)
+  private val creditRepairWrites = new AtomicLong(0L)
   private val closed = new AtomicBoolean(false)
-  private val currentTerminationAckBatch = new ThreadLocal[
-    mutable.LinkedHashMap[
-      StreamingShuffleClientHandler,
-      (TransportClient, PendingTerminationAck)]]()
   private val cumulativeCreditLock = new Object
   private val pendingCumulativeCredits = new java.util.IdentityHashMap[
     TransportClient, mutable.LinkedHashSet[StreamingShuffleClientHandler]]()
   private val scheduledCumulativeCreditClients = java.util.Collections.newSetFromMap(
     new java.util.IdentityHashMap[TransportClient, java.lang.Boolean]())
-  private val cumulativeCreditExecutor: ScheduledExecutorService =
-    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
-      "streaming-shuffle-cumulative-credit-flush")
-  private val cumulativeCreditMaxWaitMs = math.max(1L,
-    SparkEnv.get.conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS))
 
   private def decodeRoute(message: ByteBuffer): Route = {
     // Both routed writer-to-reader message types start with the same fixed layout:
@@ -350,10 +175,15 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
   }
 
-  /** Routes a body containing complete frames, preserving contiguous groups for each route. */
+  /**
+   * Routes a body containing complete frames, preserving contiguous frame batches for each
+   * logical route. A normal one-route body therefore still reaches the reader in one call, while
+   * a cross-route body is split with retained zero-copy slices.
+   */
   private def receiveMultiplexedBody(
       client: TransportClient,
-      body: ByteBuf): Unit = {
+      body: ByteBuf,
+      message: ManagedBuffer): Unit = {
     // Scan once to find contiguous route groups. The old mixed-route path first scanned the whole
     // body to decide whether it was single-route, then scanned it again while making slices. The
     // handler still performs the authoritative frame decode after routing, but the router no
@@ -381,30 +211,37 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
     groups += RouteGroup(currentRoute, groupStart, view.readerIndex())
 
-    groups.foreach { group =>
-      // Never let an asynchronously queued logical frame retain a pooled receive chunk. Copy one
-      // contiguous route group (not each frame) into exact storage so the queue's byte budget is
-      // also a useful bound on physical direct memory.
-      val frameGroup = transportBodyCompactor.copy(body, group.start, group.end - group.start)
-      val routeBody = new NettyManagedBuffer(frameGroup)
-      try {
-        val routeRegistrations = registrationsFor(group.route, client)
-        if (routeRegistrations.isEmpty) {
-          // A task may unregister immediately after consuming termination while a coalesced body
-          // is already in flight. No active reader can consume this late group.
-          logDebug(
-            s"Dropping late streaming shuffle body for inactive route " +
-              s"shuffle=${group.route.shuffleId}, writer=${group.route.writerId}, " +
-              s"reader=${group.route.readerId}")
-        } else {
-          routeRegistrations.foreach { registration =>
-            registration.handler.receiveMultiplexed(client, frameGroup, routeBody)
+    if (groups.length == 1) {
+      val routeRegistrations = registrationsFor(groups.head.route, client)
+      if (routeRegistrations.isEmpty) {
+        logDebug("Dropping late streaming shuffle body for an inactive route")
+      } else {
+        routeRegistrations.foreach(_.handler.receiveMultiplexed(client, body, message))
+      }
+    } else {
+      groups.foreach { group =>
+        val frameGroup = body.retainedSlice(group.start, group.end - group.start)
+        val routeBody = new NettyManagedBuffer(frameGroup)
+        try {
+          val routeRegistrations = registrationsFor(group.route, client)
+          if (routeRegistrations.isEmpty) {
+            // A task may unregister immediately after consuming termination while a coalesced body
+            // is already in flight on the shared channel. The body is still owned by this method;
+            // dropping that late frame is safe because no active reader can consume it.
+            logDebug(
+              s"Dropping late streaming shuffle body for inactive route " +
+                s"shuffle=${group.route.shuffleId}, writer=${group.route.writerId}, " +
+                s"reader=${group.route.readerId}")
+          } else {
+            routeRegistrations.foreach { registration =>
+              registration.handler.receiveMultiplexed(client, frameGroup, routeBody)
+            }
           }
+        } finally {
+          // Data messages retain routeBody until their queue consumer releases them; controls do
+          // not retain it and are released here.
+          routeBody.release()
         }
-      } finally {
-        // Data messages retain routeBody until their queue consumer releases them; controls do
-        // not retain it and are released here.
-        routeBody.release()
       }
     }
   }
@@ -427,9 +264,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       // readers. The router keeps one-route bodies zero-copy and only slices at route transitions.
       val body = message.convertToNetty().asInstanceOf[ByteBuf]
       try {
-        withTerminationAckBatch {
-          receiveMultiplexedBody(client, body)
-        }
+        receiveMultiplexedBody(client, body, message)
       } finally {
         body.release()
       }
@@ -456,14 +291,13 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   }
   private val clientConf = SparkTransportConf.fromSparkConf(
     conf, "streaming-shuffle-reader-multiplexed", math.max(1, conf.get(EXECUTOR_CORES)), role)
-  private val routeRegistrationTimeoutMs =
-    conf.get(STREAMING_SHUFFLE_PREPARED_ROUTE_REGISTRATION_TIMEOUT)
-  private val initialCreditWriteTimeoutMs = Option(clientConf.connectionTimeoutMs().toLong)
-    .filter(_ > 0L)
-    .map(math.min(_, routeRegistrationTimeoutMs))
-    .getOrElse(routeRegistrationTimeoutMs)
   private val transportContext = new TransportContext(clientConf, rpcHandler, true, true)
   private val clientFactory: TransportClientFactory = transportContext.createClientFactory()
+  private val cumulativeCreditExecutor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+      "streaming-shuffle-cumulative-credit-flush")
+  private val cumulativeCreditMaxWaitMs = math.max(1L,
+    conf.get(STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS))
 
   private def installRegistration(
       shuffleId: Int,
@@ -473,27 +307,23 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       remotePort: Int,
       handler: StreamingShuffleClientHandler): InstalledRegistration = {
     val route = Route(shuffleId, writerId, readerId)
-    // The writer keys replay state by TransportClient, so every lifetime of the same route needs
-    // a distinct client. Pool that client with other routes at the same lifetime generation
-    // instead of creating one unmanaged connection for each route. Atomic generation assignment
-    // also permits prepared inbox registrations to run in parallel without an executor-wide lock.
-    val consumerGeneration = routeConsumerGenerations
-      .computeIfAbsent(route, _ => new AtomicInteger(0))
-      .getAndIncrement()
-    if (consumerGeneration > 0) {
-      val active = Option(registrations.get(route)).map(_.size()).getOrElse(0)
-      logDebug(
-        s"Registering consumer generation $consumerGeneration for streaming shuffle route " +
-          s"$route: activeRegistrations=$active")
+    // A second consumer of the same shuffle partition cannot share the pooled connection: the
+    // writer may have already sent a prefix to the first consumer, while this consumer needs a
+    // fresh sequence starting at zero. Give only duplicate routes an unmanaged connection; the
+    // common one-consumer case keeps the pooled connection and its lower connection count.
+    val (client, laneShared) = registrations.synchronized {
+      val existing = registrations.get(route)
+      if ((existing == null || existing.isEmpty) && usedRoutes.add(route)) {
+        val lane = ConnectionLane(shuffleId, remoteHost, remotePort)
+        (laneClients.computeIfAbsent(
+          lane,
+          _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler)), true)
+      } else {
+        (clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler), false)
+      }
     }
-    val lane = ConnectionLane(shuffleId, remoteHost, remotePort, consumerGeneration)
-    val client = laneClients.computeIfAbsent(
-      lane,
-      _ => clientFactory.createUnmanagedClient(remoteHost, remotePort, rpcHandler))
-    val laneShared = true
-    val registration = Registration(handler, client, laneShared, new AtomicBoolean(true))
+    val registration = Registration(handler, client, laneShared)
     handler.setMultiplexedCreditSender(scheduleCumulativeCredit)
-    handler.setMultiplexedTerminationAckSender(scheduleTerminationAck)
     val routeRegistrations = registrations.computeIfAbsent(
       route, _ => new CopyOnWriteArrayList[Registration]())
     require(routeRegistrations.addIfAbsent(registration),
@@ -502,11 +332,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   }
 
   private def removeInstalled(installed: InstalledRegistration): Unit = {
-    installed.registration.initialCreditPending.set(false)
     discardPendingCumulativeCredit(installed.registration.handler)
     installed.registration.handler.clearMultiplexedCreditSender()
-    installed.registration.handler.clearMultiplexedTerminationAckSender()
-    installed.registration.handler.closeReceiveCreditLease()
     installed.routeRegistrations.remove(installed.registration)
     if (installed.routeRegistrations.isEmpty) {
       registrations.remove(installed.route, installed.routeRegistrations)
@@ -514,19 +341,21 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     if (!installed.registration.laneShared) installed.registration.client.close()
   }
 
-  private def sendInitialCreditBatch(
-      handlers: Seq[StreamingShuffleClientHandler],
-      client: TransportClient): Future[Void] = {
-    require(handlers.nonEmpty, "Initial credit batch must not be empty")
-    initialCreditWrites.incrementAndGet()
+  private def sendInitialCreditBatch(installed: Seq[InstalledRegistration]): Unit = {
+    require(installed.nonEmpty, "Initial credit batch must not be empty")
+    val client = installed.head.registration.client
+    require(installed.forall(_.registration.client eq client),
+      "Initial credit batch must use one physical client")
     var buf: CompositeByteBuf = null
     try {
-      val messages = handlers.zipWithIndex.map { case (handler, index) =>
-        handler.prepareMultiplexedInitialCredit(client, configureSocket = index == 0)
+      val messages = installed.zipWithIndex.map { case (entry, index) =>
+        entry.registration.handler.prepareMultiplexedInitialCredit(
+          client, configureSocket = index == 0)
       }
       val encodedBytes = messages.foldLeft(0)(_ + _.headerLength())
       buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
       messages.foreach(_.encode(buf))
+      val handlers = installed.map(_.registration.handler)
       client.send(buf.retain()).addListener(
         new GenericFutureListener[Future[Void]] {
           override def operationComplete(future: Future[Void]): Unit = {
@@ -542,139 +371,34 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     }
   }
 
-  /** Send one control body containing every due repair frame for a physical lane. */
-  private def sendCreditRepairBatch(
-      repairs: Seq[PendingCreditRepair],
-      client: TransportClient): Unit = {
-    require(repairs.nonEmpty, "Credit repair batch must not be empty")
-    creditRepairWrites.incrementAndGet()
-    sendCreditBatch(repairs, client)
-  }
-
-  private def sendCumulativeCreditBatch(
-      repairs: Seq[PendingCreditRepair],
-      client: TransportClient): Unit = {
-    if (repairs.isEmpty) return
-    cumulativeCreditWrites.incrementAndGet()
-    cumulativeCreditFrames.addAndGet(repairs.size)
-    sendCreditBatch(repairs, client)
-  }
-
+  /** Send a body containing the latest credit watermark for each selected logical route. */
   private def sendCreditBatch(
-      repairs: Seq[PendingCreditRepair],
+      credits: Seq[PendingCredit],
       client: TransportClient): Unit = {
+    if (credits.isEmpty) return
     var buf: CompositeByteBuf = null
     try {
-      val encodedBytes = repairs.foldLeft(0)(_ + _.message.headerLength())
+      val encodedBytes = credits.foldLeft(0)(_ + _.message.headerLength())
       buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
-      repairs.foreach(_.message.encode(buf))
+      credits.foreach(_.message.encode(buf))
       client.send(buf.retain()).addListener(
         new GenericFutureListener[Future[Void]] {
           override def operationComplete(future: Future[Void]): Unit = {
             if (!future.isSuccess) {
               val cause = Option(future.cause()).getOrElse(
-                new RuntimeException("Unknown credit repair batch send failure"))
-              repairs.foreach(_.handler.creditRepairBatchSendFailed(client, cause))
+                new RuntimeException("Unknown batched credit send failure"))
+              credits.foreach(_.handler.creditBatchSendFailed(client, cause))
             }
           }
         })
     } catch {
-      case error: Throwable =>
-        repairs.foreach(_.handler.creditRepairBatchSendFailed(client, error))
+      case error: Throwable => credits.foreach(_.handler.creditBatchSendFailed(client, error))
     } finally {
       if (buf != null) buf.release()
     }
   }
 
-  /** Combine terminal ACKs produced while routing one physical inbound body. */
-  private def withTerminationAckBatch(body: => Unit): Unit = {
-    require(currentTerminationAckBatch.get() == null,
-      "Nested streaming shuffle termination-ACK batches are not supported")
-    val pending = new mutable.LinkedHashMap[
-      StreamingShuffleClientHandler, (TransportClient, PendingTerminationAck)]()
-    currentTerminationAckBatch.set(pending)
-    try body
-    finally {
-      currentTerminationAckBatch.remove()
-      pending.values.toSeq.groupBy(_._1).foreach { case (client, entries) =>
-        sendTerminationAckBatch(client, entries.map(_._2))
-      }
-    }
-  }
-
-  private def scheduleTerminationAck(
-      client: TransportClient,
-      handler: StreamingShuffleClientHandler,
-      writerId: Int,
-      sequenceNumber: Long): Unit = {
-    val ack = PendingTerminationAck(handler, writerId, sequenceNumber)
-    val pending = currentTerminationAckBatch.get()
-    if (pending == null) {
-      sendTerminationAckBatch(client, Seq(ack))
-    } else {
-      // A duplicate terminal in the same physical body needs only one idempotent ACK.
-      pending.update(handler, client -> ack)
-    }
-  }
-
-  private def sendTerminationAckBatch(
-      client: TransportClient,
-      entries: Seq[PendingTerminationAck]): Unit = {
-    if (entries.isEmpty) return
-    terminationAckWrites.incrementAndGet()
-    terminationAckFrames.addAndGet(entries.size)
-    var buf: CompositeByteBuf = null
-    try {
-      val messages: Seq[(PendingTerminationAck, TerminationAckMessage)] = entries.map { entry =>
-        entry -> entry.handler.prepareMultiplexedTerminationAck(
-          entry.writerId, entry.sequenceNumber)
-      }
-      val encodedBytes = messages.foldLeft(0)(_ + _._2.headerLength())
-      buf = client.getChannel.alloc().compositeBuffer().capacity(encodedBytes)
-      messages.foreach(_._2.encode(buf))
-      val transportRef = buf.retain()
-      val sendFuture = try {
-        client.send(transportRef)
-      } catch {
-        case error: Throwable =>
-          transportRef.release()
-          throw error
-      }
-      sendFuture.addListener(
-        new GenericFutureListener[Future[Void]] {
-          override def operationComplete(future: Future[Void]): Unit = {
-            if (future.isSuccess) {
-              entries.foreach { entry =>
-                entry.handler.terminationAckBatchSendSucceeded(entry.writerId)
-              }
-            } else {
-              val cause = Option(future.cause()).getOrElse(
-                new RuntimeException("Unknown termination ACK batch send failure"))
-              entries.foreach { entry =>
-                entry.handler.terminationAckBatchSendFailed(client, entry.writerId, cause)
-              }
-            }
-          }
-        })
-    } catch {
-      case error: Throwable =>
-        entries.foreach { entry =>
-          entry.handler.terminationAckBatchSendFailed(client, entry.writerId, error)
-        }
-    } finally {
-      if (buf != null) buf.release()
-    }
-  }
-
-  /**
-   * Coalesce hot-path cumulative credit updates by physical lane.
-   *
-   * Q3 moves roughly 42 GiB in 32 KiB data frames. Sending one 28-byte Spark transport body for
-   * every released frame creates about a million control writes and can leave the terminal ACK
-   * behind that FIFO. Each control frame carries an absolute released-byte watermark, so keeping
-   * only the latest handler entry during this short window is lossless and bounded by the number
-   * of active logical routes, not by the number of data frames.
-   */
+  /** Collapse hot frame releases to one cumulative watermark per route and physical lane. */
   private def scheduleCumulativeCredit(
       client: TransportClient,
       handler: StreamingShuffleClientHandler): Unit = {
@@ -693,9 +417,7 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     if (schedule) {
       try {
         cumulativeCreditExecutor.schedule(
-          new Runnable {
-            override def run(): Unit = flushCumulativeCredits(client)
-          },
+          new Runnable { override def run(): Unit = flushCumulativeCredits(client) },
           cumulativeCreditMaxWaitMs,
           TimeUnit.MILLISECONDS)
       } catch {
@@ -709,10 +431,14 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
       scheduledCumulativeCreditClients.remove(client)
       Option(pendingCumulativeCredits.remove(client)).map(_.toSeq).getOrElse(Seq.empty)
     }
-    val repairs = handlers.flatMap { handler =>
-      handler.prepareMultiplexedCreditRepair().map(PendingCreditRepair(handler, _))
+    val credits = handlers.flatMap { handler =>
+      handler.prepareMultiplexedCreditRepair().map(PendingCredit(handler, _))
     }
-    sendCumulativeCreditBatch(repairs, client)
+    if (credits.nonEmpty) {
+      cumulativeCreditWrites.incrementAndGet()
+      cumulativeCreditFrames.addAndGet(credits.size)
+      sendCreditBatch(credits, client)
+    }
   }
 
   private def discardPendingCumulativeCredit(
@@ -728,50 +454,26 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     empty.foreach(pendingCumulativeCredits.remove)
   }
 
-  /** Coalesce idempotent route repairs by physical connection. */
+  /** Coalesce periodic liveness repairs by physical lane. */
   def repairCreditWindows(
       routes: Iterable[(TransportClient, StreamingShuffleClientHandler)]): Unit = {
     val byClient = new java.util.IdentityHashMap[
-      TransportClient, mutable.ArrayBuffer[PendingCreditRepair]]()
+      TransportClient, mutable.ArrayBuffer[PendingCredit]]()
     routes.foreach { case (client, handler) =>
-      handler.prepareMultiplexedCreditRepair().foreach { message =>
-        var repairs = byClient.get(client)
-        if (repairs == null) {
-          repairs = new mutable.ArrayBuffer[PendingCreditRepair]()
-          byClient.put(client, repairs)
+      val repairs = handler.prepareMultiplexedCreditRepair().toSeq ++
+        handler.prepareMultiplexedReplayRepair().toSeq
+      repairs.foreach { message =>
+        var credits = byClient.get(client)
+        if (credits == null) {
+          credits = new mutable.ArrayBuffer[PendingCredit]()
+          byClient.put(client, credits)
         }
-        repairs += PendingCreditRepair(handler, message)
+        credits += PendingCredit(handler, message)
       }
     }
     byClient.entrySet().asScala.foreach { entry =>
-      sendCreditRepairBatch(entry.getValue.toSeq, entry.getKey)
-    }
-  }
-
-  /**
-   * A completed prepared-route future means the discovery frame reached Netty, not just its FIFO.
-   */
-  private def sendAndAwaitInitialCreditBatch(
-      handlers: Seq[StreamingShuffleClientHandler],
-      client: TransportClient): Unit = {
-    val write = sendInitialCreditBatch(handlers, client)
-    try {
-      if (!write.await(initialCreditWriteTimeoutMs, TimeUnit.MILLISECONDS)) {
-        val timeout = new TimeoutException(
-          s"Streaming shuffle initial credit batch did not flush within " +
-            s"$initialCreditWriteTimeoutMs ms")
-        handlers.foreach(_.initialCreditBatchSendFailed(timeout))
-        throw timeout
-      }
-    } catch {
-      case interrupted: InterruptedException =>
-        Thread.currentThread().interrupt()
-        handlers.foreach(_.initialCreditBatchSendFailed(interrupted))
-        throw interrupted
-    }
-    if (!write.isSuccess) {
-      throw Option(write.cause()).getOrElse(
-        new RuntimeException("Unknown initial credit batch send failure"))
+      creditRepairWrites.incrementAndGet()
+      sendCreditBatch(entry.getValue.toSeq, entry.getKey)
     }
   }
 
@@ -792,14 +494,11 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         installed += installRegistration(
           shuffleId, writerId, readerId, remoteHost, remotePort, handler)
       }
-      initialCreditRegistrations.addAndGet(installed.size)
-      StreamingShuffleExecutorClient.submitInitialCredits(this, installed.map { entry =>
-        StreamingShuffleExecutorClient.InitialCredit(
-          entry.registration.client,
-          entry.registration.handler,
-          () => entry.registration.initialCreditPending.compareAndSet(true, false),
-          () => removeInstalled(entry))
-      }.toSeq)
+      // Duplicate logical consumers deliberately receive unmanaged clients. Grouping keeps the
+      // common pooled lane as one body while retaining the isolation required by duplicate routes.
+      installed.groupBy(_.registration.client).values.foreach { group =>
+        sendInitialCreditBatch(group.toSeq)
+      }
       installed.iterator.map { entry =>
         entry.route.writerId -> entry.registration.client
       }.toMap
@@ -834,11 +533,8 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     val routeRegistrations = registrations.get(route)
     if (routeRegistrations != null) {
       routeRegistrations.asScala.find(_.handler eq handler).foreach { registration =>
-        registration.initialCreditPending.set(false)
         discardPendingCumulativeCredit(handler)
         handler.clearMultiplexedCreditSender()
-        handler.clearMultiplexedTerminationAckSender()
-        handler.closeReceiveCreditLease()
         routeRegistrations.remove(registration)
         if (!registration.laneShared) registration.client.close()
       }
@@ -853,12 +549,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
     registrations.entrySet().asScala.foreach { entry =>
       if (entry.getKey.shuffleId == shuffleId &&
           registrations.remove(entry.getKey, entry.getValue)) {
-        entry.getValue.asScala.foreach(_.initialCreditPending.set(false))
         entry.getValue.asScala.foreach { registration =>
           discardPendingCumulativeCredit(registration.handler)
           registration.handler.clearMultiplexedCreditSender()
-          registration.handler.clearMultiplexedTerminationAckSender()
-          registration.handler.closeReceiveCreditLease()
         }
         entry.getValue.asScala.filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
         entry.getValue.clear()
@@ -869,52 +562,33 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
         entry.getValue.close()
       }
     }
-    routeConsumerGenerations.keySet().removeIf(_.shuffleId == shuffleId)
+    usedRoutes.removeIf(_.shuffleId == shuffleId)
   }
 
-  private[streaming] def initialCreditBatchStats: (Long, Long) =
-    (initialCreditRegistrations.get(), initialCreditWrites.get())
-
-  private[streaming] def creditRepairBatchWriteCount: Long = creditRepairWrites.get()
-
-  private[streaming] def cumulativeCreditBatchStats: (Long, Long, Long) =
-    (cumulativeCreditReleases.get(), cumulativeCreditWrites.get(), cumulativeCreditFrames.get())
-
-  private[streaming] def terminationAckBatchStats: (Long, Long) =
-    (terminationAckWrites.get(), terminationAckFrames.get())
+  private[streaming] def cumulativeCreditBatchStats: (Long, Long, Long, Long) =
+    (cumulativeCreditReleases.get(), cumulativeCreditWrites.get(),
+      cumulativeCreditFrames.get(), creditRepairWrites.get())
 
   def close(): Unit = {
     if (!closed.compareAndSet(false, true)) return
-    val (creditRegistrations, creditWrites) = initialCreditBatchStats
-    val (compactDirectCopies, compactDirectBytes, compactHeapFallbacks,
-      compactHeapFallbackBytes) = transportBodyCompactor.stats
     logInfo(
       s"Closing executor streaming-shuffle client: " +
-      s"initialCreditRegistrations=$creditRegistrations " +
-      s"initialCreditWrites=$creditWrites " +
-      s"creditRepairWrites=${creditRepairWrites.get()} " +
-      s"cumulativeCreditReleases=${cumulativeCreditReleases.get()} " +
-      s"cumulativeCreditWrites=${cumulativeCreditWrites.get()} " +
-      s"cumulativeCreditFrames=${cumulativeCreditFrames.get()} " +
-      s"terminationAckWrites=${terminationAckWrites.get()} " +
-      s"terminationAckFrames=${terminationAckFrames.get()} " +
-      s"compactDirectCopies=$compactDirectCopies " +
-      s"compactDirectBytes=$compactDirectBytes " +
-      s"compactHeapFallbacks=$compactHeapFallbacks " +
-      s"compactHeapFallbackBytes=$compactHeapFallbackBytes")
+        s"cumulativeCreditReleases=${cumulativeCreditReleases.get()} " +
+        s"cumulativeCreditWrites=${cumulativeCreditWrites.get()} " +
+        s"cumulativeCreditFrames=${cumulativeCreditFrames.get()} " +
+        s"creditRepairWrites=${creditRepairWrites.get()}")
     val activeRegistrations = registrations.values().asScala.flatMap(_.asScala).toSeq
-    activeRegistrations.foreach(_.initialCreditPending.set(false))
     activeRegistrations.foreach { registration =>
       discardPendingCumulativeCredit(registration.handler)
       registration.handler.clearMultiplexedCreditSender()
-      registration.handler.clearMultiplexedTerminationAckSender()
     }
     cumulativeCreditExecutor.shutdownNow()
     cumulativeCreditLock.synchronized {
       pendingCumulativeCredits.clear()
       scheduledCumulativeCreditClients.clear()
     }
-    activeRegistrations.filterNot(_.laneShared).map(_.client).distinct.foreach(_.close())
+    activeRegistrations
+      .filterNot(_.laneShared).map(_.client).toSeq.distinct.foreach(_.close())
     registrations.clear()
     laneClients.values().asScala.toSeq.distinct.foreach(_.close())
     laneClients.clear()

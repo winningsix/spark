@@ -167,23 +167,6 @@ private[spark] trait PipelinedShuffleManager extends ShuffleManager {
   def supportsFanOut: Boolean = false
 
   /**
-   * Whether this transport can safely run a consumer that retains its first shuffle input while
-   * waiting for another one (for example a shuffled-hash-join build). A prepared receive service
-   * that admits only a subset of reducers cannot provide this contract when map writers
-   * interleave all reducer shards: inactive shards can exhaust the bounded in-flight budget before
-   * active readers receive end-of-stream. Whole-group transports may override this to true.
-   */
-  def supportsMemoryRetainingConsumer: Boolean = false
-
-  /**
-   * Initialize executor-owned transport state after SparkEnv has created the optional streaming
-   * output tracker. Most managers are task-scoped and need no hook. A manager with a shared
-   * executor endpoint overrides this instead of requiring SparkEnv to depend on its concrete
-   * implementation class.
-   */
-  def initializeExecutor(): Unit = {}
-
-  /**
    * Whether this manager relies on a `StreamingShuffleOutputTracker` to discover writer task
    * locations. The RPC streaming transport needs it (writers publish their host/port; readers
    * look them up to open connections). An in-process transport that finds writer and reader

@@ -55,13 +55,9 @@ class TaskMetrics private[spark] () extends Serializable {
   private val _resultSerializationTime = new LongAccumulator
   private val _memoryBytesSpilled = new LongAccumulator
   private val _diskBytesSpilled = new LongAccumulator
-  private val _streamingShuffleReaderQueueBytesSpilled = new LongAccumulator
-  private val _streamingShuffleWriterReplayBytesSpilled = new LongAccumulator
   private val _peakExecutionMemory = new LongAccumulator
   private val _peakOnHeapExecutionMemory = new LongAccumulator
   private val _peakOffHeapExecutionMemory = new LongAccumulator
-  private val _retainedMemoryBytes = new LongAccumulator
-  private val _retainedMemoryBuildsCompleted = new LongAccumulator
   private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)]
 
   /**
@@ -110,14 +106,6 @@ class TaskMetrics private[spark] () extends Serializable {
    */
   def diskBytesSpilled: Long = _diskBytesSpilled.sum
 
-  /** Encoded streaming-shuffle reader inbox bytes written to executor-local spill files. */
-  private[spark] def streamingShuffleReaderQueueBytesSpilled: Long =
-    _streamingShuffleReaderQueueBytesSpilled.sum
-
-  /** Encoded streaming-shuffle writer replay bytes written to executor-local spill files. */
-  private[spark] def streamingShuffleWriterReplayBytesSpilled: Long =
-    _streamingShuffleWriterReplayBytesSpilled.sum
-
   /**
    * Peak memory used by internal data structures created during shuffles, aggregations and
    * joins. The value of this accumulator should be approximately the sum of the peak sizes
@@ -138,13 +126,6 @@ class TaskMetrics private[spark] () extends Serializable {
    * Peak off heap execution memory as tracked by TaskMemoryManager.
    */
   def peakOffHeapExecutionMemory: Long = _peakOffHeapExecutionMemory.sum
-
-  /** Bytes owned by memory-retaining operators until the task releases their state. */
-  private[spark] def retainedMemoryBytes: Long = _retainedMemoryBytes.sum
-
-  /** Number of memory-retaining build operators whose state is fully constructed. */
-  private[spark] def retainedMemoryBuildsCompleted: Long =
-    _retainedMemoryBuildsCompleted.sum
 
   /**
    * Storage statuses of any blocks that have been updated as a result of this task.
@@ -179,14 +160,7 @@ class TaskMetrics private[spark] () extends Serializable {
     _peakOffHeapExecutionMemory.setValue(v)
   private[spark] def incMemoryBytesSpilled(v: Long): Unit = _memoryBytesSpilled.add(v)
   private[spark] def incDiskBytesSpilled(v: Long): Unit = _diskBytesSpilled.add(v)
-  private[spark] def incStreamingShuffleReaderQueueBytesSpilled(v: Long): Unit =
-    _streamingShuffleReaderQueueBytesSpilled.add(v)
-  private[spark] def incStreamingShuffleWriterReplayBytesSpilled(v: Long): Unit =
-    _streamingShuffleWriterReplayBytesSpilled.add(v)
   private[spark] def incPeakExecutionMemory(v: Long): Unit = _peakExecutionMemory.add(v)
-  private[spark] def incRetainedMemoryBytes(v: Long): Unit = _retainedMemoryBytes.add(v)
-  private[spark] def incRetainedMemoryBuildsCompleted(v: Long = 1L): Unit =
-    _retainedMemoryBuildsCompleted.add(v)
   private[spark] def incUpdatedBlockStatuses(v: (BlockId, BlockStatus)): Unit =
     _updatedBlockStatuses.add(v)
   private[spark] def setUpdatedBlockStatuses(v: java.util.List[(BlockId, BlockStatus)]): Unit =
@@ -269,15 +243,9 @@ class TaskMetrics private[spark] () extends Serializable {
     RESULT_SERIALIZATION_TIME -> _resultSerializationTime,
     MEMORY_BYTES_SPILLED -> _memoryBytesSpilled,
     DISK_BYTES_SPILLED -> _diskBytesSpilled,
-    STREAMING_SHUFFLE_READER_QUEUE_BYTES_SPILLED ->
-      _streamingShuffleReaderQueueBytesSpilled,
-    STREAMING_SHUFFLE_WRITER_REPLAY_BYTES_SPILLED ->
-      _streamingShuffleWriterReplayBytesSpilled,
     PEAK_EXECUTION_MEMORY -> _peakExecutionMemory,
     PEAK_ON_HEAP_EXECUTION_MEMORY -> _peakOnHeapExecutionMemory,
     PEAK_OFF_HEAP_EXECUTION_MEMORY -> _peakOffHeapExecutionMemory,
-    RETAINED_MEMORY_BYTES -> _retainedMemoryBytes,
-    RETAINED_MEMORY_BUILDS_COMPLETED -> _retainedMemoryBuildsCompleted,
     UPDATED_BLOCK_STATUSES -> _updatedBlockStatuses,
     shuffleRead.REMOTE_BLOCKS_FETCHED -> shuffleReadMetrics._remoteBlocksFetched,
     shuffleRead.LOCAL_BLOCKS_FETCHED -> shuffleReadMetrics._localBlocksFetched,

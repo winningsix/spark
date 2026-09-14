@@ -45,7 +45,13 @@ import org.apache.spark.network.shuffle.{BlockStoreClient, MergeFinalizerListene
 import org.apache.spark.network.shuffle.protocol.MergeStatuses
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
-import org.apache.spark.rdd.{DeterministicLevel, RDD, RDDCheckpointData, ReliableRDDCheckpointData, ShuffleReducePartitionMapping}
+import org.apache.spark.rdd.{
+  DeterministicLevel,
+  RDD,
+  RDDCheckpointData,
+  ReliableRDDCheckpointData,
+  ShuffleReducePartitionMapping,
+  UnionPartition}
 import org.apache.spark.resource.{CpuAmount, ResourceProfile, TaskResourceProfile}
 import org.apache.spark.resource.ResourceProfile.{CPUS, DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
@@ -1157,8 +1163,9 @@ private[spark] class DAGScheduler(
    *    materialize the prefix stages, and the final job runs the pipelined tail.
    *
    * An UNMATERIALIZED regular boundary in a pipelined job is rejected by transports that require
-   * whole-group admission. A prepared-receive transport may materialize a regular frontier first,
-   * then start the pipelined suffix; this is used by asymmetric shuffled hash join execution.
+   * whole-group admission: its stage would have to run while gang-admitted producers already hold
+   * slots (blocked on transport backpressure waiting for consumers), and admission does not
+   * account for the prefix's slots -- the prefix could be starved and deadlock the group.
    * A pipelined shuffle BELOW a regular boundary is supported only when the manager owns prepared
    * executor inboxes and declares that capability; otherwise it would run outside the regime the
    * group machinery covers.
@@ -1288,9 +1295,9 @@ private[spark] class DAGScheduler(
   /**
    * Reject a job that uses a pipelined shuffle in combination with a cluster feature that a
    * pipelined group cannot support. Checked up front, before any stage is created, so a rejection
-   * leaves no partial scheduler state. Used by the result-job path (handleJobSubmitted); the
-   * map-stage-job path rejects a pipelined dependency outright (see handleMapStageSubmitted), which
-   * subsumes these. Returns true (and fails the job via `listener`) if rejected; false otherwise.
+   * leaves no partial scheduler state. Used by result jobs and regular map-stage jobs with
+   * pipelined ancestors. A pipelined dependency itself cannot be a map-stage job's output.
+   * Returns true (and fails the job via `listener`) if rejected; false otherwise.
    * The RDD-graph walk runs only when a relevant feature is enabled and is inert for jobs without a
    * pipelined dependency.
    *
@@ -1465,72 +1472,22 @@ private[spark] class DAGScheduler(
 
   /** Pipelined shuffle ids read directly by the stage containing `rdd`. */
   private def pipelinedShuffleIdsReadByStage(rdd: RDD[_]): Seq[Int] = {
-    // Count boundary occurrences in THIS stage, not the dependency's query-wide route
-    // multiplicity. A shuffle reused by two different consumer stages has a global multiplicity
-    // of two, but each stage owns only one reader route. Expanding that global value in both
-    // TaskSets creates four physical consumers while the producer correctly waits for two; it can
-    // then retire after the first two ACKs and strand a late prepared inbox.
-    //
-    // Deliberately walk paths rather than distinct RDD ids. ReusedExchangeExec can make two
-    // operator branches point at the same ShuffledRowRDD inside one stage. Those are two iterator
-    // consumers and therefore need two independently replayed inboxes even though the shared RDD
-    // object is encountered twice. Shuffle boundaries terminate a path as usual.
-    val shuffleIds = mutable.ArrayBuffer.empty[Int]
-    def visit(current: RDD[_]): Unit = {
+    val multiplicityByShuffleId = new HashMap[Int, Int]
+    traverseParentRDDsWithinStage(rdd, { current =>
       current.dependencies.foreach {
         case dependency: PipelinedShuffleDependency[_, _, _] =>
-          shuffleIds += dependency.shuffleId
-        case _: ShuffleDependency[_, _, _] =>
-        case dependency => visit(dependency.rdd)
+          multiplicityByShuffleId.update(
+            dependency.shuffleId,
+            math.max(
+              multiplicityByShuffleId.getOrElse(dependency.shuffleId, 0),
+              dependency.readerRouteMultiplicity))
+        case _ =>
       }
-    }
-    visit(rdd)
-    shuffleIds.sorted.toSeq
-  }
-
-  /** Largest task frontier behind a direct pipelined input read by this stage. */
-  private def maxPipelinedProducerTasksReadByStage(rdd: RDD[_]): Int = {
-    var maxTasks = 0
-    def visit(current: RDD[_]): Unit = {
-      current.dependencies.foreach {
-        case dependency: PipelinedShuffleDependency[_, _, _] =>
-          maxTasks = math.max(maxTasks, dependency.rdd.partitions.length)
-        case _: ShuffleDependency[_, _, _] =>
-        case dependency => visit(dependency.rdd)
-      }
-    }
-    visit(rdd)
-    maxTasks
-  }
-
-  /** Pipelined inputs that an operator in this stage must consume before other inputs. */
-  private def pipelinedStartupShuffleIdsReadByStage(rdd: RDD[_]): Set[Int] = {
-    val startupInputRoots = new HashSet[RDD[_]]
-    traverseParentRDDsWithinStage(rdd, { current =>
-      startupInputRoots ++= current.pipelinedStartupInputs
       true
     })
-    startupInputRoots.iterator.flatMap(pipelinedShuffleIdsReadByStage).toSet
-  }
-
-  /** Whether this stage contains a consumer whose execution memory can grow with live input. */
-  private def pipelinedReaderMemoryMayGrow(rdd: RDD[_]): Boolean = {
-    !traverseParentRDDsWithinStage(rdd, current => !current.pipelinedMemoryMayGrow)
-  }
-
-  /** Whether this stage contains a build-before-probe consumer such as ShuffledHashJoin. */
-  private def retainsExecutionMemoryUntilTaskCompletion(rdd: RDD[_]): Boolean = {
-    !traverseParentRDDsWithinStage(rdd, current => current.pipelinedStartupInputs.isEmpty)
-  }
-
-  /** Number of build-before-probe memory fences expected from each task in this stage. */
-  private def retainedMemoryBuildCount(rdd: RDD[_]): Int = {
-    var count = 0
-    traverseParentRDDsWithinStage(rdd, { current =>
-      count += current.retainedMemoryBuildCount
-      true
-    })
-    count
+    multiplicityByShuffleId.toSeq.sortBy(_._1).flatMap { case (shuffleId, multiplicity) =>
+      Seq.fill(multiplicity)(shuffleId)
+    }
   }
 
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
@@ -2462,8 +2419,14 @@ private[spark] class DAGScheduler(
     val supportedUnmaterializedRegularFrontier = supportsUnmaterializedRegularBoundary &&
       shape.hasPipelined && shape.hasUnmaterializedRegularBoundary &&
       !shape.hasPipelinedBelowRegular
+    // Prepared receive admits each pipeline segment separately. A regular boundary between
+    // segments must materialize before the downstream segment starts (submitStage enforces
+    // this), while its map tasks may consume an upstream pipelined segment.
+    val supportedSegmentedPipeline = supportsUnmaterializedRegularBoundary &&
+      !SparkEnv.get.pipelinedShuffleManager.requiresWholeGroupSlotAdmission &&
+      shape.hasPipelined && shape.hasPipelinedBelowRegular
     if (shape.isUnsupportedMix && !supportedPipelinedBelowRegular &&
-        !supportedUnmaterializedRegularFrontier) {
+        !supportedUnmaterializedRegularFrontier && !supportedSegmentedPipeline) {
       logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
         log"a regular shuffle is only supported when every regular shuffle is a materialized " +
         log"prefix below the pipelined shuffles")
@@ -2617,12 +2580,28 @@ private[spark] class DAGScheduler(
           "map output to produce statistics from. This is not supported."))
       return
     }
+    // AQE can materialize a regular exchange whose map tasks consume a pipelined input.
+    // Preserve the same job membership and validation as result jobs, otherwise those tasks
+    // launch without the reader metadata needed to prepare their receive inboxes.
+    var hasPipelined = false
     // Submitting this map stage might still require the creation of some parent stages, so make
     // sure that happens.
     var finalStage: ShuffleMapStage = null
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
+      hasPipelined = classifyJobShuffleKinds(dependency.rdd)._1
+      if (hasPipelined) {
+        if (rejectUnsupportedPipelinedJob(jobId, dependency.rdd, listener)) return
+        val manager = SparkEnv.get.pipelinedShuffleManager
+        if (!manager.supportsUnmaterializedRegularBoundary ||
+            manager.requiresWholeGroupSlotAdmission) {
+          listener.jobFailed(new SparkException(
+            "A regular map-stage job consuming a pipelined shuffle requires prepared receive."))
+          return
+        }
+        checkPipelinedGroupsSupportedInRDDGraph(dependency.rdd)
+      }
       finalStage = getOrCreateShuffleMapStage(dependency, jobId)
     } catch {
       case e: Exception =>
@@ -2631,7 +2610,8 @@ private[spark] class DAGScheduler(
         return
     }
 
-    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, properties)
+    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, properties,
+      hasPipelinedDependency = hasPipelined)
     clearCacheLocs()
     logInfo(log"Got map stage job ${MDC(JOB_ID, jobId)} " +
       log"(${MDC(CALL_SITE_SHORT_FORM, callSite.shortForm)}) with " +
@@ -2687,11 +2667,7 @@ private[spark] class DAGScheduler(
             submitWaitingPipelinedChildStages(stage)
           } else {
             val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
-            // In a prepared-receive mixed stage, materialize every regular frontier before any
-            // pipelined parent starts. Otherwise a probe producer can occupy transport/CPU while
-            // the SHJ reader is still waiting for its durable build input. Completion of the
-            // regular parent resubmits this waiting stage, at which point the pipelined group is
-            // started normally.
+            // Materialize regular build inputs before launching a segment's probe producers.
             val parentsToSubmit = if (pipelinedMissing.nonEmpty && regularMissing.nonEmpty &&
                 SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary) {
               regularMissing
@@ -3152,7 +3128,7 @@ private[spark] class DAGScheduler(
         outputCommitCoordinator.stageStart(
           stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
     }
-    val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
+    val initialTaskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
       stage match {
         case s: ShuffleMapStage =>
           partitionsToCompute.map { id => (id, getPreferredLocs(stage.rdd, id))}.toMap
@@ -3171,6 +3147,32 @@ private[spark] class DAGScheduler(
         runningStages -= stage
         return
     }
+
+    val unionAffinityPlan = if (
+      isPipelinedProducer(stage) &&
+        sc.conf.get(config.STREAMING_SHUFFLE_PRODUCER_UNION_AFFINITY_ENABLED) &&
+        initialTaskIdToLocations.values.forall(_.isEmpty)) {
+      val executorLocations = blockManagerMaster.getMemoryStatus.keysIterator
+        .filter(_.executorId != SparkContext.DRIVER_IDENTIFIER)
+        .map(id => ExecutorCacheTaskLocation(id.host, id.executorId))
+        .toSeq
+        .sortBy(location => (location.host, location.executorId))
+      DAGScheduler.planUnionTaskAffinity(
+        partitionsToCompute, stage.rdd.partitions, executorLocations)
+    } else {
+      None
+    }
+    unionAffinityPlan.foreach { plan =>
+      logInfo(log"Applying repeated-union input affinity to ${MDC(STAGE, stage)}: " +
+        log"${MDC(NUM_TASKS, plan.orderedPartitionIds.size)} tasks across " +
+        log"${MDC(NUM_EXECUTORS, plan.executorLocations.size)} executors")
+    }
+    val orderedPartitionsToCompute = unionAffinityPlan
+      .map(_.orderedPartitionIds)
+      .getOrElse(partitionsToCompute)
+    val taskIdToLocations = unionAffinityPlan
+      .map(_.preferredLocations)
+      .getOrElse(initialTaskIdToLocations)
 
     stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
 
@@ -3238,7 +3240,7 @@ private[spark] class DAGScheduler(
       stage match {
         case stage: ShuffleMapStage =>
           stage.pendingPartitions.clear()
-          partitionsToCompute.map { id =>
+          orderedPartitionsToCompute.map { id =>
             val locs = taskIdToLocations(id)
             val part = partitions(id)
             stage.pendingPartitions += id
@@ -3249,7 +3251,7 @@ private[spark] class DAGScheduler(
           }
 
         case stage: ResultStage =>
-          partitionsToCompute.map { id =>
+          orderedPartitionsToCompute.map { id =>
             val p: Int = stage.partitions(id)
             val part = partitions(p)
             val locs = taskIdToLocations(id)
@@ -3284,33 +3286,13 @@ private[spark] class DAGScheduler(
       } else {
         Seq.empty
       }
-      val pipelinedReaderStartupShuffleIds = if (pipelinedReaderShuffleIds.nonEmpty) {
-        pipelinedStartupShuffleIdsReadByStage(stage.rdd)
-      } else {
-        Set.empty[Int]
-      }
-      val retainsExecutionMemory = retainsExecutionMemoryUntilTaskCompletion(stage.rdd)
-      val retainedBuildCount = retainedMemoryBuildCount(stage.rdd)
-      val readerMemoryMayGrow =
-        (pipelinedReaderShuffleIds.nonEmpty || retainsExecutionMemory) &&
-        pipelinedReaderMemoryMayGrow(stage.rdd)
-      val readerMaxProducerTasks = if (pipelinedReaderShuffleIds.nonEmpty) {
-        maxPipelinedProducerTasksReadByStage(stage.rdd)
-      } else {
-        0
-      }
       val isPipelinedShuffleProducer = isPipelinedProducer(stage)
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
         stage.resourceProfileId, shuffleId, isPipelined = isPipelined,
         isPipelinedShuffleReader = pipelinedReaderShuffleIds.nonEmpty,
         pipelinedReaderShuffleIds = pipelinedReaderShuffleIds,
-        pipelinedReaderStartupShuffleIds = pipelinedReaderStartupShuffleIds,
-        isPipelinedShuffleProducer = isPipelinedShuffleProducer,
-        pipelinedReaderMemoryMayGrow = readerMemoryMayGrow,
-        pipelinedReaderMaxProducerTasks = readerMaxProducerTasks,
-        retainsExecutionMemory = retainsExecutionMemory,
-        retainedMemoryBuildCount = retainedBuildCount))
+        isPipelinedShuffleProducer = isPipelinedShuffleProducer))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run
@@ -5302,6 +5284,65 @@ private[spark] object DAGScheduler {
   // this is a simplistic way to avoid resubmitting tasks in the non-fetchable map stage one by one
   // as more failure events come in
   val RESUBMIT_TIMEOUT = 200
+
+  private[scheduler] case class UnionTaskAffinityPlan(
+      orderedPartitionIds: Seq[Int],
+      preferredLocations: Map[Int, Seq[TaskLocation]],
+      executorLocations: Seq[ExecutorCacheTaskLocation])
+
+  /**
+   * Build an executor-affinity plan for an opt-in repeated UnionRDD scan. Matching partition
+   * indices from each union parent are assigned to one executor and placed next to one another in
+   * that executor's pending queue. The executor-scoped input layer can then share cached blocks and
+   * in-flight range requests between the repeated scans.
+   *
+   * Return None unless this is a complete, equal-shaped union. A partial retry, a non-union stage,
+   * or differing parent partition sets keeps Spark's original task order and locality behavior.
+   */
+  private[scheduler] def planUnionTaskAffinity(
+      partitionIds: Seq[Int],
+      partitions: Array[Partition],
+      executorLocations: Seq[ExecutorCacheTaskLocation]): Option[UnionTaskAffinityPlan] = {
+    if (executorLocations.isEmpty || partitionIds.toSet != partitions.indices.toSet) {
+      return None
+    }
+
+    val unionPartitions = partitionIds.flatMap { id =>
+      partitions(id) match {
+        case partition: UnionPartition[_] =>
+          Some((id, partition.parentRddIndex, partition.parentPartition.index))
+        case _ => None
+      }
+    }
+    if (unionPartitions.size != partitionIds.size) return None
+
+    val byParent = unionPartitions.groupBy(_._2)
+    if (byParent.size < 2) return None
+    val parentIndices = byParent.keys.toSeq.sorted
+    val baseIndices = byParent(parentIndices.head).map(_._3).sorted
+    if (baseIndices.isEmpty || byParent.values.exists { entries =>
+      entries.map(_._3).sorted != baseIndices || entries.map(_._3).distinct.size != entries.size
+    }) {
+      return None
+    }
+
+    val partitionIdByParentAndBase = unionPartitions.map { case (id, parent, base) =>
+      (parent, base) -> id
+    }.toMap
+    val executors = executorLocations.distinct
+    val orderedIds = baseIndices
+      .grouped(executors.size)
+      .flatMap { baseBatch =>
+        parentIndices.iterator.flatMap { parent =>
+          baseBatch.iterator.map(base => partitionIdByParentAndBase((parent, base)))
+        }
+      }
+      .toSeq
+    val preferredLocations = unionPartitions.iterator.map { case (id, _, base) =>
+      id -> Seq(executors(Math.floorMod(base, executors.size)))
+    }.toMap
+    Some(UnionTaskAffinityPlan(orderedIds, preferredLocations, executors))
+  }
 }
 
 /**

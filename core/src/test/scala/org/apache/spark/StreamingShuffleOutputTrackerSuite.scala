@@ -25,12 +25,11 @@ import scala.util.control.NonFatal
 import org.scalatest.BeforeAndAfter
 import org.scalatest.matchers.should.Matchers
 
-import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS,
-  STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL}
+import org.apache.spark.internal.config.SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
   PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
-  StreamingShuffleReceiveInboxId, StreamingShuffleWriterLocationsAvailable}
+  StreamingShuffleReceiveInboxId}
 
 class StreamingShuffleOutputTrackerSuite
   extends SparkFunSuite
@@ -60,23 +59,15 @@ class StreamingShuffleOutputTrackerSuite
   private val trackersToStop = ArrayBuffer.empty[StreamingShuffleOutputTracker]
   private val rpcEnvsToShutdown = ArrayBuffer.empty[RpcEnv]
 
-  protected def newTrackerMaster(
-      sparkConf: SparkConf = conf,
-      writerLocationNotificationDelayMs: Long =
-        StreamingShuffleOutputTrackerMaster.WRITER_LOCATION_NOTIFICATION_DELAY_MS) = {
-    val tracker = new StreamingShuffleOutputTrackerMaster(
-      sparkConf, writerLocationNotificationDelayMs)
+  protected def newTrackerMaster(sparkConf: SparkConf = conf) = {
+    val tracker = new StreamingShuffleOutputTrackerMaster(sparkConf)
     trackersToStop += tracker
     tracker
   }
 
   protected def newTrackerWorker(
-      sparkConf: SparkConf = conf,
-      inboxDrainReadyAckDelayMs: Long =
-        StreamingShuffleOutputTrackerWorker.INBOX_DRAIN_READY_ACK_DELAY_MS)
-      : StreamingShuffleOutputTrackerWorker = {
-    val tracker = new StreamingShuffleOutputTrackerWorker(
-      sparkConf, inboxDrainReadyAckDelayMs)
+      sparkConf: SparkConf = conf): StreamingShuffleOutputTrackerWorker = {
+    val tracker = new StreamingShuffleOutputTrackerWorker(sparkConf)
     trackersToStop += tracker
     tracker
   }
@@ -142,20 +133,12 @@ class StreamingShuffleOutputTrackerSuite
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe true
     readyCallbacks shouldBe 2
 
-    val readyBatch = batch :+ batch.last
-    tracker.markInboxesDrainReady("executor-1", readyBatch)
-    readyBatch.foreach { readyId =>
-      tracker.isReceiveInboxDrainReady("executor-1", readyId) shouldBe true
-    }
-    readyCallbacks shouldBe 3
-
     tracker.releaseReceiveInbox("executor-1", id)
     releaseReceived.await(10, TimeUnit.SECONDS) shouldBe true
     released should contain only id
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
 
     tracker.markInboxDrainReady("executor-1", id)
-    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
     tracker.removeReceiveExecutor("executor-1")
     tracker.receiveExecutorIds shouldBe empty
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
@@ -163,157 +146,6 @@ class StreamingShuffleOutputTrackerSuite
     tracker.registerShuffle(7, numMaps = 1, numReduces = 1, jobId = 1)
     tracker.unregisterShuffle(7)
     tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe false
-  }
-
-  test("worker coalesces prepared inbox drain-ready acknowledgements") {
-    val endpointRpcEnv = createRpcEnv("ready-ack-batch-test")
-    val received = ArrayBuffer.empty[StreamingShuffleReceiveInboxId]
-    val messages = new CountDownLatch(1)
-    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-batch", new RpcEndpoint {
-      override val rpcEnv: RpcEnv = endpointRpcEnv
-
-      override def receive: PartialFunction[Any, Unit] = {
-        case StreamingShuffleInboxesDrainReady("executor-1", ids) =>
-          received.synchronized(received ++= ids)
-          messages.countDown()
-      }
-    })
-    val worker = newTrackerWorker(inboxDrainReadyAckDelayMs = TimeUnit.MINUTES.toMillis(1))
-    worker.trackerEndpoint = endpoint
-    val ids = (0 until 8).map { partitionId =>
-      StreamingShuffleReceiveInboxId(7, 11, 2, partitionId, -1L)
-    }
-
-    ids.foreach(worker.markInboxDrainReady("executor-1", _))
-    worker.markInboxDrainReady("executor-1", ids.head)
-    worker.flushPendingInboxDrainReadyAcks()
-
-    messages.await(10, TimeUnit.SECONDS) shouldBe true
-    received.synchronized(received.toSeq) should contain theSameElementsInOrderAs ids
-    worker.inboxDrainReadyAckStats shouldBe (8L -> 1L)
-  }
-
-  test("master accepts readiness racing with prepare reply and rejects failed prepare") {
-    val endpointRpcEnv = createRpcEnv("ready-ack-prepare-race-test")
-    val tracker = newTrackerMaster()
-    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
-    val failedId = id.copy(partitionId = 6)
-    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-prepare-race", new RpcEndpoint {
-      override val rpcEnv: RpcEnv = endpointRpcEnv
-
-      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-        case PrepareStreamingShuffleReceiveInboxes(ids) if ids == Seq(id) =>
-          tracker.markInboxesDrainReady("executor-1", ids)
-          context.reply(true)
-        case PrepareStreamingShuffleReceiveInboxes(ids) if ids == Seq(failedId) =>
-          context.reply(false)
-      }
-    })
-    tracker.registerReceiveEndpoint("executor-1", endpoint) shouldBe true
-
-    tracker.prepareReceiveInboxes("executor-1", Seq(id)) shouldBe true
-    tracker.isReceiveInboxDrainReady("executor-1", id) shouldBe true
-
-    tracker.prepareReceiveInboxes("executor-1", Seq(failedId)) shouldBe false
-    tracker.markInboxDrainReady("executor-1", failedId)
-    tracker.isReceiveInboxDrainReady("executor-1", failedId) shouldBe false
-  }
-
-  test("worker flushes pending inbox drain-ready acknowledgements on stop") {
-    val endpointRpcEnv = createRpcEnv("ready-ack-stop-test")
-    val received = new CountDownLatch(1)
-    val endpoint = endpointRpcEnv.setupEndpoint("ready-ack-stop", new RpcEndpoint {
-      override val rpcEnv: RpcEnv = endpointRpcEnv
-
-      override def receive: PartialFunction[Any, Unit] = {
-        case StreamingShuffleInboxesDrainReady("executor-1", ids) if ids.size == 1 =>
-          received.countDown()
-      }
-    })
-    val worker = newTrackerWorker(inboxDrainReadyAckDelayMs = TimeUnit.MINUTES.toMillis(1))
-    worker.trackerEndpoint = endpoint
-    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
-
-    worker.markInboxDrainReady("executor-1", id)
-    worker.stop()
-
-    received.await(10, TimeUnit.SECONDS) shouldBe true
-    worker.inboxDrainReadyAckStats shouldBe (1L -> 1L)
-  }
-
-  test("prepared receive inbox batches are sent to executors concurrently") {
-    val firstRpcEnv = createRpcEnv("parallel-receive-endpoint-1")
-    val secondRpcEnv = createRpcEnv("parallel-receive-endpoint-2")
-    val tracker = newTrackerMaster()
-    val secondEntered = new CountDownLatch(1)
-    val firstEndpoint = firstRpcEnv.setupEndpoint("parallel-receive-1", new RpcEndpoint {
-      override val rpcEnv: RpcEnv = firstRpcEnv
-
-      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-        case PrepareStreamingShuffleReceiveInboxes(_) =>
-          context.reply(secondEntered.await(5, TimeUnit.SECONDS))
-      }
-    })
-    val secondEndpoint = secondRpcEnv.setupEndpoint("parallel-receive-2", new RpcEndpoint {
-      override val rpcEnv: RpcEnv = secondRpcEnv
-
-      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-        case PrepareStreamingShuffleReceiveInboxes(_) =>
-          secondEntered.countDown()
-          context.reply(true)
-      }
-    })
-    tracker.registerReceiveEndpoint("executor-1", firstEndpoint) shouldBe true
-    tracker.registerReceiveEndpoint("executor-2", secondEndpoint) shouldBe true
-    val id = StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L)
-
-    tracker.prepareReceiveInboxesByExecutor(Map(
-      "executor-1" -> Seq(id),
-      "executor-2" -> Seq(id.copy(partitionId = 6)))) shouldBe
-      Set("executor-1", "executor-2")
-  }
-
-  test("writer publications notify each prepared executor in one batch") {
-    val endpointRpcEnv = createRpcEnv("writer-location-notification-test")
-    val notifications = ArrayBuffer.empty[(String, Seq[Int])]
-    val notificationReceived = new CountDownLatch(2)
-    def endpoint(executorId: String): RpcEndpoint = new RpcEndpoint {
-      override val rpcEnv: RpcEnv = endpointRpcEnv
-
-      override def receive: PartialFunction[Any, Unit] = {
-        case StreamingShuffleWriterLocationsAvailable(shuffleIds) =>
-          notifications.synchronized(notifications += (executorId -> shuffleIds))
-          notificationReceived.countDown()
-      }
-
-      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-        case PrepareStreamingShuffleReceiveInboxes(_) => context.reply(true)
-      }
-    }
-    val tracker = newTrackerMaster(
-      writerLocationNotificationDelayMs = TimeUnit.MINUTES.toMillis(1))
-    Seq("executor-1", "executor-2").foreach { executorId =>
-      val endpointRef = endpointRpcEnv.setupEndpoint(
-        s"writer-location-notification-$executorId", endpoint(executorId))
-      tracker.registerReceiveEndpoint(executorId, endpointRef) shouldBe true
-      tracker.prepareReceiveInboxes(executorId, Seq(
-        StreamingShuffleReceiveInboxId(7, 11, 2, 5, -1L))) shouldBe true
-    }
-    tracker.registerShuffle(7, numMaps = 8, numReduces = 1, jobId = 1)
-
-    (0 until 8).foreach { mapId =>
-      tracker.registerShuffleWriterTask(
-        7,
-        mapId,
-        StreamingShuffleTaskLocation(s"writer-$mapId", "host", 7337, mapId)) shouldBe true
-    }
-    tracker.flushPendingWriterLocationNotifications()
-
-    notificationReceived.await(10, TimeUnit.SECONDS) shouldBe true
-    notifications.synchronized(notifications.toSeq.sortBy(_._1)) shouldBe Seq(
-      "executor-1" -> Seq(7),
-      "executor-2" -> Seq(7))
-    tracker.writerLocationNotificationStats shouldBe (2L -> 2L)
   }
 
   test("test tracker workflow") {
@@ -332,12 +164,11 @@ class StreamingShuffleOutputTrackerSuite
     val numMaps = 2
     val numReduces = 2
     val jobId = 0
-    val taskMap: Map[Long, StreamingShuffleTaskLocation] =
+    val taskMap =
       Map(
-        0L -> StreamingShuffleTaskLocation("executor-1", "host-1", 0),
-        1L -> StreamingShuffleTaskLocation("executor-2", "host-2", 0))
+        0 -> StreamingShuffleTaskLocation("executor-1", "host-1", 0),
+        1 -> StreamingShuffleTaskLocation("executor-2", "host-2", 0))
     master.registerShuffle(shuffleId, numMaps, numReduces, jobId)
-    master.registerShuffle(shuffleId + 1, numMaps = 0, numReduces = numReduces, jobId = jobId)
     // register one shuffle write task
     worker.registerShuffleWriterTask(shuffleId, 0, taskMap(0))
     // Get all shuffle write task location information.  Should return None since
@@ -347,42 +178,12 @@ class StreamingShuffleOutputTrackerSuite
     worker.registerShuffleWriterTask(shuffleId, 1, taskMap(1))
     // should get all the shuffle task location information now
     worker.getAllShuffleWriterTaskLocations(shuffleId) should be(Some(taskMap))
-    val availableBatch = worker.getAvailableShuffleWriterTaskLocationsBatch(
-      Seq(shuffleId, shuffleId + 1, shuffleId + 2))
-    availableBatch.keySet shouldBe Set(shuffleId, shuffleId + 1)
-    availableBatch(shuffleId) shouldBe ShuffleLocationResponse(taskMap, numMaps)
-    availableBatch(shuffleId + 1) shouldBe ShuffleLocationResponse(Map.empty, 0)
 
     // should be a no-op for the worker
     worker.unregisterShuffle(shuffleId)
     master.unregisterShuffle(shuffleId)
-    master.unregisterShuffle(shuffleId + 1)
 
     master.getShuffleInfo(shuffleId) should be(None)
-  }
-
-  test("writer-location notification invalidates the worker snapshot cache") {
-    val sparkConf = new SparkConf()
-      .set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, TimeUnit.MINUTES.toMillis(1))
-    val master = newTrackerMaster(sparkConf)
-    val worker = newTrackerWorker(sparkConf)
-    val rpcEnv = createRpcEnv("writer-location-cache-invalidation-test")
-    val rpcEndpoint = rpcEnv.setupEndpoint(
-      StreamingShuffleOutputTracker.ENDPOINT_NAME,
-      new StreamingShuffleOutputTrackerMasterEndpoint(rpcEnv, master, sparkConf))
-    master.trackerEndpoint = rpcEndpoint
-    worker.trackerEndpoint = rpcEndpoint
-    master.registerShuffle(7, numMaps = 1, numReduces = 1, jobId = 1)
-
-    worker.getAvailableShuffleWriterTaskLocations(7).get.shuffleTaskLocations shouldBe empty
-    val location = StreamingShuffleTaskLocation("writer-1", "host", 7337, 0)
-    master.registerShuffleWriterTask(7, 0, location) shouldBe true
-    worker.getAvailableShuffleWriterTaskLocations(7).get.shuffleTaskLocations shouldBe empty
-
-    worker.invalidateAvailableShuffleWriterTaskLocations(Seq(7))
-
-    worker.getAvailableShuffleWriterTaskLocations(7).get.shuffleTaskLocations shouldBe
-      Map(0L -> location)
   }
 
   test("register task for shuffle that doesn't exist") {

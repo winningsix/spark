@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
 
-import io.netty.buffer.{ByteBuf, ByteBufOutputStream}
+import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
@@ -53,89 +53,56 @@ class UnsafeRowSerializer(
 
 private class UnsafeRowSerializerInstance(
     numFields: Int,
-    dataSize: SQLMetric) extends SerializerInstance with StreamingShuffleSerializerInstance {
+    dataSize: SQLMetric)
+    extends SerializerInstance with StreamingShuffleSerializerInstance {
 
-  private[this] val byteBufWriteBuffer: Array[Byte] = new Array[Byte](4096)
-
-  override def serializedValueSize(value: Any): Option[Int] = {
-    // The streaming representation is one four-byte length followed by the UnsafeRow bytes.
-    Some(Math.addExact(Integer.BYTES, value.asInstanceOf[UnsafeRow].getSizeInBytes))
-  }
-
-  private def byteBufBaseObject(buffer: ByteBuf): Object = {
-    if (buffer.hasArray) buffer.array() else null
-  }
-
-  private def byteBufBaseOffset(buffer: ByteBuf, index: Int): Long = {
-    if (buffer.hasArray) {
-      Platform.BYTE_ARRAY_OFFSET + buffer.arrayOffset() + index
-    } else {
-      buffer.memoryAddress() + index
-    }
-  }
-
-  /**
-   * Writes the same length-prefixed format as serializeStream directly into streaming shuffle's
-   * native buffer. UnsafeRow data is already in its wire representation, so the common direct or
-   * array-backed ByteBuf paths need one memory copy and no OutputStream layers.
-   */
   override def writeValueToByteBuf(value: Any, output: ByteBuf): Unit = {
     val row = value.asInstanceOf[UnsafeRow]
     val rowSize = row.getSizeInBytes
     if (dataSize != null) dataSize.add(rowSize)
+    output.ensureWritable(Integer.BYTES + rowSize)
     output.writeInt(rowSize)
-    output.ensureWritable(rowSize)
-    if (output.hasArray || output.hasMemoryAddress) {
-      val writerIndex = output.writerIndex()
-      Platform.copyMemory(
-        row.getBaseObject,
-        row.getBaseOffset,
-        byteBufBaseObject(output),
-        byteBufBaseOffset(output, writerIndex),
-        rowSize)
-      output.writerIndex(writerIndex + rowSize)
+    val targetIndex = output.writerIndex()
+    if (output.hasMemoryAddress) {
+      row.writeToMemory(null, output.memoryAddress() + targetIndex)
+      output.writerIndex(targetIndex + rowSize)
+    } else if (output.hasArray) {
+      row.writeToMemory(
+        output.array(), Platform.BYTE_ARRAY_OFFSET + output.arrayOffset() + targetIndex)
+      output.writerIndex(targetIndex + rowSize)
     } else {
-      // Composite/custom ByteBuf implementations need not expose a contiguous address. Preserve
-      // compatibility without penalizing the pooled direct buffers used by streaming shuffle.
-      row.writeToStream(new ByteBufOutputStream(output), byteBufWriteBuffer)
+      output.writeBytes(row.getBytes)
     }
   }
 
-  /**
-   * Reads length-prefixed rows directly from a retained streaming-shuffle ByteBuf. The returned
-   * UnsafeRow is mutable and reused, matching deserializeStream. On common contiguous buffers it
-   * points at the message memory, which remains retained until this iterator is exhausted.
-   */
   override def keyValueIteratorFromByteBuf(input: ByteBuf): Iterator[(Any, Any)] = {
+    if (!input.hasMemoryAddress && !input.hasArray) {
+      return deserializeStream(new ByteBufInputStream(input)).asKeyValueIterator
+        .asInstanceOf[Iterator[(Any, Any)]]
+    }
     new Iterator[(Any, Any)] {
-      private[this] val row = new UnsafeRow(numFields)
-      private[this] val rowTuple: (Int, UnsafeRow) = (0, row)
-      private[this] var fallbackRowBuffer: Array[Byte] = new Array[Byte](1024)
+      private val row = new UnsafeRow(numFields)
+      private val rowTuple: (Int, UnsafeRow) = (0, row)
 
       override def hasNext: Boolean = input.isReadable
 
       override def next(): (Any, Any) = {
-        if (!hasNext) throw new NoSuchElementException("End of UnsafeRow ByteBuf")
         if (input.readableBytes() < Integer.BYTES) {
-          throw new EOFException("Truncated UnsafeRow length in streaming shuffle buffer")
+          throw new EOFException("Incomplete UnsafeRow length in streaming shuffle buffer")
         }
         val rowSize = input.readInt()
-        if (rowSize < 0 || input.readableBytes() < rowSize) {
+        if (rowSize < 0 || rowSize > input.readableBytes()) {
           throw new EOFException(
             s"Invalid UnsafeRow size $rowSize with ${input.readableBytes()} readable bytes")
         }
-        if (input.hasArray || input.hasMemoryAddress) {
-          val readerIndex = input.readerIndex()
-          row.pointTo(
-            byteBufBaseObject(input), byteBufBaseOffset(input, readerIndex), rowSize)
-          input.skipBytes(rowSize)
+        val rowIndex = input.readerIndex()
+        if (input.hasMemoryAddress) {
+          row.pointTo(null, input.memoryAddress() + rowIndex, rowSize)
         } else {
-          if (fallbackRowBuffer.length < rowSize) {
-            fallbackRowBuffer = new Array[Byte](rowSize)
-          }
-          input.readBytes(fallbackRowBuffer, 0, rowSize)
-          row.pointTo(fallbackRowBuffer, Platform.BYTE_ARRAY_OFFSET, rowSize)
+          row.pointTo(
+            input.array(), Platform.BYTE_ARRAY_OFFSET + input.arrayOffset() + rowIndex, rowSize)
         }
+        input.skipBytes(rowSize)
         rowTuple
       }
     }

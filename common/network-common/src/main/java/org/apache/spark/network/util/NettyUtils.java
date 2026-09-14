@@ -19,7 +19,6 @@ package org.apache.spark.network.util;
 
 import java.util.concurrent.ThreadFactory;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
 import io.netty.channel.epoll.Epoll;
@@ -55,36 +54,7 @@ public class NettyUtils {
   private static int MAX_DEFAULT_NETTY_THREADS = 8;
 
   private static final PooledByteBufAllocator[] _sharedPooledByteBufAllocator =
-      new PooledByteBufAllocator[4];
-
-  /** Netty's ioBuffer methods prefer direct memory independently of directByDefault. */
-  private static final class HeapPooledByteBufAllocator extends PooledByteBufAllocator {
-    HeapPooledByteBufAllocator(
-        int numHeapArenas,
-        int pageSize,
-        int maxOrder,
-        int smallCacheSize,
-        int normalCacheSize,
-        boolean useCacheForAllThreads) {
-      super(false, numHeapArenas, 0, pageSize, maxOrder, smallCacheSize, normalCacheSize,
-        useCacheForAllThreads);
-    }
-
-    @Override
-    public ByteBuf ioBuffer() {
-      return heapBuffer();
-    }
-
-    @Override
-    public ByteBuf ioBuffer(int initialCapacity) {
-      return heapBuffer(initialCapacity);
-    }
-
-    @Override
-    public ByteBuf ioBuffer(int initialCapacity, int maxCapacity) {
-      return heapBuffer(initialCapacity, maxCapacity);
-    }
-  }
+      new PooledByteBufAllocator[2];
 
   public static long freeDirectMemory() {
     return PlatformDependent.maxDirectMemory() - PlatformDependent.usedDirectMemory();
@@ -181,14 +151,13 @@ public class NettyUtils {
   }
 
   /**
-   * Returns the lazily created shared pooled ByteBuf allocator for the specified direct-buffer
-   * and cache policy. Both inputs are part of the identity: otherwise the first transport to
-   * initialize a cache slot silently determines the allocation policy of every later transport.
+   * Returns the lazily created shared pooled ByteBuf allocator for the specified allowCache
+   * parameter value.
    */
   public static synchronized PooledByteBufAllocator getSharedPooledByteBufAllocator(
       boolean allowDirectBufs,
       boolean allowCache) {
-    final int index = (allowCache ? 0 : 1) + (allowDirectBufs ? 2 : 0);
+    final int index = allowCache ? 0 : 1;
     if (_sharedPooledByteBufAllocator[index] == null) {
       _sharedPooledByteBufAllocator[index] =
         createPooledByteBufAllocator(
@@ -220,26 +189,16 @@ public class NettyUtils {
     // 2. `PooledByteBufAllocator.defaultUseCacheForAllThreads()` change from true to false, we need
     //    to use `-Dio.netty.allocator.useCacheForAllThreads=true` to
     //    enable `useCacheForAllThreads`.
-    int numHeapArenas = Math.min(PooledByteBufAllocator.defaultNumHeapArena(), numCores);
-    int pageSize = PooledByteBufAllocator.defaultPageSize();
-    int maxOrder = PooledByteBufAllocator.defaultMaxOrder();
-    int smallCacheSize = allowCache ? PooledByteBufAllocator.defaultSmallCacheSize() : 0;
-    int normalCacheSize = allowCache ? PooledByteBufAllocator.defaultNormalCacheSize() : 0;
-    boolean useCacheForAllThreads =
-      allowCache && PooledByteBufAllocator.defaultUseCacheForAllThreads();
-    if (!allowDirectBufs) {
-      return new HeapPooledByteBufAllocator(
-        numHeapArenas, pageSize, maxOrder, smallCacheSize, normalCacheSize, useCacheForAllThreads);
-    }
     return new PooledByteBufAllocator(
-      PlatformDependent.directBufferPreferred(),
-      numHeapArenas,
-      Math.min(PooledByteBufAllocator.defaultNumDirectArena(), numCores),
-      pageSize,
-      maxOrder,
-      smallCacheSize,
-      normalCacheSize,
-      useCacheForAllThreads);
+      allowDirectBufs && PlatformDependent.directBufferPreferred(),
+      Math.min(PooledByteBufAllocator.defaultNumHeapArena(), numCores),
+      Math.min(PooledByteBufAllocator.defaultNumDirectArena(), allowDirectBufs ? numCores : 0),
+      PooledByteBufAllocator.defaultPageSize(),
+      PooledByteBufAllocator.defaultMaxOrder(),
+      allowCache ? PooledByteBufAllocator.defaultSmallCacheSize() : 0,
+      allowCache ? PooledByteBufAllocator.defaultNormalCacheSize() : 0,
+      allowCache ? PooledByteBufAllocator.defaultUseCacheForAllThreads() : false
+    );
   }
 
   /**

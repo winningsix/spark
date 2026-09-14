@@ -142,165 +142,6 @@ private[spark] class TaskSetManager(
 
   val taskAttempts = Array.fill[List[TaskInfo]](numTasks)(Nil)
   private[scheduler] var tasksSuccessful = 0
-  private var successfulPeakExecutionMemorySamples = 0
-  private var maximumSuccessfulPeakExecutionMemory = 0L
-  private var observedMemorySpill = false
-  private case class RunningReaderMemorySample(
-      peakBytes: Long,
-      stableHeartbeats: Int,
-      retainedBuildsComplete: Boolean)
-  private val runningReaderMemorySamples = new HashMap[Long, RunningReaderMemorySample]
-  private val preparedReaderInitialMaxTasksPerExecutor =
-    conf.get(STREAMING_SHUFFLE_PREPARED_READER_INITIAL_MAX_TASKS_PER_EXECUTOR)
-  private val preparedReaderMemorySampleTasks =
-    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MEMORY_SAMPLE_TASKS)
-  private val preparedReaderHeavyTaskPeakMemory =
-    conf.get(STREAMING_SHUFFLE_PREPARED_READER_HEAVY_TASK_PEAK_MEMORY)
-  private val preparedReaderMaxRetainedExecutionMemory =
-    conf.get(STREAMING_SHUFFLE_PREPARED_READER_MAX_RETAINED_EXECUTION_MEMORY)
-
-  private def preparedReaderMemorySampleCount: Int = {
-    successfulPeakExecutionMemorySamples +
-      runningReaderMemorySamples.valuesIterator.count { sample =>
-        sample.peakBytes > 0L && sample.stableHeartbeats >= 1
-      }
-  }
-
-  private def maximumPreparedReaderPeakExecutionMemory: Long = {
-    math.max(
-      maximumSuccessfulPeakExecutionMemory,
-      runningReaderMemorySamples.valuesIterator.map(_.peakBytes).maxOption.getOrElse(0L))
-  }
-
-  private def preparedReaderCanExpandNow: Boolean = {
-    preparedReaderInitialMaxTasksPerExecutor > 0 &&
-      preparedReaderMemorySampleCount >= preparedReaderMemorySampleTasks &&
-      maximumPreparedReaderPeakExecutionMemory < preparedReaderHeavyTaskPeakMemory &&
-      !observedMemorySpill
-  }
-
-  private def sampledPreparedReaderPeakExecutionMemory: Option[Long] = {
-    val completedBuildSamples = runningReaderMemorySamples.valuesIterator.filter { sample =>
-      sample.retainedBuildsComplete && sample.peakBytes > 0L && sample.stableHeartbeats >= 1
-    }.toSeq
-    Option.when(
-      successfulPeakExecutionMemorySamples + completedBuildSamples.size >=
-        preparedReaderMemorySampleTasks && !observedMemorySpill) {
-      math.max(
-        maximumSuccessfulPeakExecutionMemory,
-        completedBuildSamples.map(_.peakBytes).maxOption.getOrElse(0L))
-    }.filter(_ > 0L)
-  }
-
-  private[scheduler] def preparedReaderEstimatedPeakExecutionMemory: Option[Long] = synchronized {
-    sampledPreparedReaderPeakExecutionMemory
-  }
-
-  private[scheduler] def preparedReaderMaxTasksPerExecutor: Int = synchronized {
-    if (preparedReaderInitialMaxTasksPerExecutor <= 0) {
-      0
-    } else if (preparedReaderCanExpandNow) {
-      0
-    } else {
-      sampledPreparedReaderPeakExecutionMemory.filter { _ =>
-        preparedReaderMaxRetainedExecutionMemory > 0L
-      }.map { peakBytes =>
-        val budgetCap = math.min(
-          Int.MaxValue.toLong,
-          preparedReaderMaxRetainedExecutionMemory / peakBytes).toInt
-        math.max(preparedReaderInitialMaxTasksPerExecutor, budgetCap)
-      }.getOrElse(preparedReaderInitialMaxTasksPerExecutor)
-    }
-  }
-
-  private[scheduler] def preparedReaderCanExpand: Boolean = synchronized {
-    preparedReaderCanExpandNow
-  }
-
-  /**
-   * Use executor heartbeats to classify a long-running prepared reader before it completes.
-   *
-   * Some shuffle consumers finish as one wave after every producer terminal arrives, so
-   * completion-only sampling cannot lift an initial attach cap in time to help lightweight
-   * stages. A running task becomes a sample only after its peak execution-memory value is
-   * unchanged across two heartbeats. A zero-memory task is never a sample, nor is a stage marked
-   * as memory-growing: input wait can precede allocation, and a sorter's stable early peak can
-   * grow again when more streamed rows arrive. A build-before-probe task is eligible only after
-   * every retained build explicitly reports completion; that fenced live peak can safely derive
-   * a byte-budgeted cap before the probe iterator finishes.
-   *
-   * @return true when this update raises the stage's current per-executor admission cap.
-   */
-  private[scheduler] def updatePreparedReaderRunningMemorySample(
-      taskId: Long,
-      updates: Seq[AccumulatorV2[_, _]]): Boolean = synchronized {
-    if ((!taskSet.isPipelinedShuffleReader && !taskSet.retainsExecutionMemory) ||
-        taskSet.pipelinedReaderMemoryMayGrow ||
-        preparedReaderInitialMaxTasksPerExecutor <= 0) {
-      return false
-    }
-    val capBefore = preparedReaderMaxTasksPerExecutor
-    var reportedPeakExecutionMemory = 0L
-    var peakOnHeapExecutionMemory = 0L
-    var peakOffHeapExecutionMemory = 0L
-    var retainedMemoryBytes = 0L
-    var retainedMemoryBuildsCompleted = 0L
-    updates.foreach { accumulator =>
-      accumulator.name match {
-        case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
-          reportedPeakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
-          peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
-          peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.RETAINED_MEMORY_BYTES) =>
-          retainedMemoryBytes = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.RETAINED_MEMORY_BUILDS_COMPLETED) =>
-          retainedMemoryBuildsCompleted = accumulator.asInstanceOf[LongAccumulator].value
-        case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
-            if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
-          observedMemorySpill = true
-        case _ =>
-      }
-    }
-    if (taskSet.retainedMemoryBuildCount > 0 &&
-        retainedMemoryBuildsCompleted < taskSet.retainedMemoryBuildCount) {
-      // A nested SHJ can finish one hash build and then grow again while initializing another.
-      // Do not carry a temporarily stable prefix into the completed-build sampling window.
-      runningReaderMemorySamples.remove(taskId)
-      return false
-    }
-    // A retained-memory budget must compare like with like. TaskMemoryManager's peak can include
-    // transient aggregation/probe allocations in addition to the hash relations that coexist
-    // until task completion. Prefer the explicit retained byte total once every build is fenced;
-    // fall back to the larger legacy/TMM observation for operators that do not report it yet.
-    val taskMemoryManagerPeak = if (
-        Long.MaxValue - peakOnHeapExecutionMemory < peakOffHeapExecutionMemory) {
-      Long.MaxValue
-    } else {
-      peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
-    }
-    val peakExecutionMemory = if (
-        taskSet.retainedMemoryBuildCount > 0 && retainedMemoryBytes > 0L) {
-      retainedMemoryBytes
-    } else {
-      math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
-    }
-    val next = runningReaderMemorySamples.get(taskId) match {
-      case Some(previous) if previous.peakBytes == peakExecutionMemory =>
-        RunningReaderMemorySample(
-          peakExecutionMemory,
-          math.min(Int.MaxValue, previous.stableHeartbeats + 1),
-          retainedBuildsComplete = taskSet.retainedMemoryBuildCount > 0)
-      case _ => RunningReaderMemorySample(
-        peakExecutionMemory,
-        0,
-        retainedBuildsComplete = taskSet.retainedMemoryBuildCount > 0)
-    }
-    runningReaderMemorySamples.update(taskId, next)
-    val capAfter = preparedReaderMaxTasksPerExecutor
-    capBefore > 0 && (capAfter == 0 || capAfter > capBefore)
-  }
 
   val weight = 1
   val minShare = 0
@@ -330,18 +171,6 @@ private[spark] class TaskSetManager(
   private[scheduler] val runningTasksSet = new HashSet[Long]
 
   override def runningTasks: Int = runningTasksSet.size
-
-  private[scheduler] def runningTasksOnExecutor(executorId: String): Int = {
-    var count = 0
-    val taskIds = executorIdToTaskIds.getOrElse(executorId, TaskSetManager.EMPTY_LONG_SET)
-    val iterator = taskIds.iterator
-    while (iterator.hasNext) {
-      if (taskInfos.get(iterator.next()).exists(_.running)) {
-        count += 1
-      }
-    }
-    count
-  }
 
   def someAttemptSucceeded(tid: Long): Boolean = {
     successful(taskInfos(tid).index)
@@ -543,18 +372,6 @@ private[spark] class TaskSetManager(
   private def isTaskExcludededOnExecOrNode(index: Int, execId: String, host: String): Boolean = {
     taskSetExcludelistHelperOpt.exists { excludeList =>
       excludeList.isNodeExcludedForTask(host, index) ||
-        excludeList.isExecutorExcludedForTask(execId, index)
-    }
-  }
-
-  private[scheduler] def isExecutorAllowedForTask(
-      index: Int,
-      execId: String,
-      host: String): Boolean = {
-    !taskSetExcludelistHelperOpt.exists { excludeList =>
-      excludeList.isNodeExcludedForTaskSet(host) ||
-        excludeList.isExecutorExcludedForTaskSet(execId) ||
-        excludeList.isNodeExcludedForTask(host, index) ||
         excludeList.isExecutorExcludedForTask(execId, index)
     }
   }
@@ -1077,42 +894,6 @@ private[spark] class TaskSetManager(
         reason = "another attempt succeeded")
     }
     if (!successful(index)) {
-      runningReaderMemorySamples.remove(tid)
-      var reportedPeakExecutionMemory = 0L
-      var peakOnHeapExecutionMemory = 0L
-      var peakOffHeapExecutionMemory = 0L
-      var retainedMemoryBytes = 0L
-      result.accumUpdates.foreach { accumulator =>
-        accumulator.name match {
-          case Some(InternalAccumulator.PEAK_EXECUTION_MEMORY) =>
-            reportedPeakExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-          case Some(InternalAccumulator.PEAK_ON_HEAP_EXECUTION_MEMORY) =>
-            peakOnHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-          case Some(InternalAccumulator.PEAK_OFF_HEAP_EXECUTION_MEMORY) =>
-            peakOffHeapExecutionMemory = accumulator.asInstanceOf[LongAccumulator].value
-          case Some(InternalAccumulator.RETAINED_MEMORY_BYTES) =>
-            retainedMemoryBytes = accumulator.asInstanceOf[LongAccumulator].value
-          case Some(InternalAccumulator.MEMORY_BYTES_SPILLED)
-              if accumulator.asInstanceOf[LongAccumulator].value > 0L =>
-            observedMemorySpill = true
-          case _ =>
-        }
-      }
-      val taskMemoryManagerPeak = if (
-          Long.MaxValue - peakOnHeapExecutionMemory < peakOffHeapExecutionMemory) {
-        Long.MaxValue
-      } else {
-        peakOnHeapExecutionMemory + peakOffHeapExecutionMemory
-      }
-      val peakExecutionMemory = if (taskSet.retainedMemoryBuildCount > 0 &&
-          retainedMemoryBytes > 0L) {
-        retainedMemoryBytes
-      } else {
-        math.max(reportedPeakExecutionMemory, taskMemoryManagerPeak)
-      }
-      successfulPeakExecutionMemorySamples += 1
-      maximumSuccessfulPeakExecutionMemory =
-        math.max(maximumSuccessfulPeakExecutionMemory, peakExecutionMemory)
       tasksSuccessful += 1
       logInfo(log"Finished ${MDC(TASK_NAME, taskName(info.taskId))} in " +
         log"${MDC(DURATION, info.duration)} ms on ${MDC(HOST, info.host)} " +
@@ -1237,7 +1018,6 @@ private[spark] class TaskSetManager(
       }
       return
     }
-    runningReaderMemorySamples.remove(tid)
     removeRunningTask(tid)
     info.markFinished(state, clock.getTimeMillis())
     val index = info.index

@@ -184,6 +184,37 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
   import DAGSchedulerSuite._
 
+  test("repeated union task affinity groups matching input partitions per executor") {
+    val parents = (0 until 3).map { parent =>
+      sc.parallelize((0 until 5).map(index => (parent, index)), 5)
+    }
+    val union = sc.union(parents)
+    val executors = Seq(
+      ExecutorCacheTaskLocation("host-a", "1"),
+      ExecutorCacheTaskLocation("host-b", "2"))
+
+    val plan = DAGScheduler.planUnionTaskAffinity(
+      union.partitions.indices, union.partitions, executors).get
+
+    assert(plan.orderedPartitionIds === Seq(
+      0, 1, 5, 6, 10, 11,
+      2, 3, 7, 8, 12, 13,
+      4, 9, 14))
+    assert(plan.preferredLocations(0) === Seq(executors(0)))
+    assert(plan.preferredLocations(5) === Seq(executors(0)))
+    assert(plan.preferredLocations(10) === Seq(executors(0)))
+    assert(plan.preferredLocations(1) === Seq(executors(1)))
+    assert(plan.preferredLocations(6) === Seq(executors(1)))
+  }
+
+  test("repeated union task affinity rejects a partial task set") {
+    val union = sc.union(Seq(sc.parallelize(0 until 2, 2), sc.parallelize(0 until 2, 2)))
+    val executors = Seq(ExecutorCacheTaskLocation("host-a", "1"))
+
+    assert(DAGScheduler.planUnionTaskAffinity(
+      union.partitions.indices.dropRight(1), union.partitions, executors).isEmpty)
+  }
+
   // Necessary to make ScalaTest 3.x interrupt a thread on the JVM like ScalaTest 2.2.x
   implicit val defaultSignaler: Signaler = ThreadSignaler
 
@@ -6433,57 +6464,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: prepared receive materializes a regular frontier before pipeline") {
-    val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
-    val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
-    val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
-    val previousTotalQueue =
-      sc.conf.get(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY)
-    val previousSharedConnections =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
-    val previousSharedServer =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
-    sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY, 4096L)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-    try {
-      val probeProducer = new MyRDD(sc, 2, Nil)
-      val probeDep = new PipelinedShuffleDependency(probeProducer, new HashPartitioner(2))
-      val buildProducer = new MyRDD(sc, 2, Nil)
-      val buildDep = new ShuffleDependency(buildProducer, new HashPartitioner(2))
-      val consumer = new MyRDD(sc, 2, List(probeDep, buildDep), tracker = mapOutputTracker)
-
-      submit(consumer, Array(0, 1))
-      assert(taskSets.size === 1,
-        "only the regular build frontier may start before it materializes")
-      assert(taskSets.head.shuffleId.contains(buildDep.shuffleId))
-      assert(!taskSets.head.isPipelinedShuffleProducer)
-
-      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
-      assert(taskSets.size === 3,
-        "the probe producer and consumer must start together after the build frontier")
-      assert(taskSets(1).shuffleId.contains(probeDep.shuffleId))
-      assert(taskSets(1).isPipelinedShuffleProducer)
-      assert(taskSets(2).isPipelinedShuffleReader)
-
-      completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
-      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
-      assert(results === Map(0 -> 42, 1 -> 43))
-      assertDataStructuresEmpty()
-    } finally {
-      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_TOTAL_QUEUE_MAX_MEMORY, previousTotalQueue)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
-        previousSharedConnections)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
-    }
-  }
-
   test("pipelined shuffle: a regular-shuffle prefix feeding a pipelined producer is rejected") {
     // An UNMATERIALIZED regular shuffle in the PREFIX that feeds a pipelined producer
     // (regularRoot --regular--> producer(pipelined) --pipelined--> consumer) is rejected: the
@@ -6509,46 +6489,70 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: prepared receive mode allows a regular stage above a pipeline") {
-    val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
-    val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
-    val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
-    val previousSharedConnections =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
-    val previousSharedServer =
-      sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
-    sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
-    sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
-    try {
-      val producerRdd = new MyRDD(sc, 2, Nil)
-      val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-      val pipelinedConsumer =
-        new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-      val regularDep = new ShuffleDependency(pipelinedConsumer, new HashPartitioner(2))
-      val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
+  for (submission <- Seq("result", "map", "segmented")) {
+    test(s"pipelined shuffle: prepared receive regular boundary submission=$submission") {
+      val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+      val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+      val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+      val previousSharedConnections =
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+      val previousSharedServer =
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      try {
+        val producerRdd = new MyRDD(sc, 2, Nil)
+        val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
+        val pipelinedConsumer =
+          new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
+        val regularDep = new ShuffleDependency(pipelinedConsumer, new HashPartitioner(2))
+        val resultRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
 
-      submit(resultRdd, Array(0, 1))
-      assert(taskSets.size === 2,
-        "the pipelined producer and its regular shuffle-map consumer must run together")
-      assert(taskSets.head.isPipelinedShuffleProducer)
-      assert(taskSets(1).isPipelinedShuffleReader)
+        submission match {
+          case "map" => submitMapStage(regularDep)
+          case "segmented" =>
+            val downstreamDep = new PipelinedShuffleDependency(resultRdd, new HashPartitioner(2))
+            val downstream = new MyRDD(sc, 2, List(downstreamDep), tracker = mapOutputTracker)
+            submit(downstream, Array(0, 1))
+          case _ => submit(resultRdd, Array(0, 1))
+        }
+        assert(taskSets.size === 2,
+          "the pipelined producer and its regular shuffle-map consumer must run together")
+        assert(taskSets.head.isPipelinedShuffleProducer)
+        assert(taskSets(1).isPipelinedShuffleReader)
 
-      completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
-      completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
-      assert(taskSets.size === 3, "the final regular-shuffle reader starts after materialization")
-      complete(taskSets(2), Seq((Success, 42), (Success, 43)))
-      assert(results === Map(0 -> 42, 1 -> 43))
-      assertDataStructuresEmpty()
-    } finally {
-      sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
-        previousSharedConnections)
-      sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+        completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+        completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
+        submission match {
+          case "map" =>
+            assert(taskSets.size === 2, "the regular map-stage job must now be complete")
+            assert(scheduler.activeJobs.isEmpty)
+          case "segmented" =>
+            assert(taskSets.size === 4,
+              "the downstream segment must start only after the regular boundary materializes")
+            assert(taskSets(2).isPipelinedShuffleProducer)
+            assert(taskSets(3).isPipelinedShuffleReader)
+            completeShuffleMapStageSuccessfully(taskSets(2).stageId, 0, 2)
+            complete(taskSets(3), Seq((Success, 42), (Success, 43)))
+            assert(results === Map(0 -> 42, 1 -> 43))
+          case _ =>
+            assert(taskSets.size === 3,
+              "the final regular-shuffle reader starts after materialization")
+            complete(taskSets(2), Seq((Success, 42), (Success, 43)))
+            assert(results === Map(0 -> 42, 1 -> 43))
+        }
+        assertDataStructuresEmpty()
+      } finally {
+        sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+        sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+        sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+        sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
+          previousSharedConnections)
+        sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+      }
     }
   }
 
@@ -6770,67 +6774,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     completeShuffleMapStageSuccessfully(idB, 0, 2)
     val tsC = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq rddC).get
     complete(tsC, Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
-    assertDataStructuresEmpty()
-  }
-
-  test("pipelined shuffle: a shared producer prepares one route in each consumer stage") {
-    // One shuffle fans out into two DIFFERENT downstream stages. Its query-wide producer
-    // contract has multiplicity two, but each consumer TaskSet owns only one of those routes.
-    // Expanding the global multiplicity in both TaskSets creates four clients and lets the writer
-    // retire after the wrong pair of ACKs.
-    val source = new MyRDD(sc, 2, Nil)
-    val shared = new PipelinedShuffleDependency(source, new HashPartitioner(2))
-    val left = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
-    val right = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
-    val leftOutput = new PipelinedShuffleDependency(left, new HashPartitioner(2))
-    val rightOutput = new PipelinedShuffleDependency(right, new HashPartitioner(2))
-    val result = new MyRDD(sc, 2, List(leftOutput, rightOutput), tracker = mapOutputTracker)
-
-    submit(result, Array(0, 1))
-    assert(taskSets.size === 4)
-    assert(shared.readerRouteMultiplicity === 2)
-    Seq(left, right).foreach { consumer =>
-      val taskSet = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq consumer).get
-      assert(taskSet.pipelinedReaderShuffleIds === Seq(shared.shuffleId))
-    }
-
-    completeShuffleMapStageSuccessfully(
-      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq source).get.stageId, 0, 2)
-    Seq(left, right).foreach { consumer =>
-      completeShuffleMapStageSuccessfully(
-        taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq consumer).get.stageId, 0, 2)
-    }
-    complete(
-      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq result).get,
-      Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
-    assertDataStructuresEmpty()
-  }
-
-  test("pipelined shuffle: shared RDD paths prepare independent routes in one stage") {
-    // ReusedExchangeExec can collapse two operator inputs onto one ShuffledRowRDD object. The
-    // stage still invokes that iterator twice, so a distinct-RDD traversal would undercount it.
-    // Walking dependency paths preserves the two logical consumers.
-    val source = new MyRDD(sc, 2, Nil)
-    val shared = new PipelinedShuffleDependency(source, new HashPartitioner(2))
-    shared.setReaderRouteMultiplicity(2)
-    val consumer = new MyRDD(sc, 2, List(shared), tracker = mapOutputTracker)
-    val result = new MyRDD(
-      sc,
-      2,
-      List(new OneToOneDependency(consumer), new OneToOneDependency(consumer)),
-      tracker = mapOutputTracker)
-
-    submit(result, Array(0, 1))
-    assert(taskSets.size === 2)
-    val readerTaskSet = taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq result).get
-    assert(readerTaskSet.pipelinedReaderShuffleIds ===
-      Seq(shared.shuffleId, shared.shuffleId))
-
-    completeShuffleMapStageSuccessfully(
-      taskSets.find(ts => scheduler.stageIdToStage(ts.stageId).rdd eq source).get.stageId, 0, 2)
-    complete(readerTaskSet, Seq((Success, 42), (Success, 43)))
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
@@ -8342,60 +8285,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       Seq(pipelinedDep.shuffleId, pipelinedDep.shuffleId))
     completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
     complete(taskSets(1), Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
-    assertDataStructuresEmpty()
-  }
-
-  test("pipelined shuffle: TaskSet identifies an operator's startup input") {
-    val streamedProducer = new MyRDD(sc, 2, Nil)
-    val buildProducer = new MyRDD(sc, 2, Nil)
-    val streamedDep = new PipelinedShuffleDependency(
-      streamedProducer, new HashPartitioner(2))
-    val buildDep = new PipelinedShuffleDependency(buildProducer, new HashPartitioner(2))
-    val streamedInput = new MyRDD(sc, 2, List(streamedDep), tracker = mapOutputTracker)
-    val buildInput = new MyRDD(sc, 2, List(buildDep), tracker = mapOutputTracker)
-    val resultRdd = new MyRDD(
-      sc,
-      2,
-      List(new OneToOneDependency(streamedInput), new OneToOneDependency(buildInput)),
-      tracker = mapOutputTracker)
-      .setPipelinedStartupInputs(Seq(buildInput))
-
-    submit(resultRdd, Array(0, 1))
-    assert(taskSets.size === 3)
-    val readerTaskSet = taskSets.find(_.isPipelinedShuffleReader).get
-    assert(readerTaskSet.pipelinedReaderShuffleIds.toSet ===
-      Set(streamedDep.shuffleId, buildDep.shuffleId))
-    assert(readerTaskSet.pipelinedReaderStartupShuffleIds === Set(buildDep.shuffleId))
-    assert(readerTaskSet.pipelinedReaderMaxProducerTasks === 2)
-
-    taskSets.filter(_.shuffleId.nonEmpty).foreach { producerTaskSet =>
-      completeShuffleMapStageSuccessfully(producerTaskSet.stageId, 0, 2)
-    }
-    complete(readerTaskSet, Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
-    assertDataStructuresEmpty()
-  }
-
-  test("regular TaskSet preserves memory-retaining consumer admission metadata") {
-    val input = new MyRDD(sc, 2, Nil)
-    val resultRdd = new MyRDD(
-      sc,
-      2,
-      List(new OneToOneDependency(input)),
-      tracker = mapOutputTracker)
-      .setPipelinedStartupInputs(Seq(input))
-      .setPipelinedMemoryMayGrow()
-
-    submit(resultRdd, Array(0, 1))
-    assert(taskSets.size === 1)
-    assert(!taskSets.head.isPipelinedShuffleReader)
-    assert(taskSets.head.retainsExecutionMemory,
-      "regular shuffle fallback must not bypass retained-memory admission")
-    assert(taskSets.head.pipelinedReaderMemoryMayGrow,
-      "a hash build must use completed rather than early heartbeat memory samples")
-
-    complete(taskSets.head, Seq((Success, 42), (Success, 43)))
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
