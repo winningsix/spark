@@ -394,23 +394,20 @@ class StreamingShuffleClientHandler(
           case dataMessage: DataMessage =>
             updateQuota(messageSize)
             val retainedBody = managedBody.map(_.retain())
+            dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
-              try {
-                updateQuota(-messageSize)
-                if (backpressureEnabled && !terminationReceived) {
-                  if (perStreamAutoReadEnabled) {
-                    // Dedicated channels retain the original additive-credit protocol; their
-                    // channel-level autoRead is the primary admission boundary.
-                    sendCreditControlMessage(
-                      client,
-                      math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
-                  } else {
-                    val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
-                    sendCumulativeCreditAck(client, released)
-                  }
+              updateQuota(-messageSize)
+              if (backpressureEnabled && !terminationReceived) {
+                if (perStreamAutoReadEnabled) {
+                  // Dedicated channels retain the original additive-credit protocol; their
+                  // channel-level autoRead is the primary admission boundary.
+                  sendCreditControlMessage(
+                    client,
+                    math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                } else {
+                  val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                  sendCumulativeCreditAck(client, released)
                 }
-              } finally {
-                retainedBody.foreach(_.release())
               }
             })
             // We can only release the frame after all rows in the buffer have been decoded. The

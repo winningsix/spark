@@ -80,6 +80,32 @@ class StreamingShuffleReaderSuite
   private def location(mapIndex: Int): StreamingShuffleTaskLocation =
     StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, mapIndex)
 
+  test("spilled queue data frees payload but defers producer credit until consumption") {
+    withTempDir { spillDir =>
+      val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
+      val payloadReleases = new AtomicInteger(0)
+      val creditReleases = new AtomicInteger(0)
+      val bytes = Array.fill[Byte](128)(1)
+      val buffer = Unpooled.wrappedBuffer(bytes)
+      val data = new DataMessage(0, 0, bytes.length, buffer, 0L)
+      buffer.release()
+      data.setResourceReleaseCallback(() => payloadReleases.incrementAndGet())
+      data.setReleaseCallback(() => creditReleases.incrementAndGet())
+
+      try {
+        queue.put(data)
+        queue.spilledBytesCount shouldBe bytes.length.toLong
+        payloadReleases.get() shouldBe 1
+        creditReleases.get() shouldBe 0
+
+        queue.take().release()
+        creditReleases.get() shouldBe 1
+      } finally {
+        StreamingShuffleReceiveService.closeQueue(queue)
+      }
+    }
+  }
+
   test("receive session discovers each logical writer once across incremental snapshots") {
     var initialized = 0
     var discoveriesFinished = 0

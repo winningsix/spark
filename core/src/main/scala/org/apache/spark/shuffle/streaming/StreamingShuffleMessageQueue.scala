@@ -67,7 +67,8 @@ private[streaming] final class StreamingShuffleMessageQueue
       val uncompressedSize: Int,
       val checksum: Long,
       val seqNum: Long,
-      val offset: Long) extends QueueEntry {
+      val offset: Long,
+      private var consumerReleaseCallback: Runnable) extends QueueEntry {
     private var value: DataMessage = _
 
     override def materialize(): StreamingShuffleMessage = synchronized {
@@ -80,6 +81,8 @@ private[streaming] final class StreamingShuffleMessageQueue
             shuffleId, shuffleWriterId, shuffleReaderId, dataSize, uncompressedSize,
             buffer, checksum)
           value.setSeqNum(seqNum)
+          value.setReleaseCallback(consumerReleaseCallback)
+          consumerReleaseCallback = null
         } finally {
           // DataMessage retains the buffer once for its own lifetime.
           buffer.release()
@@ -92,6 +95,10 @@ private[streaming] final class StreamingShuffleMessageQueue
       if (value != null) {
         value.release()
         value = null
+      } else if (consumerReleaseCallback != null) {
+        val callback = consumerReleaseCallback
+        consumerReleaseCallback = null
+        callback.run()
       }
     }
 
@@ -174,12 +181,21 @@ private[streaming] final class StreamingShuffleMessageQueue
       val bytes = new Array[Byte](data.dataSize)
       data.data.getBytes(data.data.readerIndex(), bytes)
       val offset = writeFully(bytes)
-      val entry = new SpilledDataEntry(
+      var consumerReleaseCallback = data.takeReleaseCallback()
+      try {
+        // Free the copied Netty payload now, but keep receive credit outstanding until the
+        // downstream task consumes or cancels this entry. Returning credit here turns the
+        // bounded queue into an unbounded disk-backed receive window.
+        data.releaseOwnedResources()
+      } catch {
+        case t: Throwable =>
+          if (consumerReleaseCallback != null) consumerReleaseCallback.run()
+          consumerReleaseCallback = null
+          throw t
+      }
+      new SpilledDataEntry(
         data.shuffleId, data.shuffleWriterId, data.shuffleReaderId, data.dataSize,
-        data.uncompressedSize, data.checksum, data.getSeqNum, offset)
-      // The queue now owns the file copy, so release the Netty buffer and its quota callback.
-      data.release()
-      entry
+        data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
     case data: DataMessage if canSpill =>
       new InMemoryEntry(data)
     case data: DataMessage =>
