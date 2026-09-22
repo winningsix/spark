@@ -18,13 +18,21 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
-import io.netty.buffer.{ByteBuf, CompositeByteBuf, Unpooled}
+import scala.collection.mutable.ArrayBuffer
+
+import io.netty.buffer.{ByteBuf, Unpooled}
 import io.netty.channel.{Channel, ChannelOption}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
-import org.apache.spark.{SparkException, TaskContext}
+import org.apache.spark.{SparkEnv, SparkException, TaskContext}
+import org.apache.spark.internal.LogKeys
+import org.apache.spark.internal.config.{STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
+  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
+  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED}
+import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationAckMessage, TerminationControlMessage}
@@ -41,24 +49,48 @@ class StreamingShuffleClientHandler(
     // TODO: we might remove this field; avoid relying on it in future development.
     shuffleWriterId: Int,
     shuffleReaderId: Int,
-    queue: LinkedBlockingQueue[StreamingShuffleMessage],
+    queue: BlockingQueue[StreamingShuffleMessage],
     shuffleId: Int,
     byteLimit: Long,
     val context: TaskContext,
-    errorNotifier: ErrorNotifier) extends RpcHandler with TaskContextAwareLogging {
-  private val RECVBUF_SIZE: Integer = 32 << 10
+    errorNotifier: ErrorNotifier,
+    onMessageAvailable: () => Unit = () => ()) extends RpcHandler with TaskContextAwareLogging {
+  private val RECVBUF_SIZE: Integer = Option(SparkEnv.get)
+    .map(env => Integer.valueOf(env.conf.get(STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE)))
+    .getOrElse(Integer.valueOf(32 << 10))
   private val SENDBUF_SIZE: Integer = 512
 
-  private var lastSeqNum = -1L  // The most recent sequence number we have seen.
+  @volatile private var lastSeqNum = -1L  // The most recent sequence number we have seen.
   // Set once this writer's TerminationControlMessage has been received, so that channelInactive
   // can tell an expected end-of-stream close apart from a premature disconnect (a writer that
   // died before terminating). @volatile because it is written on the Netty event-loop thread in
   // receive() and read in channelInactive().
   @volatile private var terminationReceived = false
+
+  private[streaming] def terminationReceivedForDiagnostics: Boolean = terminationReceived
+
+  private[streaming] def lastSequenceNumberForDiagnostics: Long = lastSeqNum
   // These variables are used for flow control by updateQuota below.
   private var channel: Channel = _  // The channel to the shuffle writer, captured in channelActive.
   private var remainingBytesQuota: Long = byteLimit // Remaining bytes before pushback.
-  private var autoReadDisabledTimestamp: Long = _  // Last time pushback condition was triggered.
+  // Multiplexed routes acknowledge an absolute released-byte watermark. This makes an idle
+  // retry idempotent and lets the executor collapse many frame releases into one control body.
+  private val cumulativeReleasedBytes = new AtomicLong(0L)
+  // Set before publishing a reader-visible sequence repair. TCP preserves order, but the repair
+  // request can cross newer normal frames already in flight; duplicates are legal only while this
+  // explicit replay window is active.
+  private val replayRepairActive = new AtomicBoolean(false)
+  private val backpressureEnabled =
+    Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
+  private val messageBatchingEnabled =
+    Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
+  private val batchQueue = queue match {
+    case batched: StreamingShuffleMessageQueue if messageBatchingEnabled => Some(batched)
+    case _ => None
+  }
+  @volatile private var perStreamAutoReadEnabled = true
+  @volatile private var multiplexedCreditSender:
+      (TransportClient, StreamingShuffleClientHandler) => Unit = _
 
   setShuffleIdForLogging(shuffleId)
 
@@ -81,84 +113,191 @@ class StreamingShuffleClientHandler(
     onTermAckResponse = handler
   }
 
-  override def channelActive(client: TransportClient): Unit = {
+  /** A multiplexed channel cannot safely toggle autoRead for one logical stream. */
+  private[streaming] def useMultiplexedChannel(): Unit = {
+    perStreamAutoReadEnabled = false
+  }
+
+  private[streaming] def setMultiplexedCreditSender(
+      sender: (TransportClient, StreamingShuffleClientHandler) => Unit): Unit = {
+    multiplexedCreditSender = sender
+  }
+
+  private[streaming] def clearMultiplexedCreditSender(): Unit = {
+    multiplexedCreditSender = null
+  }
+
+  private def bindChannel(client: TransportClient, configureSocket: Boolean): Unit = {
     channel = client.getChannel
-    channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
-    channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
-    sendCreditControlMessage(client, shuffleWriterId, 1) // Tell upstream writer that we're ready.
+    if (configureSocket) {
+      channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
+      channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
+    }
+  }
+
+  private def initialCreditAmount: Int = {
+    // The first credit both discovers the route and opens its bounded receive window. On a
+    // multiplexed channel this is the logical replacement for toggling channel-wide autoRead;
+    // each route gets an independent writer-side byte budget even though the physical channel is
+    // shared with unrelated readers.
+    if (backpressureEnabled && !perStreamAutoReadEnabled) {
+      // A negative first credit opts this logical stream into writer-side byte admission. Positive
+      // credits retain the historical connection-discovery-only protocol for dedicated channels.
+      -math.min(byteLimit, Int.MaxValue.toLong).toInt
+    } else {
+      // Preserve the original connection-discovery marker when reader backpressure is disabled.
+      1
+    }
+  }
+
+  override def channelActive(client: TransportClient): Unit = {
+    bindChannel(client, configureSocket = true)
+    sendCreditControlMessage(client, initialCreditAmount)
+  }
+
+  /** Bind one logical route and return its discovery frame for an executor-level batch send. */
+  private[streaming] def prepareMultiplexedInitialCredit(
+      client: TransportClient,
+      configureSocket: Boolean): CreditControlMessage = {
+    useMultiplexedChannel()
+    bindChannel(client, configureSocket)
+    new CreditControlMessage(
+      shuffleId, shuffleWriterId, shuffleReaderId, initialCreditAmount)
+  }
+
+  /** Surface a failed executor-level discovery batch through this route's normal error path. */
+  private[streaming] def initialCreditBatchSendFailed(cause: Throwable): Unit = {
+    val error = new RuntimeException(
+      s"Error sending initial credit batch to shuffle writer $shuffleWriterId", cause)
+    logError(log"Streaming shuffle initial credit batch failed", error)
+    errorNotifier.markError(error)
+  }
+
+  /** Build the latest idempotent discovery or cumulative-credit repair frame. */
+  private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
+    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
+    if (lastSeqNum < 0) {
+      val advertised = math.min(availableReceiveBytes, Int.MaxValue.toLong).toInt
+      if (advertised > 0) {
+        Some(new CreditControlMessage(
+          shuffleId, shuffleWriterId, shuffleReaderId, -advertised))
+      } else {
+        None
+      }
+    } else {
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(cumulativeReleasedBytes.get())
+      Some(message)
+    }
+  }
+
+  /** Ask the writer to reconcile its local send cursor with the last reader-visible sequence. */
+  private[streaming] def prepareMultiplexedReplayRepair(): Option[CreditControlMessage] = {
+    if (terminationReceived) return None
+    replayRepairActive.set(true)
+    val message = new CreditControlMessage(
+      shuffleId, shuffleWriterId, shuffleReaderId, Int.MinValue)
+    message.setSeqNum(lastSeqNum)
+    Some(message)
+  }
+
+  /** Surface a failed executor-level credit batch through this route's normal error path. */
+  private[streaming] def creditBatchSendFailed(
+      client: TransportClient,
+      cause: Throwable): Unit = {
+    if (!terminationAckFailureIsExpected(cause, client)) {
+      val error = new RuntimeException(
+        s"Error sending batched credit to shuffle writer $shuffleWriterId", cause)
+      logError(log"Streaming shuffle batched credit failed", error)
+      errorNotifier.markError(error)
+    }
+  }
+
+  /** Repair route discovery or repeat the latest cumulative release watermark. */
+  private[streaming] def repairCreditWindow(client: TransportClient): Unit = {
+    prepareMultiplexedCreditRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
+    prepareMultiplexedReplayRepair().foreach(message =>
+      sendCreditControlMessage(client, message))
   }
 
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
   private def updateQuota(bytes: Long): Unit = synchronized {
+    if (!backpressureEnabled) return
     remainingBytesQuota -= bytes
-    val autoRead = remainingBytesQuota > 0
-    if (channel.config.isAutoRead != autoRead) {
-      channel.config.setAutoRead(autoRead)
-      if (autoRead) {
-        channel.read()
-      } else {
-        autoReadDisabledTimestamp = System.nanoTime()
+    if (perStreamAutoReadEnabled) {
+      val autoRead = remainingBytesQuota > 0
+      if (channel.config.isAutoRead != autoRead) {
+        channel.config.setAutoRead(autoRead)
+        if (autoRead) {
+          channel.read()
+        }
       }
     }
+  }
+
+  private def availableReceiveBytes: Long = synchronized {
+    math.max(0L, math.min(byteLimit, remainingBytesQuota))
+  }
+
+  protected def sendCumulativeCreditAck(
+      client: TransportClient,
+      releasedBytes: Long): Unit = {
+    val sender = multiplexedCreditSender
+    if (!perStreamAutoReadEnabled && sender != null) {
+      sender(client, this)
+    } else {
+      val message = new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, 0)
+      message.setSeqNum(releasedBytes)
+      sendCreditControlMessage(client, message)
+    }
+  }
+
+  protected def sendCreditControlMessage(client: TransportClient, credit: Int): Unit = {
+    sendCreditControlMessage(
+      client, new CreditControlMessage(shuffleId, shuffleWriterId, shuffleReaderId, credit))
   }
 
   private def sendCreditControlMessage(
       client: TransportClient,
-      shuffleWriterId: Int,
-      credit: Int
-  ): Unit = {
-    var buf: CompositeByteBuf = null
+      creditControlMessage: CreditControlMessage): Unit = {
     try {
-      val creditControlMessage = new CreditControlMessage(shuffleWriterId, shuffleReaderId, credit)
-      buf = client.getChannel().alloc().compositeBuffer()
-        .capacity(creditControlMessage.headerLength())
-      creditControlMessage.encode(buf)
-
-      // send() will release the buffer, so retain to avoid double free in finally clause
-      client
-        .send(buf.retain())
+      StreamingShuffleUtils.sendControlMessages(client, Seq(creditControlMessage))
         .addListener(
-          getResponseHandler(buf,
-            s"Error sending credit control message to shuffle writer ${shuffleWriterId}"))
+          getResponseHandler(
+            s"Error sending credit control message to shuffle writer ${shuffleWriterId}",
+            isExpectedFailure = ex => terminationAckFailureIsExpected(ex, client)))
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler sendCreditControlMessage failed", ex)
         errorNotifier.markError(ex)
-    } finally {
-      if (buf != null) {
-        buf.release()
-      }
     }
   }
 
   protected def sendTerminationAckMessage(client: TransportClient, shuffleWriterId: Int): Unit = {
-    var buf: CompositeByteBuf = null
     try {
-      val terminationAckMessage = new TerminationAckMessage(shuffleWriterId, shuffleReaderId)
+      val terminationAckMessage =
+        new TerminationAckMessage(shuffleId, shuffleWriterId, shuffleReaderId)
       terminationAckMessage.setSeqNum(lastSeqNum)
-      buf = client.getChannel().alloc().compositeBuffer()
-        .capacity(terminationAckMessage.headerLength())
-      terminationAckMessage.encode(buf)
-
-      // send() will release the buffer, so retain to avoid double free in finally clause
-      client
-        .send(buf.retain())
+      StreamingShuffleUtils.sendControlMessages(client, Seq(terminationAckMessage))
         .addListener(
           getResponseHandler(
-            buf,
             s"Error sending termination acknowledgment to shuffle writer ${shuffleWriterId}",
-            () => { onTermAckResponse(shuffleWriterId) }
+            () => { onTermAckResponse(shuffleWriterId) },
+            ex => terminationAckFailureIsExpected(ex, client)
           )
         )
     } catch {
       case (ex: Throwable) =>
-        logError(log"Streaming shuffle client handler sendTerminationAckMessage failed", ex)
-        errorNotifier.markError(ex)
-    } finally {
-      if (buf != null) {
-        buf.release()
-      }
+        if (terminationAckFailureIsExpected(ex, client)) {
+          logWarning(log"Ignoring termination acknowledgment failure after the writer " +
+            log"has already closed its endpoint for shuffle writer ${MDC(
+              LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}", ex)
+        } else {
+          logError(log"Streaming shuffle client handler sendTerminationAckMessage failed", ex)
+          errorNotifier.markError(ex)
+        }
     }
   }
 
@@ -166,42 +305,164 @@ class StreamingShuffleClientHandler(
       client: TransportClient,
       message: ByteBuffer,
       callback: RpcResponseCallback): Unit = {
-    // The underlying message gets freed after the call to receive, so we need to copy
-    // the underlying data.
-    //
-    // TODO: in the future, the TransportRequestHandler can be modified to
-    //  not free the underlying data.
-    var buf: ByteBuf = null
+    receiveMessage(client, message)
+  }
+
+  override def receive(client: TransportClient, message: ManagedBuffer): Unit = {
+    val body = message.convertToNetty().asInstanceOf[ByteBuf]
     try {
-      buf = Unpooled.wrappedBuffer(message).copy()
-      val shuffleMessage = StreamingShuffleMessage.decode(buf)
-      updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
-      // At this point, the message type has been read, so the decoders will read the (optional)
-      // length int, followed by the actual content.
-      shuffleMessage match {
-        case dataMessage: DataMessage =>
-          val messageSize = buf.capacity()
-          updateQuota(messageSize)
-          dataMessage.setReleaseCallback(() => updateQuota(-messageSize))
-          // we can only release the buf after we have decoded all the rows in the buffer
-          sendCreditControlMessage(client, dataMessage.shuffleWriterId, 1)
-        case controlMessage: TerminationControlMessage =>
-          // Record termination before sending the ack: the writer only closes its connection
-          // after it receives this ack, so setting the flag here guarantees it is visible before
-          // the resulting channelInactive fires, avoiding a false "premature disconnect" error.
-          terminationReceived = true
-          sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
-        case _ =>
-          throw new IllegalArgumentException(s"Unexpected message type in ShuffleClientHandler: " +
-            s"${shuffleMessage.messageType()}");
+      receiveMessage(client, body, Some(message))
+    } finally {
+      body.release()
+    }
+  }
+
+  /** Reuses the ByteBuf already inspected by the executor-level multiplexing router. */
+  private[streaming] def receiveMultiplexed(
+      client: TransportClient,
+      message: ByteBuf,
+      managedBody: ManagedBuffer): Unit = {
+    receiveMessage(client, message, Some(managedBody))
+  }
+
+  private def receiveMessage(client: TransportClient, message: ByteBuffer): Unit = {
+    val buf = Unpooled.wrappedBuffer(message).copy()
+    receiveMessage(client, buf, managedBody = None)
+  }
+
+  /**
+   * Decode directly from the Netty body.  The shared-connection path can pass a composite buffer;
+   * converting it to a ByteBuffer first may merge all components into a new contiguous allocation.
+   * The handler only needs indexed reads and slices, so keep the body in its original zero-copy
+   * representation and retain it only for data messages that outlive this callback.
+   */
+  private def receiveMessage(
+      client: TransportClient,
+      message: ByteBuf,
+      managedBody: Option[ManagedBuffer]): Unit = {
+    var buf: ByteBuf = null
+    var shuffleMessage: StreamingShuffleMessage = null
+    val decodedMessages = new ArrayBuffer[StreamingShuffleMessage]()
+    val pendingTerminationAcks = new ArrayBuffer[Int]()
+    var publishedMessage = false
+    // Both queue modes acknowledge only after ownership has transferred to the consumer.
+    def messagesPublished(): Unit = {
+      publishedMessage = true
+      pendingTerminationAcks.foreach(sendTerminationAckMessage(client, _))
+      pendingTerminationAcks.clear()
+    }
+    try {
+      // TransportRequestHandler owns the incoming ManagedBuffer only until receive() returns.
+      // DataMessage processing is asynchronous, so retain that buffer and release it with the
+      // decoded message. The direct ByteBuffer entry point has already made its private copy.
+      buf = message.duplicate()
+      while (buf.isReadable) {
+        val messageSize = StreamingShuffleUtils.frameLength(buf)
+        val frame = buf.readSlice(messageSize)
+        shuffleMessage = StreamingShuffleMessage.decode(frame)
+        // End-of-stream is a reliable control frame. A writer may retransmit it until its ACK is
+        // observed, including when the first terminal write and the ACK cross during executor
+        // teardown. Accept only the exact terminal sequence already seen; data and every other
+        // duplicate remain sequence errors. The duplicate is ACKed again but is not published to
+        // the task queue, preserving exactly-once end-of-stream for the iterator.
+        val duplicateTermination = shuffleMessage match {
+          case _: TerminationControlMessage =>
+            terminationReceived && shuffleMessage.getSeqNum == lastSeqNum
+          case _ => false
+        }
+        val duplicateReplayData = shuffleMessage match {
+          case _: DataMessage =>
+            replayRepairActive.get() && shuffleMessage.getSeqNum <= lastSeqNum
+          case _ => false
+        }
+        if (!duplicateTermination && !duplicateReplayData) {
+          updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
+        }
+        shuffleMessage match {
+          case _: DataMessage if duplicateReplayData =>
+            // The writer charged this retransmission to the logical receive window. Drop the
+            // already-published record bytes, but advance the cumulative released-byte watermark
+            // so replay cannot consume credit permanently.
+            if (backpressureEnabled) {
+              if (perStreamAutoReadEnabled) {
+                sendCreditControlMessage(client, messageSize)
+              } else {
+                val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                sendCumulativeCreditAck(client, released)
+              }
+            }
+          case dataMessage: DataMessage =>
+            updateQuota(messageSize)
+            val retainedBody = managedBody.map(_.retain())
+            dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
+            dataMessage.setReleaseCallback(() => {
+              updateQuota(-messageSize)
+              if (backpressureEnabled && !terminationReceived) {
+                if (perStreamAutoReadEnabled) {
+                  // Dedicated channels retain the original additive-credit protocol; their
+                  // channel-level autoRead is the primary admission boundary.
+                  sendCreditControlMessage(
+                    client,
+                    math.min(messageSize.toLong, Int.MaxValue.toLong).toInt)
+                } else {
+                  val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+                  sendCumulativeCreditAck(client, released)
+                }
+              }
+            })
+            // We can only release the frame after all rows in the buffer have been decoded. The
+            // release callback returns the exact encoded frame size to the writer, so a shared
+            // physical channel cannot continue filling this logical route while its queue is
+            // waiting behind another sibling input.
+          case controlMessage: TerminationControlMessage =>
+            // Record receipt before publishing so a connection close cannot be mistaken for a
+            // premature disconnect. Do not ACK a new terminal until it is safely visible in the
+            // reader queue: the writer may release this route as soon as the ACK arrives.
+            terminationReceived = true
+            if (duplicateTermination) {
+              // The original terminal was published before its ACK. A retransmission only means
+              // that ACK was lost, so acknowledge it again without adding a duplicate terminal.
+              sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+            } else {
+              pendingTerminationAcks += controlMessage.shuffleWriterId
+            }
+          case _ =>
+            throw new IllegalArgumentException(
+              s"Unexpected message type in ShuffleClientHandler: ${shuffleMessage.messageType()}")
+        }
+        if (duplicateTermination || duplicateReplayData) {
+          shuffleMessage.release()
+        } else if (batchQueue.isDefined) {
+          decodedMessages += shuffleMessage
+        } else {
+          // Preserve the original streaming behavior when batching is disabled: publish each
+          // decoded frame immediately so a reader can start consuming before this body is fully
+          // parsed.
+          queue.put(shuffleMessage)
+          messagesPublished()
+        }
+        shuffleMessage = null
       }
-      queue.put(shuffleMessage)
+      batchQueue.foreach { batched =>
+        if (decodedMessages.nonEmpty) {
+          batched.putBatch(decodedMessages.toArray)
+          decodedMessages.clear()
+          messagesPublished()
+        }
+      }
+      if (publishedMessage) {
+        onMessageAvailable()
+      }
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)
         errorNotifier.markError(ex)
     } finally {
-      if (buf != null) {
+      if (shuffleMessage != null) {
+        shuffleMessage.release()
+      }
+      decodedMessages.foreach(_.release())
+      if (buf != null && managedBody.isEmpty) {
         // If any StreamingShuffleMessage needs buf, then it would have retained it.
         buf.release()
       }
@@ -214,16 +475,31 @@ class StreamingShuffleClientHandler(
     // flag is still false means the writer disconnected before terminating -- e.g. the writer
     // task failed, its executor was lost, or the network dropped. Surface it through the shared
     // ErrorNotifier so the reader task fails instead of polling the message queue forever.
-    if (!terminationReceived) {
+    val consumerIsActive = context == null ||
+      (!context.isInterrupted() && !context.isFailed() && !context.isCompleted())
+    if (!terminationReceived && consumerIsActive) {
       errorNotifier.markError(new SparkException(
         s"Connection to streaming shuffle writer ${shuffleWriterId} closed before termination; " +
           "the writer task likely failed."))
+    } else if (!terminationReceived) {
+      logDebug(
+        s"Ignoring streaming shuffle connection close after reader task cancellation for " +
+          s"writer $shuffleWriterId")
     }
   }
 
   override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
-    logError(log"Streaming shuffle client handler caught exception.", cause)
-    errorNotifier.markError(cause)
+    // The writer closes its endpoint after receiving the termination ACK. Depending on which side
+    // wins the TCP close race, Netty can report that close as a reset/broken-pipe exception rather
+    // than a clean channelInactive. The termination frame has already proved that this route was
+    // drained, so do not turn the expected close into a fatal reader error (which would cancel all
+    // downstream writers in a pipelined group).
+    if (terminationAckFailureIsExpected(cause, client)) {
+      logDebug(log"Ignoring expected streaming shuffle connection close after termination.", cause)
+    } else {
+      logError(log"Streaming shuffle client handler caught exception.", cause)
+      errorNotifier.markError(cause)
+    }
   }
 
 
@@ -233,9 +509,9 @@ class StreamingShuffleClientHandler(
   override def getStreamManager: StreamManager = null
 
   private def getResponseHandler(
-      buf: ByteBuf,
       errorMsg: String,
-      onSuccessFunc: () => Unit = () => {})
+      onSuccessFunc: () => Unit = () => {},
+      isExpectedFailure: Throwable => Boolean = _ => false)
       : GenericFutureListener[io.netty.util.concurrent.Future[Void]] = {
     new GenericFutureListener[io.netty.util.concurrent.Future[Void]]() {
 
@@ -247,8 +523,13 @@ class StreamingShuffleClientHandler(
           // The code in listener will be executed by another thread, so we need to
           // bubble up the error here
           case (ex: Throwable) =>
-            logError(errorMsg, ex)
-            errorNotifier.markError(ex)
+            if (isExpectedFailure(ex)) {
+              logWarning(log"Ignoring expected streaming shuffle send failure: ${MDC(
+                LogKeys.MESSAGE, errorMsg)}", ex)
+            } else {
+              logError(errorMsg, ex)
+              errorNotifier.markError(ex)
+            }
         }
       }
     }
@@ -259,6 +540,20 @@ class StreamingShuffleClientHandler(
       throw new RuntimeException(
         s"${errorMsg}: ${future.cause().getMessage()}"
       )
+    }
+  }
+
+  private def terminationAckFailureIsExpected(
+      ex: Throwable,
+      client: TransportClient): Boolean = {
+    // A credit may already be queued when the writer receives our termination ACK and closes its
+    // endpoint. Netty can complete that queued write after the close, before channelInactive has
+    // been dispatched to this handler. Treat that write failure as expected only when the channel
+    // is actually closed; channelInactive still reports a genuine pre-termination disconnect.
+    if (!terminationReceived && client.getChannel.isActive) {
+      false
+    } else {
+      StreamingShuffleUtils.isConnectionClose(ex)
     }
   }
 }

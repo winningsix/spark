@@ -51,6 +51,7 @@ import io.netty.buffer.CompositeByteBuf;
 public abstract sealed class StreamingShuffleMessage
   permits CreditControlMessage, DataMessage, TerminationAckMessage, TerminationControlMessage {
   protected ByteBuf ownedBuf = null;
+  private Runnable resourceReleaseCallback = null;
   private Runnable releaseCallback = null;
 
   // To prevent any duplicate/out of order/missing messages, each writer will track the current
@@ -107,6 +108,34 @@ public abstract sealed class StreamingShuffleMessage
     this.releaseCallback = releaseCallback;
   }
 
+  /** Registers cleanup for payload ownership that may end before downstream consumption. */
+  public void setResourceReleaseCallback(Runnable resourceReleaseCallback) {
+    this.resourceReleaseCallback = resourceReleaseCallback;
+  }
+
+  /** Transfers the consumer-release callback to another owner. */
+  public Runnable takeReleaseCallback() {
+    Runnable callback = releaseCallback;
+    releaseCallback = null;
+    return callback;
+  }
+
+  /** Releases payload resources without signalling downstream consumption. */
+  public void releaseOwnedResources() {
+    try {
+      if (ownedBuf != null) {
+        ownedBuf.release();
+        ownedBuf = null;
+      }
+    } finally {
+      if (resourceReleaseCallback != null) {
+        Runnable callback = resourceReleaseCallback;
+        resourceReleaseCallback = null;
+        callback.run();
+      }
+    }
+  }
+
   /**
    * Releases any resources associated with this message.
    * In VERY RARE cases when the task fails unexpectedly, this method may be called twice.
@@ -114,13 +143,14 @@ public abstract sealed class StreamingShuffleMessage
    * NOT thread-safe.
    */
   public void release() {
-    if (ownedBuf != null) {
-      ownedBuf.release();
-      ownedBuf = null;
-    }
-    if (releaseCallback != null) {
-      releaseCallback.run();
-      releaseCallback = null;
+    try {
+      releaseOwnedResources();
+    } finally {
+      if (releaseCallback != null) {
+        Runnable callback = releaseCallback;
+        releaseCallback = null;
+        callback.run();
+      }
     }
   }
 

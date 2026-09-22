@@ -339,12 +339,14 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       list: ArrayBuffer[Int],
-      speculative: Boolean = false): Option[Int] = {
+      speculative: Boolean = false,
+      taskIndexAllowed: Int => Boolean = _ => true): Option[Int] = {
     var indexOffset = list.size
     while (indexOffset > 0) {
       indexOffset -= 1
       val index = list(indexOffset)
-      if (!isTaskExcludededOnExecOrNode(index, execId, host) &&
+      if (taskIndexAllowed(index) &&
+          !isTaskExcludededOnExecOrNode(index, execId, host) &&
           !(speculative && hasAttemptOnHost(index, host))) {
         // This should almost always be list.trimEnd(1) to remove tail
         list.remove(indexOffset)
@@ -383,11 +385,12 @@ private[spark] class TaskSetManager(
   private def dequeueTask(
       execId: String,
       host: String,
-      maxLocality: TaskLocality.Value): Option[(Int, TaskLocality.Value, Boolean)] = {
+      maxLocality: TaskLocality.Value,
+      taskIndexAllowed: Int => Boolean): Option[(Int, TaskLocality.Value, Boolean)] = {
     // Tries to schedule a regular task first; if it returns None, then schedules
     // a speculative task
-    dequeueTaskHelper(execId, host, maxLocality, false).orElse(
-      dequeueTaskHelper(execId, host, maxLocality, true))
+    dequeueTaskHelper(execId, host, maxLocality, false, taskIndexAllowed).orElse(
+      dequeueTaskHelper(execId, host, maxLocality, true, taskIndexAllowed))
   }
 
   protected def dequeueTaskHelper(
@@ -395,12 +398,21 @@ private[spark] class TaskSetManager(
       host: String,
       maxLocality: TaskLocality.Value,
       speculative: Boolean): Option[(Int, TaskLocality.Value, Boolean)] = {
+    dequeueTaskHelper(execId, host, maxLocality, speculative, _ => true)
+  }
+
+  protected def dequeueTaskHelper(
+      execId: String,
+      host: String,
+      maxLocality: TaskLocality.Value,
+      speculative: Boolean,
+      taskIndexAllowed: Int => Boolean): Option[(Int, TaskLocality.Value, Boolean)] = {
     if (speculative && speculatableTasks.isEmpty) {
       return None
     }
     val pendingTaskSetToUse = if (speculative) pendingSpeculatableTasks else pendingTasks
     def dequeue(list: ArrayBuffer[Int]): Option[Int] = {
-      val task = dequeueTaskFromList(execId, host, list, speculative)
+      val task = dequeueTaskFromList(execId, host, list, speculative, taskIndexAllowed)
       if (speculative && task.isDefined) {
         speculatableTasks -= task.get
       }
@@ -441,6 +453,11 @@ private[spark] class TaskSetManager(
     None
   }
 
+  private[scheduler] def isTaskPendingForOffer(index: Int): Boolean = {
+    index >= 0 && index < numTasks && !successful(index) && copiesRunning(index) == 0 &&
+      !barrierPendingLaunchTasks.contains(index)
+  }
+
   private[scheduler] def resetDelayScheduleTimer(
       minLocality: Option[TaskLocality.TaskLocality]): Unit = {
     lastLocalityWaitResetTime = clock.getTimeMillis()
@@ -473,7 +490,8 @@ private[spark] class TaskSetManager(
       host: String,
       maxLocality: TaskLocality.TaskLocality,
       taskCpus: BigDecimal = sched.CPUS_PER_TASK,
-      taskResourceAssignments: Map[String, Map[String, Long]] = Map.empty)
+      taskResourceAssignments: Map[String, Map[String, Long]] = Map.empty,
+      taskIndexAllowed: Int => Boolean = _ => true)
     : (Option[TaskDescription], Boolean, Int) =
   {
     val offerExcluded = taskSetExcludelistHelperOpt.exists { excludeList =>
@@ -495,7 +513,7 @@ private[spark] class TaskSetManager(
 
       var dequeuedTaskIndex: Option[Int] = None
       val taskDescription =
-        dequeueTask(execId, host, allowedLocality)
+        dequeueTask(execId, host, allowedLocality, taskIndexAllowed)
           .map { case (index, taskLocality, speculative) =>
             dequeuedTaskIndex = Some(index)
             if (legacyLocalityWaitReset && maxLocality != TaskLocality.NO_PREF) {

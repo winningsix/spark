@@ -39,6 +39,43 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
   private def withPipelinedSession(body: SparkSession => Unit): Unit =
     withPipelinedSession("pipelined-shuffle-sql", aqe = false)(body)
 
+  private def withDistributedPipelinedSession(
+      adaptive: Boolean = true,
+      networkBufferWaitMs: Long = 50,
+      taskCpus: String = "1")(body: SparkSession => Unit): Unit = {
+    SparkSession.getActiveSession.orElse(SparkSession.getDefaultSession).foreach(_.stop())
+    SparkSession.clearActiveSession()
+    SparkSession.clearDefaultSession()
+    val spark = SparkSession.builder()
+      .master("local-cluster[2,2,1024]")
+      .appName("distributed-pipelined-shuffle-sql")
+      .config("spark.shuffle.manager.incremental",
+        "org.apache.spark.shuffle.streaming.StreamingShuffleManager")
+      .config("spark.shuffle.streaming.executorReceiveService.enabled", "true")
+      .config("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
+      .config("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
+      .config("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
+      .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
+      .config("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
+      .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
+      .config("spark.shuffle.streaming.networkBufferMaxWaitTimeMs", networkBufferWaitMs.toString)
+      .config("spark.task.cpus", taskCpus)
+      .config("spark.sql.adaptive.enabled", adaptive.toString)
+      .config("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled", "true")
+      .config("spark.sql.shuffle.distributedPipelined.enabled", "true")
+      .config("spark.sql.shuffle.partitions", "2")
+      .config("spark.speculation", "false")
+      .config("spark.ui.enabled", "false")
+      .getOrCreate()
+    try {
+      body(spark)
+    } finally {
+      spark.stop()
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+    }
+  }
+
   test("batch repartition($k) runs end-to-end through the pipelined channel shuffle") {
     withPipelinedSession { spark =>
       import spark.implicits._
@@ -148,6 +185,93 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("distributed prepared receive replays hash input for a range exchange") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
+        .groupBy($"k").count().orderBy($"k")
+
+      val rows = df.as[(Long, Long)].collect().toSeq
+      val expected = (0L until 1000L).groupBy(_ % 7).map { case (key, values) =>
+        (key, values.size.toLong)
+      }.toSeq.sortBy(_._1)
+      val exchanges = collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined))
+      assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows === expected)
+    }
+  }
+
+  test("distributed range replay uses one sampling pass for skewed hash input") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      import org.apache.spark.sql.functions.{hash, lit, pmod}
+
+      // Keep only keys assigned to one of four hash reducers. With 100k distinct groups this
+      // makes RangePartitioner's ordinary sampling path classify that reducer as imbalanced and
+      // launch a second sampling job. A pipelined input instead uses its first-pass reservoir so
+      // the stream has a fixed two-consumer contract: range sampling, then the range exchange.
+      val df = spark.range(0, 100000, 1, 4)
+        .withColumn("k", $"id" % 100000)
+        .filter(pmod(hash($"k"), lit(4)) === 0)
+        .groupBy($"k").count()
+        .orderBy($"k")
+
+      val rows = df.as[(Long, Long)].collect().toSeq
+      val exchanges = collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined),
+        s"expected pipelined hash and range exchanges; plan:\n${df.queryExecution.executedPlan}")
+      assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows.nonEmpty)
+      assert(rows.map(_._1) === rows.map(_._1).sorted)
+      assert(rows.forall(_._2 == 1L))
+    }
+  }
+
+  test("distributed prepared receive multicasts a reused shuffle") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      val aggregated = spark.range(0, 1000, 1, 2)
+        .withColumn("k", ($"id" % 17))
+        .groupBy($"k").count()
+      val left = aggregated.select($"k".as("lk"), $"count".as("lc"))
+      val right = aggregated.select($"k".as("rk"), $"count".as("rc"))
+      val joined = left.join(right, $"lk" === $"rk").select($"lk", $"lc", $"rc")
+      val result = joined.as[(Long, Long, Long)]
+      val rows = result.collect().toSeq.sortBy(_._1)
+      val plan = result.queryExecution.executedPlan
+      val reusedShuffles = collect(plan) {
+        case reused @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => reused
+      }
+      val visibleShuffles = collect(plan) { case exchange: ShuffleExchangeExec => exchange }
+
+      assert(reusedShuffles.nonEmpty, s"expected shuffle exchange reuse; plan:\n$plan")
+      assert(visibleShuffles.nonEmpty && visibleShuffles.forall(_.pipelined),
+        s"every visible shuffle must be pipelined; plan:\n$plan")
+      assert(reusedShuffles.forall(
+        _.child.asInstanceOf[ShuffleExchangeExec].pipelined),
+        s"every reused shuffle must point at a pipelined exchange; plan:\n$plan")
+      assert(reusedShuffles.forall(reused => visibleShuffles.exists(_ eq reused.child)),
+        "the original and reused branches must share the same exchange instance; " +
+          s"directIds=${visibleShuffles.map(_.id)}, " +
+          s"reusedChildIds=${reusedShuffles.map(_.child.id)}; plan:\n$plan")
+
+      val expected = (0L until 1000L).groupBy(_ % 17).map { case (key, values) =>
+        (key, values.size.toLong, values.size.toLong)
+      }.toSeq.sortBy(_._1)
+      assert(rows === expected)
+    }
+  }
+
   test("sort-merge join (both sides hash-exchanged) is all-pipelined and correct") {
     // A shuffled join is the last TPC-DS transport shape not yet covered: both join inputs
     // get a hash ShuffleExchangeExec. Disable broadcast so the join is a SortMergeJoin with
@@ -176,6 +300,123 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       val r = (0L until 120L).map(i => (i % 6, i))
       val expected = (for ((lk, lv) <- l; (rk, rv) <- r if lk == rk) yield (lk, lv, rv)).toSet
       assert(rows.toSet === expected)
+    }
+  }
+
+  test("distributed shuffled hash join materializes build and pipelines probe") {
+    withDistributedPipelinedSession() { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      spark.conf.set("spark.sql.join.forceApplyShuffledHashJoin", "true")
+      val left = spark.range(0, 200, 1, 2).withColumn("k", $"id" % 10)
+      val right = spark.range(0, 120, 1, 2).withColumn("k", $"id" % 6)
+      val joined = left.join(right, "k")
+
+      assert(joined.count() === 2400L)
+      val exchanges = collect(joined.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+      assert(exchanges.count(_.pipelined) === 1,
+        s"the probe exchange must be pipelined; plan:\n${joined.queryExecution.executedPlan}")
+      assert(exchanges.count(exchange => !exchange.pipelined) === 1,
+        s"the build exchange must be regular; plan:\n${joined.queryExecution.executedPlan}")
+    }
+  }
+
+  for (adaptive <- Seq(false, true); emptyBuild <- Seq(false, true)) {
+    test(s"prepared receive pipelines nested probes AQE=$adaptive emptyBuild=$emptyBuild") {
+      // The compact transport uses one task CPU charge for readers and producers. Leave
+      // producer capacity beside four resident readers on the four-slot local cluster.
+      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+        import spark.implicits._
+        spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        spark.conf.set("spark.sql.shuffle.partitions", "4")
+        // Different join keys force an exchange between the joins, matching a general
+        // dimension/fact chain. More input tasks than executor slots exercises admission.
+        // Duplicate customer keys verify full join multiplicity, not just a top-N result.
+        val customers = spark.range(0, 12, 1, 6)
+          .filter(if (emptyBuild) $"id" < 0 else $"id" >= 0)
+          .select(($"id" % 3).as("customerKey"))
+          .hint("SHUFFLE_HASH")
+        val orders = spark.range(0, 20000, 1, 8)
+          .select($"id".as("orderKey"), ($"id" % 5).as("orderCustomer"))
+        val first = customers.join(orders, $"customerKey" === $"orderCustomer")
+          .select($"orderKey").hint("SHUFFLE_HASH")
+        val lines = spark.range(0, 40000, 1, 10).select(($"id" / 2).cast("long").as("lineKey"))
+        val joined = first.join(lines, $"orderKey" === $"lineKey").select($"orderKey")
+        val actual = joined.as[Long].collect().toSeq.sorted
+        val expected = if (emptyBuild) Seq.empty[Long] else {
+          (0L until 20000L).filter(_ % 5 < 3).flatMap(k => Seq.fill(8)(k))
+        }
+        assert(actual === expected)
+        val exchanges = collect(joined.queryExecution.executedPlan) {
+          case exchange: ShuffleExchangeExec => exchange
+        }.groupBy(_.pipelinedReuseKey).values.map(_.head).toSeq
+        assert(exchanges.size === 4)
+        assert(exchanges.count(_.pipelined) === 2,
+          s"both probe exchanges must pipeline: ${joined.queryExecution.executedPlan}")
+        assert(exchanges.count(!_.pipelined) === 2,
+          "both immediate build boundaries must remain durable")
+      }
+    }
+  }
+
+  for (adaptive <- Seq(false, true)) {
+    test(s"prepared receive nested probes preserve Q3 results against BSP AQE=$adaptive") {
+      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+        spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
+        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+        spark.conf.set("spark.sql.shuffle.partitions", "4")
+        spark.range(0, 96, 1, 6).selectExpr(
+          "id as c_custkey",
+          "if(id % 3 = 0, 'BUILDING', 'OTHER') as c_mktsegment")
+          .createOrReplaceTempView("customer")
+        spark.range(0, 20000, 1, 8).selectExpr(
+          "id as o_orderkey", "id % 96 as o_custkey",
+          "date_add(date '1995-03-01', cast(id % 30 as int)) as o_orderdate",
+          "cast(id % 5 as int) as o_shippriority")
+          .createOrReplaceTempView("orders")
+        spark.range(0, 40000, 1, 10).selectExpr(
+          "cast(id / 2 as long) as l_orderkey",
+          "cast(id + 100 as decimal(15, 2)) as l_extendedprice",
+          "cast(0.05 as decimal(15, 2)) as l_discount",
+          "date_add(date '1995-03-10', cast(id % 20 as int)) as l_shipdate")
+          .createOrReplaceTempView("lineitem")
+        // Same join hints, predicates, aggregation, and top-N as the AWS Q3 workload.
+        // Compare the complete aggregate too, so LIMIT cannot hide missing lower-ranked rows.
+        val query = """
+          |select /*+ SHUFFLE_HASH(co) */
+          |  l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue,
+          |  o_orderdate, o_shippriority
+          |from (
+          |  select /*+ SHUFFLE_HASH(c) */ o_orderkey, o_orderdate, o_shippriority
+          |  from customer c join orders o on c_custkey = o_custkey
+          |  where c_mktsegment = 'BUILDING' and o_orderdate < date '1995-03-15'
+          |) co join lineitem l on l_orderkey = o_orderkey
+          |where l_shipdate > date '1995-03-15'
+          |group by l_orderkey, o_orderdate, o_shippriority
+          |order by revenue desc, o_orderdate
+          |""".stripMargin
+        for (suffix <- Seq("", " limit 10")) {
+          spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "false")
+          val bsp = spark.sql(query + suffix).collect().toSeq
+          assert(bsp.nonEmpty)
+          spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "true")
+          val rtm = spark.sql(query + suffix)
+          assert(rtm.collect().toSeq === bsp)
+          val exchanges = collect(rtm.queryExecution.executedPlan) {
+            case exchange: ShuffleExchangeExec => exchange
+          }.groupBy(_.pipelinedReuseKey).values.map(_.head).toSeq
+          // Sorting the complete result adds a range exchange; Q3's top-N does not.
+          val rangeExchanges = exchanges.filter(_.outputPartitioning.isInstanceOf[
+            org.apache.spark.sql.catalyst.plans.physical.RangePartitioning])
+          assert(rangeExchanges.size === (if (suffix.isEmpty) 1 else 0))
+          assert(rangeExchanges.forall(_.pipelined))
+          assert(exchanges.count(_.pipelined) === 2 + rangeExchanges.size)
+          assert(exchanges.count(!_.pipelined) === 2)
+        }
+      }
     }
   }
 
@@ -556,6 +797,38 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       // 142.86) and key 6 has 142.
       assert(df.collect().length === 6)
       assert(df2.collect().length === 6)
+    }
+  }
+
+  test("distributed prepared receive replays an exchange reused by a scalar subquery") {
+    // The scalar subquery executes as an earlier Spark job. Its grouping exchange is also used by
+    // the outer query, so the first generation must remain replayable after the subquery finishes.
+    // This is the same sequential reuse shape as TPC-H Q11.
+    withDistributedPipelinedSession(adaptive = false) { spark =>
+      import spark.implicits._
+      spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7)).createOrReplaceTempView("t")
+
+      val df = spark.sql("""
+        SELECT k, COUNT(*) AS c FROM t GROUP BY k
+        HAVING COUNT(*) > (SELECT AVG(c2) FROM (SELECT COUNT(*) AS c2 FROM t GROUP BY k) s)
+      """)
+      // Execute first so AQE has installed the final plan and its reuse nodes.
+      val rows = df.collect()
+      val plan = df.queryExecution.executedPlan
+      val reused = collectWithSubqueries(plan) {
+        case r @ ReusedExchangeExec(_, _: ShuffleExchangeExec) => r
+      }
+      val directShuffles = collectWithSubqueries(plan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+      assert(reused.nonEmpty, s"expected cross-subquery shuffle reuse; plan:\n$plan")
+      assert(directShuffles.nonEmpty && directShuffles.forall(_.pipelined),
+        s"every direct shuffle must be pipelined; plan:\n$plan")
+      assert(reused.forall(_.child.asInstanceOf[ShuffleExchangeExec].pipelined),
+        s"every reused shuffle must point at a pipelined exchange; plan:\n$plan")
+
+      // 1000 = 7*142 + 6, so keys 0..5 have 143 rows (> average 142.86).
+      assert(rows.length === 6)
     }
   }
 

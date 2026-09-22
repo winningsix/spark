@@ -650,7 +650,8 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
     // Cache hits bypass shuffle readers. Materialize caches with regular shuffles so a
     // partially evicted cache can recompute only its missing partitions safely.
     var disableConfigs = Seq(
-      SQLConf.AUTO_BUCKETED_SCAN_ENABLED, SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED)
+      SQLConf.AUTO_BUCKETED_SCAN_ENABLED, SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED,
+      SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)
     if (!session.sessionState.conf.getConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING)) {
       // Allowing changing cached plan output partitioning might lead to regression as it introduces
       // extra shuffle

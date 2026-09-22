@@ -1286,6 +1286,39 @@ object SQLConf {
     .booleanConf
     .createWithDefault(false)
 
+  val DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED =
+    buildConf("spark.sql.shuffle.distributedPipelined.enabled")
+      .internal()
+      .doc("When true, eligible batch exchanges use a distributed pipelined shuffle manager. " +
+        "Independent of the local channel opt-in. Experimental; disabled by default.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED =
+    buildConf("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled")
+      .internal()
+      .doc("When true, AQE marks every safe visible shuffle exchange pipelined before creating " +
+        "query stages. This preserves the selected physical operators but deliberately gives up " +
+        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs with " +
+        "the same join and partitioning configuration.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED =
+    buildConf("spark.sql.shuffle.pipelined.nestedProbe.enabled")
+      .internal()
+      .doc("When true, keep the immediate build exchanges of shuffled hash joins regular, " +
+        "but allow probe exchanges below those boundaries to pipeline. Requires a transport " +
+        "supporting unmaterialized regular boundaries. Experimental; disabled by default.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   val ADAPTIVE_EXECUTION_ENABLED_IN_STATELESS_STREAMING =
     buildConf("spark.sql.adaptive.streaming.stateless.enabled")
       .internal()
@@ -9031,6 +9064,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
 
   def localPipelinedShuffleEnabled: Boolean = getConf(LOCAL_PIPELINED_SHUFFLE_ENABLED)
+
+  def pipelinedShuffleFullPlanAQEEnabled: Boolean =
+    getConf(PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED)
 
   def adaptiveExecutionEnabledInStatelessStreaming: Boolean =
     getConf(ADAPTIVE_EXECUTION_ENABLED_IN_STATELESS_STREAMING)

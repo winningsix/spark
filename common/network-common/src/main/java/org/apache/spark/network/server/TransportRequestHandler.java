@@ -280,7 +280,7 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
 
   private void processOneWayMessage(OneWayMessage req) {
     try {
-      rpcHandler.receive(reverseClient, req.body().nioByteBuffer());
+      rpcHandler.receive(reverseClient, req.body());
     } catch (Exception e) {
       logger.error("Error while invoking RpcHandler#receive() for one-way message from {}.", e,
         MDC.of(LogKeys.HOST_PORT, getRemoteAddress(channel)));

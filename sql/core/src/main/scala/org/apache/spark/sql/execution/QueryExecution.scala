@@ -422,13 +422,13 @@ class QueryExecution(
       case q: QueryStageExec => hasShuffle(q.plan)
       case other => other.children.exists(hasShuffle)
     }
-    if (!sparkSession.sessionState.conf.localPipelinedShuffleEnabled ||
-        !PipelinedShuffleEligibility.enabled(executedPlan, sparkSession.sessionState.conf) ||
+    if (!PipelinedShuffleEligibility.enabled(executedPlan, sparkSession.sessionState.conf) ||
         !hasShuffle(executedPlan)) {
       this
     } else {
       val session = SparkSession.getOrCloneSessionWithConfigsOff(
-        sparkSession, Seq(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED))
+        sparkSession, Seq(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED,
+          SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED))
       new QueryExecution(session, commandExecuted, mode = mode,
         shuffleCleanupModeOpt = shuffleCleanupModeOpt,
         refreshPhaseEnabled = refreshPhaseEnabled, analyzerOpt = Some(analyzer))
@@ -858,8 +858,8 @@ object QueryExecution {
       } else {
         Seq(ReuseExchangeAndSubquery)
       }) ++
-      // Opt-in (SPARK-57399): runs last so it observes the final reuse decision (a reused
-      // exchange means fan-out, which it refuses to make pipelined).
+      // Opt-in (SPARK-57399): runs last so it observes the final reuse decision and can preserve
+      // it when the configured transport supports fan-out or sequential replay.
       // No-op unless spark.sql.shuffle.localPipelined.enabled=true and AQE is off.
       Seq(EnablePipelinedShuffle)
   }

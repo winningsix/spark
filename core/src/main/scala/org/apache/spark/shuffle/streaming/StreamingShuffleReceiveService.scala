@@ -1,0 +1,471 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.shuffle.streaming
+
+import java.io.File
+import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
+  CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+
+import scala.jdk.CollectionConverters._
+
+import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.{EXECUTOR_CORES,
+  STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
+  STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
+  STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
+  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
+  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY}
+import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils, Utils}
+
+private[spark] case class StreamingShuffleReceiveInboxId(
+    shuffleId: Int,
+    stageId: Int,
+    stageAttemptNumber: Int,
+    partitionId: Int,
+    taskAttemptId: Long,
+    readerOrdinal: Int = 0)
+
+private[spark] case class PrepareStreamingShuffleReceiveInbox(
+    id: StreamingShuffleReceiveInboxId)
+
+private[spark] case class PrepareStreamingShuffleReceiveInboxes(
+    ids: Seq[StreamingShuffleReceiveInboxId])
+
+private[spark] case class ReleaseStreamingShuffleReceiveInbox(
+    id: StreamingShuffleReceiveInboxId)
+
+private[streaming] case class StreamingShuffleReceiveInboxStats(
+    spilledBytes: Long,
+    spilledMessages: Long)
+
+private[streaming] object StreamingShuffleReceiveService {
+  val ENDPOINT_NAME = "StreamingShuffleReceiveService"
+
+  def createQueue(conf: SparkConf): BlockingQueue[StreamingShuffleMessage] = {
+    if (conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)) {
+      new StreamingShuffleMessageQueue(
+        conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
+        Some(new File(Utils.getLocalDir(conf))))
+    } else {
+      new LinkedBlockingQueue[StreamingShuffleMessage]()
+    }
+  }
+
+  def closeQueue(
+      queue: BlockingQueue[StreamingShuffleMessage]): StreamingShuffleReceiveInboxStats = {
+    val messages = new java.util.ArrayList[StreamingShuffleMessage]()
+    queue.drainTo(messages)
+    messages.forEach(_.release())
+    queue match {
+      case spillable: StreamingShuffleMessageQueue =>
+        val stats = StreamingShuffleReceiveInboxStats(
+          spillable.spilledBytesCount, spillable.spilledMessagesCount)
+        spillable.close()
+        stats
+      case _ => StreamingShuffleReceiveInboxStats(0L, 0L)
+    }
+  }
+}
+
+/**
+ * Executor-scoped owner for streaming-shuffle receive queues.
+ *
+ * An attached inbox is keyed by task attempt and reader ordinal, preserving retry/speculation
+ * semantics while allowing one task to read a reused shuffle more than once. The prepare protocol
+ * creates those ordinal inboxes before compute and transfers each through a lease without moving
+ * queue cleanup back into the task.
+ */
+private[streaming] class StreamingShuffleReceiveService(
+    conf: SparkConf,
+    sharedClient: () => Option[StreamingShuffleExecutorClient] = () => None,
+    onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
+  private val inboxes =
+    new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
+  private case class TaskShuffleKey(
+      shuffleId: Int,
+      stageId: Int,
+      stageAttemptNumber: Int,
+      partitionId: Int,
+      taskAttemptId: Long)
+  private val nextReaderOrdinal = new ConcurrentHashMap[TaskShuffleKey, AtomicInteger]()
+  private case class PreparedResources(
+      discovery: StreamingShufflePreparedReceiveDiscovery,
+      clientCreationExecutor: ExecutorService) {
+    def close(): Unit = {
+      discovery.close()
+      clientCreationExecutor.shutdownNow()
+    }
+  }
+  @volatile private var preparedResources: PreparedResources = _
+
+  private def getPreparedResources: PreparedResources = {
+    var resources = preparedResources
+    if (resources == null) synchronized {
+      resources = preparedResources
+      if (resources == null) {
+        resources = PreparedResources(
+          new StreamingShufflePreparedReceiveDiscovery(conf),
+          ThreadUtils.newDaemonFixedThreadPool(
+            math.max(1, conf.get(EXECUTOR_CORES)),
+            "streaming-shuffle-prepared-client"))
+        preparedResources = resources
+      }
+    }
+    resources
+  }
+
+  def acquire(
+      shuffleId: Int,
+      context: TaskContext): StreamingShuffleReceiveInboxLease = {
+    val taskShuffleKey = TaskShuffleKey(
+      shuffleId,
+      context.stageId(),
+      context.stageAttemptNumber(),
+      context.partitionId(),
+      context.taskAttemptId())
+    val ordinalCounter = nextReaderOrdinal.computeIfAbsent(
+      taskShuffleKey, _ => new AtomicInteger(0))
+    val readerOrdinal = ordinalCounter.getAndIncrement()
+    context.addTaskCompletionListener[Unit] { _ =>
+      nextReaderOrdinal.remove(taskShuffleKey, ordinalCounter)
+    }
+    val preparedId = StreamingShuffleReceiveInboxId(
+      shuffleId,
+      context.stageId(),
+      context.stageAttemptNumber(),
+      context.partitionId(),
+      -1L,
+      readerOrdinal)
+    val prepared = inboxes.get(preparedId)
+    if (prepared != null && prepared.attach(context.taskAttemptId())) {
+      return new StreamingShuffleReceiveInboxLease(prepared, () => releaseLease(prepared))
+    }
+    val id = preparedId.copy(taskAttemptId = context.taskAttemptId())
+    val inbox = new StreamingShuffleReceiveInbox(
+      id, StreamingShuffleReceiveService.createQueue(conf))
+    require(inbox.attach(context.taskAttemptId()), s"Could not attach receive inbox $id")
+    val existing = inboxes.putIfAbsent(id, inbox)
+    require(existing == null, s"Streaming shuffle receive inbox $id is already active")
+    new StreamingShuffleReceiveInboxLease(inbox, () => releaseLease(inbox))
+  }
+
+  def prepare(id: StreamingShuffleReceiveInboxId): Boolean = synchronized {
+    require(id.taskAttemptId == -1L, s"Prepared inbox must use taskAttemptId=-1: $id")
+    val inbox = new StreamingShuffleReceiveInbox(
+      id, StreamingShuffleReceiveService.createQueue(conf))
+    val existing = inboxes.putIfAbsent(id, inbox)
+    val selected = if (existing == null) inbox else existing
+    if (existing == null) {
+      try {
+        val executorClient = sharedClient().getOrElse(throw new IllegalStateException(
+          "Prepared receive inbox requires the shared executor client"))
+        val resources = getPreparedResources
+        selected.startPreparedSession(new StreamingShufflePreparedReceiveSession(
+          selected,
+          executorClient,
+          conf,
+          resources.discovery,
+          resources.clientCreationExecutor,
+          () => onDrainReady(id)))
+        logDebug(s"Prepared streaming shuffle receive inbox $id")
+      } catch {
+        case t: Throwable =>
+          inboxes.remove(id, selected)
+          selected.close()
+          throw t
+      }
+    }
+    selected.session.isDefined
+  }
+
+  def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
+    ids.forall(prepare)
+  }
+
+  def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = {
+    val inbox = inboxes.get(id)
+    inbox != null && inboxes.remove(id, inbox) && {
+      inbox.close()
+      true
+    }
+  }
+
+  def unregisterShuffle(shuffleId: Int): Unit = {
+    inboxes.entrySet().asScala.foreach { entry =>
+      if (entry.getKey.shuffleId == shuffleId && inboxes.remove(entry.getKey, entry.getValue)) {
+        entry.getValue.close()
+      }
+    }
+  }
+
+  def close(): Unit = synchronized {
+    inboxes.entrySet().asScala.foreach { entry =>
+      if (inboxes.remove(entry.getKey, entry.getValue)) {
+        entry.getValue.close()
+      }
+    }
+    val resources = preparedResources
+    if (resources != null) {
+      resources.close()
+      preparedResources = null
+    }
+  }
+
+  private[streaming] def activeInboxCount: Int = inboxes.size()
+
+  private def releaseLease(
+      inbox: StreamingShuffleReceiveInbox): StreamingShuffleReceiveInboxStats = {
+    inboxes.remove(inbox.id, inbox)
+    inbox.close()
+  }
+
+
+}
+
+private[streaming] class StreamingShuffleReceiveInbox(
+    val id: StreamingShuffleReceiveInboxId,
+    val queue: BlockingQueue[StreamingShuffleMessage]) {
+  private val closed = new AtomicBoolean(false)
+  private val attached = new AtomicBoolean(false)
+  @volatile private var preparedSession: StreamingShufflePreparedReceiveSession = _
+
+  def attach(taskAttemptId: Long): Boolean = attached.compareAndSet(false, true)
+
+  def startPreparedSession(session: StreamingShufflePreparedReceiveSession): Unit = synchronized {
+    require(preparedSession == null, s"Prepared session already exists for $id")
+    preparedSession = session
+    session.start()
+  }
+
+  def session: Option[StreamingShufflePreparedReceiveSession] = Option(preparedSession)
+
+  def close(): StreamingShuffleReceiveInboxStats = {
+    if (!closed.compareAndSet(false, true)) {
+      return StreamingShuffleReceiveInboxStats(0L, 0L)
+    }
+    if (preparedSession != null) {
+      preparedSession.close()
+    }
+    StreamingShuffleReceiveService.closeQueue(queue)
+  }
+}
+
+private[streaming] class StreamingShuffleReceiveInboxLease(
+    private val inbox: StreamingShuffleReceiveInbox,
+    release: () => StreamingShuffleReceiveInboxStats) {
+  private val closed = new AtomicBoolean(false)
+
+  val id: StreamingShuffleReceiveInboxId = inbox.id
+  val queue: BlockingQueue[StreamingShuffleMessage] = inbox.queue
+  private[streaming] val preparedSession: Option[StreamingShufflePreparedReceiveSession] =
+    inbox.session
+
+  def close(): StreamingShuffleReceiveInboxStats = {
+    if (closed.compareAndSet(false, true)) {
+      release()
+    } else {
+      StreamingShuffleReceiveInboxStats(0L, 0L)
+    }
+  }
+}
+
+private[streaming] class StreamingShuffleReceiveServiceEndpoint(
+    override val rpcEnv: RpcEnv,
+    service: StreamingShuffleReceiveService) extends RpcEndpoint {
+  override def receive: PartialFunction[Any, Unit] = {
+    case ReleaseStreamingShuffleReceiveInbox(id) => service.releasePrepared(id)
+  }
+
+  override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+    case PrepareStreamingShuffleReceiveInbox(id) => context.reply(service.prepare(id))
+    case PrepareStreamingShuffleReceiveInboxes(ids) => context.reply(service.prepareAll(ids))
+    case ReleaseStreamingShuffleReceiveInbox(id) =>
+      context.reply(service.releasePrepared(id))
+  }
+}
+
+/**
+ * Executor-scoped writer-location discovery for prepared receive inboxes.
+ *
+ * All resident inboxes for one shuffle consume the same tracker snapshot. This changes the
+ * control-plane cost from one polling thread per reducer inbox to one bounded polling loop per
+ * executor. Inbox queues and transport handlers remain independent; only immutable location
+ * discovery and the client-creation pool are shared.
+ */
+private[streaming] class StreamingShufflePreparedReceiveDiscovery(
+    conf: SparkConf,
+    snapshotProvider: Int => Option[ShuffleLocationResponse] = shuffleId =>
+      SparkEnv.get.streamingShuffleOutputTracker.get
+        .getAvailableShuffleWriterTaskLocations(shuffleId)) extends Logging {
+  private val closed = new AtomicBoolean(false)
+  private val sessions =
+    new ConcurrentHashMap[Int, CopyOnWriteArrayList[StreamingShufflePreparedReceiveSession]]()
+  private val activeSessions = new AtomicInteger(0)
+  private val peakActiveSessions = new AtomicInteger(0)
+  private val snapshotRequests = new AtomicLong(0L)
+  private val snapshotDeliveries = new AtomicLong(0L)
+  private val refreshIntervalMs = conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL)
+  private val executor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+      "streaming-shuffle-prepared-discovery")
+
+  executor.scheduleWithFixedDelay(
+    () => poll(), 0L, refreshIntervalMs, TimeUnit.MILLISECONDS)
+
+  def register(session: StreamingShufflePreparedReceiveSession): Unit = {
+    require(!closed.get(), "Prepared receive discovery is closed")
+    val added = sessions.computeIfAbsent(
+      session.shuffleId, _ => new CopyOnWriteArrayList[StreamingShufflePreparedReceiveSession]())
+      .add(session)
+    require(added, s"Prepared receive session ${session.shuffleId} is already registered")
+    val current = activeSessions.incrementAndGet()
+    peakActiveSessions.accumulateAndGet(current, Math.max)
+  }
+
+  def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
+    val shuffleSessions = sessions.get(session.shuffleId)
+    if (shuffleSessions != null) {
+      if (shuffleSessions.remove(session)) activeSessions.decrementAndGet()
+      if (shuffleSessions.isEmpty) sessions.remove(session.shuffleId, shuffleSessions)
+    }
+  }
+
+  private def poll(): Unit = {
+    sessions.entrySet().asScala.foreach { entry =>
+      val active = entry.getValue.asScala.filterNot(_.isClosed).toSeq
+      if (active.nonEmpty) {
+        try {
+          snapshotRequests.incrementAndGet()
+          snapshotProvider(entry.getKey).foreach { snapshot =>
+            snapshotDeliveries.addAndGet(active.size)
+            active.foreach { session =>
+              try session.onWriterSnapshot(snapshot)
+              catch {
+                case error: Throwable => session.failDiscovery(error)
+              }
+            }
+          }
+        } catch {
+          case error: Throwable => active.foreach(_.failDiscovery(error))
+        }
+      }
+    }
+  }
+
+  private[streaming] def stats: (Int, Int, Long, Long) =
+    (activeSessions.get(), peakActiveSessions.get(),
+      snapshotRequests.get(), snapshotDeliveries.get())
+
+  def close(): Unit = {
+    if (closed.compareAndSet(false, true)) {
+      executor.shutdownNow()
+      logInfo(
+        s"Closing prepared shuffle discovery: activeSessions=${activeSessions.get()} " +
+          s"peakActiveSessions=${peakActiveSessions.get()} " +
+          s"snapshotRequests=${snapshotRequests.get()} " +
+          s"snapshotDeliveries=${snapshotDeliveries.get()}")
+      sessions.clear()
+      activeSessions.set(0)
+    }
+  }
+}
+
+/** Network-only reader lifecycle that starts before the compute task is launched. */
+private[streaming] class StreamingShufflePreparedReceiveSession(
+    inbox: StreamingShuffleReceiveInbox,
+    sharedClient: StreamingShuffleExecutorClient,
+    conf: SparkConf,
+    discovery: StreamingShufflePreparedReceiveDiscovery,
+    clientCreationExecutor: ExecutorService,
+    signalDrainReady: () => Unit) extends Logging {
+  private val drainReady = new AtomicBoolean(false)
+  private val drainReadyBytes = conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES)
+  private var perWriterByteLimit = 1L
+  val shuffleId: Int = inbox.id.shuffleId
+  val receiveSession = new StreamingShuffleReceiveSession(
+    shuffleId,
+    new ErrorNotifier(),
+    (writerId, _, handler) => sharedClient.unregister(
+      shuffleId, Math.toIntExact(writerId), inbox.id.partitionId, handler),
+    () => discovery.unregister(this),
+    () => markDrainReady())
+
+  private def markDrainReady(): Unit = {
+    if (drainReady.compareAndSet(false, true)) {
+      logDebug(s"Streaming shuffle receive inbox ${inbox.id} is drain-ready")
+      signalDrainReady()
+    }
+  }
+
+  private def maybeMarkDrainReady(): Unit = inbox.queue match {
+    case queue: StreamingShuffleMessageQueue
+        if drainReadyBytes == 0L || queue.queuedMemoryBytesCount >= drainReadyBytes =>
+      markDrainReady()
+    case queue if drainReadyBytes == 0L && !queue.isEmpty =>
+      markDrainReady()
+    case _ =>
+  }
+
+  def start(): Unit = discovery.register(this)
+  def isClosed: Boolean = receiveSession.isClosed
+  def failDiscovery(error: Throwable): Unit = receiveSession.failDiscovery(error)
+  def close(): Unit = receiveSession.close()
+
+  def repairIdleCreditWindows(): Unit = sharedClient.repairCreditWindows(receiveSession.routes)
+
+  def idleDiagnostics(readerTerminations: Set[Long]): String =
+    s"inbox=${inbox.id}, ${receiveSession.idleDiagnostics(readerTerminations)}"
+
+  def onWriterSnapshot(snapshot: ShuffleLocationResponse): Unit = {
+    receiveSession.onWriterSnapshot(snapshot, numWriters => {
+      // Prepared routes budget for the live producer frontier, not all lifetime map tasks.
+      val liveWriterWindow = conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE)
+        .map(math.min(numWriters, _)).getOrElse(numWriters)
+      perWriterByteLimit = math.max(
+        conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY) / math.max(1, liveWriterWindow), 1L)
+    }) { fresh =>
+      // One initial-credit body per physical executor, using the executor-owned creation pool.
+      fresh.groupBy { case (_, location) => (location.host, location.port) }
+        .flatMap { case ((host, port), locations) =>
+          val future = CompletableFuture.runAsync(
+            () => registerRoutes(host, port, locations.keys.toSeq), clientCreationExecutor)
+          locations.keys.map(_ -> future)
+        }
+    }
+  }
+
+  private def registerRoutes(host: String, port: Int, writerIds: Seq[Long]): Unit = {
+    val handlers = writerIds.map { writerId =>
+      val handler = new StreamingShuffleClientHandler(
+        writerId.toInt, inbox.id.partitionId, inbox.queue, shuffleId, perWriterByteLimit,
+        null, receiveSession.errorNotifier, () => maybeMarkDrainReady())
+      handler.setOnTermAckResponseHandler(receiveSession.onTerminationAck)
+      writerId -> handler
+    }
+    val clients = sharedClient.registerBatch(
+      shuffleId, inbox.id.partitionId, host, port,
+      handlers.map { case (writerId, handler) => writerId.toInt -> handler })
+    handlers.foreach { case (writerId, handler) =>
+      receiveSession.registerRoute(writerId, clients(writerId.toInt), handler)
+    }
+  }
+}

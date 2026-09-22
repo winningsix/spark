@@ -17,11 +17,15 @@
 
 package org.apache.spark.sql.execution.adaptive
 
+import org.apache.spark.SparkEnv
+import org.apache.spark.internal.config
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{SparkPlan, UnionExec}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.{SparkPlan, TakeOrderedAndProjectExec, UnionExec}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec,
+  ShuffleExchangeExec}
+import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
 import org.apache.spark.sql.execution.joins.SortMergeJoinExec
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -62,6 +66,104 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       }
       assert(exchangesWithPipelined(flippedUnion) == Seq(false, false),
         s"both branches must stay regular so the sibling can recover lost outputs: $flipped")
+    }
+  }
+
+  test("full-plan mode changes exchange transport without changing the join operator") {
+    withSQLConf(
+        "spark.sql.shuffle.distributedPipelined.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true",
+        "spark.sql.exchange.reuse" -> "false") {
+      import testImplicits._
+      val left = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val right = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val leftExchange = ShuffleExchangeExec(HashPartitioning(left.output, 4), left)
+      val rightExchange = ShuffleExchangeExec(HashPartitioning(right.output, 4), right)
+      val join = SortMergeJoinExec(
+        left.output, right.output, Inner, None, leftExchange, rightExchange)
+
+      val rewritten = AQEEnablePipelinedShuffle.apply(join)
+      assert(rewritten.isInstanceOf[SortMergeJoinExec])
+      assert(exchangesWithPipelined(rewritten) === Seq(true, true))
+    }
+  }
+
+  test("a reused broadcast exchange does not block a pipelined shuffle") {
+    withSQLConf(
+        "spark.sql.shuffle.distributedPipelined.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+      import testImplicits._
+      val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val shuffle = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+      val broadcast = BroadcastExchangeExec(
+        HashedRelationBroadcastMode(leaf.output), leaf)
+      val reusedBroadcast = ReusedExchangeExec(broadcast.output, broadcast)
+      val plan = UnionExec(Seq(shuffle, reusedBroadcast))
+
+      val rewritten = AQEEnablePipelinedShuffle.apply(plan)
+      assert(exchangesWithPipelined(rewritten) === Seq(true))
+      assert(rewritten.collect { case _: ReusedExchangeExec => true }.size === 1)
+    }
+  }
+
+  test("a reused shuffle is rewired to one shared pipelined exchange") {
+    withSQLConf(
+        "spark.sql.shuffle.distributedPipelined.enabled" -> "true",
+        "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+      import testImplicits._
+      val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+      val shuffle = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+      val reused = ReusedExchangeExec(shuffle.output, shuffle)
+      val plan = UnionExec(Seq(shuffle, reused))
+
+      val rewritten = AQEEnablePipelinedShuffle.apply(plan).asInstanceOf[UnionExec]
+      val rewrittenShuffle = rewritten.children.head.asInstanceOf[ShuffleExchangeExec]
+      val rewrittenReuse = rewritten.children(1).asInstanceOf[ReusedExchangeExec]
+      assert(rewrittenShuffle.pipelined)
+      assert(rewrittenReuse.child.asInstanceOf[ShuffleExchangeExec].pipelined)
+      assert(rewrittenReuse.child eq rewrittenShuffle,
+        "the original and reused branches must share one pipelined exchange instance")
+    }
+  }
+
+  test("prepared receive mode pipelines below a limit's hidden regular boundary") {
+    val previousEnabled = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
+    val previousBatching = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
+    val previousQueue = SparkEnv.get.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
+    val previousSharedConnections = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
+    val previousSharedServer = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    try {
+      withSQLConf(
+          "spark.sql.shuffle.distributedPipelined.enabled" -> "true",
+          "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+        import testImplicits._
+        val leaf = spark.range(10).select($"id" as Symbol("k")).queryExecution.executedPlan
+        val exchange = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+        val limit = TakeOrderedAndProjectExec(1, Nil, exchange.output, exchange)
+
+        val rewritten = AQEEnablePipelinedShuffle.apply(limit)
+        assert(rewritten.isInstanceOf[TakeOrderedAndProjectExec])
+        assert(exchangesWithPipelined(rewritten) === Seq(true))
+      }
+    } finally {
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
+      SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, previousSharedConnections)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
     }
   }
 }

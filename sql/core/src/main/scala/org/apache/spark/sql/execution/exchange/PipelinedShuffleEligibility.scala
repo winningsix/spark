@@ -33,11 +33,10 @@ import org.apache.spark.sql.internal.SQLConf
  * Shared environment gate for the two pipelined-shuffle enabling rules
  * ([[EnablePipelinedShuffle]] non-AQE and `AQEEnablePipelinedShuffle` under AQE). This is a
  * CORRECTNESS gate, not cosmetics: flipping an exchange to pipelined while the incremental manager
- * is still the RPC streaming one would route it to an untested transport that reports
- * `requiresDetachedRecords = false`, so the SQL layer would skip the row copy and silently corrupt
- * rows shared across the writer/reader threads. Both rules must apply the identical gate, so it
- * lives here rather than being copy-pasted into each `apply` (where the two could drift and split
- * AQE vs non-AQE behavior). Each rule keeps only its own plan-shape logic.
+ * is incompatible with the deployment would hang readers waiting on producers they cannot reach.
+ * Both rules must apply the identical gate, so it lives here rather than being copy-pasted into
+ * each `apply` (where the two could drift and split AQE vs non-AQE behavior). Each rule keeps only
+ * its own plan-shape logic.
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
@@ -76,17 +75,30 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
   }
 
   /**
-   * Whether the pipelined channel transport may be used for `plan` at all, independent of plan
-   * shape. Requires: the opt-in flag on; single-executor local mode (the in-process channel
-   * transport needs producer and consumer in one JVM); and the configured incremental manager
-   * actually being the in-process channel manager. Returns false (with a DEBUG diagnostic) when
-   * any gate fails, so the caller leaves the plan regular.
+   * Whether the configured pipelined transport may be used for `plan` at all, independent of plan
+   * shape. The manager declares whether it requires a single executor; distributed transports can
+   * therefore run in cluster mode without weakening the in-process channel's safety check.
    */
   def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
-    if (!conf.localPipelinedShuffleEnabled) {
+    val distributedEnabled = conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)
+    if (!conf.localPipelinedShuffleEnabled && !distributedEnabled) {
       return false
     }
-    if (plan.session == null || !plan.session.sparkContext.isLocal) {
+    val manager = SparkEnv.get.pipelinedShuffleManager
+    if (manager == null) {
+      logDebug("Pipelined shuffle is enabled but no incremental shuffle manager is configured; " +
+        "leaving the plan regular.")
+      return false
+    }
+    if (manager.isInstanceOf[PipelinedChannelShuffleManager]) {
+      if (!conf.localPipelinedShuffleEnabled || plan.session == null ||
+          !plan.session.sparkContext.isLocal) return false
+    } else if (!distributedEnabled || manager.requiresSingleExecutor) {
+      if (conf.localPipelinedShuffleEnabled && mismatchWarned.compareAndSet(false, true)) {
+        logWarning(s"${SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key} requires the in-process " +
+          s"channel manager in ${config.SHUFFLE_MANAGER_INCREMENTAL.key}. Distributed batch " +
+          s"execution requires ${SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key}.")
+      }
       return false
     }
     // Batch only. `IncrementalExecution.preparations` inherits QueryExecution's list, so without
@@ -114,19 +126,10 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
         "engine's own pipelined-shuffle marking.")
       return false
     }
-    if (!SparkEnv.get.pipelinedShuffleManager.isInstanceOf[PipelinedChannelShuffleManager]) {
-      // WARN, not DEBUG, and once per JVM: the user asked for this feature and is silently not
-      // getting it, which no plan or metric reveals. The flag alone cannot select the transport --
-      // the manager is a separate, start-up-only config -- so the mismatch is a misconfiguration
-      // the user has to act on, unlike the plan-shape fallbacks (reuse, coalesce) which are normal
-      // outcomes and stay at DEBUG.
-      if (mismatchWarned.compareAndSet(false, true)) {
-        logWarning(s"${SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key} is enabled but " +
-          s"${config.SHUFFLE_MANAGER_INCREMENTAL.key} is not the in-process channel manager, so " +
-          s"no shuffle will be pipelined. Set it to " +
-          s"${classOf[PipelinedChannelShuffleManager].getName} to enable the feature, or unset " +
-          s"the SQL flag to silence this warning.")
-      }
+    if (manager.requiresSingleExecutor &&
+        (plan.session == null || !plan.session.sparkContext.isLocal)) {
+      logDebug("The configured pipelined shuffle manager requires a single executor; leaving " +
+        "the cluster-mode plan regular.")
       return false
     }
     true
