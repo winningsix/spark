@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import io.netty.buffer.Unpooled
 import org.mockito.ArgumentMatchers.{any, eq => eqTo}
-import org.mockito.Mockito.{verify, when}
+import org.mockito.Mockito.{atLeastOnce, verify, when}
 import org.scalatest.concurrent.Eventually.eventually
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.matchers.should.Matchers
@@ -37,7 +37,8 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREM
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
-  STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
+  STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
+  STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
   TerminationAckMessage, TerminationControlMessage}
@@ -138,8 +139,10 @@ class StreamingShuffleManagerSuite
   }
 
   test("prepared receive service enables elastic group admission") {
-    Seq(false -> true, true -> false).foreach { case (receiveServiceEnabled, requiresWholeGroup) =>
+    for (receiveServiceEnabled <- Seq(false, true); waitForAcks <- Seq(false, true)) {
+      val requiresWholeGroup = !receiveServiceEnabled || waitForAcks
       val conf = new SparkConf()
+        .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, waitForAcks)
         .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, receiveServiceEnabled)
         .set(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, receiveServiceEnabled)
         .set(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
@@ -150,9 +153,80 @@ class StreamingShuffleManagerSuite
         SparkEnv.get.pipelinedShuffleManager.requiresWholeGroupSlotAdmission shouldBe
           requiresWholeGroup
         SparkEnv.get.pipelinedShuffleManager.supportsUnmaterializedRegularBoundary shouldBe
-          receiveServiceEnabled
+          !requiresWholeGroup
         SparkEnv.get.pipelinedShuffleManager.supportsFanOut shouldBe true
       }
+    }
+  }
+
+  test("a prepared route failure before the first frame wakes its reader with the error") {
+    val conf = new SparkConf()
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => None)
+    val executor = ThreadUtils.newDaemonFixedThreadPool(1, "prepared-error-test")
+    val client = mock[StreamingShuffleExecutorClient]
+    val transport = mock[TransportClient]
+    val ready = new AtomicInteger()
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox, client, conf, discovery, executor, () => { ready.incrementAndGet(); () })
+    when(client.registerBatch(
+      eqTo(7), eqTo(0), eqTo("writer-host"), eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenAnswer { invocation =>
+        val handler = invocation.getArgument[Seq[(Int, StreamingShuffleClientHandler)]](4).head._2
+        handler.channelInactive(transport)
+        assert(session.receiveSession.errorNotifier.getError().isDefined)
+        assert(ready.get() == 1)
+        Map(3 -> transport)
+      }
+    try {
+      session.onWriterSnapshot(ShuffleLocationResponse(
+        Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)), 1))
+      eventually(Timeout(10.seconds)) {
+        ready.get() shouldBe 1
+        session.receiveSession.errorNotifier.getError().get.getMessage should
+          include("closed before termination")
+      }
+      inbox.queue shouldBe empty
+    } finally {
+      session.close()
+      discovery.close()
+      executor.shutdownNow()
+    }
+  }
+
+  test("prepared discovery repairs an idle route before its reader task can launch") {
+    val conf = new SparkConf().set(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL, 10L)
+    val discovery = new StreamingShufflePreparedReceiveDiscovery(conf, _ => Some(
+      ShuffleLocationResponse(
+        Map(3L -> StreamingShuffleTaskLocation("executor-1", "writer-host", 7337, 0)), 1)))
+    val executor = ThreadUtils.newDaemonFixedThreadPool(1, "prepared-repair-test")
+    val client = mock[StreamingShuffleExecutorClient]
+    val transport = mock[TransportClient]
+    val ready = new AtomicInteger()
+    val inbox = new StreamingShuffleReceiveInbox(
+      StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L),
+      new LinkedBlockingQueue[StreamingShuffleMessage]())
+    val session = new StreamingShufflePreparedReceiveSession(
+      inbox, client, conf, discovery, executor, () => { ready.incrementAndGet(); () })
+    when(client.registerBatch(
+      eqTo(7), eqTo(0), eqTo("writer-host"), eqTo(7337),
+      any[Seq[(Int, StreamingShuffleClientHandler)]]))
+      .thenReturn(Map(3 -> transport))
+    try {
+      session.start()
+      eventually(Timeout(10.seconds)) {
+        session.receiveSession.routes.size shouldBe 1
+        verify(client, atLeastOnce()).repairCreditWindows(session.receiveSession.routes)
+      }
+      ready.get() shouldBe 0
+      inbox.queue shouldBe empty
+    } finally {
+      session.close()
+      discovery.close()
+      executor.shutdownNow()
     }
   }
 

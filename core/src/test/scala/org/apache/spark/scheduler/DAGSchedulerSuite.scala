@@ -6927,11 +6927,14 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
       val previousSharedServer =
         sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+      val previousWaitForAcks =
+        sc.conf.get(config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
       sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
       sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
       sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
       sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
       sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      sc.conf.set(config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
       try {
         val producerRdd = new MyRDD(sc, 2, Nil)
         val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
@@ -6981,6 +6984,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
           previousSharedConnections)
         sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+        sc.conf.set(config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, previousWaitForAcks)
       }
     }
   }
@@ -8880,6 +8884,23 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     complete(taskSets(1), Seq((Success, 42), (Success, 43)))
     assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
+  }
+
+  test("pipelined reader inbox counts are local to each consumer stage") {
+    val producer = new MyRDD(sc, 2, Nil)
+    val dependency = new PipelinedShuffleDependency(producer, new HashPartitioner(2))
+    dependency.setReaderRouteMultiplicity(2)
+    // Managers without live-reduce hints still need both physical routes before writer cleanup.
+    assert(dependency.expectedReaderRoutes.toSeq === Seq(2, 2))
+    val reader = new MyRDD(sc, 2, List(dependency), tracker = mapOutputTracker)
+    val branchA = new MyRDD(sc, 2, List(new OneToOneDependency(reader)))
+    val branchB = new MyRDD(sc, 2, List(new OneToOneDependency(reader)))
+    assert(scheduler.pipelinedShuffleIdsReadByStage(branchA) === Seq(dependency.shuffleId))
+    assert(scheduler.pipelinedShuffleIdsReadByStage(branchB) === Seq(dependency.shuffleId))
+    val combined = new MyRDD(sc, 2,
+      List(new OneToOneDependency(branchA), new OneToOneDependency(branchB)))
+    assert(scheduler.pipelinedShuffleIdsReadByStage(combined) ===
+      Seq(dependency.shuffleId, dependency.shuffleId))
   }
 
   // Resource-profile rejection. The gang slot check measures capacity against the DEFAULT

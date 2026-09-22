@@ -136,11 +136,14 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
       config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
     val previousSharedServer = SparkEnv.get.conf.get(
       config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)
+    val previousWaitForAcks = SparkEnv.get.conf.get(
+      config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
     try {
       withSQLConf(
           "spark.sql.shuffle.distributedPipelined.enabled" -> "true",
@@ -164,6 +167,8 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
         config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, previousSharedConnections)
       SparkEnv.get.conf.set(
         config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, previousSharedServer)
+      SparkEnv.get.conf.set(
+        config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, previousWaitForAcks)
     }
   }
 }

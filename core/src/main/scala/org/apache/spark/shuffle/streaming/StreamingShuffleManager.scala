@@ -23,7 +23,8 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
-  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED}
+  STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
+  STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.TransportClientFactory
 import org.apache.spark.network.netty.SparkTransportConf
@@ -114,11 +115,15 @@ private[spark] class StreamingShuffleManager
   }
 
   override def requiresWholeGroupSlotAdmission: Boolean = {
-    !preparedReceiveServiceConfigured
+    // A spilled receive queue still holds credit until a compute task consumes it. Synchronous
+    // writers therefore need slots for the whole group; preparation alone cannot free their
+    // slots when they fill the receive windows and wait for terminal acknowledgements.
+    !preparedReceiveServiceConfigured ||
+      SparkEnv.get.conf.get(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
   }
 
   override def supportsUnmaterializedRegularBoundary: Boolean = {
-    preparedReceiveServiceConfigured
+    !requiresWholeGroupSlotAdmission
   }
 
   override def supportsSequentialReplay: Boolean = true

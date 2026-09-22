@@ -39,6 +39,9 @@ import org.apache.spark.resource.{CpuAmount, ExecutorResourceRequests, ResourceA
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
+import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInboxes,
+  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
@@ -2986,6 +2989,64 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(launched.length === 2)
     assert(taskScheduler.resourceOffers(offers).flatten.isEmpty,
       "the producer must not launch another task while its two-task window is full")
+  }
+
+  Seq("application", "task", "decommission").foreach { exclusion =>
+    test(s"prepared readers avoid $exclusion exclusions and fail on lost placement") {
+      val scheduler = setupSchedulerWithMockTaskSetExcludelist(
+        config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true")
+      val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+      val prepared = new LinkedBlockingQueue[(String, StreamingShuffleReceiveInboxId)]()
+      val offers = IndexedSeq(
+        WorkerOffer("executor0", "host0", 1), WorkerOffer("executor1", "host1", 1))
+      scheduler.resourceOffers(offers)
+      val endpoints = offers.map { offer =>
+        val endpoint = sc.env.rpcEnv.setupEndpoint(s"prepared-test-${offer.executorId}",
+          new RpcEndpoint {
+            override val rpcEnv: RpcEnv = sc.env.rpcEnv
+            override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+              case PrepareStreamingShuffleReceiveInboxes(ids) =>
+                ids.foreach(id => prepared.add(offer.executorId -> id))
+                context.reply(true)
+            }
+            override def receive: PartialFunction[Any, Unit] = {
+              case _: ReleaseStreamingShuffleReceiveInbox =>
+            }
+          })
+        tracker.registerReceiveEndpoint(offer.executorId, endpoint)
+        endpoint
+      }
+      try {
+        val reader = new TaskSet(Array[Task[_]](new FakeTask(0, 0)),
+          stageId = 0, stageAttemptId = 0, priority = 0, properties = null,
+          resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, shuffleId = None,
+          isPipelined = true, isPipelinedShuffleReader = true,
+          pipelinedReaderShuffleIds = Seq(7))
+        scheduler.submitTasks(reader)
+        exclusion match {
+          case "application" => when(healthTracker.isExecutorExcluded("executor0")).thenReturn(true)
+          case "task" =>
+            when(stageToMockTaskSetExcludelist(0)
+              .isExecutorExcludedForTask("executor0", 0)).thenReturn(true)
+          case "decommission" =>
+            scheduler.executorDecommission("executor0", ExecutorDecommissionInfo("test"))
+        }
+        assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+        val assignment = prepared.poll(10, TimeUnit.SECONDS)
+        assert(assignment != null && assignment._1 == "executor1")
+        assert(prepared.isEmpty)
+
+        // Once prepared, an acknowledged stream may exist only in this inbox. Fail the group
+        // instead of silently attaching to a fresh empty inbox or waiting on an excluded executor.
+        scheduler.executorDecommission("executor1", ExecutorDecommissionInfo("test"))
+        assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+        assert(failedTaskSet)
+        assert(failedTaskSetReason.contains("lost its schedulable executor executor1"))
+      } finally {
+        endpoints.foreach(sc.env.rpcEnv.stop)
+      }
+    }
   }
 
   test("pipelined reader CPU charge leaves executor slots for producers") {

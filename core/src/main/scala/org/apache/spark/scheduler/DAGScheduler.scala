@@ -1514,22 +1514,40 @@ private[spark] class DAGScheduler(
   }
 
   /** Pipelined shuffle ids read directly by the stage containing `rdd`. */
-  private def pipelinedShuffleIdsReadByStage(rdd: RDD[_]): Seq[Int] = {
-    val multiplicityByShuffleId = new HashMap[Int, Int]
-    traverseParentRDDsWithinStage(rdd, { current =>
-      current.dependencies.foreach {
-        case dependency: PipelinedShuffleDependency[_, _, _] =>
-          multiplicityByShuffleId.update(
-            dependency.shuffleId,
-            math.max(
-              multiplicityByShuffleId.getOrElse(dependency.shuffleId, 0),
-              dependency.readerRouteMultiplicity))
-        case _ =>
+  private[scheduler] def pipelinedShuffleIdsReadByStage(rdd: RDD[_]): Seq[Int] = {
+    // Count occurrences in this stage, not the producer's total routes across all stages.
+    // Memoize each narrow subtree but include its counts once per consuming dependency: two
+    // branches can execute the same reader RDD twice, while two separate stages each read it once.
+    val counts = new HashMap[RDD[_], Map[Int, Int]]
+    val pending = mutable.Stack[(RDD[_], Boolean)]((rdd, false))
+    while (pending.nonEmpty) {
+      val entry: (RDD[_], Boolean) = pending.pop()
+      val current = entry._1
+      val expanded = entry._2
+      if (!counts.contains(current)) {
+        if (expanded) {
+          val result = new HashMap[Int, Int]
+          current.dependencies.foreach {
+            case dependency: PipelinedShuffleDependency[_, _, _] =>
+              result.update(dependency.shuffleId, result.getOrElse(dependency.shuffleId, 0) + 1)
+            case dependency: NarrowDependency[_] =>
+              counts(dependency.rdd).foreach { case (shuffleId, count) =>
+                result.update(shuffleId, result.getOrElse(shuffleId, 0) + count)
+              }
+            case _ =>
+          }
+          counts.update(current, result.toMap)
+        } else {
+          pending.push((current, true))
+          current.dependencies.foreach {
+            case dependency: NarrowDependency[_] => pending.push((dependency.rdd, false))
+            case _ =>
+          }
+        }
       }
-      true
-    })
-    multiplicityByShuffleId.toSeq.sortBy(_._1).flatMap { case (shuffleId, multiplicity) =>
-      Seq.fill(multiplicity)(shuffleId)
+    }
+    counts(rdd).toSeq.sortBy(_._1).flatMap { case (shuffleId, count) =>
+      Seq.fill(count)(shuffleId)
     }
   }
 

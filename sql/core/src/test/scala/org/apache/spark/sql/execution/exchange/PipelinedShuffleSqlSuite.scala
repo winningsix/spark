@@ -42,11 +42,12 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
   private def withDistributedPipelinedSession(
       adaptive: Boolean = true,
       networkBufferWaitMs: Long = 50,
-      taskCpus: String = "1")(body: SparkSession => Unit): Unit = {
+      taskCpus: String = "1",
+      extraConf: Map[String, String] = Map.empty)(body: SparkSession => Unit): Unit = {
     SparkSession.getActiveSession.orElse(SparkSession.getDefaultSession).foreach(_.stop())
     SparkSession.clearActiveSession()
     SparkSession.clearDefaultSession()
-    val spark = SparkSession.builder()
+    val builder = SparkSession.builder()
       .master("local-cluster[2,2,1024]")
       .appName("distributed-pipelined-shuffle-sql")
       .config("spark.shuffle.manager.incremental",
@@ -58,6 +59,7 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
       .config("spark.shuffle.streaming.elasticProducers.maxTasksPerStage", "1")
       .config("spark.shuffle.streaming.reader.waitForTerminationAcks", "false")
+      .config("spark.shuffle.streaming.writer.waitForTerminationAcks", "false")
       .config("spark.shuffle.streaming.networkBufferMaxWaitTimeMs", networkBufferWaitMs.toString)
       .config("spark.task.cpus", taskCpus)
       .config("spark.sql.adaptive.enabled", adaptive.toString)
@@ -66,10 +68,23 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       .config("spark.sql.shuffle.partitions", "2")
       .config("spark.speculation", "false")
       .config("spark.ui.enabled", "false")
-      .getOrCreate()
+    extraConf.foreach { case (key, value) => builder.config(key, value) }
+    val spark = builder.getOrCreate()
+    val pool = Executors.newSingleThreadExecutor()
     try {
-      body(spark)
+      val result = pool.submit(new Runnable {
+        override def run(): Unit = body(spark)
+      })
+      try {
+        result.get(90, TimeUnit.SECONDS)
+      } catch {
+        case _: java.util.concurrent.TimeoutException =>
+          result.cancel(true)
+          spark.sparkContext.cancelAllJobs()
+          fail("Distributed pipelined shuffle did not complete within 90 seconds")
+      }
     } finally {
+      pool.shutdownNow()
       spark.stop()
       SparkSession.clearActiveSession()
       SparkSession.clearDefaultSession()
@@ -269,6 +284,60 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
         (key, values.size.toLong, values.size.toLong)
       }.toSeq.sortBy(_._1)
       assert(rows === expected)
+    }
+  }
+
+  test("prepared synchronous writers reject a group exceeding available slots") {
+    withDistributedPipelinedSession(adaptive = false, extraConf = Map(
+      "spark.shuffle.streaming.writer.waitForTerminationAcks" -> "true")) { spark =>
+      val error = intercept[Exception] {
+        spark.range(0, 10000, 1, 4).repartition(8).collect()
+      }
+      assert(error.toString.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT"))
+    }
+  }
+
+  test("prepared uncompressed writers recycle a small raw buffer pool under backpressure") {
+    withDistributedPipelinedSession(extraConf = Map(
+      "spark.shuffle.compress" -> "false",
+      "spark.shuffle.streaming.networkBufferSize" -> "1024",
+      "spark.shuffle.streaming.rawBufferPoolMaxMemory" -> "16k",
+      "spark.shuffle.streaming.writerReplayMaxMemory" -> "1k",
+      "spark.shuffle.streaming.readerMaxMemory" -> "1024")) { spark =>
+      import spark.implicits._
+      val values = spark.range(0, 20000, 1, 4).repartition(2, $"id")
+        .as[Long].collect().sorted
+      assert(values.toSeq === (0L until 20000L))
+    }
+  }
+
+  test("prepared exchange reuse across consumer stages drains every credit window") {
+    withDistributedPipelinedSession(taskCpus = "0.25", extraConf = Map(
+      "spark.shuffle.streaming.readerMaxMemory" -> "1024",
+      "spark.shuffle.streaming.writerReplayMaxMemory" -> "16k")) { spark =>
+      import spark.implicits._
+      import org.apache.spark.sql.functions.sum
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      def query = {
+        val base = spark.range(0, 20000, 1, 4).select(($"id" % 2000).as("g"), $"id")
+          .groupBy("g").agg(sum("id").as("v"))
+        val left = base.select(($"g" % 7).as("k"), $"v")
+          .groupBy("k").agg(sum("v").as("a"))
+        val right = base.select(($"g" % 11).as("k"), $"v")
+          .groupBy("k").agg(sum("v").as("b"))
+        // Null-safe equality avoids different inferred is-not-null filters being pushed into
+        // the common producer, which would correctly prevent exchange reuse.
+        left.join(right, left("k") <=> right("k"))
+          .select(left("k"), left("a"), right("b")).as[(Long, Long, Long)]
+      }
+      spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "false")
+      val expected = query.collect().toSeq.sortBy(_._1)
+      spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "true")
+      val streamed = query
+      assert(streamed.collect().toSeq.sortBy(_._1) === expected)
+      assert(collect(streamed.queryExecution.executedPlan) {
+        case ReusedExchangeExec(_, exchange: ShuffleExchangeExec) if exchange.pipelined => exchange
+      }.nonEmpty, s"expected a reused pipelined exchange:\n${streamed.queryExecution.executedPlan}")
     }
   }
 

@@ -18,12 +18,13 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.zip.CRC32C
 
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, Unpooled}
+import io.netty.buffer.{ByteBuf, Unpooled, UnpooledByteBufAllocator}
 import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
 import io.netty.util.concurrent.GenericFutureListener
 import org.mockito.ArgumentMatchers.any
@@ -41,6 +42,7 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCRE
   STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_WRITER_CONNECTION_TIMEOUT_MS,
   STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS,
+  STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
@@ -134,6 +136,205 @@ class StreamingShuffleWriterSuite
         handler.handleMessage(client, replay)
         handler.availableDataCredit(0, client) shouldBe 100L
       } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  Seq(0L, 1L).foreach { replayLimit =>
+    test(s"uncompressed raw owner retires before task cleanup (replayLimit=$replayLimit)") {
+      val conf = newConf().set(SHUFFLE_COMPRESS, false)
+        .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, replayLimit)
+      withSpark(new SparkContext("local", "raw-buffer-retirement", conf)) { sc =>
+        val context = createTaskContext(sc.conf, 0)
+        val writer = newWriter(sc, context)
+        val raw = Unpooled.directBuffer(sc.conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE))
+        try {
+          val client = bindMockClient(writer, 0)(_ => ())
+          writer.transportServerHandler.handleMessage(
+            client, new CreditControlMessage(0, 0, 0, 1))
+          val data = writer.TimestampedBuffer(raw)
+          data.serializationStream.get.writeKey(1).writeValue(2).flush()
+          writer.shards(0).send(data)
+          eventually(Timeout(10.seconds)) {
+            // The owner must retire after both replay and transport release, without waiting
+            // for task completion. Depending on remaining transient slices it is pooled or freed.
+            assert(raw.refCnt() == 0 || writer.bufferPool.asScala.exists(_ eq raw))
+          }
+        } finally {
+          context.markTaskCompleted(None)
+        }
+      }
+    }
+  }
+
+  test("cross-route transport capacity does not park outbound submitters") {
+    val notifier = new ErrorNotifier()
+    val batcher = new StreamingShuffleTransportBatcher(
+      UnpooledByteBufAllocator.DEFAULT,
+      maxBytes = 1,
+      maxWaitTimeMs = 0L,
+      maxInFlightBytes = 1L << 20,
+      notifier)
+    val firstOwner = new Object()
+    val secondOwner = new Object()
+    val firstClient = mock[TransportClient]
+    val secondClient = mock[TransportClient]
+    val firstFuture = mock[ChannelFuture]
+    val secondFuture = mock[ChannelFuture]
+    val firstListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val secondListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val secondSends = new AtomicInteger()
+    val completions = new AtomicInteger()
+    when(firstFuture.isSuccess).thenReturn(true)
+    when(secondFuture.isSuccess).thenReturn(true)
+    when(firstFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        firstListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        firstFuture
+      }
+    when(secondFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        secondListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        secondFuture
+      }
+    when(firstClient.send(any[ByteBuf])).thenReturn(firstFuture)
+    when(secondClient.send(any[ByteBuf])).thenAnswer { _ =>
+      secondSends.incrementAndGet()
+      secondFuture
+    }
+
+    val firstBody = Unpooled.buffer(16).writeLong(1L)
+    val secondBody = Unpooled.buffer(16).writeLong(2L)
+    val submitter = new Thread(() =>
+      batcher.submit(secondClient, secondBody, () => { completions.incrementAndGet(); () },
+        secondOwner, notifier))
+    try {
+      batcher.submit(firstClient, firstBody, () => { completions.incrementAndGet(); () },
+        firstOwner, notifier)
+      eventually(Timeout(10.seconds)) { firstListener.get() should not be null }
+
+      submitter.start()
+      submitter.join(10000)
+      assert(!submitter.isAlive,
+        s"second submitter parked:\n${submitter.getStackTrace.mkString("\n")}")
+      secondSends.get() shouldBe 1
+      secondListener.get() should not be null
+      batcher.hasQueued(secondOwner) shouldBe false
+
+      firstBody.release()
+      firstListener.get().operationComplete(firstFuture)
+      secondBody.release()
+      secondListener.get().operationComplete(secondFuture)
+      eventually(Timeout(10.seconds)) { completions.get() shouldBe 2 }
+    } finally {
+      if (submitter.isAlive) {
+        submitter.interrupt()
+        submitter.join(10000)
+      }
+      if (firstBody.refCnt() > 0) firstBody.release(firstBody.refCnt())
+      if (secondBody.refCnt() > 0) secondBody.release(secondBody.refCnt())
+      batcher.discard()
+    }
+  }
+
+  test("same-lane submissions preserve call order without completion fencing") {
+    val notifier = new ErrorNotifier()
+    val batcher = new StreamingShuffleTransportBatcher(
+      UnpooledByteBufAllocator.DEFAULT,
+      maxBytes = 1,
+      maxWaitTimeMs = 0L,
+      maxInFlightBytes = 2L << 20,
+      notifier)
+    val owner = new Object()
+    val client = mock[TransportClient]
+    val firstFuture = mock[ChannelFuture]
+    val secondFuture = mock[ChannelFuture]
+    val firstListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val secondListener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val sends = new ConcurrentLinkedQueue[Int]()
+    when(firstFuture.isSuccess).thenReturn(true)
+    when(secondFuture.isSuccess).thenReturn(true)
+    when(firstFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        firstListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        firstFuture
+      }
+    when(secondFuture.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        secondListener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        secondFuture
+      }
+    when(client.send(any[ByteBuf])).thenAnswer { _ =>
+      if (sends.isEmpty) {
+        sends.add(1)
+        firstFuture
+      } else {
+        sends.add(2)
+        secondFuture
+      }
+    }
+
+    val firstBody = Unpooled.buffer(16).writeLong(1L)
+    val secondBody = Unpooled.buffer(16).writeLong(2L)
+    try {
+      batcher.submit(client, firstBody, () => (), owner, notifier)
+      batcher.submit(client, secondBody, () => (), owner, notifier)
+      sends.asScala.toSeq shouldBe Seq(1, 2)
+      firstListener.get() should not be null
+      secondListener.get() should not be null
+      batcher.hasQueued(owner) shouldBe false
+
+      firstBody.release()
+      firstListener.get().operationComplete(firstFuture)
+      secondBody.release()
+      secondListener.get().operationComplete(secondFuture)
+    } finally {
+      if (firstBody.refCnt() > 0) firstBody.release(firstBody.refCnt())
+      if (secondBody.refCnt() > 0) secondBody.release(secondBody.refCnt())
+      batcher.discard()
+    }
+  }
+
+  test("timed buffer detachment cannot overtake the close admission fence") {
+    withSpark(new SparkContext("local", "timed-close-fence", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val writer = newWriter(sc, context)
+      val frames = new ConcurrentLinkedQueue[StreamingShuffleMessageType]()
+      bindMockClient(writer, 0) { sent =>
+        val view = sent.duplicate()
+        while (view.isReadable) {
+          frames.add(StreamingShuffleMessageType.decode(view.getInt(view.readerIndex())))
+          view.skipBytes(StreamingShuffleUtils.frameLength(view))
+        }
+      }
+      val shard = writer.shards(0)
+      val started = new CountDownLatch(1)
+      val timer = new Thread(() => {
+        started.countDown()
+        shard.send()
+      })
+      try {
+        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+        data.serializationStream.get.writeKey(1).writeValue(2).flush()
+        shard.putBuffer(data)
+        shard.synchronized {
+          timer.start()
+          assert(started.await(10, TimeUnit.SECONDS))
+          eventually(Timeout(10.seconds)) {
+            assert(timer.getState == Thread.State.BLOCKED)
+          }
+          shard.close()
+        }
+        timer.join(10000)
+        assert(!timer.isAlive)
+        eventually(Timeout(10.seconds)) {
+          frames.asScala.toSeq shouldBe Seq(
+            StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW,
+            StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE)
+        }
+      } finally {
+        timer.join(10000)
         context.markTaskCompleted(None)
       }
     }

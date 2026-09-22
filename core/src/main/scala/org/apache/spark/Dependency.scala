@@ -360,7 +360,8 @@ class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
 
   private[spark] def expectedReaderRoutes: Array[Int] = synchronized {
     if (configuredExpectedReaderRoutes == null) {
-      Array.fill(partitioner.numPartitions)(1)
+      // Managers without live-reduce hints still need every fan-out route before writer cleanup.
+      Array.fill(partitioner.numPartitions)(configuredReaderRouteMultiplicity)
     } else {
       configuredExpectedReaderRoutes.clone()
     }

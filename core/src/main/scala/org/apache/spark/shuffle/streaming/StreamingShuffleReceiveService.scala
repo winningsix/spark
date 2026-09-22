@@ -358,8 +358,10 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
           snapshotProvider(entry.getKey).foreach { snapshot =>
             snapshotDeliveries.addAndGet(active.size)
             active.foreach { session =>
-              try session.onWriterSnapshot(snapshot)
-              catch {
+              try {
+                session.onWriterSnapshot(snapshot)
+                session.repairBeforeTaskLaunch()
+              } catch {
                 case error: Throwable => session.failDiscovery(error)
               }
             }
@@ -399,20 +401,33 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
     signalDrainReady: () => Unit) extends Logging {
   private val drainReady = new AtomicBoolean(false)
   private val drainReadyBytes = conf.get(STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES)
+  private var lastPreTaskRepairNanos = System.nanoTime()
   private var perWriterByteLimit = 1L
   val shuffleId: Int = inbox.id.shuffleId
   val receiveSession = new StreamingShuffleReceiveSession(
     shuffleId,
-    new ErrorNotifier(),
+    new ErrorNotifier() {
+      override def markError(error: Throwable): Unit = {
+        // A prepared reader has no task polling this notifier yet. Publish the error before
+        // waking its task, including failures before the first successfully decoded frame.
+        super.markError(error)
+        markDrainReady()
+      }
+    },
     (writerId, _, handler) => sharedClient.unregister(
       shuffleId, Math.toIntExact(writerId), inbox.id.partitionId, handler),
-    () => discovery.unregister(this),
+    () => {
+      // Location discovery can finish before any frame arrives. Keep polling until readiness
+      // so an idle prepared route can recover even though its compute task has not launched.
+      if (drainReady.get()) discovery.unregister(this)
+    },
     () => markDrainReady())
 
   private def markDrainReady(): Unit = {
     if (drainReady.compareAndSet(false, true)) {
       logDebug(s"Streaming shuffle receive inbox ${inbox.id} is drain-ready")
       signalDrainReady()
+      if (receiveSession.isDiscoveryFinished) discovery.unregister(this)
     }
   }
 
@@ -428,9 +443,23 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
   def start(): Unit = discovery.register(this)
   def isClosed: Boolean = receiveSession.isClosed
   def failDiscovery(error: Throwable): Unit = receiveSession.failDiscovery(error)
-  def close(): Unit = receiveSession.close()
+  def close(): Unit = {
+    try receiveSession.close()
+    finally discovery.unregister(this)
+  }
 
   def repairIdleCreditWindows(): Unit = sharedClient.repairCreditWindows(receiveSession.routes)
+
+  private[streaming] def repairBeforeTaskLaunch(): Unit = {
+    val now = System.nanoTime()
+    if (!drainReady.get() && inbox.queue.isEmpty &&
+        now - lastPreTaskRepairNanos >= TimeUnit.MILLISECONDS.toNanos(500L)) {
+      // A missing first frame cannot be repaired by the task's idle loop: that task is still
+      // waiting for this inbox to become ready. Discovery owns recovery until the first frame.
+      lastPreTaskRepairNanos = now
+      repairIdleCreditWindows()
+    }
+  }
 
   def idleDiagnostics(readerTerminations: Set[Long]): String =
     s"inbox=${inbox.id}, ${receiveSession.idleDiagnostics(readerTerminations)}"

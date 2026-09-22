@@ -32,7 +32,10 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
  *
  * Each input body contains complete streaming-shuffle frames and ownership is transferred to this
  * class.  A batch is only released by the transport completion callback (or by discard()), so
- * this class does not add a second copy or change the per-route sequence numbers.
+ * this class does not add a second copy or change the per-route sequence numbers. The transport
+ * capacity window is best effort: a saturated window must not defer an already-framed batch,
+ * because terminal frames and downstream credit can depend on that batch reaching Netty. Route
+ * credit and the executor raw-buffer pool remain the hard memory bounds.
  */
 private[streaming] final class StreamingShuffleTransportBatcher(
     allocator: ByteBufAllocator,
@@ -55,11 +58,11 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   require(maxInFlightBytes >= maxBytes,
     "maxInFlightBytes must be at least maxBytes so one transport batch can be admitted")
 
-  // Admission is expressed in MiB units to keep Semaphore's permit count within Int while
-  // bounding the aggregate direct memory held by all completed-at-transport writers on this
-  // executor. A permit remains held until TransportClient's completion callback, not merely until
-  // the body is handed to Netty, because the latter can still retain the direct payload in the
-  // channel's outbound queue.
+  // Admission is expressed in MiB units to keep Semaphore's permit count within Int. A permit
+  // remains held until TransportClient's completion callback, not merely until the body is handed
+  // to Netty, because the latter can still retain the direct payload in the channel's outbound
+  // queue. When the window is saturated, the batch is submitted without a permit rather than
+  // blocking or queueing: either choice can deadlock the streaming shuffle's credit cycle.
   private val permitUnitBytes = 1L << 20
   private val maxPermits = Math.toIntExact(
     (maxInFlightBytes + permitUnitBytes - 1) / permitUnitBytes)
@@ -82,16 +85,20 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   private var closed = false
 
   private def permitsFor(bytes: Int): Int = {
-    Math.toIntExact((bytes.toLong + permitUnitBytes - 1) / permitUnitBytes)
+    // One oversized body must still be admissible. Charging the full window preserves the
+    // best-effort bound without requesting a permit count that can never be satisfied.
+    math.min(maxPermits,
+      Math.toIntExact((bytes.toLong + permitUnitBytes - 1) / permitUnitBytes))
   }
 
-  private def acquire(bytes: Int): Int = {
+  private def tryAcquire(bytes: Int): Int = {
     val permits = permitsFor(bytes)
-    inFlightPermits.acquire(permits)
-    permits
+    if (inFlightPermits.tryAcquire(permits)) permits else 0
   }
 
-  private def release(permits: Int): Unit = inFlightPermits.release(permits)
+  private def release(permits: Int): Unit = {
+    if (permits > 0) inFlightPermits.release(permits)
+  }
 
   /** Takes ownership of body and queues it for client. */
   def submit(client: TransportClient, body: ByteBuf, onComplete: () => Unit): Unit = {
@@ -140,6 +147,16 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   /** Flushes all bodies queued for one client before a later control frame is sent. */
   def flush(client: TransportClient): Unit = synchronized {
     flushLocked(client)
+  }
+
+  /** Whether this owner still has a body waiting for the current aggregate to be flushed. */
+  def hasQueued(owner: AnyRef): Boolean = synchronized {
+    val pendingIterator = pending.values().iterator()
+    var found = false
+    while (pendingIterator.hasNext && !found) {
+      found = pendingIterator.next().bodies.exists(_.owner eq owner)
+    }
+    found
   }
 
   /** Remove one writer's unsent bodies without affecting other writers on the channel. */
@@ -195,11 +212,20 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     val batch = pending.remove(client)
     if (batch == null || batch.bodies.isEmpty) return
 
+    // This method runs under the batcher's monitor, so calls to a given TransportClient retain
+    // their publication order. Transport completion is deliberately not an ordering fence: it
+    // would couple progress to downstream credit and can deadlock terminal delivery.
+    sendAdmittedLocked(client, batch, tryAcquire(batch.bytes))
+  }
+
+  /** Send immediately, optionally holding capacity until transport completion. */
+  private def sendAdmittedLocked(
+      client: TransportClient,
+      batch: PendingBatch,
+      admittedPermits: Int): Unit = {
     var outbound: ByteBuf = null
     var addedBodies = 0
-    var admittedPermits = 0
     try {
-      admittedPermits = acquire(batch.bytes)
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
@@ -225,7 +251,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
         // Components already added to the aggregate were released above. Bodies after the
         // failing component still own their original reference.
         batch.bodies.drop(addedBodies).foreach(_.body.release())
-        if (admittedPermits > 0) release(admittedPermits)
+        release(admittedPermits)
         if (!isExpectedConnectionClose(client, e)) {
           errorNotifier.markError(e)
         }

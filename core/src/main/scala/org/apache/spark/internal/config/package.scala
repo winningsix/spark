@@ -2202,7 +2202,9 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.executorReceiveService.enabled")
       .doc("When true, streaming shuffle reader inboxes are owned by an executor-scoped receive " +
         "service in the shuffle manager. The scheduler prepares and routes them before task " +
-        "launch, then pins reader tasks to attach and drain the prepared inboxes.")
+        "launch, then pins reader tasks to attach and drain the prepared inboxes. Writers that " +
+        "wait for termination acknowledgements still require whole-group slot admission; " +
+        "elastic admission requires spark.shuffle.streaming.writer.waitForTerminationAcks=false.")
       .version("4.3.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

@@ -283,9 +283,15 @@ private[spark] class TaskSchedulerImpl(
       taskSets: Iterable[TaskSetManager]): Unit = {
     if (!executorReceiveServiceEnabled) return
     streamingTrackerMaster.foreach { tracker =>
-      val activeExecutors = executorIdToRunningTaskIds.keySet.toSet
+      val activeExecutors = executorIdToRunningTaskIds.keySet.filter { executorId =>
+        !executorsPendingDecommission.contains(executorId) &&
+          !healthTrackerOpt.exists { tracker =>
+            tracker.isExecutorExcluded(executorId) ||
+              tracker.isNodeExcluded(executorIdToHost(executorId))
+          }
+      }.toSet
       val receiveExecutors = tracker.receiveExecutorIds.filter(activeExecutors.contains).sorted
-      if (activeExecutors.nonEmpty && receiveExecutors.size == activeExecutors.size) {
+      if (receiveExecutors.nonEmpty || preTaskReaderAssignments.nonEmpty) {
         val pendingAssignments = new ArrayBuffer[(PreTaskReaderKey, PreTaskReaderAssignment)]
         taskSets.iterator.filter { taskSet =>
           !taskSet.isZombie && taskSet.taskSet.isPipelinedShuffleReader &&
@@ -294,9 +300,24 @@ private[spark] class TaskSchedulerImpl(
           taskSet.tasks.indices.foreach { taskIndex =>
             val key = PreTaskReaderKey(
               taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
-            if (!preTaskReaderAssignments.contains(key)) {
-              val executorId = receiveExecutors(TaskSchedulerImpl.preparedReaderExecutorIndex(
-                taskIndex, receiveExecutors.size, preparedReaderDiagonalAssignment))
+            val eligibleExecutors = receiveExecutors.filter { executorId =>
+              taskSet.canPrepareReaderOnExecutor(
+                taskIndex, executorId, executorIdToHost(executorId))
+            }
+            preTaskReaderAssignments.get(key).foreach { assignment =>
+              if (taskSet.isTaskPendingForOffer(taskIndex) &&
+                  !eligibleExecutors.contains(assignment.executorId)) {
+                // The old inbox may already own the only remaining copy of an acknowledged
+                // stream. Moving it by registering a fresh route could silently lose that data.
+                // Pipelined groups recover as a whole, just as on executor loss.
+                taskSet.abort(s"Prepared streaming shuffle reader lost its schedulable " +
+                  s"executor ${assignment.executorId}; resubmit the pipelined job")
+              }
+            }
+            if (!taskSet.isZombie && taskSet.isTaskPendingForOffer(taskIndex) &&
+                !preTaskReaderAssignments.contains(key) && eligibleExecutors.nonEmpty) {
+              val executorId = eligibleExecutors(TaskSchedulerImpl.preparedReaderExecutorIndex(
+                taskIndex, eligibleExecutors.size, preparedReaderDiagonalAssignment))
               val partitionId = taskSet.tasks(taskIndex).partitionId
               val nextOrdinalByShuffle = new HashMap[Int, Int]
               val inboxes = taskSet.taskSet.pipelinedReaderShuffleIds.map { shuffleId =>
@@ -319,7 +340,13 @@ private[spark] class TaskSchedulerImpl(
         // the resource-offer path (p52 with two inputs means at least 104 round trips). Send one
         // batch to each executor, then publish assignments only after that executor acknowledged
         // every inbox in the batch.
-        pendingAssignments.groupBy(_._2.executorId).foreach { case (executorId, assignments) =>
+        val liveAssignments = pendingAssignments.filter { case (key, _) =>
+          taskSets.exists { manager =>
+            !manager.isZombie && manager.stageId == key.stageId &&
+              manager.taskSet.stageAttemptId == key.stageAttemptId
+          }
+        }
+        liveAssignments.groupBy(_._2.executorId).foreach { case (executorId, assignments) =>
           if (tracker.prepareReceiveInboxes(
               executorId, assignments.flatMap(_._2.inboxes).toSeq)) {
             assignments.foreach { case (key, assignment) =>

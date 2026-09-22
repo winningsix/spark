@@ -1412,19 +1412,27 @@ class StreamingShuffleWriter[K, V](
     /** Queue an ordered terminal repair for routes whose application ACK is missing. */
     private[streaming] def retryUnackedTermination(): Int = {
       synchronized {
-        val retry = replayHistory.lastOption.filter(entry => !entry.isData).toSeq.flatMap {
-          terminal =>
-          transportServerHandler.clientsFor(id).filter { target =>
-            !terminationAckedClients.contains(target) &&
-              !terminalRetryPendingClients.contains(target)
-          }.map { target =>
-            terminalRetryPendingClients += target
-            outboundActions.append(ReplayAction(target, terminal.sequenceNum, Some(terminal)))
-            target
+        // lastEnqueuedByClient advances when a body is handed to the executor batcher. If that
+        // body is still waiting for the shared transport window, a terminal retry based on the
+        // logical cursor can otherwise overtake the queued data. Once admitted, Netty preserves
+        // channel order and ordinary retry fencing is sufficient.
+        if (crossRouteBatcher.exists(_.hasQueued(this))) {
+          0
+        } else {
+          val retry = replayHistory.lastOption.filter(entry => !entry.isData).toSeq.flatMap {
+            terminal =>
+            transportServerHandler.clientsFor(id).filter { target =>
+              !terminationAckedClients.contains(target) &&
+                !terminalRetryPendingClients.contains(target)
+            }.map { target =>
+              terminalRetryPendingClients += target
+              outboundActions.append(ReplayAction(target, terminal.sequenceNum, Some(terminal)))
+              target
+            }
           }
+          if (retry.nonEmpty) scheduleOutboundDrainLocked()
+          retry.size
         }
-        if (retry.nonEmpty) scheduleOutboundDrainLocked()
-        retry.size
       }
     }
 
@@ -1539,9 +1547,15 @@ class StreamingShuffleWriter[K, V](
         }
       }
 
-      def markReplayComplete(): Unit = retireIfReady()
+      def markReplayComplete(): Unit = {
+        replayComplete.set(true)
+        retireIfReady()
+      }
 
-      def markNetworkComplete(): Unit = retireIfReady()
+      def markNetworkComplete(): Unit = {
+        networkComplete.set(true)
+        retireIfReady()
+      }
 
       /** Release only the producer owner during failure cleanup; never recycle an in-flight buf. */
       def forceRelease(): Unit = {
@@ -1655,7 +1669,9 @@ class StreamingShuffleWriter[K, V](
     }
 
     // Consume the current buffer, if it exists, and send it as a DataMessage.
-    def send(): Unit = {
+    def send(): Unit = synchronized {
+      // Detaching a timed buffer and admitting it must be atomic with close's terminal admission.
+      // Otherwise close can observe an empty buffer before this thread appends the detached data.
       val b = takeBuffer()
       if (b != null) {
         admitTimestampedBuffer(b, flushBatch = true)
@@ -1676,7 +1692,7 @@ class StreamingShuffleWriter[K, V](
 
     def putBuffer(b: TimestampedBuffer): Unit = assert(buffer.getAndSet(b) == null)
 
-    def close(): Unit = {
+    def close(): Unit = synchronized {
       val b = takeBuffer()
       if (b != null) admitTimestampedBuffer(b, flushBatch = false)
       if (asyncCompression) {

@@ -458,6 +458,14 @@ private[spark] class TaskSetManager(
       !barrierPendingLaunchTasks.contains(index)
   }
 
+  private[scheduler] def canPrepareReaderOnExecutor(
+      index: Int, executorId: String, host: String): Boolean = {
+    !taskSetExcludelistHelperOpt.exists { excludeList =>
+      excludeList.isNodeExcludedForTaskSet(host) ||
+        excludeList.isExecutorExcludedForTaskSet(executorId)
+    } && !isTaskExcludededOnExecOrNode(index, executorId, host)
+  }
+
   private[scheduler] def resetDelayScheduleTimer(
       minLocality: Option[TaskLocality.TaskLocality]): Unit = {
     lastLocalityWaitResetTime = clock.getTimeMillis()
