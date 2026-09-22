@@ -1332,7 +1332,8 @@ private[spark] class DAGScheduler(
   /**
    * Classify a job's shuffle shape, or fail it via `listener` if it uses a pipelined shuffle with
    * an incompatible cluster feature. Checked before any stage is created, so a rejection leaves
-   * no partial scheduler state. Regular map-stage jobs may have pipelined ancestors when the manager supports them.
+   * no partial scheduler state. Regular map-stage jobs may have pipelined ancestors when the
+   * manager supports them.
    *
    * Rejected combinations:
    *  - Speculation: a speculative copy of a producer would race a consumer already reading the

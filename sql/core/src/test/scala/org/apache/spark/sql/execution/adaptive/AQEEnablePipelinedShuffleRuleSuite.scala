@@ -35,6 +35,21 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
   private def exchangesWithPipelined(plan: SparkPlan): Seq[Boolean] =
     plan.collect { case s: ShuffleExchangeExec => s.pipelined }
 
+  test("the local opt-in does not enable the distributed transport") {
+    assert(!SparkEnv.get.pipelinedShuffleManager.requiresSingleExecutor)
+    for (local <- Seq(false, true); distributed <- Seq(false, true)) {
+      withSQLConf(
+          "spark.sql.shuffle.localPipelined.enabled" -> local.toString,
+          "spark.sql.shuffle.distributedPipelined.enabled" -> distributed.toString,
+          "spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled" -> "true") {
+        val leaf = spark.range(10).queryExecution.executedPlan
+        val exchange = ShuffleExchangeExec(HashPartitioning(leaf.output, 4), leaf)
+        val rewritten = AQEEnablePipelinedShuffle.apply(exchange)
+        assert(exchangesWithPipelined(rewritten) === Seq(distributed))
+      }
+    }
+  }
+
   test("a regular sibling prevents a mixed pipelined job") {
     // A free candidate and its blocked twin would form a mixed job. The regular sibling must
     // remain recoverable across actions, so the entire plan must retain regular shuffles.

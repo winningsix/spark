@@ -285,8 +285,12 @@ class StreamingShuffleManagerSuite
         }
       } finally {
         queued.filter(_ != null).foreach(_.release())
-        writerHandlers.foreach { case (writerId, handler) => server.unregister(7, writerId, handler) }
-        readerHandlers.foreach { case (writerId, handler) => client.unregister(7, writerId, 0, handler) }
+        writerHandlers.foreach { case (writerId, handler) =>
+          server.unregister(7, writerId, handler)
+        }
+        readerHandlers.foreach { case (writerId, handler) =>
+          client.unregister(7, writerId, 0, handler)
+        }
         client.close()
         server.close()
       }

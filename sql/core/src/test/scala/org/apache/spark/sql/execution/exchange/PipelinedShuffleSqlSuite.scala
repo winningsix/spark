@@ -22,7 +22,7 @@ import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.local.pipelined.ChannelShuffleRendezvous
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 
@@ -88,6 +88,18 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       spark.stop()
       SparkSession.clearActiveSession()
       SparkSession.clearDefaultSession()
+    }
+  }
+
+  test("the distributed opt-in does not enable the local channel transport") {
+    withPipelinedSession { spark =>
+      spark.conf.set("spark.sql.shuffle.localPipelined.enabled", "false")
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "true")
+      val df = spark.range(20).repartition(2)
+      assert(collect(df.queryExecution.executedPlan) {
+        case s: ShuffleExchangeExec if s.pipelined => s
+      }.isEmpty)
+      assert(df.collect().sorted === (0L until 20L).toArray)
     }
   }
 
@@ -318,7 +330,7 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       import spark.implicits._
       import org.apache.spark.sql.functions.sum
       spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-      def query = {
+      def query: Dataset[(Long, Long, Long)] = {
         val base = spark.range(0, 20000, 1, 4).select(($"id" % 2000).as("g"), $"id")
           .groupBy("g").agg(sum("id").as("v"))
         val left = base.select(($"g" % 7).as("k"), $"v")
@@ -396,7 +408,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     test(s"prepared receive pipelines nested probes AQE=$adaptive emptyBuild=$emptyBuild") {
       // The compact transport uses one task CPU charge for readers and producers. Leave
       // producer capacity beside four resident readers on the four-slot local cluster.
-      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+      withDistributedPipelinedSession(
+          adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
         import spark.implicits._
         spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
         spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
@@ -433,7 +446,8 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
 
   for (adaptive <- Seq(false, true)) {
     test(s"prepared receive nested probes preserve Q3 results against BSP AQE=$adaptive") {
-      withDistributedPipelinedSession(adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
+      withDistributedPipelinedSession(
+          adaptive, networkBufferWaitMs = 0, taskCpus = "0.5") { spark =>
         spark.conf.set("spark.sql.shuffle.pipelined.nestedProbe.enabled", "true")
         spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
         spark.conf.set("spark.sql.shuffle.partitions", "4")

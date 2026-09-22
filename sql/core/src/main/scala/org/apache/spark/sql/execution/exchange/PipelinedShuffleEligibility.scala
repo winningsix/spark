@@ -92,7 +92,9 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
     }
     if (manager.isInstanceOf[PipelinedChannelShuffleManager]) {
       if (!conf.localPipelinedShuffleEnabled || plan.session == null ||
-          !plan.session.sparkContext.isLocal) return false
+          !plan.session.sparkContext.isLocal) {
+        return false
+      }
     } else if (!distributedEnabled || manager.requiresSingleExecutor) {
       if (conf.localPipelinedShuffleEnabled && mismatchWarned.compareAndSet(false, true)) {
         logWarning(s"${SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key} requires the in-process " +

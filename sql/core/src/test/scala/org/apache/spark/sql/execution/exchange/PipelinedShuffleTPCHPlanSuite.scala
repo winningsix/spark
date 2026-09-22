@@ -44,6 +44,8 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
       .set("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
       .set("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
       .set("spark.shuffle.streaming.sharedConnections.enabled", "true")
+      // Prepared receive crosses hidden regular boundaries only with asynchronous delivery.
+      .set("spark.shuffle.streaming.writer.waitForTerminationAcks", "false")
       .set(SQLConf.ADAPTIVE_EXECUTION_ENABLED, false)
       .set(SQLConf.SHUFFLE_PARTITIONS, 52)
   }

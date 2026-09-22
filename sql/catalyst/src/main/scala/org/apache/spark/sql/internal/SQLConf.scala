@@ -1301,8 +1301,8 @@ object SQLConf {
       .internal()
       .doc("When true, AQE marks every safe visible shuffle exchange pipelined before creating " +
         "query stages. This preserves the selected physical operators but deliberately gives up " +
-        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs with " +
-        "the same join and partitioning configuration.")
+        "runtime map statistics for later AQE replanning. Use matched BSP and pipelined runs " +
+        "with the same join and partitioning configuration.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf

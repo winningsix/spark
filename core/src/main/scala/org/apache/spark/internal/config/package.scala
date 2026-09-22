@@ -1997,7 +1997,7 @@ package object config {
       .doc("Whether streaming shuffle readers apply the per-writer byte quota by toggling " +
         "Netty auto-read. Disabling this lets chained pipelined readers drain all incoming " +
         "streams without a quota-induced cross-input cycle; executor memory is then the bound.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2009,7 +2009,7 @@ package object config {
         "queue. When positive, data beyond this bound is spilled to executor-local disk and " +
         "reloaded in queue order when the operator consumes it. Zero disables reader queue " +
         "spilling and preserves the unbounded in-memory queue behavior.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
@@ -2024,7 +2024,7 @@ package object config {
         "proves that endpoint preparation and producer routing are operational without imposing " +
         "a size barrier on small or sparse inputs. Positive values are experimental and an inbox " +
         "still becomes ready after every writer has terminated so empty partitions cannot hang.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
@@ -2036,7 +2036,7 @@ package object config {
       .doc("Socket send and receive buffer size for streaming shuffle data channels. This is " +
         "independent of the serialized message size; a larger value allows the transport to " +
         "keep more data in flight on high-bandwidth paths without changing message framing.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2050,7 +2050,7 @@ package object config {
         "so batching reduces per-message Netty and syscall overhead without changing record " +
         "framing or sequence numbers. A value no larger than networkBufferSize effectively " +
         "disables batching.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2064,7 +2064,7 @@ package object config {
         "reader client demultiplexes the independently framed messages without copying their " +
         "payloads. A value no larger than networkBatchSize effectively disables cross-route " +
         "aggregation.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2076,7 +2076,7 @@ package object config {
       .doc("Maximum time in milliseconds a partially-filled cross-route streaming shuffle " +
         "batch is held before being flushed. This bounds reader latency while allowing logical " +
         "routes sharing one executor connection to be combined.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .longConf
@@ -2090,7 +2090,7 @@ package object config {
         "shared by streaming shuffle writers on one executor. This executor-level admission " +
         "limit prevents per-writer route windows from multiplying across concurrent pipelined " +
         "stages and exhausting Netty direct memory.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
@@ -2103,7 +2103,7 @@ package object config {
       .doc("Maximum executor-wide bytes reserved for reusable streaming-shuffle serialization " +
         "buffers. Sharing this pool across map writers bounds direct memory without making a " +
         "blocked writer hold a private budget that sibling producer stages cannot borrow.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
@@ -2116,7 +2116,7 @@ package object config {
       .doc("Whether a streaming shuffle reader enqueues all decoded messages from one transport " +
         "body as one queue batch. The reader still consumes messages individually; disabling " +
         "this option is intended for apples-to-apples queue-overhead experiments.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2128,7 +2128,7 @@ package object config {
         "shuffle writer task. When positive, older replay frames are appended to an " +
         "executor-local temporary file and read back only for a late reader. Zero preserves the " +
         "in-memory replay path and disables this spill fallback.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .bytesConf(ByteUnit.BYTE)
@@ -2141,7 +2141,7 @@ package object config {
         "writerMaxMemory semaphore. Disabling this permits a pipelined producer to continue " +
         "sending while a downstream reader is consuming another input; it is intended for " +
         "experiments where executor memory and Netty watermarks provide the effective bound.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2154,7 +2154,7 @@ package object config {
         "multiply the thread count by the number of concurrent map tasks. Two event-loop threads " +
         "avoid multiplying the host-wide RPC thread default by every map " +
         "task while retaining concurrent channel processing.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2167,7 +2167,7 @@ package object config {
         "Netty server instead of creating one server and event-loop group per map task. Reader " +
         "connections remain task scoped; the shared server removes listener and event-loop " +
         "multiplication without changing the data protocol or task lifecycle.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2179,7 +2179,7 @@ package object config {
         "streaming shuffle writer server. The shared server handles routes from many concurrent " +
         "map tasks, so it needs its own concurrency setting; this does not change the thread " +
         "count of task-scoped writer servers, which remains controlled by writerServerThreads.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2192,7 +2192,7 @@ package object config {
       .doc("When true, streaming shuffle readers multiplex their logical writer streams over " +
         "executor-scoped pooled connections. This removes the TCP connection per writer-reader " +
         "pair while retaining independent message routing and sequence validation.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2205,7 +2205,7 @@ package object config {
         "launch, then pins reader tasks to attach and drain the prepared inboxes. Writers that " +
         "wait for termination acknowledgements still require whole-group slot admission; " +
         "elastic admission requires spark.shuffle.streaming.writer.waitForTerminationAcks=false.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2216,7 +2216,7 @@ package object config {
       .doc("Whether a streaming shuffle reader waits for all termination-ack send callbacks " +
         "before completing its iterator. Disabling this avoids a termination/back-pressure " +
         "cycle in chained pipelined shuffles; acknowledgements are still sent asynchronously.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
         .booleanConf
@@ -2229,7 +2229,7 @@ package object config {
         "registration, network-send, and acknowledgement barriers to asynchronous cleanup. The " +
         "task slot is released immediately while the endpoint and replay data remain available " +
         "for late readers.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2240,7 +2240,7 @@ package object config {
       .doc("Minimum number of downstream clients that a streaming writer waits for per reader " +
         "partition before sending its first message. This is a CPU POC safeguard for pipelined " +
         "batches with multiple downstream consumers; one client is the default.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2253,7 +2253,7 @@ package object config {
         "alive after currently registered readers acknowledge termination. A positive value " +
         "allows late pipelined readers to connect and receive the replayed stream; zero keeps " +
         "the normal immediate cleanup behavior.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .longConf
@@ -2267,7 +2267,7 @@ package object config {
         "partially discovered writer set from exhausting executor network buffers while reader " +
         "routes are still being registered. Combined reader-producer stages are not limited by " +
         "this pure-producer window because their complete reader frontier must remain resident.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2282,7 +2282,7 @@ package object config {
         "tasks remain ahead of producers in offer order. When unset, maxTasksPerStage remains " +
         "the limit throughout the stage lifetime. The prepared receive queue remains the " +
         "memory/spill boundary while this larger tail wave drains.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2296,7 +2296,7 @@ package object config {
         "This opt-in scheduling policy lets executor-scoped input caches and in-flight reads be " +
         "reused across repeated scans. It applies only when every task has no existing locality " +
         "preference and all union parents expose the same partition-index set.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2308,7 +2308,7 @@ package object config {
         "assignment after each executor-width block. The rotation preserves an even task count " +
         "while mixing partition-index residue classes across executors, reducing persistent " +
         "executor skew when adjacent shuffle partitions have periodic cost patterns.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
@@ -2319,7 +2319,7 @@ package object config {
       .doc("Number of threads used by a task-owned pipelined shuffle reader to create its " +
         "writer clients. Prepared readers instead share an executor-scoped pool bounded by " +
         "spark.executor.cores, avoiding one thread pool per resident inbox.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
@@ -2331,7 +2331,7 @@ package object config {
       .doc("Minimum interval between driver location-snapshot requests for the same streaming " +
         "shuffle on one executor. All resident readers on that executor share the cached " +
         "snapshot, preventing an O(readers) polling storm while writers register incrementally.")
-      .version("4.3.0")
+      .version("4.4.0")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .timeConf(TimeUnit.MILLISECONDS)

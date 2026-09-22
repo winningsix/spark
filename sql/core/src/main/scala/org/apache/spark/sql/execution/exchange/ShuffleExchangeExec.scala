@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.exchange
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Supplier
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 import org.apache.spark._
@@ -206,11 +207,16 @@ case class ShuffleExchangeExec(
 
   override def nodeName: String = "Exchange"
 
-  // The transport changes how rows move, not the exchange's relational semantics. Ignoring the
-  // flag here lets ReuseExchangeAndSubquery preserve the same exchange-reuse shape when a
-  // separately prepared subquery has already been switched to the pipelined transport.
+  // A replay-capable transport can share an exchange with a separately prepared subquery.
+  // Preserve the upstream channel's distinct canonical form: it cannot replay a transient
+  // exchange across the subquery and outer query's separate jobs.
   override protected def doCanonicalize(): SparkPlan = {
-    super.doCanonicalize().asInstanceOf[ShuffleExchangeExec].copy(pipelined = false)
+    val canonical = super.doCanonicalize().asInstanceOf[ShuffleExchangeExec]
+    if (Option(SparkEnv.get).exists(_.pipelinedShuffleManager.supportsSequentialReplay)) {
+      canonical.copy(pipelined = false)
+    } else {
+      canonical
+    }
   }
 
   // `pipelined` is only meaningful for a Real-Time Mode plan, and the default arg string is
