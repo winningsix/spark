@@ -47,10 +47,9 @@ import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_NETWORK_BATCH_SIZE,
   STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
-  STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED,
   STREAMING_SHUFFLE_WRITER_CONNECTION_TIMEOUT_MS,
   STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS,
-  STREAMING_SHUFFLE_WRITER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER,
+  STREAMING_SHUFFLE_WRITER_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY,
   STREAMING_SHUFFLE_WRITER_SERVER_THREADS,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
@@ -118,12 +117,8 @@ class StreamingShuffleWriter[K, V](
   private val TIME_BASED_FLUSH_ENABLED = MAX_BUFFERING_TIME_MS > 0
   private val CONFIGURED_WAIT_FOR_TERMINATION_ACKS =
     conf.get(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
-  private val MIN_CLIENTS_PER_READER =
-    conf.get(STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER)
   private val LINGER_AFTER_TERMINATION_MS =
     conf.get(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS)
-  private val WRITER_BACKPRESSURE_ENABLED =
-    conf.get(STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED)
   private val EXECUTOR_RECEIVE_SERVICE_ENABLED =
     conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
   private val REPLAY_MAX_MEMORY =
@@ -591,7 +586,6 @@ class StreamingShuffleWriter[K, V](
     // reference without putting a buffer back in the pool while an in-flight transport slice may
     // still exist.
     private val uncompressedBufferLeases = new mutable.ArrayBuffer[RawBufferLease]()
-    private val firstMessageSent = new AtomicBoolean(false)
     // A blocking multi-input operator can stop consuming one input while it consumes another.
     // Bound direct buffers retained by Netty for this route and let queued frames move to the
     // existing replay spill file when this route is full. The limit is per route, so one stalled
@@ -1244,14 +1238,6 @@ class StreamingShuffleWriter[K, V](
         networkComplete()
         return
       }
-      if (firstMessageSent.compareAndSet(false, true) &&
-          MIN_CLIENTS_PER_READER > 1 && !REPLAYABLE_FOR_INTERNAL_CONSUMER) {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
-        while (transportServerHandler.clientsFor(id).size < MIN_CLIENTS_PER_READER &&
-            System.nanoTime() < deadline) {
-          Thread.sleep(10)
-        }
-      }
       // A control frame must be ordered after every data frame already admitted to the pending
       // batch. Flush before encoding it so the control frame cannot be included in the data batch
       // and cannot overtake the batch through a separate completion callback.
@@ -1468,9 +1454,7 @@ class StreamingShuffleWriter[K, V](
         timestampedBuffer.serializationStream.foreach(_.close())
       }
       releaseRawBuffer(timestampedBuffer.buffer)
-      if (WRITER_BACKPRESSURE_ENABLED) {
-        allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
-      }
+      allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
     }
 
     /** Append producer work to this shard's ordered admission chain. */
@@ -1640,9 +1624,7 @@ class StreamingShuffleWriter[K, V](
       val networkComplete: () => Unit = uncompressedLease match {
         case Some(lease) => () => {
           lease.markNetworkComplete()
-          if (WRITER_BACKPRESSURE_ENABLED) {
-            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
-          }
+          allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
         }
         case None => () => ()
       }
@@ -1651,9 +1633,7 @@ class StreamingShuffleWriter[K, V](
       } else {
         () => {
           releaseRawAfterSend()
-          if (WRITER_BACKPRESSURE_ENABLED) {
-            allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
-          }
+          allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
         }
       }
       send(dataMessage, () => {
@@ -2211,29 +2191,16 @@ class StreamingShuffleWriter[K, V](
     // byte size, so this bounds in-flight memory only on a best-effort basis: a single
     // serialized row larger than BUFFER_SIZE (rows are not split across buffers, see write())
     // grows its buffer past BUFFER_SIZE and thus exceeds the tracked budget.
-    if (WRITER_BACKPRESSURE_ENABLED) {
-      if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
-        shards.foreach(_.send())
-        while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
-          val spilled = shards.iterator.map(_.spillOnePendingData()).exists(identity)
-          if (!spilled) {
-            throwErrorIfExists()
-          }
+    if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
+      shards.foreach(_.send())
+      while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
+        val spilled = shards.iterator.map(_.spillOnePendingData()).exists(identity)
+        if (!spilled) {
+          throwErrorIfExists()
         }
       }
     }
     var buffer = bufferPool.pollLast()
-    if (buffer == null && !WRITER_BACKPRESSURE_ENABLED && REPLAY_MAX_MEMORY > 0) {
-      // A blocking multi-input consumer can leave encoded DataActions queued indefinitely.  The
-      // relaxed writer must not wait on the normal semaphore (that closes the cross-input cycle),
-      // but allocating a new direct buffer for every queued frame is equally unsafe.  Replay spill
-      // is already the durable ordered representation, so retire one oldest pending envelope and
-      // reuse its raw input buffer before growing executor direct memory.  If every candidate is
-      // genuinely in flight, the executor-level transport window remains the finite bound and a
-      // new allocation is required for progress.
-      shards.iterator.exists(_.spillOnePendingData())
-      buffer = bufferPool.pollLast()
-    }
     if (buffer == null) {
       sharedExecutorServer match {
         case Some(shared) =>
@@ -2280,9 +2247,7 @@ class StreamingShuffleWriter[K, V](
       // Reserve the budget with the task memory manager for accounting/visibility. In-flight
       // buffer memory is bounded by allocatedBufferBytesSemaphore; we ignore the return value
       // because we cannot act on a partial grant here (this consumer cannot spill).
-      if (WRITER_BACKPRESSURE_ENABLED) {
-        memoryConsumer.acquireMemory(TOTAL_TCPBUF_BYTES + MAX_BUFFER_BYTES)
-      }
+      memoryConsumer.acquireMemory(TOTAL_TCPBUF_BYTES + MAX_BUFFER_BYTES)
       flushThread.foreach(_.start())
       records.foreach { record =>
         val shard = shards(partitioner.getPartition(record._1))

@@ -1992,16 +1992,6 @@ package object config {
       .checkValue(_ > 0, "spark.shuffle.streaming.writerMaxMemory must be positive.")
       .createWithDefault(32 << 20) // 32 MB
 
-  private[spark] val STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED =
-    ConfigBuilder("spark.shuffle.streaming.readerBackpressure.enabled")
-      .doc("Whether streaming shuffle readers apply the per-writer byte quota by toggling " +
-        "Netty auto-read. Disabling this lets chained pipelined readers drain all incoming " +
-        "streams without a quota-induced cross-input cycle; executor memory is then the bound.")
-      .version("4.4.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .booleanConf
-      .createWithDefault(true)
 
   private[spark] val STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY =
     ConfigBuilder("spark.shuffle.streaming.readerQueueMaxMemory")
@@ -2111,16 +2101,6 @@ package object config {
         "spark.shuffle.streaming.rawBufferPoolMaxMemory must be positive.")
       .createWithDefault(4L << 30) // 4 GB
 
-  private[spark] val STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED =
-    ConfigBuilder("spark.shuffle.streaming.readerMessageBatching.enabled")
-      .doc("Whether a streaming shuffle reader enqueues all decoded messages from one transport " +
-        "body as one queue batch. The reader still consumes messages individually; disabling " +
-        "this option is intended for apples-to-apples queue-overhead experiments.")
-      .version("4.4.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .booleanConf
-      .createWithDefault(true)
 
   private[spark] val STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY =
     ConfigBuilder("spark.shuffle.streaming.writerReplayMaxMemory")
@@ -2135,17 +2115,6 @@ package object config {
       .checkValue(_ >= 0, "spark.shuffle.streaming.writerReplayMaxMemory must be non-negative.")
       .createWithDefault(0L)
 
-  private[spark] val STREAMING_SHUFFLE_WRITER_BACKPRESSURE_ENABLED =
-    ConfigBuilder("spark.shuffle.streaming.writerBackpressure.enabled")
-      .doc("Whether streaming shuffle writers bound in-flight data buffers with the " +
-        "writerMaxMemory semaphore. Disabling this permits a pipelined producer to continue " +
-        "sending while a downstream reader is consuming another input; it is intended for " +
-        "experiments where executor memory and Netty watermarks provide the effective bound.")
-      .version("4.4.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .booleanConf
-      .createWithDefault(true)
 
   private[spark] val STREAMING_SHUFFLE_WRITER_SERVER_THREADS =
     ConfigBuilder("spark.shuffle.streaming.writerServerThreads")
@@ -2235,17 +2204,6 @@ package object config {
       .booleanConf
       .createWithDefault(true)
 
-  private[spark] val STREAMING_SHUFFLE_WRITER_MIN_CLIENTS_PER_READER =
-    ConfigBuilder("spark.shuffle.streaming.writer.minClientsPerReader")
-      .doc("Minimum number of downstream clients that a streaming writer waits for per reader " +
-        "partition before sending its first message. This is a CPU POC safeguard for pipelined " +
-        "batches with multiple downstream consumers; one client is the default.")
-      .version("4.4.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 1, "must be at least one")
-      .createWithDefault(1)
 
   private[spark] val STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS =
     ConfigBuilder("spark.shuffle.streaming.writer.lingerAfterTerminationMs")
@@ -2314,17 +2272,6 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
-  private[spark] val STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS =
-    ConfigBuilder("spark.shuffle.streaming.reader.clientCreationThreads")
-      .doc("Number of threads used by a task-owned pipelined shuffle reader to create its " +
-        "writer clients. Prepared readers instead share an executor-scoped pool bounded by " +
-        "spark.executor.cores, avoiding one thread pool per resident inbox.")
-      .version("4.4.0")
-      .internal()
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(_ >= 1, "must be at least one")
-      .createWithDefault(1)
 
   private[spark] val STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL =
     ConfigBuilder("spark.shuffle.streaming.locationRefreshInterval")

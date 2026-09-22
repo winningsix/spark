@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import io.netty.buffer.Unpooled
 import org.mockito.ArgumentMatchers.{any, eq => eqTo}
-import org.mockito.Mockito.{atLeastOnce, verify, when}
+import org.mockito.Mockito.{atLeastOnce, inOrder => inMockitoOrder, never, verify, when}
 import org.scalatest.concurrent.Eventually.eventually
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.matchers.should.Matchers
@@ -36,10 +36,10 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREM
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
-  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
+  STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
-import org.apache.spark.network.client.TransportClient
+import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
   TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
@@ -138,13 +138,156 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  Seq("reader", "writer", "receive endpoint").foreach { operation =>
+    test(s"a stopped shuffle manager rejects a late $operation") {
+      val manager = new StreamingShuffleManager()
+      manager.stop()
+      try {
+        val error = intercept[IllegalStateException] {
+          operation match {
+            case "reader" => manager.getReader[Int, Int](null, 0, 1, 0, 1, null, null)
+            case "writer" => manager.getWriter[Int, Int](null, 0L, null, null)
+            case _ => manager.initializeReceiveServiceEndpoint()
+          }
+        }
+        error.getMessage should include("Streaming shuffle manager is stopped")
+      } finally {
+        manager.stop()
+      }
+    }
+  }
+
+  Seq("receive service", "shared client", "reader factory", "writer server").foreach { resource =>
+    test(s"shuffle manager stop fences pending $resource initialization") {
+      val conf = new SparkConf()
+        .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, resource == "receive service")
+        .set(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
+        .set(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, resource != "reader factory")
+        .set(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
+      withSpark(new SparkContext("local", "shuffle-stop-race", conf)) { _ =>
+        val manager = new StreamingShuffleManager()
+        val failures = new LinkedBlockingQueue[Throwable]()
+        val worker = new Thread(() => {
+          try {
+            if (resource == "writer server") {
+              manager.getWriter[Int, Int](null, 0L, null, null)
+            } else {
+              manager.getReader[Int, Int](null, 0, 1, 0, 1, null, null)
+            }
+          } catch {
+            case error: Throwable => failures.add(error)
+          }
+          ()
+        }, "shuffle-manager-stop-race")
+        worker.setDaemon(true)
+        try {
+          manager.synchronized {
+            worker.start()
+            // The task has passed its entry check but cannot initialize the lazy resource yet.
+            eventually(Timeout(5.seconds)) {
+              worker.getState shouldBe Thread.State.BLOCKED
+            }
+            manager.stop()
+          }
+          val error = failures.poll(5, TimeUnit.SECONDS)
+          error shouldBe a[IllegalStateException]
+          error.getMessage should include("Streaming shuffle manager is stopped")
+          worker.join(5000L)
+          assert(!worker.isAlive)
+        } finally {
+          manager.stop()
+          worker.interrupt()
+          worker.join(5000L)
+        }
+      }
+    }
+  }
+
+  test("shuffle manager cleanup is outside its monitor and continues after a close failure") {
+    val manager = new StreamingShuffleManager()
+    val closedUnderManagerLock = new AtomicBoolean(true)
+    val service = new StreamingShuffleReceiveService(new SparkConf(false)) {
+      override def close(): Unit = {
+        closedUnderManagerLock.set(Thread.holdsLock(manager))
+        super.close()
+        throw new IllegalStateException("injected receive service close failure")
+      }
+    }
+    val factory = mock[TransportClientFactory]
+    val client = mock[StreamingShuffleExecutorClient]
+    val server = mock[StreamingShuffleExecutorServer]
+    // Inject owned resources without starting network threads, including a failed close.
+    Seq("readerClientFactory" -> factory, "receiveService" -> service,
+      "sharedExecutorClient" -> client, "sharedWriterServer" -> server).foreach {
+      case (name, resource) =>
+        val field = classOf[StreamingShuffleManager].getDeclaredField(name)
+        field.setAccessible(true)
+        field.set(manager, resource)
+    }
+    manager.stop()
+    manager.stop()
+    assert(!closedUnderManagerLock.get())
+    val order = inMockitoOrder(factory, client, server)
+    order.verify(factory).close()
+    order.verify(client).close()
+    order.verify(server).close()
+    order.verifyNoMoreInteractions()
+  }
+
+  Seq(false, true).foreach { throwOnFailure =>
+    test(s"prepare rollback preserves existing inboxes and shared client: throw=$throwOnFailure") {
+      withSpark(new SparkContext("local", "prepare-rollback", new SparkConf())) { _ =>
+        val client = mock[StreamingShuffleExecutorClient]
+        val service = new StreamingShuffleReceiveService(SparkEnv.get.conf, () => Some(client)) {
+          override def prepare(id: StreamingShuffleReceiveInboxId): Boolean = {
+            if (id.partitionId == 2) {
+              if (throwOnFailure) throw new IllegalStateException("prepare failed")
+              false
+            } else {
+              super.prepare(id)
+            }
+          }
+        }
+        val existing = StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L)
+        val created = existing.copy(partitionId = 1)
+        val failed = existing.copy(partitionId = 2)
+        try {
+          service.prepare(existing) shouldBe true
+          if (throwOnFailure) {
+            intercept[IllegalStateException] {
+              service.prepareAll(Seq(existing, created, failed))
+            }
+          } else {
+            service.prepareAll(Seq(existing, created, failed)) shouldBe false
+          }
+          service.activeInboxCount shouldBe 1
+          service.releasePrepared(created) shouldBe false
+          service.releasePrepared(existing) shouldBe true
+          service.releasePrepared(existing) shouldBe false
+          verify(client, never()).close()
+        } finally {
+          service.close()
+        }
+      }
+    }
+  }
+
+  test("a closed receive service cannot be resurrected by a late prepare") {
+    val service = new StreamingShuffleReceiveService(new SparkConf(false))
+    service.close()
+    service.close()
+    intercept[IllegalArgumentException] {
+      service.prepare(StreamingShuffleReceiveInboxId(7, 9, 0, 0, -1L))
+    }
+    service.activeInboxCount shouldBe 0
+  }
+
   test("prepared receive service enables elastic group admission") {
     for (receiveServiceEnabled <- Seq(false, true); waitForAcks <- Seq(false, true)) {
       val requiresWholeGroup = !receiveServiceEnabled || waitForAcks
       val conf = new SparkConf()
         .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, waitForAcks)
         .set(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, receiveServiceEnabled)
-        .set(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, receiveServiceEnabled)
         .set(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY,
           if (receiveServiceEnabled) 1024L else 0L)
         .set(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, receiveServiceEnabled)

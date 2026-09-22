@@ -144,8 +144,6 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
   test("prepared receive mode pipelines below a limit's hidden regular boundary") {
     val previousEnabled = SparkEnv.get.conf.get(
       config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
-    val previousBatching = SparkEnv.get.conf.get(
-      config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
     val previousQueue = SparkEnv.get.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
     val previousSharedConnections = SparkEnv.get.conf.get(
       config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
@@ -154,7 +152,6 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
     val previousWaitForAcks = SparkEnv.get.conf.get(
       config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-    SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
     SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
@@ -175,8 +172,6 @@ class AQEEnablePipelinedShuffleRuleSuite extends QueryTest with SharedSparkSessi
     } finally {
       SparkEnv.get.conf.set(
         config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
-      SparkEnv.get.conf.set(
-        config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
       SparkEnv.get.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
       SparkEnv.get.conf.set(
         config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, previousSharedConnections)

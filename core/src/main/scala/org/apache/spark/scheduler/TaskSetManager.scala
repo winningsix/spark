@@ -453,12 +453,16 @@ private[spark] class TaskSetManager(
     None
   }
 
-  private[scheduler] def isTaskPendingForOffer(index: Int): Boolean = {
+  private[spark] def isActiveForScheduling: Boolean = !isZombie
+
+  private[spark] def numCompletedTasks: Int = tasksSuccessful
+
+  private[spark] def isTaskPendingForOffer(index: Int): Boolean = {
     index >= 0 && index < numTasks && !successful(index) && copiesRunning(index) == 0 &&
       !barrierPendingLaunchTasks.contains(index)
   }
 
-  private[scheduler] def canPrepareReaderOnExecutor(
+  private[spark] def canPrepareReaderOnExecutor(
       index: Int, executorId: String, host: String): Boolean = {
     !taskSetExcludelistHelperOpt.exists { excludeList =>
       excludeList.isNodeExcludedForTaskSet(host) ||

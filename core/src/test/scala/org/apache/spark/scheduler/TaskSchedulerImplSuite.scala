@@ -41,7 +41,8 @@ import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
 import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInboxes,
-  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId}
+  ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId,
+  StreamingShuffleSchedulingPolicy}
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{Clock, ManualClock, ThreadUtils}
 
@@ -94,10 +95,12 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     val executors = 4
     val tasks = 12
     val legacy = (0 until tasks).map { index =>
-      TaskSchedulerImpl.preparedReaderExecutorIndex(index, executors, diagonalAssignment = false)
+      StreamingShuffleSchedulingPolicy.preparedReaderExecutorIndex(
+        index, executors, diagonalAssignment = false)
     }
     val diagonal = (0 until tasks).map { index =>
-      TaskSchedulerImpl.preparedReaderExecutorIndex(index, executors, diagonalAssignment = true)
+      StreamingShuffleSchedulingPolicy.preparedReaderExecutorIndex(
+        index, executors, diagonalAssignment = true)
     }
 
     assert(legacy === Seq(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3))
@@ -3045,6 +3048,118 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         assert(failedTaskSetReason.contains("lost its schedulable executor executor1"))
       } finally {
         endpoints.foreach(sc.env.rpcEnv.stop)
+      }
+    }
+  }
+
+  test("receive prepare does not block resource offers and needs both data and an ACK") {
+    val scheduler = setupScheduler(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true")
+    val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    val requests = new LinkedBlockingQueue[(Seq[StreamingShuffleReceiveInboxId], RpcCallContext)]()
+    val offers = IndexedSeq(WorkerOffer("executor0", "host0", 2))
+    scheduler.resourceOffers(offers)
+    val endpoint = sc.env.rpcEnv.setupEndpoint("async-prepare-test", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = sc.env.rpcEnv
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInboxes(ids) => requests.add((ids, context))
+      }
+      override def receive: PartialFunction[Any, Unit] = {
+        case _: ReleaseStreamingShuffleReceiveInbox =>
+      }
+    })
+    val offerExecutor = ThreadUtils.newDaemonSingleThreadExecutor("async-prepare-test")
+    var pendingReply: RpcCallContext = null
+    try {
+      tracker.registerReceiveEndpoint("executor0", endpoint)
+      val reader = new TaskSet(Array[Task[_]](new FakeTask(0, 0)),
+        stageId = 0, stageAttemptId = 0, priority = 0, properties = null,
+        resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, shuffleId = None,
+        isPipelined = true, isPipelinedShuffleReader = true,
+        pipelinedReaderShuffleIds = Seq(7))
+      scheduler.submitTasks(reader)
+      val offered = offerExecutor.submit(new java.util.concurrent.Callable[Boolean] {
+        override def call(): Boolean = scheduler.resourceOffers(offers).flatten.isEmpty
+      })
+      val request = requests.poll(10, TimeUnit.SECONDS)
+      assert(request != null)
+      pendingReply = request._2
+      assert(offered.get(10, TimeUnit.SECONDS),
+        "resourceOffers must not wait for the prepare ACK")
+      request._1.foreach(tracker.markInboxDrainReady("executor0", _))
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty,
+        "data readiness cannot bypass an outstanding prepare ACK")
+      scheduler.submitTasks(FakeTask.createTaskSet(1, stageId = 1, stageAttemptId = 0))
+      val ordinary = scheduler.resourceOffers(offers).flatten
+      assert(ordinary.size === 1, "unrelated work must remain schedulable during preparation")
+      assert(scheduler.taskIdToTaskSetManager.get(ordinary.head.taskId).stageId === 1)
+      pendingReply.reply(true)
+      pendingReply = null
+      eventually(timeout(10.seconds)) {
+        val launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 1)
+        assert(scheduler.taskIdToTaskSetManager.get(launched.head.taskId).stageId === 0)
+      }
+      assert(requests.isEmpty, "repeated offers must not duplicate receive preparation")
+    } finally {
+      if (pendingReply != null) pendingReply.reply(false)
+      offerExecutor.shutdownNow()
+      sc.env.rpcEnv.stop(endpoint)
+    }
+  }
+
+  Seq("cancel", "failure", "executor loss").foreach { action =>
+    test(s"an in-flight receive preparation is fenced after $action") {
+      val scheduler = setupScheduler(
+        config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true")
+      val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+      val requests =
+        new LinkedBlockingQueue[(Seq[StreamingShuffleReceiveInboxId], RpcCallContext)]()
+      val released = new LinkedBlockingQueue[StreamingShuffleReceiveInboxId]()
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 1))
+      scheduler.resourceOffers(offers)
+      val endpoint = sc.env.rpcEnv.setupEndpoint("cancel-prepare-test", new RpcEndpoint {
+        override val rpcEnv: RpcEnv = sc.env.rpcEnv
+        override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case PrepareStreamingShuffleReceiveInboxes(ids) => requests.add((ids, context))
+        }
+        override def receive: PartialFunction[Any, Unit] = {
+          case ReleaseStreamingShuffleReceiveInbox(id) => released.add(id)
+        }
+      })
+      try {
+        tracker.registerReceiveEndpoint("executor0", endpoint)
+        val reader = new TaskSet(Array[Task[_]](new FakeTask(0, 0)),
+          stageId = 0, stageAttemptId = 0, priority = 0, properties = null,
+          resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, shuffleId = None,
+          isPipelined = true, isPipelinedShuffleReader = true,
+          pipelinedReaderShuffleIds = Seq(7))
+        scheduler.submitTasks(reader)
+        assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+        val request = requests.poll(10, TimeUnit.SECONDS)
+        assert(request != null)
+        action match {
+          case "cancel" => scheduler.killAllTaskAttempts(0, true, "test cancellation")
+          case "executor loss" =>
+            scheduler.executorLost("executor0", ExecutorProcessLost("test loss"))
+          case "failure" =>
+        }
+        request._2.reply(action != "failure")
+        assert(released.poll(10, TimeUnit.SECONDS) != null)
+        request._1.foreach(tracker.markInboxDrainReady("executor0", _))
+        assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+        if (action != "cancel") {
+          eventually(timeout(10.seconds)) {
+            assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+            assert(failedTaskSet)
+          }
+        }
+        assert(tracker.receiveCoordinator.snapshot.isEmpty)
+        assert(requests.isEmpty)
+      } finally {
+        sc.env.rpcEnv.stop(endpoint)
       }
     }
   }

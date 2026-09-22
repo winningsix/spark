@@ -40,7 +40,6 @@ class PipelinedShuffleTPCHPlanSuite extends BenchmarkQueryTest with TPCHBase {
       .set("spark.shuffle.manager.incremental",
         "org.apache.spark.shuffle.streaming.StreamingShuffleManager")
       .set("spark.shuffle.streaming.executorReceiveService.enabled", "true")
-      .set("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
       .set("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
       .set("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
       .set("spark.shuffle.streaming.sharedConnections.enabled", "true")

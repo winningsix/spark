@@ -27,8 +27,7 @@ import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
-import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInbox,
-  PrepareStreamingShuffleReceiveInboxes, ReleaseStreamingShuffleReceiveInbox,
+import org.apache.spark.shuffle.streaming.{StreamingShuffleReadinessCoordinator,
   StreamingShuffleReceiveInboxId}
 import org.apache.spark.util.ThreadUtils
 
@@ -290,10 +289,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     new ConcurrentHashMap[Int, ConcurrentHashMap[Long, StreamingShuffleTaskLocation]]()
 
   private val shuffleInfos = new ConcurrentHashMap[Int, StreamingShuffleInfo]()
-  private val receiveEndpoints = new ConcurrentHashMap[String, RpcEndpointRef]()
-  private val drainReadyInboxes =
-    ConcurrentHashMap.newKeySet[(String, StreamingShuffleReceiveInboxId)]()
-  @volatile private var inboxReadyCallback: () => Unit = () => ()
+  private[spark] val receiveCoordinator = new StreamingShuffleReadinessCoordinator
 
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
@@ -352,67 +348,19 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     // Either way, no orphan remains. See registerShuffleWriterTask.
     shuffleInfos.remove(shuffleId)
     taskLocations.remove(shuffleId)
-    drainReadyInboxes.removeIf { case (_, id) => id.shuffleId == shuffleId }
+    receiveCoordinator.unregisterShuffle(shuffleId)
   }
 
   override def registerReceiveEndpoint(
       executorId: String,
       endpoint: RpcEndpointRef): Boolean = {
-    receiveEndpoints.put(executorId, endpoint)
-    inboxReadyCallback()
-    true
+    receiveCoordinator.registerExecutor(executorId, endpoint)
   }
 
   override def markInboxDrainReady(
       executorId: String,
       id: StreamingShuffleReceiveInboxId): Unit = {
-    if (drainReadyInboxes.add((executorId, id))) inboxReadyCallback()
-  }
-
-  private[spark] def setInboxReadyCallback(callback: () => Unit): Unit = {
-    inboxReadyCallback = callback
-  }
-
-  private[spark] def receiveExecutorIds: Seq[String] = receiveEndpoints.keySet().asScala.toSeq
-
-  private[spark] def prepareReceiveInbox(
-      executorId: String,
-      id: StreamingShuffleReceiveInboxId): Boolean = {
-    val endpoint = receiveEndpoints.get(executorId)
-    endpoint != null && endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInbox(id))
-  }
-
-  private[spark] def prepareReceiveInboxes(
-      executorId: String,
-      ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = {
-    if (ids.isEmpty) {
-      true
-    } else {
-      val endpoint = receiveEndpoints.get(executorId)
-      endpoint != null &&
-        endpoint.askSync[Boolean](PrepareStreamingShuffleReceiveInboxes(ids))
-    }
-  }
-
-  private[spark] def releaseReceiveInbox(
-      executorId: String,
-      id: StreamingShuffleReceiveInboxId): Unit = {
-    drainReadyInboxes.remove((executorId, id))
-    Option(receiveEndpoints.get(executorId)).foreach(
-      _.send(ReleaseStreamingShuffleReceiveInbox(id)))
-  }
-
-  private[spark] def removeReceiveExecutor(executorId: String): Unit = {
-    receiveEndpoints.remove(executorId)
-    drainReadyInboxes.removeIf { case (readyExecutorId, _) =>
-      readyExecutorId == executorId
-    }
-  }
-
-  private[spark] def isReceiveInboxDrainReady(
-      executorId: String,
-      id: StreamingShuffleReceiveInboxId): Boolean = {
-    drainReadyInboxes.contains((executorId, id))
+    receiveCoordinator.markDrainReady(executorId, id)
   }
 
   def post(message: StreamingShuffleTaskLocationTrackerMasterMessage): Unit = {
@@ -545,6 +493,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   }
 
   override def stop(): Unit = {
+    receiveCoordinator.close()
     trackerMasterMessages.offer(PoisonPill)
     threadpool.shutdown()
     if (trackerEndpoint != null) {

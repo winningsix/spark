@@ -29,9 +29,7 @@ import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.config.{STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE,
-  STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
-  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED}
+import org.apache.spark.internal.config.STREAMING_SHUFFLE_DATA_SOCKET_BUFFER_SIZE
 import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
@@ -80,12 +78,8 @@ class StreamingShuffleClientHandler(
   // request can cross newer normal frames already in flight; duplicates are legal only while this
   // explicit replay window is active.
   private val replayRepairActive = new AtomicBoolean(false)
-  private val backpressureEnabled =
-    Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED))
-  private val messageBatchingEnabled =
-    Option(SparkEnv.get).forall(_.conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED))
   private val batchQueue = queue match {
-    case batched: StreamingShuffleMessageQueue if messageBatchingEnabled => Some(batched)
+    case batched: StreamingShuffleMessageQueue => Some(batched)
     case _ => None
   }
   @volatile private var perStreamAutoReadEnabled = true
@@ -140,7 +134,7 @@ class StreamingShuffleClientHandler(
     // multiplexed channel this is the logical replacement for toggling channel-wide autoRead;
     // each route gets an independent writer-side byte budget even though the physical channel is
     // shared with unrelated readers.
-    if (backpressureEnabled && !perStreamAutoReadEnabled) {
+    if (!perStreamAutoReadEnabled) {
       // A negative first credit opts this logical stream into writer-side byte admission. Positive
       // credits retain the historical connection-discovery-only protocol for dedicated channels.
       -math.min(byteLimit, Int.MaxValue.toLong).toInt
@@ -175,7 +169,7 @@ class StreamingShuffleClientHandler(
 
   /** Build the latest idempotent discovery or cumulative-credit repair frame. */
   private[streaming] def prepareMultiplexedCreditRepair(): Option[CreditControlMessage] = {
-    if (!backpressureEnabled || perStreamAutoReadEnabled || terminationReceived) return None
+    if (perStreamAutoReadEnabled || terminationReceived) return None
     if (lastSeqNum < 0) {
       val advertised = math.min(availableReceiveBytes, Int.MaxValue.toLong).toInt
       if (advertised > 0) {
@@ -224,7 +218,6 @@ class StreamingShuffleClientHandler(
   // Update the number of outstanding bytes from this writer, toggling auto-read if necessary.
   // Can be called from main or Netty threads, so synchronization is required.
   private def updateQuota(bytes: Long): Unit = synchronized {
-    if (!backpressureEnabled) return
     remainingBytesQuota -= bytes
     if (perStreamAutoReadEnabled) {
       val autoRead = remainingBytesQuota > 0
@@ -383,13 +376,11 @@ class StreamingShuffleClientHandler(
             // The writer charged this retransmission to the logical receive window. Drop the
             // already-published record bytes, but advance the cumulative released-byte watermark
             // so replay cannot consume credit permanently.
-            if (backpressureEnabled) {
-              if (perStreamAutoReadEnabled) {
-                sendCreditControlMessage(client, messageSize)
-              } else {
-                val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
-                sendCumulativeCreditAck(client, released)
-              }
+            if (perStreamAutoReadEnabled) {
+              sendCreditControlMessage(client, messageSize)
+            } else {
+              val released = cumulativeReleasedBytes.addAndGet(messageSize.toLong)
+              sendCumulativeCreditAck(client, released)
             }
           case dataMessage: DataMessage =>
             updateQuota(messageSize)
@@ -397,7 +388,7 @@ class StreamingShuffleClientHandler(
             dataMessage.setResourceReleaseCallback(() => retainedBody.foreach(_.release()))
             dataMessage.setReleaseCallback(() => {
               updateQuota(-messageSize)
-              if (backpressureEnabled && !terminationReceived) {
+              if (!terminationReceived) {
                 if (perStreamAutoReadEnabled) {
                   // Dedicated channels retain the original additive-credit protocol; their
                   // channel-level autoRead is the primary admission boundary.

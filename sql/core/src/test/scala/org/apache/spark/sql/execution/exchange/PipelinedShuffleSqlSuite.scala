@@ -24,6 +24,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.local.pipelined.ChannelShuffleRendezvous
 import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 
 /**
@@ -53,7 +54,6 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       .config("spark.shuffle.manager.incremental",
         "org.apache.spark.shuffle.streaming.StreamingShuffleManager")
       .config("spark.shuffle.streaming.executorReceiveService.enabled", "true")
-      .config("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
       .config("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
       .config("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
       .config("spark.shuffle.streaming.sharedConnections.enabled", "true")
@@ -968,24 +968,31 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       implicit val ctx = spark.sqlContext
       val input = MemoryStream[Int]
       val agg = input.toDF().selectExpr("value % 10 AS k").groupBy($"k").count()
-      val q = agg.writeStream.format("memory").queryName("pipelined_stream_probe")
-        .outputMode("complete").start()
       try {
-        input.addData(1 to 200: _*)
-        q.processAllAvailable()
-        val plan = q.asInstanceOf[
-            org.apache.spark.sql.execution.streaming.runtime.StreamingQueryWrapper]
-          .streamingQuery.lastExecution.executedPlan
-        val flipped = collect(plan) { case s: ShuffleExchangeExec if s.pipelined => s }
-        val all = collect(plan) { case s: ShuffleExchangeExec => s }
-        assert(all.nonEmpty,
-          s"precondition: the streaming plan should contain a state-store shuffle; plan:\n$plan")
-        assert(flipped.isEmpty,
-          s"a streaming plan must not be rewritten by the batch rule; plan:\n$plan")
+        val q = agg.writeStream.format("memory").queryName("pipelined_stream_probe")
+          .outputMode("complete").start()
+        try {
+          input.addData(1 to 200: _*)
+          q.processAllAvailable()
+          val plan = q.asInstanceOf[
+              org.apache.spark.sql.execution.streaming.runtime.StreamingQueryWrapper]
+            .streamingQuery.lastExecution.executedPlan
+          val flipped = collect(plan) { case s: ShuffleExchangeExec if s.pipelined => s }
+          val all = collect(plan) { case s: ShuffleExchangeExec => s }
+          assert(all.nonEmpty,
+            s"precondition: the streaming plan should contain a state-store shuffle; plan:\n$plan")
+          assert(flipped.isEmpty,
+            s"a streaming plan must not be rewritten by the batch rule; plan:\n$plan")
+        } finally {
+          q.stop()
+          spark.sql("DROP VIEW IF EXISTS pipelined_stream_probe")
+        }
       } finally {
-        q.stop()
-        spark.sql("DROP VIEW IF EXISTS pipelined_stream_probe")
+        // Match StreamTest's cleanup even if starting or stopping the query fails.
+        StateStore.stop()
       }
+      assert(!StateStore.isMaintenanceRunning,
+        "The streaming probe must not leave StateStore maintenance running")
     }
   }
 

@@ -260,7 +260,6 @@ class StreamingShuffleSuite
       .setAppName("distributed-prepared-streaming-shuffle-test")
       .set(SHUFFLE_MANAGER_INCREMENTAL, classOf[StreamingShuffleManager].getName)
       .set("spark.shuffle.streaming.executorReceiveService.enabled", "true")
-      .set("spark.shuffle.streaming.readerMessageBatching.enabled", "true")
       .set("spark.shuffle.streaming.readerQueueMaxMemory", "64k")
       .set("spark.shuffle.streaming.sharedWriterServer.enabled", "true")
       .set("spark.shuffle.streaming.sharedConnections.enabled", "true")

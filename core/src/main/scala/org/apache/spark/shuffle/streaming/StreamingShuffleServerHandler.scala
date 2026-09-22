@@ -25,8 +25,7 @@ import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.{ByteBuf, Unpooled}
 
-import org.apache.spark.{SparkEnv, TaskContext}
-import org.apache.spark.internal.config.STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED
+import org.apache.spark.TaskContext
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, StreamingShuffleMessage, TerminationAckMessage}
@@ -121,16 +120,13 @@ class StreamingShuffleServerHandler(
   }
   private val creditByReaderAndClient =
     Array.fill(numReaders)(new ConcurrentHashMap[TransportClient, RouteCreditState]())
-  private val creditFlowControlEnabled = Option(SparkEnv.get).forall { env =>
-    env.conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
-  }
 
   private[streaming] def clientsFor(readerId: Int): Seq[TransportClient] = {
     clientsByReader(readerId).asScala.toSeq
   }
 
   private[streaming] def isCreditControlled(readerId: Int, client: TransportClient): Boolean = {
-    creditFlowControlEnabled && creditState(readerId, client) != null
+    creditState(readerId, client) != null
   }
 
   private[streaming] def allExpectedReadersConnectedFuture: CompletableFuture[Void] = {
@@ -243,7 +239,7 @@ class StreamingShuffleServerHandler(
           onReplayRequested(readerId, client, creditControlMessage.getSeqNum)
           return
         }
-        val enablesCreditFlow = creditFlowControlEnabled && encodedCredit < 0
+        val enablesCreditFlow = encodedCredit < 0
         val credit = if (encodedCredit < 0) -encodedCredit else encodedCredit
         val state = if (enablesCreditFlow) {
           enableCreditControl(readerId, client)

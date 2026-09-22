@@ -19,10 +19,11 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.File
 import java.util.concurrent.{BlockingQueue, CompletableFuture, ConcurrentHashMap,
-  CopyOnWriteArrayList, ExecutorService, LinkedBlockingQueue, ScheduledExecutorService, TimeUnit}
+  CopyOnWriteArrayList, ExecutorService, ScheduledExecutorService, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
 import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
@@ -30,7 +31,7 @@ import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
-  STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
+  STREAMING_SHUFFLE_READER_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY}
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
@@ -61,13 +62,9 @@ private[streaming] object StreamingShuffleReceiveService {
   val ENDPOINT_NAME = "StreamingShuffleReceiveService"
 
   def createQueue(conf: SparkConf): BlockingQueue[StreamingShuffleMessage] = {
-    if (conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)) {
-      new StreamingShuffleMessageQueue(
-        conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
-        Some(new File(Utils.getLocalDir(conf))))
-    } else {
-      new LinkedBlockingQueue[StreamingShuffleMessage]()
-    }
+    new StreamingShuffleMessageQueue(
+      conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
+      Some(new File(Utils.getLocalDir(conf))))
   }
 
   def closeQueue(
@@ -100,6 +97,7 @@ private[streaming] class StreamingShuffleReceiveService(
     onDrainReady: StreamingShuffleReceiveInboxId => Unit = _ => ()) extends Logging {
   private val inboxes =
     new ConcurrentHashMap[StreamingShuffleReceiveInboxId, StreamingShuffleReceiveInbox]()
+  private var closed = false
   private case class TaskShuffleKey(
       shuffleId: Int,
       stageId: Int,
@@ -135,7 +133,8 @@ private[streaming] class StreamingShuffleReceiveService(
 
   def acquire(
       shuffleId: Int,
-      context: TaskContext): StreamingShuffleReceiveInboxLease = {
+      context: TaskContext): StreamingShuffleReceiveInboxLease = synchronized {
+    require(!closed, "Streaming shuffle receive service is closed")
     val taskShuffleKey = TaskShuffleKey(
       shuffleId,
       context.stageId(),
@@ -169,6 +168,7 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def prepare(id: StreamingShuffleReceiveInboxId): Boolean = synchronized {
+    require(!closed, "Streaming shuffle receive service is closed")
     require(id.taskAttemptId == -1L, s"Prepared inbox must use taskAttemptId=-1: $id")
     val inbox = new StreamingShuffleReceiveInbox(
       id, StreamingShuffleReceiveService.createQueue(conf))
@@ -198,10 +198,24 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def prepareAll(ids: Seq[StreamingShuffleReceiveInboxId]): Boolean = synchronized {
-    ids.forall(prepare)
+    // The batch owns only the inboxes it creates, not existing inputs of another live reader.
+    // Hold the service monitor across preparation and rollback, including against cleanup.
+    val existing = ids.filter(inboxes.containsKey).toSet
+    def rollback(): Unit = ids.filterNot(existing.contains).foreach { id =>
+      Utils.tryLogNonFatalError { releasePrepared(id) }
+    }
+    try {
+      val prepared = ids.forall(prepare)
+      if (!prepared) rollback()
+      prepared
+    } catch {
+      case NonFatal(error) =>
+        rollback()
+        throw error
+    }
   }
 
-  def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = {
+  def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = synchronized {
     val inbox = inboxes.get(id)
     inbox != null && inboxes.remove(id, inbox) && {
       inbox.close()
@@ -209,7 +223,8 @@ private[streaming] class StreamingShuffleReceiveService(
     }
   }
 
-  def unregisterShuffle(shuffleId: Int): Unit = {
+  def unregisterShuffle(shuffleId: Int): Unit = synchronized {
+    nextReaderOrdinal.keySet().removeIf(_.shuffleId == shuffleId)
     inboxes.entrySet().asScala.foreach { entry =>
       if (entry.getKey.shuffleId == shuffleId && inboxes.remove(entry.getKey, entry.getValue)) {
         entry.getValue.close()
@@ -218,6 +233,8 @@ private[streaming] class StreamingShuffleReceiveService(
   }
 
   def close(): Unit = synchronized {
+    closed = true
+    nextReaderOrdinal.clear()
     inboxes.entrySet().asScala.foreach { entry =>
       if (inboxes.remove(entry.getKey, entry.getValue)) {
         entry.getValue.close()
@@ -233,7 +250,7 @@ private[streaming] class StreamingShuffleReceiveService(
   private[streaming] def activeInboxCount: Int = inboxes.size()
 
   private def releaseLease(
-      inbox: StreamingShuffleReceiveInbox): StreamingShuffleReceiveInboxStats = {
+      inbox: StreamingShuffleReceiveInbox): StreamingShuffleReceiveInboxStats = synchronized {
     inboxes.remove(inbox.id, inbox)
     inbox.close()
   }

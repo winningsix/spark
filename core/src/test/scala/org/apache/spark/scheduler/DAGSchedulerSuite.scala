@@ -49,6 +49,7 @@ import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.shuffle.{FetchFailedException, MetadataFetchFailedException}
+import org.apache.spark.shuffle.streaming.StreamingShuffleStagePlanning
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId, BlockManagerMaster}
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, CallSite, Clock, LongAccumulator, SystemClock, ThreadUtils, Utils}
 import org.apache.spark.util.ArrayImplicits._
@@ -194,7 +195,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       ExecutorCacheTaskLocation("host-a", "1"),
       ExecutorCacheTaskLocation("host-b", "2"))
 
-    val plan = DAGScheduler.planUnionTaskAffinity(
+    val plan = StreamingShuffleStagePlanning.planUnionTaskAffinity(
       union.partitions.indices, union.partitions, executors).get
 
     assert(plan.orderedPartitionIds === Seq(
@@ -212,7 +213,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val union = sc.union(Seq(sc.parallelize(0 until 2, 2), sc.parallelize(0 until 2, 2)))
     val executors = Seq(ExecutorCacheTaskLocation("host-a", "1"))
 
-    assert(DAGScheduler.planUnionTaskAffinity(
+    assert(StreamingShuffleStagePlanning.planUnionTaskAffinity(
       union.partitions.indices.dropRight(1), union.partitions, executors).isEmpty)
   }
 
@@ -6921,7 +6922,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   for (submission <- Seq("result", "map", "segmented")) {
     test(s"pipelined shuffle: prepared receive regular boundary submission=$submission") {
       val previousEnabled = sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)
-      val previousBatching = sc.conf.get(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED)
       val previousQueue = sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY)
       val previousSharedConnections =
         sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
@@ -6930,7 +6930,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       val previousWaitForAcks =
         sc.conf.get(config.STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS)
       sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, true)
-      sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, true)
       sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, 1024L)
       sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, true)
       sc.conf.set(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED, true)
@@ -6979,7 +6978,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         assertDataStructuresEmpty()
       } finally {
         sc.conf.set(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED, previousEnabled)
-        sc.conf.set(config.STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED, previousBatching)
         sc.conf.set(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, previousQueue)
         sc.conf.set(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
           previousSharedConnections)
@@ -8895,11 +8893,13 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val reader = new MyRDD(sc, 2, List(dependency), tracker = mapOutputTracker)
     val branchA = new MyRDD(sc, 2, List(new OneToOneDependency(reader)))
     val branchB = new MyRDD(sc, 2, List(new OneToOneDependency(reader)))
-    assert(scheduler.pipelinedShuffleIdsReadByStage(branchA) === Seq(dependency.shuffleId))
-    assert(scheduler.pipelinedShuffleIdsReadByStage(branchB) === Seq(dependency.shuffleId))
+    assert(StreamingShuffleStagePlanning.shuffleIdsReadByStage(branchA) ===
+      Seq(dependency.shuffleId))
+    assert(StreamingShuffleStagePlanning.shuffleIdsReadByStage(branchB) ===
+      Seq(dependency.shuffleId))
     val combined = new MyRDD(sc, 2,
       List(new OneToOneDependency(branchA), new OneToOneDependency(branchB)))
-    assert(scheduler.pipelinedShuffleIdsReadByStage(combined) ===
+    assert(StreamingShuffleStagePlanning.shuffleIdsReadByStage(combined) ===
       Seq(dependency.shuffleId, dependency.shuffleId))
   }
 

@@ -25,8 +25,7 @@ import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 import org.apache.spark.{SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED,
-  STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS, STREAMING_SHUFFLE_READER_MAX_MEMORY,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
@@ -189,8 +188,6 @@ class StreamingShuffleReader[K, C](
   // We might need to revisit if the size limit is enough. If not, there should be a way to tie it
   // to the per-task memory limit from the task context.
   private val MAX_MEMORY = conf.get(STREAMING_SHUFFLE_READER_MAX_MEMORY)
-  private val READER_BACKPRESSURE_ENABLED =
-    conf.get(STREAMING_SHUFFLE_READER_BACKPRESSURE_ENABLED)
   // Data and termination messages from all writers are put into this queue.
   private[spark] val messageQueue: BlockingQueue[StreamingShuffleMessage] =
     receiveInbox.map(_.queue).getOrElse(StreamingShuffleReceiveService.createQueue(conf))
@@ -218,7 +215,7 @@ class StreamingShuffleReader[K, C](
 
   // thread pool used to perform client creation in parallel
   private[spark] lazy val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
-    conf.get(STREAMING_SHUFFLE_READER_CLIENT_CREATION_THREADS),
+    1,
     s"streaming-shuffle-async-client-creation-${context.partitionId()}")
 
   private val receiveSession = preparedSession.map(_.receiveSession).getOrElse {
@@ -322,7 +319,7 @@ class StreamingShuffleReader[K, C](
             .foreach { snapshot =>
               receiveSession.onWriterSnapshot(snapshot, numWriters => {
                 perWriterByteLimit = math.max(MAX_MEMORY / math.max(1, numWriters), 1L)
-                if (READER_BACKPRESSURE_ENABLED) memoryConsumer.acquireMemory(MAX_MEMORY)
+                memoryConsumer.acquireMemory(MAX_MEMORY)
               }) { locations =>
                 locations.map { case (writerId, location) =>
                   writerId -> CompletableFuture.runAsync(() => {

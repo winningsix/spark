@@ -21,7 +21,6 @@ import org.apache.spark.{ShuffleDependency, SparkContext, SparkEnv, SparkExcepti
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES, EXECUTOR_ID,
   STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED,
-  STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED,
   STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY, STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED,
   STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
@@ -32,6 +31,7 @@ import org.apache.spark.network.server.NoOpRpcHandler
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.shuffle._
+import org.apache.spark.util.Utils
 
 class StreamingShuffleHandle[K, V, C](shuffleId: Int, dependency: ShuffleDependency[K, V, C])
   extends BaseShuffleHandle[K, V, C](shuffleId, dependency)
@@ -108,7 +108,6 @@ private[spark] class StreamingShuffleManager
   private def preparedReceiveServiceConfigured: Boolean = {
     val conf = SparkEnv.get.conf
     conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED) &&
-      conf.get(STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED) &&
       conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY) > 0L &&
       conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED) &&
       conf.get(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
@@ -137,10 +136,17 @@ private[spark] class StreamingShuffleManager
   @volatile private var sharedWriterServer: StreamingShuffleExecutorServer = _
   @volatile private var receiveService: StreamingShuffleReceiveService = _
   @volatile private var receiveServiceEndpoint: RpcEndpointRef = _
+  @volatile private var stopped = false
+
+  private def checkNotStopped(): Unit = {
+    if (stopped) throw new IllegalStateException("Streaming shuffle manager is stopped")
+  }
 
   private def getReceiveService: StreamingShuffleReceiveService = {
+    checkNotStopped()
     var service = receiveService
     if (service == null) synchronized {
+      checkNotStopped()
       service = receiveService
       if (service == null) {
         service = new StreamingShuffleReceiveService(
@@ -155,11 +161,11 @@ private[spark] class StreamingShuffleManager
   }
 
   private[spark] def initializeReceiveServiceEndpoint(): Unit = synchronized {
+    checkNotStopped()
     val env = SparkEnv.get
     if (env.conf.get(STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED)) {
       require(preparedReceiveServiceConfigured,
-        s"${STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key} requires " +
-          s"${STREAMING_SHUFFLE_READER_MESSAGE_BATCHING_ENABLED.key}=true, a positive " +
+        s"${STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key} requires a positive " +
           s"${STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY.key}, " +
           s"${STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED.key}=true, and " +
           s"${STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED.key}=true")
@@ -176,8 +182,10 @@ private[spark] class StreamingShuffleManager
   }
 
   private def getSharedWriterServer: StreamingShuffleExecutorServer = {
+    checkNotStopped()
     var server = sharedWriterServer
     if (server == null) synchronized {
+      checkNotStopped()
       server = sharedWriterServer
       if (server == null) {
         server = new StreamingShuffleExecutorServer()
@@ -194,8 +202,10 @@ private[spark] class StreamingShuffleManager
    * loop per reader-writer pair.
    */
   private def getReaderClientFactory: TransportClientFactory = {
+    checkNotStopped()
     var factory = readerClientFactory
     if (factory == null) synchronized {
+      checkNotStopped()
       factory = readerClientFactory
       if (factory == null) {
         val conf = SparkEnv.get.conf
@@ -217,8 +227,10 @@ private[spark] class StreamingShuffleManager
   }
 
   private def getSharedExecutorClient: StreamingShuffleExecutorClient = {
+    checkNotStopped()
     var client = sharedExecutorClient
     if (client == null) synchronized {
+      checkNotStopped()
       client = sharedExecutorClient
       if (client == null) {
         client = new StreamingShuffleExecutorClient()
@@ -239,6 +251,7 @@ private[spark] class StreamingShuffleManager
       mapId: Long,
       context: TaskContext,
       metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
+    checkNotStopped()
     val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, V, _]]
     val sharedServer = if (SparkEnv.get.conf.get(STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED)) {
       Some(getSharedWriterServer)
@@ -264,6 +277,7 @@ private[spark] class StreamingShuffleManager
       endPartition: Int,
       context: TaskContext,
       metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] = {
+    checkNotStopped()
     val streamingShuffleHandle = handle.asInstanceOf[StreamingShuffleHandle[K, _, C]]
     val conf = SparkEnv.get.conf
     val useSharedConnections = conf.get(STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED)
@@ -293,37 +307,35 @@ private[spark] class StreamingShuffleManager
   }
 
   override def unregisterShuffle(shuffleId: Int): Boolean = {
-    if (receiveService != null) {
-      receiveService.unregisterShuffle(shuffleId)
-    }
-    if (sharedExecutorClient != null) {
-      sharedExecutorClient.unregisterShuffle(shuffleId)
-    }
+    Option(receiveService).foreach(_.unregisterShuffle(shuffleId))
+    Option(sharedExecutorClient).foreach(_.unregisterShuffle(shuffleId))
     true
   }
 
-  override def stop(): Unit = synchronized {
-    if (receiveServiceEndpoint != null) {
-      SparkEnv.get.rpcEnv.stop(receiveServiceEndpoint)
+  override def stop(): Unit = {
+    val (endpoint, factory, service, client, server) = synchronized {
+      if (stopped) return
+      stopped = true
+      val resources = (receiveServiceEndpoint, readerClientFactory, receiveService,
+        sharedExecutorClient, sharedWriterServer)
       receiveServiceEndpoint = null
-    }
-    if (readerClientFactory != null) {
-      readerClientFactory.close()
       readerClientFactory = null
+      receiveService = null
+      sharedExecutorClient = null
+      sharedWriterServer = null
+      resources
     }
+    // A prepare call holds the service monitor while obtaining the shared client. Never wait
+    // for that monitor with the manager lock held. Fencing initialization above also prevents
+    // a late prepare from recreating resources after this snapshot has been detached.
+    Option(endpoint).foreach { ref =>
+      Utils.tryLogNonFatalError { SparkEnv.get.rpcEnv.stop(ref) }
+    }
+    Option(factory).foreach { resource => Utils.tryLogNonFatalError { resource.close() } }
     // Prepared receive sessions can still own route registrations and client-creation work.
     // Stop them before closing the executor-scoped client they unregister from.
-    if (receiveService != null) {
-      receiveService.close()
-      receiveService = null
-    }
-    if (sharedExecutorClient != null) {
-      sharedExecutorClient.close()
-      sharedExecutorClient = null
-    }
-    if (sharedWriterServer != null) {
-      sharedWriterServer.close()
-      sharedWriterServer = null
-    }
+    Option(service).foreach { resource => Utils.tryLogNonFatalError { resource.close() } }
+    Option(client).foreach { resource => Utils.tryLogNonFatalError { resource.close() } }
+    Option(server).foreach { resource => Utils.tryLogNonFatalError { resource.close() } }
   }
 }
