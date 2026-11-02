@@ -1340,11 +1340,15 @@ class StreamingShuffleWriter[K, V](
       // TransportClient. The old logical reader's termination ACK must not suppress the new
       // reader's authoritative repair request on that lane.
       if (terminationAckedClients.remove(target)) terminationAckReceived.set(false)
-      val localCursor = lastEnqueuedByClient.getOrElse(target, -1L)
-      if (lastObservedSequence < localCursor) {
-        lastEnqueuedByClient.update(target, lastObservedSequence)
-      }
       if (!replayPendingClients.contains(target)) {
+        // An idle request can cross frames already submitted by the current replay. Rewinding
+        // that active walk on every request repeatedly sends its prefix and can prevent it from
+        // ever reaching the terminal. Let the fenced walk finish; a later idle request can start
+        // another repair if its suffix still has not become reader-visible.
+        val localCursor = lastEnqueuedByClient.getOrElse(target, -1L)
+        if (lastObservedSequence < localCursor) {
+          lastEnqueuedByClient.update(target, lastObservedSequence)
+        }
         replayHistory.lastOption.foreach { tail =>
           replayPendingClients += target
           outboundActions.prepend(ReplayAction(target, tail.sequenceNum))

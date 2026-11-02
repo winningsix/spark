@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 import java.util.zip.CRC32C
 
 import scala.jdk.CollectionConverters._
@@ -446,6 +446,62 @@ class StreamingShuffleWriterSuite
         }
       } finally {
         timer.join(10000)
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
+  test("repeated idle repair does not rewind an active replay") {
+    val conf = newConf().set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS, 50L)
+    withSpark(new SparkContext("local", "active-replay-progress", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val writer = newWriter(sc, context)
+      val sequences = new ConcurrentLinkedQueue[Long]()
+      val repairing = new AtomicBoolean(false)
+      val duplicateRepairs = new AtomicInteger()
+      val clientRef = new AtomicReference[TransportClient]()
+      val client = bindMockClient(writer, 0) { sent =>
+        val view = sent.duplicate()
+        while (view.isReadable) {
+          sequences.add(view.getLong(view.readerIndex() + 4))
+          view.skipBytes(StreamingShuffleUtils.frameLength(view))
+        }
+        // An idle request can arrive after replay advanced its submission cursor but before
+        // those frames reached the reader. Repeated requests must not restart the same prefix.
+        if (repairing.get() && duplicateRepairs.incrementAndGet() <= 8) {
+          writer.shards(0).replayFromObserved(clientRef.get(), -1L)
+        }
+      }
+      clientRef.set(client)
+      try {
+        writer.shards(0).synchronized {
+          writer.transportServerHandler.handleMessage(
+            client, new CreditControlMessage(0, 0, 0, -(1 << 20)))
+          (0 until 3).foreach { value =>
+            val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+            data.serializationStream.get.writeKey(value).writeValue(value).flush()
+            writer.shards(0).send(data)
+          }
+          writer.shards(0).close()
+        }
+        eventually(Timeout(10.seconds)) {
+          sequences.asScala.toVector shouldBe Vector(0L, 1L, 2L, 3L)
+        }
+        sequences.clear()
+        repairing.set(true)
+        eventually(Timeout(10.seconds)) {
+          if (!sequences.asScala.exists(_ == 3L)) {
+            writer.shards(0).replayFromObserved(client, -1L)
+          }
+          sequences.asScala should contain(3L)
+        }
+        sequences.asScala.toVector shouldBe Vector(0L, 1L, 2L, 3L)
+        writer.errorNotifier.getError() shouldBe empty
+      } finally {
+        val ack = new TerminationAckMessage(0, 0, 0)
+        ack.setSeqNum(3L)
+        writer.transportServerHandler.handleMessage(client, ack)
         context.markTaskCompleted(None)
       }
     }
