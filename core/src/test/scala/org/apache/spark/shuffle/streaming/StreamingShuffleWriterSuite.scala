@@ -18,8 +18,8 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Semaphore, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 import java.util.zip.CRC32C
 
 import scala.jdk.CollectionConverters._
@@ -162,6 +162,52 @@ class StreamingShuffleWriterSuite
             // for task completion. Depending on remaining transient slices it is pooled or freed.
             assert(raw.refCnt() == 0 || writer.bufferPool.asScala.exists(_ eq raw))
           }
+        } finally {
+          context.markTaskCompleted(None)
+        }
+      }
+    }
+  }
+
+  Seq(0L, 1L).foreach { replayLimit =>
+    test(s"compressed input returns its buffer permits once (replayLimit=$replayLimit)") {
+      val conf = newConf().set(SHUFFLE_COMPRESS, true)
+        .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, replayLimit)
+      withSpark(new SparkContext("local", "compressed-buffer-permits", conf)) { sc =>
+        val context = createTaskContext(sc.conf, 0)
+        val writer = newWriter(sc, context)
+        // Observe the real admission counter, including the early compression release and
+        // the later transport/spill completion, without allocating gigabytes to overflow it.
+        def writerField[T](name: String): T = {
+          val field = writer.getClass.getDeclaredFields.find { field =>
+            field.getName == name || field.getName.endsWith("$$" + name)
+          }.get
+          field.setAccessible(true)
+          field.get(writer).asInstanceOf[T]
+        }
+        val permits = writerField[Semaphore]("allocatedBufferBytesSemaphore")
+        val pending = writerField[AtomicLong]("pendingSends")
+        val initialPermits = permits.availablePermits()
+        val bufferSize = sc.conf.get(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE)
+        val sends = new AtomicInteger()
+        try {
+          val client = bindMockClient(writer, 0)(_ => { sends.incrementAndGet(); () })
+          writer.transportServerHandler.handleMessage(
+            client, new CreditControlMessage(0, 0, 0, 1))
+          // Model newBuffer's reservation and supply a compressible serialized payload.
+          permits.acquire(bufferSize)
+          val data = writer.TimestampedBuffer(Unpooled.directBuffer(bufferSize))
+          (0 until 256).foreach { _ =>
+            data.serializationStream.get.writeKey(1).writeValue(2)
+          }
+          data.serializationStream.get.flush()
+          writer.shards(0).send(data)
+          eventually(Timeout(10.seconds)) {
+            sends.get() should be > 0
+            pending.get() shouldBe 0L
+          }
+          permits.availablePermits() shouldBe initialPermits
+          writer.errorNotifier.getError() shouldBe empty
         } finally {
           context.markTaskCompleted(None)
         }

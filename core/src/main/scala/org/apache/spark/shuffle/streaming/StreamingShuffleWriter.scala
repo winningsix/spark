@@ -1609,7 +1609,10 @@ class StreamingShuffleWriter[K, V](
       val releaseRawAfterSend: () => Unit = uncompressedLease match {
         case Some(_) => () => ()
         case None => () => {
-          if (rawReleased.compareAndSet(false, true)) releaseRawBuffer(rawBuffer)
+          if (rawReleased.compareAndSet(false, true)) {
+            try releaseRawBuffer(rawBuffer)
+            finally allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
+          }
           ()
         }
       }
@@ -1631,10 +1634,9 @@ class StreamingShuffleWriter[K, V](
       val releaseInputResources: () => Unit = if (uncompressedLease.isDefined) {
         () => ()
       } else {
-        () => {
-          releaseRawAfterSend()
-          allocatedBufferBytesSemaphore.release(BUFFER_SIZE)
-        }
+        // Compression releases the input before network admission. A later spill or transport
+        // completion calls this same hook, so the permit must share the raw owner's once fence.
+        releaseRawAfterSend
       }
       send(dataMessage, () => {
         // Completion is accounted separately from input-buffer ownership.
