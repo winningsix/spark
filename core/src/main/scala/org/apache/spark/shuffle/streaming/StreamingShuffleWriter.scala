@@ -737,8 +737,10 @@ class StreamingShuffleWriter[K, V](
         .filterNot(replayPendingClients.contains)
     }
 
-    private def dataBodyBytes(entries: Seq[PendingSend]): Long = {
-      entries.iterator.map(entry => replayLength(entry.sequenceNum, entry)).sum
+    private def dataBodyBytes(target: TransportClient, entries: Seq[PendingSend]): Long = {
+      val cursor = lastEnqueuedByClient.getOrElse(target, -1L)
+      entries.iterator.filter(_.sequenceNum > cursor)
+        .map(entry => replayLength(entry.sequenceNum, entry)).sum
     }
 
     /** Return the next encoded frame that this logical route still needs. */
@@ -770,9 +772,11 @@ class StreamingShuffleWriter[K, V](
     private def dataCreditAvailable(
         connected: TransportClient,
         entries: Seq[PendingSend]): Boolean = {
-      val bytes = dataBodyBytes(entries)
       val targets = connectedTargets(connected)
-      targets.forall(target => transportServerHandler.hasDataCredit(id, target, bytes))
+      targets.forall { target =>
+        val bytes = dataBodyBytes(target, entries)
+        bytes == 0L || transportServerHandler.hasDataCredit(id, target, bytes)
+      }
     }
 
     private def creditControlledTargets(connected: TransportClient): Boolean = {
@@ -795,29 +799,36 @@ class StreamingShuffleWriter[K, V](
         transportServerHandler.isCreditControlled(id, target))
       if (controlledTargets.isEmpty) return entries.size
 
-      val available = controlledTargets.iterator
-        .map(target => transportServerHandler.availableDataCredit(id, target))
-        .min
-      if (available <= 0L || entries.isEmpty) return 0
-
-      var count = 0
-      var bytes = 0L
-      while (count < entries.size) {
-        val nextBytes = replayLength(entries(count).sequenceNum, entries(count))
-        if (count > 0 && bytes + nextBytes > available) return count
-        bytes += nextBytes
-        count += 1
+      def prefixFor(target: TransportClient): Int = {
+        val available = transportServerHandler.availableDataCredit(id, target)
+        val cursor = lastEnqueuedByClient.getOrElse(target, -1L)
+        var count = 0
+        var bytes = 0L
+        while (count < entries.size) {
+          val entry = entries(count)
+          val nextBytes = if (entry.sequenceNum > cursor) {
+            replayLength(entry.sequenceNum, entry)
+          } else {
+            0L
+          }
+          if (nextBytes > 0L && (available <= 0L ||
+              (bytes > 0L && bytes + nextBytes > available))) return count
+          bytes += nextBytes
+          count += 1
+        }
+        count
       }
-      count
+      controlledTargets.iterator.map(prefixFor).min
     }
 
     /** Reserve the credit after all other writer-side admission checks have passed. */
     private def consumeDataCredit(
         connected: TransportClient,
         entries: Seq[PendingSend]): Unit = {
-      val bytes = dataBodyBytes(entries)
       connectedTargets(connected).foreach { target =>
-        transportServerHandler.consumeDataCredit(id, target, bytes)
+        // Replay may have overtaken this queued action. Charge only frames still to be sent;
+        // the reader cannot return credit for an original action that now sends no bytes.
+        transportServerHandler.consumeDataCredit(id, target, dataBodyBytes(target, entries))
       }
     }
 

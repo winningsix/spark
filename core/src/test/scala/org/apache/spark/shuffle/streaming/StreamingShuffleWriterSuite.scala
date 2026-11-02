@@ -451,6 +451,60 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("replay does not charge queued data a second time") {
+    val conf = newConf().set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS, 50L)
+    withSpark(new SparkContext("local", "replay-credit-accounting", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val writer = newWriter(sc, context)
+      val sequences = new ConcurrentLinkedQueue[Long]()
+      val sentBytes = new java.util.concurrent.atomic.AtomicLong()
+      val client = bindMockClient(writer, 0) { sent =>
+        val view = sent.duplicate()
+        while (view.isReadable) {
+          val size = StreamingShuffleUtils.frameLength(view)
+          if (StreamingShuffleMessageType.decode(view.getInt(view.readerIndex())) ==
+              StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW) {
+            sentBytes.addAndGet(size)
+          }
+          sequences.add(view.getLong(view.readerIndex() + 4))
+          view.skipBytes(size)
+        }
+      }
+      def send(value: Int): Unit = {
+        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+        data.serializationStream.get.writeKey(value).writeValue(value).flush()
+        writer.shards(0).send(data)
+      }
+      try {
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, -(1 << 20)))
+        send(0)
+        eventually(Timeout(10.seconds)) {
+          sequences.asScala.toVector shouldBe Vector(0L)
+        }
+        writer.shards(0).synchronized {
+          (1 to 3).foreach(send)
+          // The repair overtakes data already queued for dispatch. Those original actions must
+          // release their resources without charging bytes that replay has already delivered.
+          writer.shards(0).replayFromObserved(client, 0L)
+          writer.shards(0).close()
+        }
+        eventually(Timeout(10.seconds)) {
+          sequences.asScala.toVector shouldBe Vector(0L, 1L, 2L, 3L, 4L)
+          writer.transportServerHandler.availableDataCredit(0, client) shouldBe
+            ((1 << 20).toLong - sentBytes.get())
+        }
+        writer.errorNotifier.getError() shouldBe empty
+      } finally {
+        val ack = new TerminationAckMessage(0, 0, 0)
+        ack.setSeqNum(4L)
+        writer.transportServerHandler.handleMessage(client, ack)
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   test("repeated idle repair does not rewind an active replay") {
     val conf = newConf().set(SHUFFLE_COMPRESS, false)
       .set(STREAMING_SHUFFLE_WRITER_LINGER_AFTER_TERMINATION_MS, 50L)
