@@ -85,6 +85,12 @@ final class UnsafeSorterSpillMerger {
         if (spillReader != null) {
           if (spillReader.hasNext()) {
             spillReader.loadNext();
+            // The previous winner is outside the heap and its competitors have not advanced.
+            // If it still precedes their minimum, avoid a heap insertion followed by removal.
+            if (priorityQueue.isEmpty() ||
+                priorityQueue.comparator().compare(spillReader, priorityQueue.peek()) <= 0) {
+              return;
+            }
             priorityQueue.add(spillReader);
           }
         }
