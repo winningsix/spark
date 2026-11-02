@@ -427,6 +427,54 @@ class StreamingShuffleReaderSuite
     queue shouldBe empty
   }
 
+  Seq("exhausted", "cancelled", "failed").foreach { completion =>
+    test(s"reader publishes final shuffle metrics when $completion without a heartbeat") {
+      withSpark(new SparkContext("local", "final-reader-metrics", newConf())) { sc =>
+        val numMaps = if (completion == "exhausted") 0 else 1
+        SparkEnv.get.streamingShuffleOutputTracker.get
+          .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+          .registerShuffle(shuffleId = 0, numMaps = numMaps, numReduces = 1, jobId = 0)
+        val rdd = sc.parallelize(Seq.empty[(Int, Int)], numSlices = 1)
+        val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+        val context = createTaskContext(sc.conf, 0)
+        val metrics = context.taskMetrics
+        val readMetrics = metrics.createTempShuffleReadMetrics()
+        val siblingMetrics = metrics.createTempShuffleReadMetrics()
+        val manager = new StreamingShuffleManager()
+        try {
+          val reader = manager.getReader[Int, Int](
+            new StreamingShuffleHandle(0, dep), 0, numMaps, 0, 1, context, readMetrics)
+          val it = reader.read()
+          // A heartbeat captured only the early wait. Both dependencies continue afterwards.
+          readMetrics.incFetchWaitTime(5L)
+          metrics.mergeShuffleReadMetrics()
+          readMetrics.incFetchWaitTime(7L)
+          siblingMetrics.incFetchWaitTime(13L)
+          metrics.shuffleReadMetrics.fetchWaitTime shouldBe 5L
+
+          completion match {
+            case "exhausted" =>
+              it.hasNext shouldBe false
+              metrics.shuffleReadMetrics.fetchWaitTime shouldBe 25L
+              context.markTaskCompleted(None)
+            case "cancelled" =>
+              context.markInterrupted("cancelled before consuming the input")
+              context.markTaskCompleted(None)
+            case "failed" =>
+              val error = new IllegalStateException("failed before consuming the input")
+              context.markTaskFailed(error)
+              context.markTaskCompleted(Some(error))
+          }
+          // Completion must publish all final values without double counting an exhausted reader.
+          metrics.shuffleReadMetrics.fetchWaitTime shouldBe 25L
+        } finally {
+          context.markTaskCompleted(None)
+          manager.stop()
+        }
+      }
+    }
+  }
+
   test("getReader routes to a StreamingShuffleReader wired with the given context") {
     // A construction/routing smoke test: the manager must dispatch to the streaming reader (not a
     // fallback shuffle reader), the reader must construct successfully (its constructor asserts the

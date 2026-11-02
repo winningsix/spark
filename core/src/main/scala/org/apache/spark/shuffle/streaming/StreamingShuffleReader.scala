@@ -33,7 +33,7 @@ import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleReader, ShuffleReadMetricsReporter}
-import org.apache.spark.util.{ErrorNotifier, NextIterator, ThreadUtils, Utils}
+import org.apache.spark.util.{CompletionIterator, ErrorNotifier, NextIterator, ThreadUtils, Utils}
 
 /**
  * Default factory used by `StreamingShuffleReader` to create its output iterator.
@@ -306,7 +306,13 @@ class StreamingShuffleReader[K, C](
   // when the task is completed.  Without this, threads, client connections/factories,
   // message buffers, and memory allocations could be leaked.
   context.addTaskCompletionListener[Unit] { _ =>
-    cleanupResources()
+    try {
+      cleanupResources()
+    } finally {
+      // Early termination and failures may leave the iterator unexhausted. Publish the final
+      // temporary metrics even when no executor heartbeat follows the last queue wait.
+      context.taskMetrics().mergeShuffleReadMetrics()
+    }
   }
 
   if (preparedSession.isEmpty) {
@@ -536,7 +542,7 @@ class StreamingShuffleReader[K, C](
       }
     }
 
-    new StreamingShuffleReaderIteratorFactory().create(
+    val iterator = new StreamingShuffleReaderIteratorFactory().create(
       messageQueue,
       handleTerminationMessage,
       handleDataMessage,
@@ -560,5 +566,7 @@ class StreamingShuffleReader[K, C](
       },
       recordQueueWaitNanos
     )
+    CompletionIterator[Product2[K, C], Iterator[Product2[K, C]]](
+      iterator, context.taskMetrics().mergeShuffleReadMetrics())
   }
 }
