@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import io.netty.channel.Channel;
 import org.junit.jupiter.api.Test;
 
+import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
 
@@ -48,6 +49,31 @@ public class AbstractAuthRpcHandlerSuite {
         RpcResponseCallback callback) {
       return true;
     }
+  }
+
+  @Test
+  public void testManagedMessageRejectedBeforeAuthWithoutMaterializing() {
+    RpcHandler delegate = mock(RpcHandler.class);
+    AbstractAuthRpcHandler handler = new TestAuthRpcHandler(delegate);
+    ManagedBuffer body = mock(ManagedBuffer.class);
+    TransportClient client = mock(TransportClient.class);
+
+    assertThrows(SecurityException.class, () -> handler.receive(client, body));
+    verifyNoInteractions(delegate, body);
+  }
+
+  @Test
+  public void testManagedMessageDelegatesAfterAuthWithoutMaterializing() throws Exception {
+    RpcHandler delegate = mock(RpcHandler.class);
+    AbstractAuthRpcHandler handler = new TestAuthRpcHandler(delegate);
+    TransportClient client = mock(TransportClient.class);
+    handler.receive(client, ByteBuffer.allocate(0), mock(RpcResponseCallback.class));
+    ManagedBuffer body = mock(ManagedBuffer.class);
+
+    handler.receive(client, body);
+    verify(delegate).receive(client, body);
+    verifyNoMoreInteractions(delegate);
+    verifyNoInteractions(body);
   }
 
   @Test

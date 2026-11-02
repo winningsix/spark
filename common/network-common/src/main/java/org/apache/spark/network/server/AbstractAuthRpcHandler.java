@@ -73,6 +73,15 @@ public abstract class AbstractAuthRpcHandler extends RpcHandler {
   }
 
   @Override
+  public final void receive(TransportClient client, ManagedBuffer message) throws Exception {
+    if (isAuthenticated) {
+      delegate.receive(client, message);
+    } else {
+      throw new SecurityException("Unauthenticated call to receive().");
+    }
+  }
+
+  @Override
   public final StreamCallbackWithID receiveStream(
       TransportClient client,
       ByteBuffer message,
