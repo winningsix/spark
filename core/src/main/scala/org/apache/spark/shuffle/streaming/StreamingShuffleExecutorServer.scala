@@ -69,10 +69,14 @@ private[streaming] class StreamingShuffleExecutorServer extends Logging {
         val current = handlers.get(routeKey)
         decoded match {
           case credit: CreditControlMessage
-              if current == null && !knownWriterRoutes.contains(routeKey) =>
+              if current == null && !knownWriterRoutes.contains(routeKey) &&
+                credit.numMessages != 0 && credit.numMessages != Int.MinValue =>
             // Prepared readers may publish their initial credit while the map task is between
             // advertising its shared endpoint and registering this logical writer route. Keep
-            // the latest idempotent credit per physical reader route and apply it at register().
+            // the latest discovery credit per physical reader route and apply it at register().
+            // Release watermarks and sequence repairs cannot refer to data sent by an unregistered
+            // writer. In particular, a sequence repair must not replace discovery: handling it
+            // alone does not attach the client or open its initial byte window.
             pendingCredits.computeIfAbsent(
               routeKey,
               _ => new ConcurrentHashMap[PendingCreditRoute, CreditControlMessage]())

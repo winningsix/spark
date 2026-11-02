@@ -40,7 +40,7 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_MANAGER_INCREM
   STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED, STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED,
   STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
-import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage,
+import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage, StreamingShuffleMessage,
   TerminationAckMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.{getQueryId, getWriterId, QUERY_ID_PROPERTY_KEY}
 import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
@@ -370,6 +370,41 @@ class StreamingShuffleManagerSuite
       session.close()
       discovery.close()
       executor.shutdownNow()
+    }
+  }
+
+  test("idle repairs before writer registration preserve route discovery") {
+    withSpark(new SparkContext("local", "pending-discovery", new SparkConf())) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = mock[TransportClient]
+      val handler = new StreamingShuffleServerHandler(
+        (_, _) => (), 7, 1, TaskContext.empty(), new ErrorNotifier())
+      def deliver(credit: Int): Unit = {
+        val message = new CreditControlMessage(7, 3, 0, credit)
+        message.setSeqNum(-1L)
+        val buf = Unpooled.compositeBuffer()
+        buf.addComponent(Unpooled.buffer(message.headerLength()))
+        try {
+          message.encode(buf)
+          server.handleControlBody(client, buf)
+        } finally {
+          buf.release()
+        }
+      }
+      try {
+        deliver(-40)
+        deliver(0)
+        deliver(Int.MinValue)
+        server.pendingCreditRouteCount shouldBe 1
+        server.register(7, 3, handler)
+        handler.futureClients(0).isDone shouldBe true
+        handler.clientsFor(0) should contain only client
+        handler.availableDataCredit(0, client) shouldBe 40L
+        server.pendingCreditRouteCount shouldBe 0
+      } finally {
+        server.unregister(7, 3, handler)
+        server.close()
+      }
     }
   }
 
