@@ -26,10 +26,10 @@ import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.{AbstractByteBufAllocator, ByteBuf, CompositeByteBuf, Unpooled,
   UnpooledByteBufAllocator}
-import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
+import io.netty.channel.{Channel, ChannelConfig, ChannelFuture, ChannelOption}
 import io.netty.util.concurrent.GenericFutureListener
-import org.mockito.ArgumentMatchers.any
-import org.mockito.Mockito.when
+import org.mockito.ArgumentMatchers.{any, eq => eqTo}
+import org.mockito.Mockito.{never, verify, when}
 import org.scalatest.concurrent.Eventually.eventually
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.matchers.should.Matchers
@@ -85,6 +85,33 @@ class StreamingShuffleWriterSuite
       localProperties = properties,
       metricsSystem = mock[MetricsSystem],
       cpuAmount = 1)
+  }
+
+  test("shared control sockets retain transport buffer settings") {
+    withSpark(new SparkContext("local", "shared-control-sockets", newConf())) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      val writer = newWriter(sc, context, sharedServer = Some(server))
+      try {
+        val writerClient = bindMockClient(writer, 0)(_ => ())
+        verify(writerClient.getChannel.config, never()).setOption(
+          eqTo(ChannelOption.SO_RCVBUF), any[Integer])
+
+        val readerClient = mock[TransportClient]
+        val channel = mock[Channel]
+        val config = mock[ChannelConfig]
+        when(readerClient.getChannel).thenReturn(channel)
+        when(channel.config).thenReturn(config)
+        val reader = new StreamingShuffleClientHandler(
+          0, 0, new java.util.concurrent.LinkedBlockingQueue[StreamingShuffleMessage](),
+          0, 1024L, null, new ErrorNotifier())
+        reader.prepareMultiplexedInitialCredit(readerClient, configureSocket = true)
+        verify(config, never()).setOption(eqTo(ChannelOption.SO_SNDBUF), any[Integer])
+      } finally {
+        context.markTaskCompleted(None)
+        server.close()
+      }
+    }
   }
 
   test("cumulative route credit repairs are bounded and idempotent") {
@@ -729,14 +756,17 @@ class StreamingShuffleWriterSuite
   private def newWriter(
       sc: SparkContext,
       context: TaskContext,
-      errorNotifier: ErrorNotifier = new ErrorNotifier()): StreamingShuffleWriter[Int, Int] = {
+      errorNotifier: ErrorNotifier = new ErrorNotifier(),
+      sharedServer: Option[StreamingShuffleExecutorServer] = None)
+      : StreamingShuffleWriter[Int, Int] = {
     SparkEnv.get.streamingShuffleOutputTracker.get
       .asInstanceOf[StreamingShuffleOutputTrackerMaster]
       .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
     val rdd = sc.parallelize(1 to 4).map(x => (x, x))
     val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
     val handle = new StreamingShuffleHandle(0, dep)
-    new StreamingShuffleWriter[Int, Int](handle, 0, context, errorNotifier = errorNotifier)
+    new StreamingShuffleWriter[Int, Int](
+      handle, 0, context, sharedExecutorServer = sharedServer, errorNotifier = errorNotifier)
   }
 
   // A mock TransportClient whose send(ByteBuf) invokes `onSend` and then completes the write

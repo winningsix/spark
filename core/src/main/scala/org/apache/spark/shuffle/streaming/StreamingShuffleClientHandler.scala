@@ -125,7 +125,11 @@ class StreamingShuffleClientHandler(
     channel = client.getChannel
     if (configureSocket) {
       channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
-      channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
+      // Multiplexed credit batches share this socket across many routes. Do not constrain their
+      // send window to the legacy single-route control buffer.
+      if (perStreamAutoReadEnabled) {
+        channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
+      }
     }
   }
 

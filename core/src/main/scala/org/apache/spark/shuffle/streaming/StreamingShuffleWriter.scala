@@ -468,7 +468,13 @@ class StreamingShuffleWriter[K, V](
             }
         }).thenApply(c => {
           c.getChannel.config.setOption(ChannelOption.SO_SNDBUF, SEND_BUFFER_SIZE)
-          c.getChannel.config.setOption(ChannelOption.SO_RCVBUF, RECV_BUFFER_SIZE)
+          // A shared connection carries credit/ACK batches for many logical routes. The legacy
+          // 512-byte receive buffer makes that control traffic TCP-window limited and can starve
+          // data dispatch even after readers have released their credit. Preserve transport-level
+          // socket sizing for shared endpoints; dedicated routes retain their original setting.
+          if (sharedExecutorServer.isEmpty) {
+            c.getChannel.config.setOption(ChannelOption.SO_RCVBUF, RECV_BUFFER_SIZE)
+          }
           c
         }))
     val buffer: AtomicReference[TimestampedBuffer] = new AtomicReference(null)
