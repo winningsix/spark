@@ -547,7 +547,14 @@ trait JoinSelectionHelper extends Logging {
    * dynamic.
    */
   private def canBuildLocalHashMapBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
-    plan.stats.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+    conf.getConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD) match {
+      case Some(threshold) =>
+        val size = plan.stats.sizeInBytes
+        !plan.isStreaming && threshold > 0 && size < conf.defaultSizeInBytes &&
+          size <= BigInt(threshold) * conf.numShufflePartitions
+      case None =>
+        plan.stats.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+    }
   }
 
   /**

@@ -61,6 +61,32 @@ class JoinSuite extends SharedSparkSession with AdaptiveSparkPlanHelper
     assert(planned.size === 1)
   }
 
+  test("static hash join size threshold preserves results and explicit hints") {
+    withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "2",
+        SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "512") {
+      val probe = spark.range(10000)
+      val build = spark.range(100)
+      val joined = probe.join(build, Seq("id"))
+      val hashJoins = joined.queryExecution.executedPlan.collect {
+        case j: ShuffledHashJoinExec => j
+      }
+      assert(hashJoins.size == 1 && hashJoins.head.buildSide == BuildRight)
+      checkAnswer(joined, build.toDF())
+      val merged = probe.hint("MERGE").join(build, Seq("id"))
+      assert(merged.queryExecution.executedPlan.exists(_.isInstanceOf[SortMergeJoinExec]))
+      checkAnswer(merged, build.toDF())
+      withSQLConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "0") {
+        val hinted = probe.join(build.hint("SHUFFLE_HASH"), Seq("id"))
+        assert(hinted.queryExecution.executedPlan.exists(_.isInstanceOf[ShuffledHashJoinExec]))
+        checkAnswer(hinted, build.toDF())
+      }
+    }
+  }
+
   def assertJoin(pair: (String, Class[_ <: BinaryExecNode])): Any = {
     val sqlString = pair._1
     val c = pair._2

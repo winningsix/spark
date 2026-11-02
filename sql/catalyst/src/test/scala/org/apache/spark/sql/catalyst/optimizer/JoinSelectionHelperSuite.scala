@@ -149,6 +149,43 @@ class JoinSelectionHelperSuite extends PlanTest with JoinSelectionHelper {
     assert(getSmallerSide(left, right) === BuildRight)
   }
 
+  test("static hash join size threshold is independent of broadcast and opt-in") {
+    withSQLConf(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "2") {
+      assert(getShuffleHashJoinBuildSide(join, hintOnly = false, SQLConf.get).isEmpty)
+      withSQLConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> "500") {
+        assert(getShuffleHashJoinBuildSide(join, hintOnly = false, SQLConf.get)
+          .contains(BuildRight))
+        assert(getBroadcastBuildSide(join, hintOnly = false, SQLConf.get).isEmpty)
+        withSQLConf(SQLConf.PREFER_SORTMERGEJOIN.key -> "true") {
+          assert(getShuffleHashJoinBuildSide(join, hintOnly = false, SQLConf.get).isEmpty)
+        }
+      }
+      Seq("499", "0").foreach { threshold =>
+        withSQLConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> threshold) {
+          assert(getShuffleHashJoinBuildSide(join, hintOnly = false, SQLConf.get).isEmpty)
+        }
+      }
+    }
+  }
+
+  test("static hash join size threshold rejects unknown sizes without overflowing") {
+    withSQLConf(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "2",
+        SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key -> Long.MaxValue.toString) {
+      assert(getShuffleHashJoinBuildSide(join, hintOnly = false, SQLConf.get)
+        .contains(BuildRight))
+      val unknown = join.copy(
+        left = left.copy(size = Some(BigInt(SQLConf.get.defaultSizeInBytes))),
+        right = right.copy(size = Some(BigInt(SQLConf.get.defaultSizeInBytes))))
+      assert(getShuffleHashJoinBuildSide(unknown, hintOnly = false, SQLConf.get).isEmpty)
+    }
+  }
+
   test("canBroadcastBySize should return true if the plan size is less than 10MB") {
     withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
       assert(canBroadcastBySize(left, SQLConf.get) === false)

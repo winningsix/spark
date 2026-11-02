@@ -1076,6 +1076,21 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD =
+    buildConf("spark.sql.join.maxShuffledHashJoinLocalMapThreshold")
+      .internal()
+      .doc("Optional estimated input size per partition for static shuffled hash join " +
+        "selection when spark.sql.join.preferSortMergeJoin is false. When unset, selection " +
+        "uses spark.sql.autoBroadcastJoinThreshold as before. Setting this independently " +
+        "allows shuffled hash joins while broadcast is disabled; zero disables automatic " +
+        "size-based selection. Unknown input sizes are ineligible. This is an average input " +
+        "size estimate, not a bound on skewed partitions or hash-table memory. Explicit join " +
+        "hints retain their precedence. It does not replace adaptive join selection.")
+      .version("4.4.0")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "must be non-negative")
+      .createOptional
+
   val SPLIT_STREAMED_SIDE_JOIN_CONDITION =
     buildConf("spark.sql.join.splitStreamedSideJoinCondition")
       .internal()
