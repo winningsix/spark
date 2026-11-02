@@ -24,7 +24,8 @@ import java.util.zip.CRC32C
 
 import scala.jdk.CollectionConverters._
 
-import io.netty.buffer.{ByteBuf, Unpooled, UnpooledByteBufAllocator}
+import io.netty.buffer.{AbstractByteBufAllocator, ByteBuf, CompositeByteBuf, Unpooled,
+  UnpooledByteBufAllocator}
 import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
 import io.netty.util.concurrent.GenericFutureListener
 import org.mockito.ArgumentMatchers.any
@@ -235,6 +236,70 @@ class StreamingShuffleWriterSuite
       if (firstBody.refCnt() > 0) firstBody.release(firstBody.refCnt())
       if (secondBody.refCnt() > 0) secondBody.release(secondBody.refCnt())
       batcher.discard()
+    }
+  }
+
+  test("cross-route batching consolidates its payload prefix only once") {
+    val notifier = new ErrorNotifier()
+    val allocations = new ConcurrentLinkedQueue[Int]()
+    val allocator = new AbstractByteBufAllocator(true) {
+      override def isDirectBufferPooled: Boolean = false
+      override protected def newDirectBuffer(initialCapacity: Int, maxCapacity: Int): ByteBuf = {
+        allocations.add(initialCapacity)
+        Unpooled.directBuffer(initialCapacity, maxCapacity)
+      }
+      override protected def newHeapBuffer(initialCapacity: Int, maxCapacity: Int): ByteBuf = {
+        allocations.add(initialCapacity)
+        Unpooled.buffer(initialCapacity, maxCapacity)
+      }
+    }
+    val batcher = new StreamingShuffleTransportBatcher(
+      allocator, 1024, 0L, notifier)
+    val client = mock[TransportClient]
+    val future = mock[ChannelFuture]
+    val listener = new AtomicReference[GenericFutureListener[ChannelFuture]]()
+    val sent = new AtomicReference[ByteBuf]()
+    val completions = new AtomicInteger()
+    when(future.isSuccess).thenReturn(true)
+    when(future.addListener(any[GenericFutureListener[ChannelFuture]]))
+      .thenAnswer { invocation =>
+        listener.set(invocation.getArgument[GenericFutureListener[ChannelFuture]](0))
+        future
+      }
+    when(client.send(any[ByteBuf])).thenAnswer { invocation =>
+      sent.set(invocation.getArgument[ByteBuf](0))
+      future
+    }
+    val components = (0 until 8).map(i => Unpooled.directBuffer(8).writeLong(i.toLong))
+    val bodies = components.grouped(4).map { parts =>
+      val body = Unpooled.compositeBuffer(parts.size)
+      parts.foreach(part => body.addComponent(true, part))
+      body
+    }.toSeq
+    try {
+      bodies.foreach { body =>
+        batcher.submit(client, body, () => { completions.incrementAndGet(); () })
+      }
+      batcher.flush(client)
+      val outbound = sent.get().asInstanceOf[CompositeByteBuf]
+      outbound.readableBytes() shouldBe 64
+      (0 until 8).map(i => outbound.getLong(i * 8)) shouldBe (0L until 8L)
+      outbound.numComponents() shouldBe bodies.size
+      // Incremental consolidation would copy prefixes of 24, 40 and 56 bytes. The same final
+      // layout needs only the last copy; its trailing component remains transport-owned.
+      allocations.asScala.toSeq shouldBe Seq(56)
+      components.dropRight(1).foreach(_.refCnt() shouldBe 0)
+      components.last.refCnt() shouldBe 1
+      completions.get() shouldBe 0
+      outbound.release()
+      listener.get().operationComplete(future)
+      components.foreach(_.refCnt() shouldBe 0)
+      completions.get() shouldBe bodies.size
+      notifier.throwErrorIfExists()
+    } finally {
+      batcher.discard()
+      Option(sent.get()).filter(_.refCnt() > 0).foreach(_.release())
+      bodies.filter(_.refCnt() > 0).foreach(_.release())
     }
   }
 

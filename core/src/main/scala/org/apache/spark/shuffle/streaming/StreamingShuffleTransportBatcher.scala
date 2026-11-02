@@ -32,7 +32,7 @@ import org.apache.spark.util.{ErrorNotifier, ThreadUtils}
  *
  * Each input body contains complete streaming-shuffle frames and ownership is transferred to this
  * class.  A batch is only released by the transport completion callback (or by discard()), so
- * this class does not add a second copy or change the per-route sequence numbers. The transport
+ * this class does not change the framing or per-route sequence numbers. The transport
  * capacity window is best effort: a saturated window must not defer an already-framed batch,
  * because terminal frames and downstream credit can depend on that batch reaching Netty. Route
  * credit and the executor raw-buffer pool remain the hard memory bounds.
@@ -229,11 +229,27 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
       } else {
-        val composite = allocator.compositeBuffer(batch.bodies.length)
+        // Each framed body can contain several components. Reserve for the flattened count,
+        // otherwise Netty consolidates and copies payloads as soon as that limit is exceeded.
+        val numComponents = batch.bodies.foldLeft(0) { (count, pendingBody) =>
+          val components = pendingBody.body match {
+            case composite: CompositeByteBuf => composite.numComponents()
+            case _ => 1
+          }
+          Math.addExact(count, components)
+        }
+        val composite = allocator.compositeBuffer(math.max(1, numComponents))
         outbound = composite
         batch.bodies.foreach { body =>
           addBodyComponents(composite, body.body)
           addedBodies += 1
+        }
+        if (numComponents > batch.bodies.length) {
+          // Preserve the layout produced by Netty's incremental consolidation, but copy its
+          // growing prefix only once. With a component limit L, each additional L components
+          // would otherwise consolidate that prefix again, leaving (N - 1) % L trailing parts.
+          val prefixComponents = numComponents - (numComponents - 1) % batch.bodies.length
+          composite.consolidate(0, prefixComponents)
         }
       }
       val future = client.send(outbound)
