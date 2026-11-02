@@ -19,6 +19,7 @@ package org.apache.spark.network.protocol;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.WritableByteChannel;
 import javax.annotation.Nullable;
 
@@ -149,13 +150,19 @@ public class MessageWithHeader extends AbstractFileRegion {
       written = target.write(buffer);
     } else {
       ByteBuffer[] buffers = buf.nioBuffers(buf.readerIndex(), length);
-      for (ByteBuffer buffer: buffers) {
-        int remaining = buffer.remaining();
-        int w = target.write(buffer);
-        written += w;
-        if (w < remaining) {
-          // Could not write all, we need to break now.
-          break;
+      if (target instanceof GatheringByteChannel gatheringChannel) {
+        // Preserve the bounded, zero-copy views while submitting adjacent components together.
+        // A short or zero write is resumed using the ByteBuf reader index on the next call.
+        written = (int) gatheringChannel.write(buffers);
+      } else {
+        for (ByteBuffer buffer: buffers) {
+          int remaining = buffer.remaining();
+          int w = target.write(buffer);
+          written += w;
+          if (w < remaining) {
+            // Could not write all, we need to break now.
+            break;
+          }
         }
       }
     }

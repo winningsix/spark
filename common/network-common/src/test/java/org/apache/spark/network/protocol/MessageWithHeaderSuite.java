@@ -19,6 +19,7 @@ package org.apache.spark.network.protocol;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.WritableByteChannel;
 
 import io.netty.buffer.ByteBuf;
@@ -69,6 +70,115 @@ public class MessageWithHeaderSuite {
     compositeByteBuf.addComponent(true, header.slice(4, 4));
     assertEquals(2, compositeByteBuf.nioBufferCount());
     testByteBufBody(compositeByteBuf);
+  }
+
+  @Test
+  public void testGatheringWriteResumesAcrossHeaderAndBody() throws Exception {
+    ByteBuf header = Unpooled.copyLong(42);
+    CompositeByteBuf body = Unpooled.compositeBuffer();
+    for (long value = 1; value <= 3; value++) {
+      body.addComponent(true, Unpooled.copyLong(value));
+    }
+    ManagedBuffer managed = new NettyManagedBuffer(body);
+    MessageWithHeader msg = new MessageWithHeader(
+      managed, header, managed.convertToNetty(), managed.size());
+    TestGatheringChannel channel = new TestGatheringChannel((int) msg.count());
+    try {
+      int[] quotas = {0, 5, 13, 0, 100};
+      int[] expectedWrites = {0, 5, 13, 0, 14};
+      for (int i = 0; i < quotas.length; i++) {
+        channel.quota = quotas[i];
+        assertEquals(expectedWrites[i], msg.transferTo(channel, msg.transferred()));
+        assertEquals(channel.length(), msg.transferred());
+      }
+      assertEquals(msg.count(), msg.transferred());
+      assertEquals(3, channel.gatherWrites);
+      // Header short writes remain scalar; the composite body uses one syscall per attempt.
+      assertEquals(3, channel.scalarWrites);
+      ByteBuffer result = ByteBuffer.wrap(channel.getData());
+      assertEquals(42L, result.getLong());
+      for (long value = 1; value <= 3; value++) {
+        assertEquals(value, result.getLong());
+      }
+    } finally {
+      msg.release();
+    }
+    assertEquals(0, header.refCnt());
+    assertEquals(0, body.refCnt());
+  }
+
+  @Test
+  public void testGatheringWriteKeepsTransferSizeBounded() throws Exception {
+    CompositeByteBuf body = Unpooled.compositeBuffer();
+    for (int i = 0; i < 3; i++) {
+      body.addComponent(true, Unpooled.buffer(128 * 1024).writeZero(128 * 1024));
+    }
+    ManagedBuffer managed = new NettyManagedBuffer(body);
+    MessageWithHeader msg = new MessageWithHeader(
+      managed, Unpooled.EMPTY_BUFFER, managed.convertToNetty(), managed.size());
+    TestGatheringChannel channel = new TestGatheringChannel((int) msg.count());
+    try {
+      channel.quota = Integer.MAX_VALUE;
+      assertEquals(256 * 1024, msg.transferTo(channel, msg.transferred()));
+      assertEquals(128 * 1024, msg.transferTo(channel, msg.transferred()));
+      assertEquals(msg.count(), msg.transferred());
+      assertEquals(2, channel.gatherWrites);
+      assertEquals(0, channel.scalarWrites);
+      assertEquals(256 * 1024, channel.maxGatherBytes);
+    } finally {
+      msg.release();
+    }
+    assertEquals(0, body.refCnt());
+  }
+
+  private static class TestGatheringChannel extends ByteArrayWritableChannel
+      implements GatheringByteChannel {
+    private int quota;
+    private int scalarWrites;
+    private int gatherWrites;
+    private long maxGatherBytes;
+
+    TestGatheringChannel(int size) {
+      super(size);
+    }
+
+    private int writeLimited(ByteBuffer src) {
+      int limit = src.limit();
+      src.limit(src.position() + Math.min(src.remaining(), quota));
+      int written = super.write(src);
+      src.limit(limit);
+      quota -= written;
+      return written;
+    }
+
+    @Override
+    public int write(ByteBuffer src) {
+      scalarWrites++;
+      return writeLimited(src);
+    }
+
+    @Override
+    public long write(ByteBuffer[] srcs, int offset, int length) {
+      gatherWrites++;
+      long offered = 0;
+      for (int i = offset; i < offset + length; i++) {
+        offered += srcs[i].remaining();
+      }
+      maxGatherBytes = Math.max(maxGatherBytes, offered);
+      long written = 0;
+      for (int i = offset; i < offset + length; i++) {
+        written += writeLimited(srcs[i]);
+        if (srcs[i].hasRemaining()) {
+          break;
+        }
+      }
+      return written;
+    }
+
+    @Override
+    public long write(ByteBuffer[] srcs) {
+      return write(srcs, 0, srcs.length);
+    }
   }
 
   /**
