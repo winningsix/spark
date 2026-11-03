@@ -122,6 +122,24 @@ private[spark] class UnifiedMemoryManager(
     maxOffHeapMemory - offHeapExecutionMemoryPool.memoryUsed
   }
 
+  override def tryAcquireExecutionMemoryForExecutor(
+      numBytes: Long,
+      memoryMode: MemoryMode): Option[ExecutionMemoryReservation] = synchronized {
+    require(numBytes >= 0)
+    val free = memoryMode match {
+      case MemoryMode.ON_HEAP => onHeapExecutionMemoryPool.memoryFree
+      case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool.memoryFree
+    }
+    // This path cannot reclaim storage on a transport thread. Conservatively subtract tracked
+    // unmanaged usage from the existing free execution space, just as task allocation accounts
+    // for it when computing the maximum pool it can grow into.
+    if (numBytes > math.max(0L, free - getUnmanagedMemoryUsed(memoryMode))) {
+      None
+    } else {
+      super.tryAcquireExecutionMemoryForExecutor(numBytes, memoryMode)
+    }
+  }
+
   /**
    * Try to acquire up to `numBytes` of execution memory for the current task and return the
    * number of bytes obtained, or 0 if none can be allocated.

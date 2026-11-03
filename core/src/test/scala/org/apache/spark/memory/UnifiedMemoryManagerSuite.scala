@@ -75,6 +75,79 @@ class UnifiedMemoryManagerSuite extends MemoryManagerSuite with PrivateMethodTes
     assert(mm.executionMemoryUsed === 0L)
   }
 
+  Seq(MemoryMode.ON_HEAP, MemoryMode.OFF_HEAP).foreach { mode =>
+    test(s"executor reservations survive task cleanup and leave compute capacity ($mode)") {
+      val mm = createMemoryManager(1000L, 1000L)
+      makeMemoryStore(mm)
+      // Each execution pool starts at 500 bytes. Executor retention may use half of it.
+      val reservation = mm.tryAcquireExecutionMemoryForExecutor(200L, mode).get
+      assert(reservation.size == 200L)
+      assert(mm.tryAcquireExecutionMemoryForExecutor(51L, mode).isEmpty)
+      assert(mm.executionMemoryUsed == 200L)
+      assert(mm.acquireExecutionMemory(100L, 42L, mode) == 100L)
+      assert(new TaskMemoryManager(mm, 42L).cleanUpAllAllocatedMemory() == 100L)
+      assert(mm.executionMemoryUsed == 200L)
+      reservation.close()
+      reservation.close()
+      assert(mm.executionMemoryUsed == 0L)
+      val next = mm.tryAcquireExecutionMemoryForExecutor(250L, mode).get
+      next.close()
+      assert(mm.executionMemoryUsed == 0L)
+    }
+  }
+
+  test("executor reservations neither wait for tasks nor evict storage") {
+    val (mm, ms) = makeThings(1000L)
+    val mode = MemoryMode.ON_HEAP
+    assert(mm.acquireExecutionMemory(490L, 1L, mode) == 490L)
+    // Ten bytes are free; a larger request must fail atomically, without a partial reservation.
+    assert(mm.tryAcquireExecutionMemoryForExecutor(11L, mode).isEmpty)
+    val reservation = mm.tryAcquireExecutionMemoryForExecutor(10L, mode).get
+    assert(mm.executionMemoryUsed == 500L)
+    assertEvictBlocksToFreeSpaceNotCalled(ms)
+    mm.releaseAllExecutionMemoryForTask(1L)
+    assert(mm.executionMemoryUsed == 10L)
+    reservation.close()
+    assert(mm.executionMemoryUsed == 0L)
+  }
+
+  test("executor reservations respect tracked unmanaged memory") {
+    val conf = new SparkConf(false).set(UNMANAGED_MEMORY_POLLING_INTERVAL, 100L)
+    val mm = new UnifiedMemoryManager(conf, 1000L, 500L, 1)
+    val consumer = new UnmanagedMemoryConsumer {
+      override def unmanagedMemoryConsumerId: UnmanagedMemoryConsumerId =
+        UnmanagedMemoryConsumerId("ExecutorReservationTest", "retained-input")
+      override def memoryMode: MemoryMode = MemoryMode.ON_HEAP
+      override def getMemBytesUsed: Long = 400L
+    }
+    try {
+      UnifiedMemoryManager.registerUnmanagedMemoryConsumer(consumer)
+      val poll = PrivateMethod[Unit](Symbol("pollUnmanagedMemoryUsers"))
+      UnifiedMemoryManager.invokePrivate(poll())
+      assert(mm.tryAcquireExecutionMemoryForExecutor(101L, MemoryMode.ON_HEAP).isEmpty)
+      val reservation = mm.tryAcquireExecutionMemoryForExecutor(100L, MemoryMode.ON_HEAP).get
+      assert(mm.executionMemoryUsed == 100L)
+      reservation.close()
+      assert(mm.executionMemoryUsed == 0L)
+    } finally {
+      UnifiedMemoryManager.clearUnmanagedMemoryUsers()
+      UnifiedMemoryManager.shutdownUnmanagedMemoryPoller()
+    }
+  }
+
+  test("task memory shares exclude executor reservations after storage borrows free space") {
+    val (mm, _) = makeThings(1000L)
+    val mode = MemoryMode.ON_HEAP
+    val reservation = mm.tryAcquireExecutionMemoryForExecutor(250L, mode).get
+    assert(mm.acquireStorageMemory(dummyBlock, 750L, mode))
+    // Storage can shrink the execution pool down to the reservation. The consumer must still
+    // be able to grow its compute share by reclaiming borrowed execution space.
+    assert(mm.acquireExecutionMemory(100L, 1L, mode) == 100L)
+    mm.releaseAllExecutionMemoryForTask(1L)
+    reservation.close()
+    assert(mm.executionMemoryUsed == 0L)
+  }
+
   test("basic storage memory") {
     val maxMemory = 1000L
     val (mm, ms) = makeThings(maxMemory)

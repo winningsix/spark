@@ -64,21 +64,22 @@ private[streaming] object StreamingShuffleReceiveService {
   def createQueue(conf: SparkConf): BlockingQueue[StreamingShuffleMessage] = {
     new StreamingShuffleMessageQueue(
       conf.get(STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY),
-      Some(new File(Utils.getLocalDir(conf))))
+      Some(new File(Utils.getLocalDir(conf))),
+      Option(SparkEnv.get).flatMap(env => Option(env.memoryManager)))
   }
 
   def closeQueue(
       queue: BlockingQueue[StreamingShuffleMessage]): StreamingShuffleReceiveInboxStats = {
-    val messages = new java.util.ArrayList[StreamingShuffleMessage]()
-    queue.drainTo(messages)
-    messages.forEach(_.release())
     queue match {
       case spillable: StreamingShuffleMessageQueue =>
-        val stats = StreamingShuffleReceiveInboxStats(
-          spillable.spilledBytesCount, spillable.spilledMessagesCount)
         spillable.close()
-        stats
-      case _ => StreamingShuffleReceiveInboxStats(0L, 0L)
+        StreamingShuffleReceiveInboxStats(
+          spillable.spilledBytesCount, spillable.spilledMessagesCount)
+      case _ =>
+        val messages = new java.util.ArrayList[StreamingShuffleMessage]()
+        queue.drainTo(messages)
+        messages.forEach(_.release())
+        StreamingShuffleReceiveInboxStats(0L, 0L)
     }
   }
 }
@@ -450,7 +451,10 @@ private[streaming] class StreamingShufflePreparedReceiveSession(
 
   private def maybeMarkDrainReady(): Unit = inbox.queue match {
     case queue: StreamingShuffleMessageQueue
-        if drainReadyBytes == 0L || queue.queuedMemoryBytesCount >= drainReadyBytes =>
+        if drainReadyBytes == 0L || queue.queuedMemoryBytesCount >= drainReadyBytes ||
+          queue.spilledMessagesCount > 0L =>
+      // Memory pressure must wake the consumer even if the optional batching threshold was
+      // not reached. Otherwise spilled input can exhaust route credit before compute starts.
       markDrainReady()
     case queue if drainReadyBytes == 0L && !queue.isEmpty =>
       markDrainReady()

@@ -56,8 +56,34 @@ private[memory] class ExecutionMemoryPool(
   @GuardedBy("lock")
   private val memoryForTask = new mutable.HashMap[Long, Long]()
 
+  // Buffers whose lifetime extends beyond a task, such as prepared shuffle input and replay.
+  @GuardedBy("lock")
+  private var memoryForExecutor = 0L
+
   override def memoryUsed: Long = lock.synchronized {
-    memoryForTask.values.sum
+    memoryForTask.values.sum + memoryForExecutor
+  }
+
+  /**
+   * Reserve existing free space without waiting or evicting blocks on a transport thread.
+   * Leave at least half the current pool for task computation when admitting these buffers.
+   * Callers must spill if the entire request cannot be granted.
+   */
+  def tryAcquireMemoryForExecutor(numBytes: Long): Boolean = lock.synchronized {
+    require(numBytes >= 0)
+    if (numBytes > memoryFree || numBytes > math.max(0L, poolSize / 2 - memoryForExecutor)) {
+      false
+    } else {
+      memoryForExecutor += numBytes
+      lock.notifyAll()
+      true
+    }
+  }
+
+  def releaseMemoryForExecutor(numBytes: Long): Unit = lock.synchronized {
+    require(numBytes >= 0 && numBytes <= memoryForExecutor)
+    memoryForExecutor -= numBytes
+    lock.notifyAll()
   }
 
   /**
@@ -125,8 +151,8 @@ private[memory] class ExecutionMemoryPool(
       // occupies. Otherwise, we may run into SPARK-12155 where, in unified memory management,
       // we did not take into account space that could have been freed by evicting cached blocks.
       val maxPoolSize = computeMaxPoolSize()
-      val maxMemoryPerTask = maxPoolSize / numActiveTasks
-      val minMemoryPerTask = poolSize / (2 * numActiveTasks)
+      val maxMemoryPerTask = math.max(0L, maxPoolSize - memoryForExecutor) / numActiveTasks
+      val minMemoryPerTask = (poolSize - memoryForExecutor) / (2 * numActiveTasks)
 
       // How much we can grant this task; keep its share within 0 <= X <= 1 / numActiveTasks
       val maxToGrant = math.min(numBytes, math.max(0, maxMemoryPerTask - curMem))

@@ -114,6 +114,105 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("executor replay reservation follows the last outbound reference across task cleanup") {
+    val conf = newConf().set(SHUFFLE_COMPRESS, false)
+      .set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 0L)
+    withSpark(new SparkContext("local", "executor-replay-ownership", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      val writer = newWriter(sc, context, sharedServer = Some(server))
+      val manager = SparkEnv.get.memoryManager
+      val retained = new AtomicReference[ByteBuf]()
+      try {
+        val client = bindMockClient(writer, 0) { sent =>
+          assert(retained.compareAndSet(null, sent.retain()))
+        }
+        writer.transportServerHandler.handleMessage(
+          client, new CreditControlMessage(0, 0, 0, -(1 << 20)))
+        val data = writer.TimestampedBuffer(Unpooled.directBuffer(128))
+        data.serializationStream.get.writeKey(1).writeValue(2).flush()
+        writer.shards(0).send(data)
+        eventually(Timeout(10.seconds)) {
+          assert(retained.get() != null)
+          assert(manager.executionMemoryUsed > 0L)
+        }
+        new TaskMemoryManager(manager, 42L).cleanUpAllAllocatedMemory()
+        val reserved = manager.executionMemoryUsed
+        assert(reserved > 0L)
+        context.markTaskFailed(new RuntimeException("injected producer failure"))
+        context.markTaskCompleted(None)
+        // Cleanup drops replay and producer owners, but the transport still owns its slice.
+        assert(manager.executionMemoryUsed == reserved)
+        retained.getAndSet(null).release()
+        eventually(Timeout(10.seconds)) {
+          assert(manager.executionMemoryUsed == 0L)
+        }
+      } finally {
+        context.markTaskCompleted(None)
+        Option(retained.getAndSet(null)).foreach(_.release())
+        server.close()
+      }
+    }
+  }
+
+  test("exhausted executor budget spills replay even when the per-writer cap is disabled") {
+    val conf = newConf().set(STREAMING_SHUFFLE_WRITER_REPLAY_MAX_MEMORY, 0L)
+    withSpark(new SparkContext("local", "executor-replay-spill", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      val writer = newWriter(sc, context, sharedServer = Some(server))
+      val manager = SparkEnv.get.memoryManager
+      // The default execution pool starts at half the managed heap, and executor retention
+      // can reserve half that pool. Hold that allowance to model other completed producers.
+      val reservation = manager.tryAcquireExecutionMemoryForExecutor(
+        manager.maxOnHeapStorageMemory / 4, manager.tungstenMemoryMode).get
+      val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](128)(3))
+      val message = new DataMessage(0, 0, 128, buffer, 0L)
+      buffer.release()
+      try {
+        // No reader is connected, so the payload must be retained for a later reader or spilled.
+        writer.shards(0).send(message)
+        assert(buffer.refCnt() == 0)
+        assert(manager.executionMemoryUsed == reservation.size)
+      } finally {
+        context.markTaskCompleted(None)
+        reservation.close()
+        server.close()
+      }
+      assert(manager.executionMemoryUsed == 0L)
+    }
+  }
+
+  test("relaxed writer returns task memory before deferred transport cleanup") {
+    val conf = newConf().set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+    withSpark(new SparkContext("local", "relaxed-writer-task-memory", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      val writer = newWriter(sc, context, sharedServer = Some(server))
+      val terminal = new AtomicLong(-1L)
+      val client = bindMockClient(writer, 0) { sent =>
+        terminal.set(sent.getLong(sent.readerIndex() + 4))
+      }
+      try {
+        writer.write(Iterator.empty)
+        context.markTaskCompleted(None)
+        // TaskRunner clears the task ledger after completion listeners, while the terminal ACK
+        // may arrive later. The delayed cleanup must not attempt to free this task's memory again.
+        assert(context.taskMemoryManager.cleanUpAllAllocatedMemory() == 0L)
+        eventually(Timeout(10.seconds)) {
+          assert(terminal.get() >= 0L)
+        }
+        val ack = new TerminationAckMessage(0, 0, 0)
+        ack.setSeqNum(terminal.get())
+        writer.transportServerHandler.handleMessage(client, ack)
+        assert(writer.errorNotifier.getError().isEmpty)
+      } finally {
+        context.markTaskCompleted(None)
+        server.close()
+      }
+    }
+  }
+
   test("cumulative route credit repairs are bounded and idempotent") {
     withSpark(new SparkContext("local", "cumulative-credit-repair", newConf())) { sc =>
       val context = createTaskContext(sc.conf, 0)

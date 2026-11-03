@@ -24,8 +24,12 @@ import java.util.{AbstractQueue, ArrayList, Collection, Iterator => JIterator}
 import java.util.concurrent.{BlockingQueue, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
+import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
+
 import io.netty.buffer.Unpooled
 
+import org.apache.spark.memory.MemoryManager
 import org.apache.spark.network.shuffle.streaming.DataMessage
 import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
 
@@ -39,7 +43,9 @@ import org.apache.spark.network.shuffle.streaming.StreamingShuffleMessage
  * each writer connection can have its own Netty event loop.
  */
 private[streaming] final class StreamingShuffleMessageQueue
-    (maxInMemoryBytes: Long = 0L, spillDirectory: Option[File] = None)
+    (maxInMemoryBytes: Long = 0L,
+     spillDirectory: Option[File] = None,
+     memoryManager: Option[MemoryManager] = None)
     extends AbstractQueue[StreamingShuffleMessage] with BlockingQueue[StreamingShuffleMessage] {
 
   require(maxInMemoryBytes >= 0, "maxInMemoryBytes must be non-negative")
@@ -111,6 +117,10 @@ private[streaming] final class StreamingShuffleMessageQueue
   private var currentBatch: Array[QueueEntry] = null
   private var currentIndex = 0
   private val stateLock = new Object
+  // Serialize publication with close, including payload reservation and spill-file creation.
+  // A network callback already in progress must not publish a new owner after cancellation.
+  private val publicationLock = new Object
+  private var closed = false
   private val messageCount = new AtomicInteger(0)
   private val queuedMemoryBytes = new AtomicLong(0L)
   private val spillLock = new Object
@@ -176,8 +186,33 @@ private[streaming] final class StreamingShuffleMessageQueue
     }
   }
 
+  private def reserveMessage(data: DataMessage): Boolean = {
+    if (!reserveInMemory(data.dataSize.toLong)) return false
+    // The executor reservation follows the message through dequeue and reader consumption.
+    // Queue occupancy alone would return the budget while the reader still holds the payload.
+    if (canSpill && memoryManager.isDefined) {
+      val manager = memoryManager.get
+      // Charge the configured execution pool even when off-heap execution is disabled. This is
+      // a retained-payload budget, not a measurement of Netty's physical allocation or RSS.
+      val reservation = manager.tryAcquireExecutionMemoryForExecutor(
+        data.dataSize, manager.tungstenMemoryMode)
+      reservation match {
+        case Some(reservation) =>
+          val callback = data.takeReleaseCallback()
+          data.setReleaseCallback(() => {
+            try reservation.close()
+            finally if (callback != null) callback.run()
+          })
+        case None =>
+          queuedMemoryBytes.addAndGet(-data.dataSize.toLong)
+          return false
+      }
+    }
+    true
+  }
+
   private def toEntry(message: StreamingShuffleMessage): QueueEntry = message match {
-    case data: DataMessage if canSpill && !reserveInMemory(data.dataSize.toLong) =>
+    case data: DataMessage if !reserveMessage(data) =>
       val bytes = new Array[Byte](data.dataSize)
       data.data.getBytes(data.data.readerIndex(), bytes)
       val offset = writeFully(bytes)
@@ -196,10 +231,7 @@ private[streaming] final class StreamingShuffleMessageQueue
       new SpilledDataEntry(
         data.shuffleId, data.shuffleWriterId, data.shuffleReaderId, data.dataSize,
         data.uncompressedSize, data.checksum, data.getSeqNum, offset, consumerReleaseCallback)
-    case data: DataMessage if canSpill =>
-      new InMemoryEntry(data)
     case data: DataMessage =>
-      reserveInMemory(data.dataSize.toLong)
       new InMemoryEntry(data)
     case other =>
       new InMemoryEntry(other)
@@ -213,7 +245,11 @@ private[streaming] final class StreamingShuffleMessageQueue
   }
 
   /** Enqueues all messages atomically with respect to the reader's batch boundary. */
-  def putBatch(messages: Array[StreamingShuffleMessage]): Unit = {
+  def putBatch(messages: Array[StreamingShuffleMessage]): Unit = publicationLock.synchronized {
+    if (closed) {
+      releaseAll(messages.iterator.map(message => () => message.release()))
+      return
+    }
     if (messages.nonEmpty) {
       val entries = new Array[QueueEntry](messages.length)
       var converted = 0
@@ -228,16 +264,16 @@ private[streaming] final class StreamingShuffleMessageQueue
         batches.put(entries)
       } catch {
         case t: Throwable =>
-          if (converted > 0) {
-            var i = 0
-            while (i < converted) {
-              if (entries(i) != null) entries(i).release()
-              i += 1
+          val convertedReleases = entries.iterator.take(converted).map { entry =>
+            () => {
+              queuedMemoryBytes.addAndGet(-entry.inMemoryBytes)
+              entry.release()
             }
           }
-          while (converted < messages.length) {
-            messages(converted).release()
-            converted += 1
+          val remainingReleases = messages.iterator.drop(converted)
+            .map(message => () => message.release())
+          try releaseAll(convertedReleases ++ remainingReleases) catch {
+            case NonFatal(error) => if (error ne t) t.addSuppressed(error)
           }
           if (counted) messageCount.addAndGet(-messages.length)
           throw t
@@ -380,14 +416,60 @@ private[streaming] final class StreamingShuffleMessageQueue
 
   private[streaming] def spilledMessagesCount: Long = spilledMessages.get()
 
-  private[streaming] def close(): Unit = spillLock.synchronized {
-    if (spillChannel != null) {
-      try spillChannel.close() finally {
-        spillRaf.close()
-        if (spillFile != null && !spillFile.delete()) spillFile.deleteOnExit()
-        spillChannel = null
-        spillRaf = null
-        spillFile = null
+  /** Discard a quiesced inbox without reading spilled payloads back into memory. */
+  private def discardAll(): Unit = {
+    val discarded = new ArrayList[QueueEntry]()
+    stateLock.synchronized {
+      if (currentBatch != null) {
+        while (currentIndex < currentBatch.length) {
+          discarded.add(currentBatch(currentIndex))
+          currentIndex += 1
+        }
+        currentBatch = null
+        currentIndex = 0
+      }
+      var batch = batches.poll()
+      while (batch != null) {
+        batch.foreach(discarded.add)
+        batch = batches.poll()
+      }
+      discarded.asScala.foreach { entry =>
+        queuedMemoryBytes.addAndGet(-entry.inMemoryBytes)
+        messageCount.decrementAndGet()
+      }
+    }
+    releaseAll(discarded.asScala.iterator.map(entry => () => entry.release()))
+  }
+
+  private def releaseAll(releases: Iterator[() => Unit]): Unit = {
+    var failure: Throwable = null
+    releases.foreach { release =>
+      try release() catch {
+        case NonFatal(error) =>
+          if (failure == null) {
+            failure = error
+          } else if (failure ne error) {
+            failure.addSuppressed(error)
+          }
+      }
+    }
+    if (failure != null) throw failure
+  }
+
+  private[streaming] def close(): Unit = publicationLock.synchronized {
+    if (closed) return
+    closed = true
+    try discardAll() finally {
+      spillLock.synchronized {
+        if (spillChannel != null) {
+          try spillChannel.close() finally {
+            spillRaf.close()
+            if (spillFile != null && !spillFile.delete()) spillFile.deleteOnExit()
+            spillChannel = null
+            spillRaf = null
+            spillFile = null
+          }
+        }
       }
     }
   }

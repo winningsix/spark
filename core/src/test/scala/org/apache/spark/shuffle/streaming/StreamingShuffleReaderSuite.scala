@@ -17,6 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.io.RandomAccessFile
 import java.util.Properties
 import java.util.concurrent.{Callable, CompletableFuture, CompletionException, CountDownLatch, ExecutionException, Executors, LinkedBlockingQueue, TimeoutException, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
@@ -28,7 +29,7 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.SHUFFLE_MANAGER_INCREMENTAL
-import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
+import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager, UnifiedMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
@@ -103,6 +104,150 @@ class StreamingShuffleReaderSuite
       } finally {
         StreamingShuffleReceiveService.closeQueue(queue)
       }
+    }
+  }
+
+  test("prepared inboxes share executor memory until consumption, independent of task cleanup") {
+    withTempDir { spillDir =>
+      val manager = new UnifiedMemoryManager(new SparkConf(false), 1024L, 0L, 1)
+      val first = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(manager))
+      val second = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(manager))
+      val credits = new AtomicInteger(0)
+      val resources = new AtomicInteger(0)
+      def message(): DataMessage = {
+        val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](400)(7))
+        val data = new DataMessage(0, 0, 400, buffer, 0L)
+        buffer.release()
+        data.setResourceReleaseCallback(() => resources.incrementAndGet())
+        data.setReleaseCallback(() => credits.incrementAndGet())
+        data
+      }
+      try {
+        first.put(message())
+        second.put(message())
+        manager.executionMemoryUsed shouldBe 400L
+        first.spilledBytesCount shouldBe 0L
+        second.spilledBytesCount shouldBe 400L
+        resources.get() shouldBe 1
+        credits.get() shouldBe 0
+        new TaskMemoryManager(manager, 1L).cleanUpAllAllocatedMemory()
+        manager.executionMemoryUsed shouldBe 400L
+        val input = first.take()
+        try {
+          first.queuedMemoryBytesCount shouldBe 0L
+          manager.executionMemoryUsed shouldBe 400L
+        } finally {
+          input.release()
+        }
+        manager.executionMemoryUsed shouldBe 0L
+        resources.get() shouldBe 2
+        val spilled = second.take().asInstanceOf[DataMessage]
+        try {
+          spilled.data.getByte(spilled.data.readerIndex()) shouldBe 7.toByte
+          credits.get() shouldBe 1
+        } finally {
+          spilled.release()
+        }
+        credits.get() shouldBe 2
+        // A later task wave can reuse the same budget.
+        second.put(message())
+        manager.executionMemoryUsed shouldBe 400L
+      } finally {
+        StreamingShuffleReceiveService.closeQueue(first)
+        StreamingShuffleReceiveService.closeQueue(second)
+      }
+      manager.executionMemoryUsed shouldBe 0L
+      credits.get() shouldBe 3
+    }
+  }
+
+  test("cancelling a spilled inbox releases credit without reading its spill file") {
+    withTempDir { spillDir =>
+      val queue = new StreamingShuffleMessageQueue(1L, Some(spillDir))
+      val credits = new AtomicInteger(0)
+      (1 to 3).foreach { _ =>
+        val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](128)(1))
+        val data = new DataMessage(0, 0, 128, buffer, 0L)
+        buffer.release()
+        data.setReleaseCallback(() => credits.incrementAndGet())
+        queue.put(data)
+      }
+      // Cleanup must not deserialize or even read these now-unused records.
+      spillDir.listFiles().foreach { file =>
+        val truncated = new RandomAccessFile(file, "rw")
+        try truncated.setLength(0L) finally truncated.close()
+      }
+      StreamingShuffleReceiveService.closeQueue(queue)
+      credits.get() shouldBe 3
+      queue.size() shouldBe 0
+      queue.queuedMemoryBytesCount shouldBe 0L
+      spillDir.listFiles() shouldBe empty
+      StreamingShuffleReceiveService.closeQueue(queue)
+      credits.get() shouldBe 3
+    }
+  }
+
+  test("inbox cancellation fences concurrent and late network publication") {
+    withTempDir { spillDir =>
+      val manager = new UnifiedMemoryManager(new SparkConf(false), 1024L, 0L, 1)
+      val queue = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(manager))
+      val credits = new AtomicInteger(0)
+      val pool = Executors.newSingleThreadExecutor()
+      val started = new CountDownLatch(1)
+      def publish(): Unit = {
+        val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](400)(1))
+        val message = new DataMessage(0, 0, 400, buffer, 0L)
+        buffer.release()
+        message.setReleaseCallback(() => credits.incrementAndGet())
+        queue.put(message)
+      }
+      try {
+        val producer = pool.submit(new Runnable {
+          override def run(): Unit = {
+            started.countDown()
+            (1 to 100).foreach(_ => publish())
+          }
+        })
+        assert(started.await(10, TimeUnit.SECONDS))
+        StreamingShuffleReceiveService.closeQueue(queue)
+        producer.get(10, TimeUnit.SECONDS)
+        publish()
+        manager.executionMemoryUsed shouldBe 0L
+        queue.size() shouldBe 0
+        credits.get() shouldBe 101
+        spillDir.listFiles() shouldBe empty
+      } finally {
+        pool.shutdownNow()
+        StreamingShuffleReceiveService.closeQueue(queue)
+      }
+    }
+  }
+
+  test("inbox cleanup releases every reservation even if credit callbacks fail") {
+    withTempDir { spillDir =>
+      val manager = new UnifiedMemoryManager(new SparkConf(false), 1024L, 0L, 1)
+      val queue = new StreamingShuffleMessageQueue(1024L, Some(spillDir), Some(manager))
+      val failure = new IllegalStateException("injected credit callback failure")
+      val credits = new AtomicInteger(0)
+      (1 to 3).foreach { _ =>
+        val buffer = Unpooled.wrappedBuffer(Array.fill[Byte](400)(1))
+        val message = new DataMessage(0, 0, 400, buffer, 0L)
+        buffer.release()
+        message.setReleaseCallback(() => {
+          credits.incrementAndGet()
+          throw failure
+        })
+        queue.put(message)
+      }
+      val thrown = intercept[IllegalStateException] {
+        StreamingShuffleReceiveService.closeQueue(queue)
+      }
+      assert(thrown eq failure)
+      credits.get() shouldBe 3
+      manager.executionMemoryUsed shouldBe 0L
+      queue.size() shouldBe 0
+      spillDir.listFiles() shouldBe empty
+      StreamingShuffleReceiveService.closeQueue(queue)
     }
   }
 

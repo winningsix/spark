@@ -1265,13 +1265,33 @@ class StreamingShuffleWriter[K, V](
       }
       val sequenceNum = lastSentSequenceNum.incrementAndGet()
       message.setSeqNum(sequenceNum)
+      val reserveReplay = sharedExecutorServer.isDefined && message.isInstanceOf[DataMessage]
+      val reservation = if (reserveReplay) {
+        val manager = SparkEnv.get.memoryManager
+        val bytes = message.headerLength().toLong + message.asInstanceOf[DataMessage].dataSize
+        manager.tryAcquireExecutionMemoryForExecutor(bytes, manager.tungstenMemoryMode)
+      } else {
+        None
+      }
       var buf: CompositeByteBuf = null
       try {
-        buf = server.getPooledByteBufAllocator.compositeBuffer().capacity(message.headerLength())
+        buf = reservation match {
+          case Some(lease) =>
+            // The envelope is shared by replay and outbound sends. Returning the budget when
+            // only replay retires would miss slices still retained by a network write.
+            new CompositeByteBuf(server.getPooledByteBufAllocator, true, 16) {
+              override protected def deallocate(): Unit = {
+                try super.deallocate()
+                finally lease.close()
+              }
+            }
+          case None => server.getPooledByteBufAllocator.compositeBuffer()
+        }
+        buf.capacity(message.headerLength())
         message.encode(buf)
       } catch {
         case e: Throwable =>
-          if (buf != null) buf.release()
+          if (buf != null) buf.release() else reservation.foreach(_.close())
           throw e
       } finally {
         message.release()
@@ -1291,6 +1311,7 @@ class StreamingShuffleWriter[K, V](
         // Install the PendingSend before enforcing the replay cap. A spilled replay duplicate is
         // not itself a memory bound if the queued send still owns an encoded duplicate of the
         // same payload; retiring both copies is what lets a blocked route release direct memory.
+        if (reserveReplay && reservation.isEmpty) spillReplayEntry(replayEntry)
         spillReplayHistoryIfNeeded()
         if (pendingBatchBytes >= BATCH_SIZE) flushPendingBatch()
         return
@@ -2034,6 +2055,11 @@ class StreamingShuffleWriter[K, V](
    */
   private[streaming] def cleanupResources(): Unit = {
     if (!cleanupStarted.compareAndSet(false, true)) return
+    // Return task-owned accounting before TaskMemoryManager clears its task ledger. Replay
+    // buffers that survive this callback now keep their own executor reservations until release.
+    Utils.tryLogNonFatalError {
+      memoryConsumer.freeMemory(memoryConsumer.getUsed())
+    }
     if (!WAIT_FOR_TERMINATION_ACKS && context.getTaskFailure.isEmpty) {
       // The relaxed lifecycle removes delivery and ACK waits from the Spark task's critical path.
       // Keep the writer object, replay data, and endpoint alive until both asynchronous barriers
@@ -2140,9 +2166,6 @@ class StreamingShuffleWriter[K, V](
           partitionId += 1
         }
       }
-    }
-    Utils.tryLogNonFatalError {
-      memoryConsumer.freeMemory(memoryConsumer.getUsed())
     }
     logDebug(log"Resource cleanup took ${MDC(LogKeys.DURATION,
       System.currentTimeMillis() - cleanupStartTime)} ms")

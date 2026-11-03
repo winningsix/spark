@@ -233,6 +233,23 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("prepared inbox spill wakes consumers before the ready-bytes threshold") {
+    withDistributedPipelinedSession(adaptive = false, extraConf = Map(
+        "spark.shuffle.streaming.readerQueueMaxMemory" -> "1b",
+        "spark.shuffle.streaming.preparedInbox.readyBytes" -> "1m",
+        "spark.shuffle.streaming.readerMaxMemory" -> "8192",
+        "spark.shuffle.streaming.networkBufferSize" -> "1024",
+        "spark.shuffle.compress" -> "false")) { spark =>
+      // Route credit is much smaller than the optional readiness threshold. Waiting for that
+      // threshold after spilling would leave producers waiting for consumers that cannot start.
+      val df = spark.range(0, 20000, 1, 4).repartition(2)
+      assert(df.collect().sorted.toSeq === (0L until 20000L))
+      assert(collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec if exchange.pipelined => exchange
+      }.nonEmpty)
+    }
+  }
+
   test("distributed range replay uses one sampling pass for skewed hash input") {
     withDistributedPipelinedSession() { spark =>
       import spark.implicits._

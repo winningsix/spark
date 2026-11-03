@@ -17,6 +17,7 @@
 
 package org.apache.spark.memory
 
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.annotation.concurrent.GuardedBy
 
 import org.apache.spark.SparkConf
@@ -127,6 +128,26 @@ private[spark] abstract class MemoryManager(
       numBytes: Long,
       taskAttemptId: Long,
       memoryMode: MemoryMode): Long
+
+  /**
+   * Reserve execution memory for state that outlives a task. Unlike task allocation, this never
+   * waits for memory or evicts storage blocks and grants either the whole request or nothing.
+   * The owner must close the reservation when its buffers are released, including on failure.
+   * Task completion deliberately does not release these reservations.
+   */
+  def tryAcquireExecutionMemoryForExecutor(
+      numBytes: Long,
+      memoryMode: MemoryMode): Option[ExecutionMemoryReservation] = synchronized {
+    val pool = memoryMode match {
+      case MemoryMode.ON_HEAP => onHeapExecutionMemoryPool
+      case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool
+    }
+    if (pool.tryAcquireMemoryForExecutor(numBytes)) {
+      Some(new ExecutionMemoryReservation(numBytes, () => pool.releaseMemoryForExecutor(numBytes)))
+    } else {
+      None
+    }
+  }
 
   /**
    * Release numBytes of execution memory belonging to the given task.
@@ -286,5 +307,16 @@ private[spark] abstract class MemoryManager(
       case MemoryMode.ON_HEAP => MemoryAllocator.HEAP
       case MemoryMode.OFF_HEAP => MemoryAllocator.UNSAFE
     }
+  }
+}
+
+/** An executor-owned reservation whose release is independent of task cleanup. */
+private[spark] final class ExecutionMemoryReservation private[memory](
+    val size: Long,
+    release: () => Unit) extends AutoCloseable {
+  private val closed = new AtomicBoolean(false)
+
+  override def close(): Unit = {
+    if (closed.compareAndSet(false, true)) release()
   }
 }
