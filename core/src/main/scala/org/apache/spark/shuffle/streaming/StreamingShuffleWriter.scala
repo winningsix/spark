@@ -818,7 +818,9 @@ class StreamingShuffleWriter[K, V](
             0L
           }
           if (nextBytes > 0L && (available <= 0L ||
-              (bytes > 0L && bytes + nextBytes > available))) return count
+              (bytes > 0L && bytes + nextBytes > available))) {
+            return count
+          }
           bytes += nextBytes
           count += 1
         }
