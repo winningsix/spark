@@ -218,6 +218,44 @@ These are single-host, two-executor results, not multi-host or general zero-over
 See [the elastic-producer performance report](rtm_elastic_admission_performance_20261105.md)
 for samples, CPU and I/O evidence, correctness, and remaining limitations.
 
+The subsequent code cleanup separates graph-to-admission descriptor construction from
+DAGScheduler event handling, separates reservation placement from policy selection, shares
+planner consumer checks, and moves the shared compression primitives into their own file.
+It follows the community review emphasis on
+[shared correctness checks](https://github.com/apache/spark/pull/58097#discussion_r3874738592),
+[preserving disabled-feature behavior](https://github.com/apache/spark/pull/58097#discussion_r3816785113),
+and [stage identity in admission accounting](https://github.com/apache/spark/pull/57341#discussion_r3655488036).
+The cleanup passed 462 tests (302 core/transport, 73 DAG, 87 SQL), all four core/SQL main/test
+scalastyle checks, and 24 SF1000 query executions with matching results and clean event logs.
+Floating aggregates use absolute tolerance 1e-8 and relative tolerance 1e-12; keys and other
+fields are exact. Both executors loaded the frozen core and SQL artifacts for each version.
+
+Performance qualification compares pre-cleanup `dc64852fad8` with source `eb6b8735abb`.
+Both enable elastic admission with producer minimum 1. This is not a BSP comparison or an
+admission-disabled comparison. Physical plans match. Each cohort has one warm-up per version
+and three alternating measured pairs. After the first Q3 cohort exceeded the 2% regression
+tolerance, a fixed second cohort was declared and run with unchanged artifacts and settings.
+All measured samples are retained:
+
+| Query/cohort | Before, seconds | After, seconds | Median change |
+| --- | --- | --- | --- |
+| Q1 | 24.059, 22.628, 23.352 | 23.046, 22.266, 28.461 | -1.31% |
+| Q3 initial | 79.330, 85.317, 75.702 | 81.062, 77.948, 85.450 | +2.18% |
+| Q3 repeat | 76.376, 75.864, 75.155 | 93.768, 90.603, 79.877 | +19.43% |
+
+Pooling all six measured Q3 samples gives 76.120 s before and 83.256 s after (+9.37%).
+Median task CPU parallelism falls from 23.17 to 22.00; physical device writes are similar
+(96.25 versus 96.03 GiB, including host activity and delayed writeback). Q3 remains at 164
+successful tasks per query, with unchanged logical shuffle-write bytes. Writer and compression
+instruction-bytecode comparisons show no hot-path change, but this does not establish the
+cause of the timing difference. The cleanup therefore fails the Q3 performance gate and is
+kept on `codex/rtm-code-cleanup-20261105`; the remote qualified POC branch is not advanced.
+The results are from one host with two executors and do not qualify multi-host networking.
+Evidence, artifact hashes, per-run metrics, and retained warm-ups are under
+`/disk0/tmp/ferdinandx/rtm-code-cleanup-20261105/`, with the combined benchmark record at
+`perf/FINAL_ALL_SUMMARY.json`. The remaining performance difference requires attribution
+before promoting the cleanup to the qualified POC.
+
 A later phase may separate operator state residency from compute threads. Blocked execution
 instances could yield threads and resume when input or output capacity becomes available. That
 requires operator-level cooperative execution and memory management; it cannot be achieved merely
