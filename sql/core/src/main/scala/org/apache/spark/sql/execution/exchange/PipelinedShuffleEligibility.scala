@@ -29,25 +29,20 @@ import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.joins.CartesianProductExec
 import org.apache.spark.sql.internal.SQLConf
 
-/**
- * Shared environment gate for the two pipelined-shuffle enabling rules
- * ([[EnablePipelinedShuffle]] non-AQE and `AQEEnablePipelinedShuffle` under AQE). This is a
- * CORRECTNESS gate, not cosmetics: flipping an exchange to pipelined while the incremental manager
- * is incompatible with the deployment would hang readers waiting on producers they cannot reach.
- * Both rules must apply the identical gate, so it lives here rather than being copy-pasted into
- * each `apply` (where the two could drift and split AQE vs non-AQE behavior). Each rule keeps only
- * its own plan-shape logic.
- */
+/** Shared deployment and consumer checks for batch pipelined-shuffle planning rules. */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
   // The flag/manager mismatch is a start-up misconfiguration, so warn once per JVM rather than on
   // every query planned in the session.
   private val mismatchWarned = new AtomicBoolean(false)
 
-  /** Operators whose consumers cannot safely drain a bounded, single-reader channel. */
-  def isUnsupportedConsumer(plan: SparkPlan): Boolean = plan match {
-    case _: CoalesceExec | _: CartesianProductExec | _: DeserializeToObjectExec |
-        _: CollectLimitExec | _: CollectTailExec | _: TakeOrderedAndProjectExec => true
+  /** Limits require a transport that supports their hidden materialized shuffle boundary. */
+  def isUnsupportedConsumer(
+      plan: SparkPlan,
+      supportsUnmaterializedRegularBoundary: Boolean = false): Boolean = plan match {
+    case _: CoalesceExec | _: CartesianProductExec | _: DeserializeToObjectExec => true
+    case _: CollectLimitExec | _: CollectTailExec | _: TakeOrderedAndProjectExec =>
+      !supportsUnmaterializedRegularBoundary
     case _ => false
   }
 
@@ -103,19 +98,7 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
       }
       return false
     }
-    // Batch only. `IncrementalExecution.preparations` inherits QueryExecution's list, so without
-    // this gate a streaming plan would be rewritten here: every micro-batch exchange (the
-    // state-store shuffles, the static side of a stream-static join) would be flipped to pipelined
-    // BEFORE `MarkPipelinedShuffleForRealTimeMode` runs. That contradicts what the Real-Time Mode
-    // rule deliberately does -- it leaves the static side regular, because pulling it into the gang
-    // would demand slots for stages that must instead finish first, failing admission. Streaming
-    // marks its own pipelined boundaries; this opt-in batch path must not pre-empt that decision.
-    // (`logicalLink.exists(_.isStreaming)` is the same signal InsertAdaptiveSparkPlan uses to keep
-    // AQE off streaming plans.)
-    // Dataset.rdd exposes arbitrary consumers beyond the SQL plan, including RDD shuffles,
-    // multi-partition reads and repeated reads of the same partition. Cached inputs also hide
-    // shuffle lineage: cache hits skip those readers, while misses may require regular stages.
-    // RDD scans can hide arbitrary shuffle lineage and sharing outside the SQL plan as well.
+    // RDD exports, scans, and cached inputs can introduce readers outside this SQL plan.
     def hasUnsupportedBoundary(p: SparkPlan): Boolean = p match {
       case _: DeserializeToObjectExec | _: InMemoryTableScanExec |
           _: RDDScanExec | _: ExternalRDDScanExec[_] => true
@@ -123,6 +106,7 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
       case other => other.children.exists(hasUnsupportedBoundary)
     }
     if (hasUnsupportedBoundary(plan)) return false
+    // Streaming execution selects its own exchanges, including materialized static inputs.
     if (plan.exists(_.logicalLink.exists(_.isStreaming))) {
       logDebug("Pipelined shuffle: the plan is a streaming plan; leaving it to the streaming " +
         "engine's own pipelined-shuffle marking.")

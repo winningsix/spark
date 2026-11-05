@@ -22,60 +22,19 @@ import scala.collection.mutable
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{CoalesceExec, CollectLimitExec, CollectTailExec, SparkPlan, TakeOrderedAndProjectExec}
-import org.apache.spark.sql.execution.joins.{CartesianProductExec, ShuffledHashJoinExec}
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Opt-in (SPARK-57399). Rewrites EVERY [[ShuffleExchangeExec]] in a
- * batch physical plan to `pipelined = true`, so each shuffle is served by the configured
- * pipelined shuffle manager and the concurrent-stage scheduler runs the map and reduce stages
- * together. This is the minimal SQL entry point that lets a batch query exercise a
- * pipelined execution path; a production version would be a targeted,
- * cost/shape-aware replacement rather than a blanket rewrite.
+ * Selects pipelined exchanges for opt-in batch queries using the configured transport.
+ * Local channel execution requires the complete group to fit local capacity. Distributed
+ * execution preserves shuffled-hash-join build boundaries when supported by the transport.
+ * Unsupported consumers and exchange reuse retain regular execution unless the transport can
+ * serve them. Streaming queries use their own exchange-selection rule.
  *
- * Enabled by the local channel or distributed batch opt-in. It runs in the non-AQE
- * `preparations` list, so it also requires AQE to be off (under AQE the plan is hidden behind
- * an opaque `AdaptiveSparkPlanExec` leaf and this rule sees no exchanges).
- *
- * Rewriting ALL visible shuffles (not just hash-partitioning ones) keeps the job all-pipelined.
- * A manager with executor-owned prepared inboxes may additionally support a hidden regular
- * boundary above the pipeline; other unmaterialized mixed shapes are rejected by DAGScheduler.
- * SinglePartition and RangePartitioning exchanges pipeline fine -- the channel transport only
- * routes by `partitioner.getPartition(key)` and does not care which partitioning produced the
- * id (SinglePartition is the numPartitions == 1 degenerate case).
- *
- * These shapes make the rule leave the whole plan regular:
- *   - the estimated producer and consumer widths cannot fit local task capacity.
- *   - Dataset.rdd deserialization and cached inputs (the shared eligibility gate): their actual
- *     shuffle readers depend on consumers or cache availability outside this plan.
- *   - shuffle reuse when the configured manager does not support fan-out. A fan-out-capable
- *     manager preserves exchange reuse by routing every reader to the same pipelined exchange.
- *     Reused broadcast exchanges never consume the pipelined transport and do not block rewrite.
- *   - an UNSUPPORTED CONSUMER reading a shuffle (see [[readsShuffleThroughUnsupportedConsumer]]):
- *     an operator that would drain a shuffle in a way the channel transport cannot serve, or that
- *     builds its own hidden regular shuffle. If such an operator sits above any shuffle the rule
- *     leaves the WHOLE plan regular unless the configured manager explicitly supports the hidden
- *     regular boundary above a pipeline.
- *     The query runs correctly, just not pipelined. The unsupported consumers are:
- *       - `CoalesceExec` (user `.coalesce(n)`): its `CoalescedRDD` makes ONE reduce task drain
- *         SEVERAL reduce partitions sequentially. The single-threaded writer parks on a full
- *         bounded queue filling a later partition before emitting an earlier one's markers, so a
- *         reader draining partitions in order deadlocks the writer with no timeout escape;
- *         `coalesce`'s narrow-merge contract also cannot be honored by re-hashing to `n`.
- *       - `CartesianProductExec`: its `UnsafeCartesianRDD` reads each left (child) partition once
- *         per right partition, so N reduce tasks mint N readers on the SAME rendezvous queue for
- *         one `(shuffleId, epoch, pid)` -- rows and end-of-stream markers split
- *         nondeterministically (wrong results), a reader short of `numMaps` markers hangs, and
- *         the first to finish abandons the queue and discards the others' data. The fan-out check
- *         does not catch it (one consumer RDD, computed many times), nor the width-1 require.
- *       - `CollectLimitExec` / `CollectTailExec` / `TakeOrderedAndProjectExec`: each builds a
- *         hidden regular (`pipelined = false`) shuffle inside `doExecute` via
- *         `prepareShuffleDependency`, invisible to this plan walk. A flipped exchange below one of
- *         them would sit under that unmaterialized regular boundary and the job would hard-fail at
- *         submission unless the manager supports executor-owned prepared receive. (`.collect()`
- *         on a limit takes `executeTake` and never hits `doExecute`; `.write` / `.toLocalIterator`
- *         / a non-root position do.)
+ * This rule runs during non-AQE preparation and in the opt-in AQE full-plan path once the
+ * adaptive plan is visible. [[PipelinedShuffleEligibility]] owns the shared eligibility checks.
  */
 object EnablePipelinedShuffle extends Rule[SparkPlan] {
 
@@ -231,20 +190,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
     rewriteExchanges(_ => true)
   }
 
-  /**
-   * True if any [[ShuffleExchangeExec]] in `plan` is read by an operator the configured transport
-   * cannot serve. The unsupported operators (see class doc for why each is fatal) are
-   * `CoalesceExec`, `CartesianProductExec`, and, when the manager cannot prepare a regular
-   * boundary above a pipeline, the limit operators `CollectLimitExec` / `CollectTailExec` /
-   * `TakeOrderedAndProjectExec`. For each such operator anywhere in the plan, check whether a
-   * shuffle is reachable below it.
-   *
-   * The reachability walk descends through EVERY child of a non-exchange node -- not only unary
-   * children -- so a shuffle behind a `UnionExec`/join (a `BinaryExecNode`) beneath the operator
-   * is still found. It stops at the FIRST [[ShuffleExchangeExec]] on each path: a shuffle deeper
-   * than that first one is not read by this operator (the intervening exchange's own reader reads
-   * one reduce partition per task), so it is not this operator's concern.
-   */
+  /** Check all child branches for a shuffle read through an unsupported consumer. */
   private def readsShuffleThroughUnsupportedConsumer(
       plan: SparkPlan,
       supportsUnmaterializedRegularBoundary: Boolean): Boolean = {
@@ -252,14 +198,9 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       case _: ShuffleExchangeExec => true
       case other => other.children.exists(reachesShuffle)
     }
-    def isUnsupportedConsumer(p: SparkPlan): Boolean = p match {
-      case _: CoalesceExec | _: CartesianProductExec => true
-      case _: CollectLimitExec | _: CollectTailExec | _: TakeOrderedAndProjectExec =>
-        !supportsUnmaterializedRegularBoundary
-      case other => PipelinedShuffleEligibility.isUnsupportedConsumer(other)
-    }
     plan.exists {
-      case p if isUnsupportedConsumer(p) =>
+      case p if PipelinedShuffleEligibility.isUnsupportedConsumer(
+          p, supportsUnmaterializedRegularBoundary) =>
         p.children.exists(reachesShuffle)
       case _ => false
     }
