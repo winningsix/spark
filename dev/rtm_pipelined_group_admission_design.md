@@ -182,6 +182,18 @@ SQL tests. Of the six SQL tests, three enable the new reservation policy; the ot
 coverage of the legacy spill-readiness path and Q3 correctness with AQE disabled and enabled.
 The Q3 checks are not evidence that the new admission policy has been qualified for Q3 performance.
 
+Subsequent SF1000 qualification found and fixed two admission defects: asynchronous reader
+result processing could rearm startup timeout, and range-sampling replay could wait for a
+completed producer that would never submit tasks again. The fixes passed 255 focused tests.
+The measurements also exposed a remaining performance limitation of a fixed producer window:
+Q1's 33 scan tasks form a second wave at window 32, increasing median time by 15.7%. A larger
+window removes that regression, but cannot be a universal setting for multi-branch groups.
+Minimum producer reservation and runtime producer parallelism need separate policies; expansion
+into available capacity remains unimplemented. Q3 also did not pass the final performance check,
+with substantial sample variation and brief unrelated host activity.
+See [the SF1000 performance report](rtm_group_admission_performance_20261105.md) for the full
+protocol, retained samples, functional fixes, and qualification limits.
+
 A later phase may separate operator state residency from compute threads. Blocked execution
 instances could yield threads and resume when input or output capacity becomes available. That
 requires operator-level cooperative execution and memory management; it cannot be achieved merely
