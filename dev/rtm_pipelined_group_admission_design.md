@@ -256,6 +256,92 @@ Evidence, artifact hashes, per-run metrics, and retained warm-ups are under
 `perf/FINAL_ALL_SUMMARY.json`. The remaining performance difference requires attribution
 before promoting the cleanup to the qualified POC.
 
+## Full TPC-H and native-engine qualification
+
+The subsequent Q1-Q22 campaign uses SF1000 float Parquet (376,772,841,750 bytes), two executor
+processes pinned to 16 physical cores each, 32 GiB heap per executor, and 32 shuffle partitions.
+Spark reserves 128 logical task slots over 32 physical cores (`spark.task.cpus=0.25`). This is a
+single-host test; it does not qualify physical multi-host networking. These performance runs are
+sequential; the mixed-workload functional test does not establish concurrent-query throughput.
+BSP and RTM use the same POC artifact, with AQE and automatic size-based broadcast selection disabled. Required null-aware
+anti joins can still broadcast. This is not a comparison with unmodified upstream Spark defaults.
+
+Two defects were fixed during qualification. Commit `17028964edc` moves transport batch publication
+out of the shared metadata monitor into per-connection locks, preserving connection order without
+serializing independent peers. Commit `594d4e13a04` keeps live one-way shuffle connections open
+while idle; explicit unregister still closes them. The idle-event regression test fails before the
+fix and passes after it. The final implementation passed 659 core tests, 99 SQL tests, and all four
+core/SQL main/test scalastyle checks. These are related-suite results, not the entire Spark test suite.
+
+The source comparison remains unqualified: pooling both predeclared Q1 cohorts gives 22.743 s
+before cleanup and 23.495 s at `17028964edc` (+3.30%, beyond the 2% gate). Launch and drain timing
+do not establish an admission regression; attribution remains open. This source comparison is
+separate from the same-artifact BSP/RTM comparison. The qualified POC branch remains unchanged.
+
+Full-query coverage includes rejected runs. Eight query shapes exceed the configured resident-reader
+capacity; Q13 fails hash-table allocation and Q18 still fails under heap pressure after the idle-close
+fix. Q4 includes a retried BSP task. Q15 compares independently accumulated floating sums with exact
+equality and returns different rows; separate fixed-point diagnostics agree in all four engine modes,
+but do not replace the original failed case. These failures must not be converted into speedups.
+Successful task events also do not imply warning-free logs: the executor-log audit separately records
+caught page-allocation failures followed by spill recovery and writer cleanup cancellation errors.
+
+The ten queries with correct results and clean task events completed one warm-up and three
+alternating measured pairs per mode. The following are median SQL times in seconds. Native
+blocking and pipeline plans can choose different joins; their default-mode comparison does not
+isolate transport alone. Q11 returns zero rows at this scale with the retained benchmark literal.
+
+| Query | Spark BSP | Spark RTM | RTM time change | Native blocking | Native pipeline |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q1 | 23.539 | 24.436 | +3.81% | 9.420 | 9.401 |
+| Q3 | 91.410 | 77.645 | -15.06% | 62.145 | 48.793 |
+| Q6 | 4.096 | 4.044 | -1.28% | 3.923 | 3.848 |
+| Q11 | 43.053 | 32.710 | -24.03% | 54.545 | 9.357 |
+| Q12 | 43.460 | 41.771 | -3.89% | 33.543 | 29.329 |
+| Q14 | 12.965 | 13.845 | +6.79% | 9.986 | 4.895 |
+| Q16 | 28.777 | 24.931 | -13.37% | 18.044 | 6.544 |
+| Q17 | 278.839 | 255.482 | -8.38% | 142.119 | 49.169 |
+| Q19 | 15.113 | 14.760 | -2.34% | 12.288 | 10.709 |
+| Q22 | 30.912 | 25.716 | -16.81% | 15.725 | 5.346 |
+
+Q1 and Q14 fail the wall-time gate. Q16 and Q22 meet the local time, CPU, and physical-write
+criteria; physical multi-host networking remains unqualified for every query. Faster time alone
+does not establish all KPI targets: Q3 reduces physical writes by 38.1%, below the 50% target.
+
+The DataFusion/Ballista reference identifies several distinct costs. Its local partitions bypass
+network serialization, single-consumer queues do not retain a full replay copy, and blocked futures
+share compute threads. Spark Q3 retained about 56.2 GiB of writer replay spill, so avoiding ordinary
+shuffle files does not remove all intermediate writes. Removing replay requires an explicit consumer
+ownership and failure contract. Native join choices and build orientation also differ from Spark;
+a separate comparison controls join families instead of attributing every default speedup to the
+transport. Q17 additionally exposes ineffective partial aggregation. The frozen Spark build already
+has adaptive partial aggregation; enabling it in both BSP and RTM is a separate operator experiment,
+not a transport-only improvement.
+
+The separately qualified native join-family control keeps two sort-merge joins in both Q3 modes
+and one in both Q4 modes. With correct results and clean events, Q3 medians are 62.075 s blocking
+and 58.023 s pipeline (-6.53%); Q4 medians are 38.591 s and 32.841 s (-14.90%). Q3's default native
+comparison is 62.145 s and 48.793 s (-21.49%), so its default gain includes a substantial planning
+contribution. Matching join families still does not make every physical operator identical.
+
+The separate adaptive-partial-aggregation Q17 cohort passes result and task-event checks. Medians
+are 216.848 s BSP and 197.113 s RTM (-9.10%). Both report zero task-level logical disk spill,
+but physical writes remain 269.264 and 152.700 GiB. Partial output increases from about 3.918 to
+6.000 billion rows. RTM loopback RX is 137.078 GiB and median peak worker RSS is 125.044 GiB,
+compared with 112.385 and 86.672 GiB in the earlier default cohort. RSS is not a live-allocation
+or leak measurement. The experiment supports reducing ineffective aggregation work, but does not
+establish lower overall memory use or eliminate replay and transport costs. Config-on and config-off
+were separate cohorts, not interleaved trials; this is not a qualified config-only speedup.
+The Q1 sentinel under this option passes results and events at 22.547 s BSP and 22.301 s RTM
+(a timing tie). Two RTM windows have unexplained host-wide I/O/loopback counter increases despite
+small worker writes and zero logical spill; they do not qualify an I/O-overhead claim. This cohort
+does not erase the failed default-policy or source-regression Q1 cohorts.
+
+The full samples, exact artifacts, correctness checks, physical I/O, CPU metrics, contextual log
+audit, and remaining qualification work are recorded in
+`/disk0/tmp/ferdinandx/rtm-full-qualification-20261105/qualification_report.txt` and
+`/disk0/tmp/ferdinandx/rtm-full-qualification-20261105/performance_summary.csv`.
+
 A later phase may separate operator state residency from compute threads. Blocked execution
 instances could yield threads and resume when input or output capacity becomes available. That
 requires operator-level cooperative execution and memory management; it cannot be achieved merely
