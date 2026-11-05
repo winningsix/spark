@@ -34,7 +34,8 @@ import org.apache.spark.scheduler.TaskSetManager
 private[spark] class StreamingShuffleSchedulingPolicy(
     conf: SparkConf,
     abortTimer: ScheduledExecutorService,
-    reviveOffers: () => Unit) {
+    reviveOffers: () => Unit,
+    admission: Option[StreamingShuffleGroupAdmission] = None) {
   private val offerReadyPreTaskReaderIndices =
     new HashMap[(Int, Int, String), HashSet[Int]]
   private val executorReceiveServiceEnabled =
@@ -81,7 +82,9 @@ private[spark] class StreamingShuffleSchedulingPolicy(
       val pending = new ArrayBuffer[StreamingShuffleReaderPreparation]
       taskSets.iterator.filter { taskSet =>
         taskSet.isActiveForScheduling && taskSet.taskSet.isPipelinedShuffleReader &&
-          taskSet.taskSet.pipelinedReaderShuffleIds.nonEmpty
+          taskSet.taskSet.pipelinedReaderShuffleIds.nonEmpty &&
+          (!taskSet.taskSet.pipelinedGroupAdmissionRequired ||
+            admission.exists(_.admitted(taskSet.stageId)))
       }.foreach { taskSet =>
         taskSet.tasks.indices.foreach { taskIndex =>
           val key = StreamingShuffleReaderKey(
@@ -89,7 +92,9 @@ private[spark] class StreamingShuffleSchedulingPolicy(
           if (taskSet.isActiveForScheduling && taskSet.isTaskPendingForOffer(taskIndex)) {
             val eligibleExecutors = receiveExecutors.filter { executorId =>
               taskSet.canPrepareReaderOnExecutor(
-                taskIndex, executorId, activeExecutorHosts(executorId))
+                taskIndex, executorId, activeExecutorHosts(executorId)) &&
+                (!taskSet.taskSet.pipelinedGroupAdmissionRequired || admission.exists(a =>
+                  a.readerPlacement(taskSet.stageId, taskIndex).contains(executorId)))
             }
             existing.get(key) match {
               case Some(state) if state.failure.isDefined =>
@@ -131,7 +136,7 @@ private[spark] class StreamingShuffleSchedulingPolicy(
       coordinator.snapshot.foreach { case (key, state) =>
         managersByStage.get((key.stageId, key.stageAttemptId)).foreach { manager =>
           if (manager.isActiveForScheduling && manager.isTaskPendingForOffer(key.taskIndex) &&
-              state.ready) {
+              (if (admission.exists(_.admitted(key.stageId))) state.prepared else state.ready)) {
             offerReadyPreTaskReaderIndices.getOrElseUpdate(
               (key.stageId, key.stageAttemptId, state.executorId), new HashSet[Int]) +=
               key.taskIndex
@@ -203,7 +208,8 @@ private[spark] class StreamingShuffleSchedulingPolicy(
     } else {
       elasticProducerMaxTasksPerStage
     }
-    !executorReceiveServiceEnabled || !pureProducer ||
+    admission.exists(_.contains(taskSet.stageId)) ||
+      !executorReceiveServiceEnabled || !pureProducer ||
       taskLimit.forall(taskSet.runningTasks < _)
   }
 
@@ -219,9 +225,13 @@ private[spark] class StreamingShuffleSchedulingPolicy(
     preparePipelinedReaders(taskSets, executorHosts)
     rebuildOfferReadyPreTaskReaderIndices(taskSets)
     // Ready readers drain before producers; preserve the pool order within each category.
-    val ordered = taskSets.zipWithIndex.sortBy { case (taskSet, index) =>
-      (if (isOfferReadyPipelinedReader(taskSet)) 0 else 1, index)
-    }.map(_._1)
+    val ordered = if (admission.exists(a => taskSets.exists(m => a.contains(m.stageId)))) {
+      admission.get.orderWithinGroups(taskSets)
+    } else {
+      taskSets.zipWithIndex.sortBy { case (taskSet, index) =>
+        (if (isOfferReadyPipelinedReader(taskSet)) 0 else 1, index)
+      }.map(_._1)
+    }
     // Task-set references belong to this offer pass, not to the long-lived shuffle policy.
     StreamingShuffleOfferPlan(ordered, taskSet =>
       solePureProducer.contains(taskSet) && readerFrontierStartedForProducer(taskSet, taskSets))

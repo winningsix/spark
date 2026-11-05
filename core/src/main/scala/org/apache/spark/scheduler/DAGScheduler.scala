@@ -50,7 +50,8 @@ import org.apache.spark.resource.{CpuAmount, ResourceProfile, TaskResourceProfil
 import org.apache.spark.resource.ResourceProfile.{CPUS, DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.rpc.RpcTimeoutException
-import org.apache.spark.shuffle.streaming.StreamingShuffleStagePlanning
+import org.apache.spark.shuffle.streaming.{PipelinedGroupAdmission, PipelinedStageAdmission,
+  StreamingShuffleStagePlanning}
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
 import org.apache.spark.util._
@@ -1639,6 +1640,7 @@ private[spark] class DAGScheduler(
     if (job.hasPipelinedDependency && pipelinedManagerWantsLiveReduceHints) {
       sc.env.pipelinedShuffleManager.endRun(job.jobId)
     }
+    taskScheduler.releasePipelinedGroups(job.jobId)
     cleanupStagesForJob(job.jobId)
     jobIdToActiveJob -= job.jobId
     activeJobs -= job
@@ -2514,6 +2516,7 @@ private[spark] class DAGScheduler(
     val requiresWholeGroupAdmission =
       SparkEnv.get.pipelinedShuffleManager.requiresWholeGroupSlotAdmission
     if (hasPipelined && requiresWholeGroupAdmission &&
+        !usesPipelinedGroupAdmission(properties) &&
         rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions, listener)) {
       return
     }
@@ -2632,7 +2635,66 @@ private[spark] class DAGScheduler(
     if (hasPipelined && pipelinedManagerWantsLiveReduceHints) {
       sc.env.pipelinedShuffleManager.startRun(jobId)
     }
-    submitStage(finalStage)
+    if (registerPipelinedAdmission(job)) submitStage(finalStage)
+  }
+
+  private def usesPipelinedGroupAdmission(properties: Properties): Boolean = {
+    sc.conf.get(config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED) &&
+      !Option(properties).exists(p =>
+        p.getProperty(StructuredStreamingIdAwareSchedulerLogging.QUERY_ID_KEY) != null)
+  }
+
+  /** Register the complete stage components before any task set can trigger resource offers. */
+  private def registerPipelinedAdmission(job: ActiveJob): Boolean = {
+    if (!job.hasPipelinedDependency || !usesPipelinedGroupAdmission(job.properties)) return true
+    try {
+      require(sc.conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED) &&
+        sc.conf.get(config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY) > 0 &&
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED) &&
+        sc.conf.get(config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED),
+        "Pipelined group reservations require executor-owned prepared receive")
+      require(sc.resourceProfileManager.defaultResourceProfile.taskResources.keys
+        .forall(_ == ResourceProfile.CPUS),
+        "Pipelined group reservations currently support CPU only")
+      val stages = jobIdToStageIds(job.jobId).toSeq.map(stageIdToStage)
+      val adjacent = new HashMap[Int, HashSet[Int]]
+      stages.foreach { child =>
+        child.parents.filter(isPipelinedProducer).foreach { parent =>
+          adjacent.getOrElseUpdate(child.id, new HashSet[Int]) += parent.id
+          adjacent.getOrElseUpdate(parent.id, new HashSet[Int]) += child.id
+        }
+      }
+      val remaining = new HashSet[Int] ++ adjacent.keys
+      val groups = new mutable.ArrayBuffer[PipelinedGroupAdmission]
+      while (remaining.nonEmpty) {
+        val members = new HashSet[Int]
+        val pending = new mutable.Stack[Int]
+        pending.push(remaining.head)
+        while (pending.nonEmpty) {
+          val id = pending.pop()
+          if (members.add(id)) {
+            remaining -= id
+            adjacent(id).foreach(next => pending.push(next))
+          }
+        }
+        require(members.forall { id =>
+          stageIdToStage(id).parents.forall(p => isPipelinedProducer(p) || !members(p.id))
+        }, "A materialized dependency cannot be internal to a reserved pipelined group")
+        val descriptors = members.toSeq.sorted.map { id =>
+          val stage = stageIdToStage(id)
+          PipelinedStageAdmission(id, stage.getNextAttemptId, stage.numTasks,
+            StreamingShuffleStagePlanning.shuffleIdsReadByStage(stage.rdd).nonEmpty,
+            isPipelinedProducer(stage))
+        }
+        groups += PipelinedGroupAdmission(job.jobId, descriptors)
+      }
+      taskScheduler.registerPipelinedGroups(groups.toSeq)
+      true
+    } catch {
+      case NonFatal(error) =>
+        abortStage(job.finalStage, error.getMessage, Some(error))
+        false
+    }
   }
 
   private[scheduler] def handleMapStageSubmitted(jobId: Int,
@@ -2716,6 +2778,7 @@ private[spark] class DAGScheduler(
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos,
         Utils.cloneProperties(properties)))
+    if (!registerPipelinedAdmission(job)) return
     submitStage(finalStage)
 
     // If the whole stage has already finished, tell the listener and remove it
@@ -2789,13 +2852,10 @@ private[spark] class DAGScheduler(
               pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
 
             if (regularMissing.isEmpty && allPipelinedParentsRunning) {
-              // The whole group's capacity was already admitted up front (handleJobSubmitted ->
-              // rejectUnadmittablePipelinedGroup) before any member was submitted, so the group is
-              // known to fit; just co-schedule this consumer with its running producer(s). No slot
-              // check here -- that would re-measure capacity against a mid-flight snapshot and is
-              // unnecessary once admission is decided up front (gang admission). Group-level
-              // idiom rejection (fan-out, internal regular shuffle) already happened at job
-              // submission (checkPipelinedGroupsSupportedInRDDGraph + the all-pipelined check).
+              // A submitted parent makes the consumer eligible for submission, not immediate
+              // task launch. Reserved batch groups were registered before this recursion;
+              // TaskScheduler gates their launch until all members and resources are ready.
+              // Other modes retain the job-level capacity check where the transport requires it.
               logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its running " +
                 log"pipelined producer(s) ${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
               // Record that this stage is co-scheduled with still-running pipelined producers,
@@ -3349,7 +3409,8 @@ private[spark] class DAGScheduler(
         stage.resourceProfileId, shuffleId, isPipelined = isPipelined,
         isPipelinedShuffleReader = pipelinedReaderShuffleIds.nonEmpty,
         pipelinedReaderShuffleIds = pipelinedReaderShuffleIds,
-        isPipelinedShuffleProducer = isPipelinedShuffleProducer))
+        isPipelinedShuffleProducer = isPipelinedShuffleProducer,
+        pipelinedGroupAdmissionRequired = isPipelined && usesPipelinedGroupAdmission(properties)))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run

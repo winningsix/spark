@@ -44,8 +44,8 @@ private[spark] class FairSchedulingAlgorithm extends SchedulingAlgorithm {
   override def comparator(s1: Schedulable, s2: Schedulable): Boolean = {
     val minShare1 = s1.minShare
     val minShare2 = s2.minShare
-    val runningTasks1 = s1.runningTasks
-    val runningTasks2 = s2.runningTasks
+    val runningTasks1 = s1.runningTasks.toLong + s1.reservedTasks
+    val runningTasks2 = s2.runningTasks.toLong + s2.reservedTasks
     val s1Needy = runningTasks1 < minShare1
     val s2Needy = runningTasks2 < minShare2
     val minShareRatio1 = runningTasks1.toDouble / math.max(minShare1, 1.0)

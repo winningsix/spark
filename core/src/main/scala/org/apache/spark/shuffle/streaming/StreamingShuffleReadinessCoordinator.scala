@@ -38,7 +38,8 @@ private[spark] case class StreamingShuffleReaderPreparation(
 private[spark] case class StreamingShuffleReaderReadiness(
     executorId: String,
     ready: Boolean,
-    failure: Option[String])
+    failure: Option[String],
+    prepared: Boolean = false)
 
 /**
  * Driver-side control plane for the streaming shuffle's executor-owned receive buffers.
@@ -94,7 +95,8 @@ private[spark] class StreamingShuffleReadinessCoordinator {
     entries.iterator.map { case (key, entry) =>
       key -> StreamingShuffleReaderReadiness(entry.request.executorId,
         entry.failure.isEmpty && entry.acknowledged &&
-          entry.inboxes.forall(entry.drainReady.contains), entry.failure)
+          entry.inboxes.forall(entry.drainReady.contains), entry.failure,
+        prepared = entry.acknowledged && entry.failure.isEmpty)
     }.toMap
   }
 

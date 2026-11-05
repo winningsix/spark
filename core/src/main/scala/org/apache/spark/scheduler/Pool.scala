@@ -40,6 +40,7 @@ private[spark] class Pool(
   val weight = initWeight
   val minShare = initMinShare
   var runningTasks = 0
+  private var pendingReservations = 0
   val priority = 0
 
   // A pool's stage id is used to break the tie in scheduling.
@@ -110,6 +111,16 @@ private[spark] class Pool(
       sortedTaskSetQueue ++= schedulable.getSortedTaskSetQueue.filter(_.isSchedulable)
     }
     sortedTaskSetQueue
+  }
+
+  override def reservedTasks: Int = pendingReservations
+
+  // Admission consumes fair-share entitlement before tasks launch, without reporting idle
+  // reservations as running tasks in the UI or executor-allocation bookkeeping.
+  private[spark] def addReservedTasks(delta: Int): Unit = {
+    require(pendingReservations + delta >= 0, "Pool reservations cannot be negative")
+    pendingReservations += delta
+    if (parent != null) parent.addReservedTasks(delta)
   }
 
   def increaseRunningTasks(taskNum: Int): Unit = {

@@ -22,7 +22,7 @@ import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.local.pipelined.ChannelShuffleRendezvous
-import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
@@ -88,6 +88,119 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       spark.stop()
       SparkSession.clearActiveSession()
       SparkSession.clearDefaultSession()
+    }
+  }
+
+  test("reserved pipeline runs a wide source and two reader stages on two executors") {
+    withDistributedPipelinedSession(adaptive = false, taskCpus = "0.5", extraConf = Map(
+        "spark.shuffle.streaming.groupAdmission.enabled" -> "true",
+        "spark.shuffle.streaming.groupAdmission.producerWindow" -> "1",
+        "spark.shuffle.streaming.groupAdmission.timeout" -> "30s",
+        "spark.shuffle.streaming.preparedInbox.readyBytes" -> "1m")) { spark =>
+      import spark.implicits._
+      def query: DataFrame = spark.range(0, 20000, 1, 12).repartition(2, $"id")
+        .select(($"id" % 7).as("k")).groupBy($"k").count()
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "false")
+      val expected = query.as[(Long, Long)].collect().toSet
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "true")
+      val pipelined = query
+      assert(pipelined.as[(Long, Long)].collect().toSet === expected)
+      assert(collect(pipelined.queryExecution.executedPlan) {
+        case s: ShuffleExchangeExec if s.pipelined => s
+      }.size === 2)
+    }
+  }
+
+  test("reserved pipeline waits for a materialized hash join build before probe admission") {
+    withDistributedPipelinedSession(adaptive = false, taskCpus = "0.5", extraConf = Map(
+        "spark.shuffle.streaming.groupAdmission.enabled" -> "true",
+        "spark.shuffle.streaming.groupAdmission.timeout" -> "30s")) { spark =>
+      import spark.implicits._
+      spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      def query: DataFrame = {
+        val build = spark.range(0, 10, 1, 6).select($"id".as("k")).hint("SHUFFLE_HASH")
+        val probe = spark.range(0, 10000, 1, 12).select(($"id" % 10).as("k"))
+        build.join(probe, "k").groupBy($"k").count()
+      }
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "false")
+      val expected = query.as[(Long, Long)].collect().toSet
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", "true")
+      val pipelined = query
+      assert(pipelined.as[(Long, Long)].collect().toSet === expected)
+      val exchanges = collect(pipelined.queryExecution.executedPlan) {
+        case s: ShuffleExchangeExec => s
+      }
+      assert(exchanges.exists(_.pipelined))
+      assert(exchanges.exists(!_.pipelined))
+    }
+  }
+
+  test("reserved pipeline makes progress alongside a BSP backlog on two executors") {
+    withDistributedPipelinedSession(adaptive = false, taskCpus = "0.5", extraConf = Map(
+        "spark.scheduler.mode" -> "FAIR",
+        "spark.shuffle.streaming.groupAdmission.enabled" -> "true",
+        "spark.shuffle.streaming.groupAdmission.reservationDelay" -> "0ms",
+        "spark.shuffle.streaming.groupAdmission.timeout" -> "30s")) { spark =>
+      import spark.implicits._
+      val context = spark.sparkContext
+      val stages = new java.util.concurrent.ConcurrentHashMap[Int, String]()
+      val bspRunning = new java.util.concurrent.atomic.AtomicInteger()
+      val overlapped = new java.util.concurrent.atomic.AtomicBoolean()
+      val failures = new java.util.concurrent.atomic.AtomicInteger()
+      val bspStarted = new CountDownLatch(1)
+      val listener = new org.apache.spark.scheduler.SparkListener {
+        override def onStageSubmitted(e: org.apache.spark.scheduler.SparkListenerStageSubmitted)
+            : Unit = {
+          Option(e.properties).flatMap(p => Option(p.getProperty("spark.jobGroup.id")))
+            .foreach(stages.put(e.stageInfo.stageId, _))
+        }
+        override def onTaskStart(e: org.apache.spark.scheduler.SparkListenerTaskStart): Unit = {
+          if (stages.get(e.stageId) == "admission-bsp") {
+            bspRunning.incrementAndGet()
+            bspStarted.countDown()
+          } else if (stages.get(e.stageId) == "admission-pipeline" && bspRunning.get() > 0) {
+            overlapped.set(true)
+          }
+        }
+        override def onTaskEnd(e: org.apache.spark.scheduler.SparkListenerTaskEnd): Unit = {
+          if (stages.get(e.stageId) == "admission-bsp") bspRunning.decrementAndGet()
+          if (e.reason != org.apache.spark.Success) failures.incrementAndGet()
+        }
+      }
+      context.addSparkListener(listener)
+      val background = Executors.newSingleThreadExecutor()
+      try {
+        val bsp = background.submit(new Callable[Array[(Int, Int)]] {
+          override def call(): Array[(Int, Int)] = {
+            context.setJobGroup("admission-bsp", "BSP backlog")
+            context.setLocalProperty("spark.scheduler.pool", "bsp")
+            context.parallelize(0 until 24, 24).mapPartitions { values =>
+              Thread.sleep(1000)
+              values.map(v => (v % 4, v))
+            }.reduceByKey(_ + _, 4).collect()
+          }
+        })
+        assert(bspStarted.await(20, TimeUnit.SECONDS))
+        context.setJobGroup("admission-pipeline", "Pipelined query")
+        context.setLocalProperty("spark.scheduler.pool", "pipeline")
+        val query = spark.range(0, 20000, 1, 12).repartition(2, $"id")
+          .select(($"id" % 7).as("k")).groupBy($"k").count()
+        val expected = (0L until 20000L).groupBy(_ % 7).map { case (k, rows) =>
+          k -> rows.size.toLong
+        }
+        assert(query.as[(Long, Long)].collect().toMap === expected)
+        val expectedBsp = (0 until 24).groupBy(_ % 4).map { case (k, values) => k -> values.sum }
+        assert(bsp.get(30, TimeUnit.SECONDS).toMap === expectedBsp)
+        context.listenerBus.waitUntilEmpty()
+        assert(overlapped.get(), "BSP tasks must still run when pipeline tasks start")
+        assert(failures.get() === 0)
+      } finally {
+        context.clearJobGroup()
+        context.setLocalProperty("spark.scheduler.pool", null)
+        context.cancelJobGroup("admission-bsp")
+        context.removeSparkListener(listener)
+        background.shutdownNow()
+      }
     }
   }
 

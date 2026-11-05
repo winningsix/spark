@@ -46,7 +46,9 @@ private[spark] class TaskSet(
     val pipelinedReaderShuffleIds: Seq[Int] = Seq.empty,
     // True when this stage writes a pipelined shuffle. A reader that also writes one is a combined
     // stage; only a pure producer is governed by the elastic producer launch window.
-    val isPipelinedShuffleProducer: Boolean = false) {
+    val isPipelinedShuffleProducer: Boolean = false,
+    // Finite batch admission is opt-in and must not change RTM streaming task scheduling.
+    val pipelinedGroupAdmissionRequired: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

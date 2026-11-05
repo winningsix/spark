@@ -40,7 +40,8 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.shuffle.streaming.{StreamingShuffleSchedulingPolicy, StreamingShuffleTaskResources}
+import org.apache.spark.shuffle.streaming.{PipelinedGroupAdmission, StreamingShuffleGroupAdmission,
+  StreamingShuffleSchedulingPolicy, StreamingShuffleTaskResources}
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
@@ -240,8 +241,20 @@ private[spark] class TaskSchedulerImpl(
   // default scheduler is FIFO
   val schedulingMode: SchedulingMode = conf.get(SCHEDULER_MODE)
 
+  private[scheduler] lazy val pipelinedAdmission =
+    new StreamingShuffleGroupAdmission(conf,
+      manager => StreamingShuffleTaskResources.taskCpus(conf, manager.taskSet,
+        ResourceProfile.getTaskCpusOrDefaultForProfile(
+          sc.resourceProfileManager.resourceProfileFromId(
+            manager.taskSet.resourceProfileId), conf)),
+      (manager, executorId) => manager.runningTasksSet.count { id =>
+        manager.taskInfos(id).executorId == executorId
+      })
+
   private lazy val pipelinedScheduling = new StreamingShuffleSchedulingPolicy(
-    conf, abortTimer, () => backend.reviveOffers())
+    conf, abortTimer, () => backend.reviveOffers(), Some(pipelinedAdmission))
+
+  private var pipelinedAdmissionTimerStarted = false
 
   val rootPool: Pool = new Pool("", schedulingMode, 0, 0)
 
@@ -301,6 +314,27 @@ private[spark] class TaskSchedulerImpl(
     waitBackendReady()
   }
 
+  override def registerPipelinedGroups(
+      groups: Seq[PipelinedGroupAdmission]): Unit = synchronized {
+    pipelinedAdmission.register(groups)
+    if (!pipelinedAdmissionTimerStarted) {
+      pipelinedAdmissionTimerStarted = true
+      abortTimer.scheduleAtFixedRate(new Runnable {
+        override def run(): Unit = {
+          TaskSchedulerImpl.this.synchronized {
+            pipelinedAdmission.expire(clock.getTimeMillis())
+          }
+          backend.reviveOffers()
+        }
+      }, 1, 1, TimeUnit.SECONDS)
+    }
+  }
+
+  override def releasePipelinedGroups(jobId: Int): Unit = {
+    synchronized { pipelinedAdmission.releaseJob(jobId) }
+    backend.reviveOffers()
+  }
+
   override def submitTasks(taskSet: TaskSet): Unit = {
     val tasks = taskSet.tasks
     logInfo(log"Adding task set " + taskSet.logId +
@@ -326,6 +360,7 @@ private[spark] class TaskSchedulerImpl(
       }
       stageTaskSets(taskSet.stageAttemptId) = manager
       schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
+      pipelinedAdmission.submitted(manager)
 
       if (!isLocal && !hasReceivedTask) {
         starvationTimer.scheduleAtFixedRate(new TimerTask() {
@@ -385,6 +420,7 @@ private[spark] class TaskSchedulerImpl(
       interruptThread: Boolean,
       reason: String): Unit = synchronized {
     logInfo(log"Canceling stage ${MDC(LogKeys.STAGE_ID, stageId)}")
+    pipelinedAdmission.cancelStage(stageId)
     // Kill all running tasks for the stage.
     logInfo(log"Killing all running tasks in stage ${MDC(LogKeys.STAGE_ID, stageId)}: " +
       log"${MDC(LogKeys.REASON, reason)}")
@@ -440,6 +476,7 @@ private[spark] class TaskSchedulerImpl(
         taskSetsByStageIdAndAttempt -= manager.taskSet.stageId
       }
     }
+    pipelinedAdmission.finishStage(manager)
     pipelinedScheduling.releaseStage(manager.taskSet.stageId, manager.taskSet.stageAttemptId)
     noRejectsSinceLastReset -= manager.taskSet
     manager.parent.removeSchedulable(manager)
@@ -489,7 +526,8 @@ private[spark] class TaskSchedulerImpl(
       val taskSetRpID = taskSet.taskSet.resourceProfileId
 
       // check whether the task can be scheduled to the executor base on resource profile.
-      if (pipelinedScheduling.elasticProducerLaunchAllowed(taskSet, soleActivePureProducer) &&
+      if (pipelinedAdmission.launchAllowed(taskSet, execId, availableCpus(i)) &&
+          pipelinedScheduling.elasticProducerLaunchAllowed(taskSet, soleActivePureProducer) &&
           sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
@@ -640,7 +678,16 @@ private[spark] class TaskSchedulerImpl(
     val availableResources = shuffledOffers.map(_.resources).toArray
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
+    pipelinedAdmission.syncPoolAccounting()
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    if (pipelinedAdmission.enabled) {
+      val receiveExecutors = SparkEnv.get.streamingShuffleOutputTracker.collect {
+        case tracker: org.apache.spark.StreamingShuffleOutputTrackerMaster =>
+          tracker.receiveCoordinator.executorIds.toSet
+      }.getOrElse(Set.empty[String]) -- executorsPendingDecommission.keySet
+      pipelinedAdmission.prepare(sortedTaskSets.toSeq, shuffledOffers, availableCpus,
+        receiveExecutors, clock.getTimeMillis())
+    }
     val offerPlan = pipelinedScheduling.prepareOffers(sortedTaskSets.toSeq, {
       executorIdToRunningTaskIds.keysIterator.filter { executorId =>
         !executorsPendingDecommission.contains(executorId) &&
@@ -857,6 +904,7 @@ private[spark] class TaskSchedulerImpl(
     if (tasks.nonEmpty) {
       hasLaunchedTask = true
     }
+    pipelinedAdmission.syncPoolAccounting()
     return tasks.map(_.toSeq)
   }
 
@@ -1050,7 +1098,10 @@ private[spark] class TaskSchedulerImpl(
   }
 
   override def stop(exitCode: Int = 0): Unit = {
-    synchronized { pipelinedScheduling.close() }
+    synchronized {
+      pipelinedAdmission.close()
+      pipelinedScheduling.close()
+    }
     Utils.tryLogNonFatalError {
       speculationScheduler.shutdown()
     }
@@ -1091,6 +1142,7 @@ private[spark] class TaskSchedulerImpl(
     synchronized {
       // Don't bother noting decommissioning for executors that we don't know about
       if (executorIdToHost.contains(executorId)) {
+        pipelinedAdmission.removeExecutor(executorId)
         executorsPendingDecommission(executorId) =
           ExecutorDecommissionState(clock.getTimeMillis(), decommissionInfo.workerHost)
       }
@@ -1109,6 +1161,7 @@ private[spark] class TaskSchedulerImpl(
     var failedExecutor: Option[String] = None
 
     synchronized {
+      pipelinedAdmission.removeExecutor(executorId)
       pipelinedScheduling.removeExecutor(executorId)
       if (executorIdToRunningTaskIds.contains(executorId)) {
         val host = executorIdToHost(executorId)

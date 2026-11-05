@@ -21,6 +21,7 @@ import scala.collection.mutable.Map
 
 import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
+import org.apache.spark.shuffle.streaming.PipelinedGroupAdmission
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.AccumulatorV2
 
@@ -50,6 +51,12 @@ private[spark] trait TaskScheduler {
 
   // Disconnect from the cluster.
   def stop(exitCode: Int = 0): Unit
+
+  def registerPipelinedGroups(groups: Seq[PipelinedGroupAdmission]): Unit = {
+    throw new UnsupportedOperationException("Pipelined group reservations are not supported")
+  }
+
+  def releasePipelinedGroups(jobId: Int): Unit = { }
 
   // Submit a sequence of tasks to run.
   def submitTasks(taskSet: TaskSet): Unit

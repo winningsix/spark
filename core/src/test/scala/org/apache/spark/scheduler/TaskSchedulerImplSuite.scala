@@ -40,7 +40,8 @@ import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEnv}
-import org.apache.spark.shuffle.streaming.{PrepareStreamingShuffleReceiveInboxes,
+import org.apache.spark.shuffle.streaming.{PipelinedGroupAdmission, PipelinedStageAdmission,
+  PrepareStreamingShuffleReceiveInboxes,
   ReleaseStreamingShuffleReceiveInbox, StreamingShuffleReceiveInboxId,
   StreamingShuffleSchedulingPolicy}
 import org.apache.spark.status.api.v1.ThreadStackTrace
@@ -3280,6 +3281,318 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskScheduler.resourceOffers(offers).flatten.length === 4)
     assert(taskScheduler.taskSetManagerForAttempt(0, 0).get.runningTasks === 2)
     assert(taskScheduler.taskSetManagerForAttempt(1, 0).get.runningTasks === 2)
+  }
+
+
+  private def reservedPipelineTasks(
+      stageId: Int,
+      count: Int,
+      reads: Seq[Int],
+      writes: Option[Int],
+      poolName: String = "default"): TaskSet = {
+    val properties = new Properties()
+    properties.setProperty("spark.scheduler.pool", poolName)
+    new TaskSet(Array.tabulate[Task[_]](count)(i => new FakeTask(stageId, i)),
+      stageId, 0, 0, properties, 0, writes, isPipelined = true,
+      isPipelinedShuffleReader = reads.nonEmpty, pipelinedReaderShuffleIds = reads,
+      isPipelinedShuffleProducer = writes.nonEmpty, pipelinedGroupAdmissionRequired = true)
+  }
+
+  private def registerReservedPipeline(
+      scheduler: TaskSchedulerImpl,
+      tasks: Seq[TaskSet],
+      jobId: Int = 0): Unit = {
+    scheduler.registerPipelinedGroups(Seq(PipelinedGroupAdmission(jobId, tasks.map { t =>
+      PipelinedStageAdmission(t.stageId, t.stageAttemptId, t.tasks.length,
+        t.isPipelinedShuffleReader, t.isPipelinedShuffleProducer)
+    })))
+  }
+
+  private def withReservedPipeline(
+      extra: Seq[(String, String)] = Seq.empty)(
+      body: (TaskSchedulerImpl,
+        LinkedBlockingQueue[(Seq[StreamingShuffleReceiveInboxId], RpcCallContext)]) => Unit)
+      : Unit = {
+    val scheduler = setupScheduler((Seq(
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY.key -> "0ms") ++ extra): _*)
+    val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+      .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+    val requests =
+      new LinkedBlockingQueue[(Seq[StreamingShuffleReceiveInboxId], RpcCallContext)]()
+    val endpoint = sc.env.rpcEnv.setupEndpoint("reserved-pipeline-test", new RpcEndpoint {
+      override val rpcEnv: RpcEnv = sc.env.rpcEnv
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case PrepareStreamingShuffleReceiveInboxes(ids) => requests.add((ids, context))
+      }
+      override def receive: PartialFunction[Any, Unit] = {
+        case _: ReleaseStreamingShuffleReceiveInbox =>
+      }
+    })
+    scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 0)))
+    tracker.registerReceiveEndpoint("executor0", endpoint)
+    try body(scheduler, requests) finally {
+      scheduler.releasePipelinedGroups(0)
+      scheduler.releasePipelinedGroups(1)
+      var request = requests.poll()
+      while (request != null) {
+        request._2.reply(false)
+        request = requests.poll()
+      }
+      sc.env.rpcEnv.stop(endpoint)
+    }
+  }
+
+  test("reserved pipeline gates early producers and starts empty readers on prepare ACK") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val middle = reservedPipelineTasks(1, 2, Seq(7), Some(8))
+      val result = reservedPipelineTasks(2, 2, Seq(8), None)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 6))
+      registerReservedPipeline(scheduler, Seq(producer, middle, result))
+      scheduler.submitTasks(producer)
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty,
+        "producer submission must not launch before the complete group is submitted")
+      scheduler.submitTasks(middle)
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      assert(requests.isEmpty, "an incomplete group must not prepare receive buffers")
+      scheduler.submitTasks(result)
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 5)
+      assert(scheduler.rootPool.runningTasks === 0)
+      assert(scheduler.rootPool.reservedTasks === 5, "idle reservations must be pool-accounted")
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null && preparation._1.size == 4)
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty, "prepare ACK is required")
+      preparation._2.reply(true)
+      var launched = Seq.empty[TaskDescription]
+      eventually(timeout(10.seconds)) {
+        launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 5)
+      }
+      val counts = launched.groupBy(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId)
+      assert(counts.view.mapValues(_.size).toMap === Map(0 -> 1, 1 -> 2, 2 -> 2))
+      assert(scheduler.rootPool.runningTasks === 5, "launched tasks must not be counted twice")
+      assert(!failedTaskSet)
+      val first = counts(0).head
+      val manager = scheduler.taskSetManagerForAttempt(0, 0).get
+      val value = SparkEnv.get.serializer.newInstance().serialize(1)
+      manager.handleSuccessfulTask(first.taskId,
+        new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
+      val replacement = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 2))).flatten
+      assert(replacement.size === 1)
+      assert(scheduler.taskIdToTaskSetManager.get(replacement.head.taskId).stageId === 0)
+      assert(scheduler.rootPool.runningTasks === 5)
+    }
+  }
+
+  test("reserved pipeline accumulates slots alongside BSP and releases on cancellation") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(1, 2, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      scheduler.submitTasks(producer)
+      scheduler.submitTasks(reader)
+      scheduler.submitTasks(FakeTask.createTaskSet(10, stageId = 10, stageAttemptId = 0))
+      assert(scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 1)))
+        .flatten.isEmpty)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 1)
+      assert(scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 2)))
+        .flatten.isEmpty)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 2)
+      val bsp = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 4))).flatten
+      assert(bsp.size === 1, "only the unreserved CPU may be used by BSP")
+      assert(scheduler.taskIdToTaskSetManager.get(bsp.head.taskId).stageId === 10)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      scheduler.killAllTaskAttempts(0, true, "test cancellation")
+      scheduler.killAllTaskAttempts(1, true, "test cancellation")
+      scheduler.releasePipelinedGroups(0)
+      preparation._2.reply(true)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      assert(scheduler.rootPool.runningTasks === 1)
+      val following = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 3))).flatten
+      assert(following.size === 3)
+      assert(following.forall(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId == 10))
+    }
+  }
+
+  test("reserved pipeline keeps a producer window for each input branch") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val left = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val right = reservedPipelineTasks(1, 10, Seq.empty, Some(8))
+      val reader = reservedPipelineTasks(2, 2, Seq(7, 8), None)
+      registerReservedPipeline(scheduler, Seq(left, right, reader))
+      Seq(left, right, reader).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 4))
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      preparation._2.reply(true)
+      eventually(timeout(10.seconds)) {
+        val launched = scheduler.resourceOffers(offers).flatten
+        val counts = launched.groupBy(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId)
+        assert(counts.view.mapValues(_.size).toMap === Map(0 -> 1, 1 -> 1, 2 -> 2))
+      }
+    }
+  }
+
+  test("reserved pipeline times out and returns partially reserved slots") {
+    withReservedPipeline() { (scheduler, _) =>
+      val tasks = Seq(reservedPipelineTasks(0, 10, Seq.empty, Some(7)),
+        reservedPipelineTasks(1, 2, Seq(7), None))
+      registerReservedPipeline(scheduler, tasks)
+      tasks.foreach(scheduler.submitTasks)
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 1)))
+      assert(scheduler.pipelinedAdmission.reservedSlots === 1)
+      scheduler.pipelinedAdmission.expire(Long.MaxValue)
+      assert(failedTaskSet)
+      assert(failedTaskSetReason.contains("Timed out waiting for pipelined group"))
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      assert(scheduler.rootPool.runningTasks === 0)
+      scheduler.submitTasks(FakeTask.createTaskSet(1, stageId = 10, stageAttemptId = 0))
+      assert(scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 1)))
+        .flatten.size === 1)
+    }
+  }
+
+  test("reserved pipeline does not reserve while a prerequisite delays a reader submission") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(1, 2, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      scheduler.submitTasks(producer)
+      scheduler.submitTasks(FakeTask.createTaskSet(3, stageId = 10, stageAttemptId = 0))
+      val launched = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 3))).flatten
+      assert(launched.size === 3)
+      assert(launched.forall(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId == 10))
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      assert(requests.isEmpty)
+    }
+  }
+
+  test("reserved pipeline fails if a reserved executor is lost before task launch") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val tasks = Seq(reservedPipelineTasks(0, 10, Seq.empty, Some(7)),
+        reservedPipelineTasks(1, 2, Seq(7), None))
+      registerReservedPipeline(scheduler, tasks)
+      tasks.foreach(scheduler.submitTasks)
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 3)))
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      scheduler.executorLost("executor0", ExecutorProcessLost("test loss"))
+      assert(failedTaskSet)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      preparation._2.reply(true)
+      assert(scheduler.rootPool.runningTasks === 0)
+    }
+  }
+
+  test("reserved pipeline respects FAIR pool order before aging and accounts reservation shares") {
+    withReservedPipeline(Seq(
+        "spark.scheduler.mode" -> "FAIR",
+        config.STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY.key -> "5s")) { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7), poolName = "pipeline")
+      val reader = reservedPipelineTasks(1, 2, Seq(7), None, poolName = "pipeline")
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      scheduler.submitTasks(producer)
+      scheduler.submitTasks(reader)
+      val bsp = FakeTask.createTaskSet(10, stageId = 10, stageAttemptId = 0)
+      scheduler.submitTasks(bsp)
+      val producerManager = scheduler.taskSetManagerForAttempt(0, 0).get
+      val readerManager = scheduler.taskSetManagerForAttempt(1, 0).get
+      val bspManager = scheduler.taskSetManagerForAttempt(10, 0).get
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 3))
+      val admission = scheduler.pipelinedAdmission
+      // Exercise the policy with the pool's chosen order; BSP is ahead initially.
+      assert(producerManager.parent ne bspManager.parent)
+      assert(producerManager.parent eq readerManager.parent)
+      val ordered = Seq(bspManager, producerManager, readerManager)
+      admission.prepare(ordered, offers, Array(BigDecimal(3)), Set("executor0"), 0)
+      assert(admission.reservedSlots === 0)
+      assert(admission.launchAllowed(bspManager, "executor0", BigDecimal(3)))
+      admission.prepare(ordered, offers, Array(BigDecimal(1)), Set("executor0"), 5000)
+      assert(admission.reservedSlots === 1)
+      assert(!admission.launchAllowed(bspManager, "executor0", BigDecimal(1)))
+      assert(scheduler.rootPool.runningTasks === 0)
+      assert(scheduler.rootPool.reservedTasks === 1)
+      assert(producerManager.parent.reservedTasks === 1)
+      assert(bspManager.parent.reservedTasks === 0)
+      assert(new FairSchedulingAlgorithm().comparator(bspManager.parent, producerManager.parent))
+      scheduler.releasePipelinedGroups(0)
+      assert(scheduler.rootPool.runningTasks === 0)
+      assert(scheduler.rootPool.reservedTasks === 0)
+      assert(admission.launchAllowed(bspManager, "executor0", BigDecimal(1)))
+      assert(requests.isEmpty)
+    }
+  }
+
+  test("reserved pipeline limits concurrent groups and releases successful stages") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val first = Seq(reservedPipelineTasks(0, 1, Seq.empty, Some(7)),
+        reservedPipelineTasks(1, 1, Seq(7), None))
+      val second = Seq(reservedPipelineTasks(2, 1, Seq.empty, Some(8)),
+        reservedPipelineTasks(3, 1, Seq(8), None))
+      registerReservedPipeline(scheduler, first)
+      registerReservedPipeline(scheduler, second, jobId = 1)
+      (first ++ second).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 4))
+      scheduler.resourceOffers(offers)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 2)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null && preparation._1.forall(_.shuffleId == 7))
+      preparation._2.reply(true)
+      var launched = Seq.empty[TaskDescription]
+      eventually(timeout(10.seconds)) {
+        launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 2)
+      }
+      launched.foreach { task =>
+        val manager = scheduler.taskIdToTaskSetManager.get(task.taskId)
+        val value = SparkEnv.get.serializer.newInstance().serialize(1)
+        manager.handleSuccessfulTask(task.taskId,
+          new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
+      }
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      assert(scheduler.rootPool.runningTasks === 0)
+      scheduler.resourceOffers(offers)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 2)
+      val next = requests.poll(10, TimeUnit.SECONDS)
+      assert(next != null && next._1.forall(_.shuffleId == 8))
+      next._2.reply(false)
+    }
+  }
+
+  test("reserved pipeline rejects an unregistered batch task set") {
+    withReservedPipeline() { (scheduler, _) =>
+      scheduler.submitTasks(reservedPipelineTasks(0, 10, Seq.empty, Some(7)))
+      assert(failedTaskSet)
+      assert(failedTaskSetReason.contains("without a registered group"))
+      assert(scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 4)))
+        .flatten.isEmpty)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+    }
+  }
+
+  test("reserved pipeline opt-in does not gate legacy streaming task sets") {
+    withReservedPipeline() { (scheduler, _) =>
+      val properties = new Properties()
+      properties.setProperty(StructuredStreamingIdAwareSchedulerLogging.QUERY_ID_KEY, "stream")
+      val tasks = new TaskSet(Array.tabulate[Task[_]](3)(i => new FakeTask(0, i)),
+        0, 0, 0, properties, 0, Some(7), isPipelined = true,
+        isPipelinedShuffleProducer = true)
+      scheduler.submitTasks(tasks)
+      val launched = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 3))).flatten
+      assert(launched.size === 3)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
+      assert(!failedTaskSet)
+    }
   }
 
 }

@@ -49,7 +49,7 @@ import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.shuffle.{FetchFailedException, MetadataFetchFailedException}
-import org.apache.spark.shuffle.streaming.StreamingShuffleStagePlanning
+import org.apache.spark.shuffle.streaming.{PipelinedGroupAdmission, StreamingShuffleStagePlanning}
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId, BlockManagerMaster}
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, CallSite, Clock, LongAccumulator, SystemClock, ThreadUtils, Utils}
 import org.apache.spark.util.ArrayImplicits._
@@ -236,7 +236,15 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
   val tasksMarkedAsCompleted = new ArrayBuffer[Task[_]]()
 
+  private val registeredAdmissionGroups = new ArrayBuffer[PipelinedGroupAdmission]
+
   val taskScheduler = new TaskScheduler() {
+    override def registerPipelinedGroups(groups: Seq[PipelinedGroupAdmission]): Unit = {
+      registeredAdmissionGroups ++= groups
+    }
+    override def releasePipelinedGroups(jobId: Int): Unit = {
+      registeredAdmissionGroups.filterInPlace(_.jobId != jobId)
+    }
     val executorsPendingDecommission = new HashMap[String, ExecutorDecommissionState]
     override def schedulingMode: SchedulingMode = SchedulingMode.FIFO
     override def rootPool: Pool = new Pool("", schedulingMode, 0, 0)
@@ -248,6 +256,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         blockManagerId: BlockManagerId,
         executorUpdates: Map[(Int, Int), ExecutorMetrics]): Boolean = true
     override def submitTasks(taskSet: TaskSet) = {
+      if (taskSet.pipelinedGroupAdmissionRequired) {
+        assert(registeredAdmissionGroups.exists(_.stages.exists(_.stageId == taskSet.stageId)),
+          "The complete descriptor must be registered before submitting a member task set")
+      }
       // normally done by TaskSetManager
       taskSet.tasks.foreach(_.epoch = mapOutputTracker.getEpoch)
       taskSets += taskSet
@@ -488,6 +500,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     failure = null
     sc.addSparkListener(sparkListener)
     taskSets.clear()
+    registeredAdmissionGroups.clear()
     tasksMarkedAsCompleted.clear()
     cancelledStages.clear()
     cacheLocations.clear()
@@ -7536,6 +7549,63 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     } finally {
       myScheduler.maxConcurrentTasksForTest = 1000
       myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
+    }
+  }
+
+  test("reserved pipeline registers the whole connected graph before producer submission") {
+    val source = new MyRDD(sc, 12, Nil)
+    val first = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    val middle = new MyRDD(sc, 2, List(first), tracker = mapOutputTracker)
+    val second = new PipelinedShuffleDependency(middle, new HashPartitioner(2))
+    val result = new MyRDD(sc, 2, List(second), tracker = mapOutputTracker)
+    val settings = Map(
+      config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY.key -> "64k",
+      config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED.key -> "true")
+    val previous = settings.keys.map(k => k -> sc.conf.getOption(k)).toMap
+    settings.foreach { case (k, v) => sc.conf.set(k, v) }
+    try {
+      val job = submit(result, Array(0, 1))
+      assert(failure == null)
+      assert(registeredAdmissionGroups.size === 1)
+      val members = registeredAdmissionGroups.head.stages
+      assert(members.map(s => (s.numTasks, s.reader, s.producer)).toSet ===
+        Set((12, false, true), (2, true, true), (2, true, false)))
+      assert(taskSets.size === 3)
+      assert(taskSets.head.isPipelinedShuffleProducer && !taskSets.head.isPipelinedShuffleReader)
+      cancel(job)
+      assert(registeredAdmissionGroups.isEmpty)
+      assertDataStructuresEmpty()
+    } finally {
+      previous.foreach { case (k, v) =>
+        v match {
+          case Some(value) => sc.conf.set(k, value)
+          case None => sc.conf.remove(k)
+        }
+      }
+    }
+  }
+
+  test("reserved pipeline opt-in preserves the streaming submission path") {
+    val source = new MyRDD(sc, 2, Nil)
+    val dependency = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    val result = new MyRDD(sc, 2, List(dependency), tracker = mapOutputTracker)
+    val previous = sc.conf.get(config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED)
+    sc.conf.set(config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED, true)
+    val properties = new Properties()
+    properties.setProperty(StructuredStreamingIdAwareSchedulerLogging.QUERY_ID_KEY, "stream")
+    try {
+      val job = submit(result, Array(0, 1), properties = properties)
+      assert(failure == null)
+      assert(registeredAdmissionGroups.isEmpty)
+      assert(taskSets.size === 2)
+      assert(taskSets.forall(!_.pipelinedGroupAdmissionRequired))
+      cancel(job)
+      assertDataStructuresEmpty()
+    } finally {
+      sc.conf.set(config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED, previous)
     }
   }
 

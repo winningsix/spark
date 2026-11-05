@@ -2218,6 +2218,57 @@ package object config {
       .checkValue(_ >= 0, "must be non-negative")
       .createWithDefault(0L)
 
+  private[spark] val STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.groupAdmission.enabled")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doc("Reserve CPU placements for all readers and a rolling window per pure producer " +
+        "before launching a finite batch pipeline. Requires prepared receive service.")
+      .version("5.0.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val STREAMING_SHUFFLE_GROUP_PRODUCER_WINDOW =
+    ConfigBuilder("spark.shuffle.streaming.groupAdmission.producerWindow")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doc("Reserved concurrent tasks per pure producer stage in an admitted batch group.")
+      .version("5.0.0")
+      .intConf
+      .checkValue(_ >= 1, "must be at least one")
+      .createWithDefault(1)
+
+  private[spark] val STREAMING_SHUFFLE_GROUP_MAX_CONCURRENT =
+    ConfigBuilder("spark.shuffle.streaming.groupAdmission.maxConcurrentGroups")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doc("Maximum admitted or partially reserved batch pipeline groups per application.")
+      .version("5.0.0")
+      .intConf
+      .checkValue(_ >= 1, "must be at least one")
+      .createWithDefault(1)
+
+  private[spark] val STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY =
+    ConfigBuilder("spark.shuffle.streaming.groupAdmission.reservationDelay")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doc("Wait before a complete group may reserve ahead of earlier pending BSP work. " +
+        "Existing reservations remain charged to their scheduling pool.")
+      .version("5.0.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 0, "must be non-negative")
+      .createWithDefaultString("5s")
+
+  private[spark] val STREAMING_SHUFFLE_GROUP_ADMISSION_TIMEOUT =
+    ConfigBuilder("spark.shuffle.streaming.groupAdmission.timeout")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doc("Maximum wait after all group task sets are submitted, including reader startup.")
+      .version("5.0.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefaultString("60s")
+
   private[spark] val STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE =
     ConfigBuilder("spark.shuffle.streaming.elasticProducers.maxTasksPerStage")
       .doc("Maximum number of pure producer tasks from each stage that may be running at once " +
