@@ -3349,7 +3349,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
       val middle = reservedPipelineTasks(1, 2, Seq(7), Some(8))
       val result = reservedPipelineTasks(2, 2, Seq(8), None)
-      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 6))
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 5))
       registerReservedPipeline(scheduler, Seq(producer, middle, result))
       scheduler.submitTasks(producer)
       assert(scheduler.resourceOffers(offers).flatten.isEmpty,
@@ -3381,7 +3381,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       manager.handleSuccessfulTask(first.taskId,
         new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
       val replacement = scheduler.resourceOffers(
-        IndexedSeq(WorkerOffer("executor0", "host0", 2))).flatten
+        IndexedSeq(WorkerOffer("executor0", "host0", 1))).flatten
       assert(replacement.size === 1)
       assert(scheduler.taskIdToTaskSetManager.get(replacement.head.taskId).stageId === 0)
       assert(scheduler.rootPool.runningTasks === 5)
@@ -3478,6 +3478,101 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         val counts = launched.groupBy(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId)
         assert(counts.view.mapValues(_.size).toMap === Map(0 -> 1, 1 -> 1, 2 -> 2))
       }
+    }
+  }
+
+  test("reserved pipeline expands beyond its minimum without a final scan wave") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 33, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(1, 32, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      Seq(producer, reader).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 65))
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 33)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      preparation._2.reply(true)
+      eventually(timeout(10.seconds)) {
+        val launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 65, "all 33 scan partitions should launch in the first wave")
+      }
+      assert(scheduler.rootPool.runningTasks === 65)
+      assert(scheduler.rootPool.reservedTasks === 0)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 33,
+        "extra running producers must not acquire permanent reservations")
+    }
+  }
+
+  test("reserved pipeline expansion preserves other input minima and returns CPUs to FAIR") {
+    withReservedPipeline(Seq("spark.scheduler.mode" -> "FAIR")) { (scheduler, requests) =>
+      val left = reservedPipelineTasks(0, 10, Seq.empty, Some(7), "pipeline")
+      val right = reservedPipelineTasks(1, 10, Seq.empty, Some(8), "pipeline")
+      val reader = reservedPipelineTasks(2, 2, Seq(7, 8), None, "pipeline")
+      registerReservedPipeline(scheduler, Seq(left, right, reader))
+      Seq(left, right, reader).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 6))
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      preparation._2.reply(true)
+      var launched = Seq.empty[TaskDescription]
+      eventually(timeout(10.seconds)) {
+        launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 6)
+      }
+      val counts = launched.groupBy(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId)
+      assert(counts.view.mapValues(_.size).toMap === Map(0 -> 3, 1 -> 1, 2 -> 2),
+        "expansion must leave the other producer branch its minimum")
+      val value = SparkEnv.get.serializer.newInstance().serialize(1)
+      val manager = scheduler.taskSetManagerForAttempt(0, 0).get
+      counts(0).take(2).foreach { task =>
+        manager.handleSuccessfulTask(task.taskId,
+          new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
+      }
+      scheduler.submitTasks(FakeTask.createTaskSet(10, stageId = 10, stageAttemptId = 0))
+      val bsp = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 2))).flatten
+      assert(bsp.size === 2)
+      assert(bsp.forall(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId == 10),
+        "FAIR must give returned, unreserved CPUs to the underallocated BSP pool")
+      assert(scheduler.pipelinedAdmission.reservedSlots === 4)
+      assert(scheduler.rootPool.reservedTasks === 0)
+    }
+  }
+
+  test("reserved pipeline fails on loss of an executor used by completed extra producers") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(1, 2, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      Seq(producer, reader).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 3))
+      scheduler.resourceOffers(offers)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      preparation._2.reply(true)
+      eventually(timeout(10.seconds)) {
+        assert(scheduler.resourceOffers(offers).flatten.size === 3)
+      }
+      val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+      tracker.registerReceiveEndpoint("executor1",
+        sc.env.rpcEnv.setupEndpointRef(sc.env.rpcEnv.address, "reserved-pipeline-test"))
+      val extra = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor1", "host1", 2))).flatten
+      assert(extra.size === 2)
+      assert(extra.forall(t => scheduler.taskIdToTaskSetManager.get(t.taskId).stageId == 0))
+      assert(scheduler.pipelinedAdmission.reservedSlots === 3)
+      val value = SparkEnv.get.serializer.newInstance().serialize(1)
+      val manager = scheduler.taskSetManagerForAttempt(0, 0).get
+      extra.foreach { task =>
+        manager.handleSuccessfulTask(task.taskId,
+          new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
+      }
+      scheduler.executorLost("executor1", ExecutorProcessLost("test borrowed executor loss"))
+      assert(failedTaskSet)
+      assert(scheduler.pipelinedAdmission.reservedSlots === 0)
     }
   }
 

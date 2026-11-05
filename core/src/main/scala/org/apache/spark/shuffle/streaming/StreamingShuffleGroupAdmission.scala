@@ -37,15 +37,16 @@ private[spark] case class PipelinedGroupAdmission(
 /**
  * CPU-only reservations for finite pipelined groups. Called only under the task scheduler lock.
  * Registration precedes every member's submission. A complete group reserves reader placements
- * and a separate rolling window for each pure producer. Reserved but idle slots are charged to
- * the owning pool, and cannot be lent to non-preemptible tasks. No RPC waits occur here.
+ * and a minimum rolling window for each pure producer. Producers may also use unreserved CPUs
+ * in the scheduler's task-set order. Reserved but idle slots are charged to the owning pool,
+ * and cannot be lent to non-preemptible tasks. No RPC waits occur here.
  */
 private[spark] class StreamingShuffleGroupAdmission(
     conf: SparkConf,
     taskCpus: TaskSetManager => BigDecimal,
     runningOn: (TaskSetManager, String) => Int) {
   val enabled: Boolean = conf.get(STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED)
-  private val window = conf.get(STREAMING_SHUFFLE_GROUP_PRODUCER_WINDOW)
+  private val minimumProducers = conf.get(STREAMING_SHUFFLE_GROUP_PRODUCER_WINDOW)
   private val maxGroups = conf.get(STREAMING_SHUFFLE_GROUP_MAX_CONCURRENT)
   private val agingMs = conf.get(STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY)
   private val timeoutMs = conf.get(STREAMING_SHUFFLE_GROUP_ADMISSION_TIMEOUT)
@@ -75,6 +76,7 @@ private[spark] class StreamingShuffleGroupAdmission(
   }
   private val groups = mutable.ArrayBuffer.empty[Group]
   private val byStage = mutable.HashMap.empty[Int, Group]
+  private var receiveExecutors = Set.empty[String]
 
   def register(descriptors: Seq[PipelinedGroupAdmission]): Unit = {
     require(enabled, "Pipelined group admission is disabled")
@@ -179,6 +181,7 @@ private[spark] class StreamingShuffleGroupAdmission(
       availableCpus: Array[BigDecimal],
       receiveExecutors: Set[String],
       now: Long): Unit = {
+    this.receiveExecutors = receiveExecutors
     groups.toSeq.filter(g => !g.failed && g.managers.values.exists { m =>
       !m.isActiveForScheduling && m.numCompletedTasks != m.numTasks
     }).foreach(g => fail(g, "A reserved pipelined task set was aborted"))
@@ -201,7 +204,7 @@ private[spark] class StreamingShuffleGroupAdmission(
     }
     targets.foreach { g =>
       val demand = g.descriptor.stages.sortBy(s => (!s.reader, s.stageId)).flatMap { s =>
-        val count = if (s.reader) s.numTasks else math.min(window, s.numTasks)
+        val count = if (s.reader) s.numTasks else math.min(minimumProducers, s.numTasks)
         (0 until count).map(i => (s, i))
       }
       demand.foreach { case (stage, index) =>
@@ -234,11 +237,16 @@ private[spark] class StreamingShuffleGroupAdmission(
     val cpus = taskCpus(manager)
     byStage.get(manager.stageId) match {
       case Some(g) =>
+        val reader = g.stage(manager.stageId).reader
+        val ownIdle = idleSlots(g, executorId, manager.stageId)
+        // The minimum is a liveness reservation, not a throughput cap. Extra producers
+        // consume only unreserved offers, never another branch's or group's idle slots.
+        // Their normal running-task accounting disappears when they finish; no extra
+        // reservation is retained, so subsequent offers can serve other pools or BSP.
         g.admitted && !g.failed &&
-          (g.stage(manager.stageId).reader || g.readersStarted) &&
-          idleSlots(g, executorId, manager.stageId) > 0 &&
-          freeCpus - allIdleCpus(executorId) +
-            cpus * idleSlots(g, executorId, manager.stageId) >= cpus
+          (reader || g.readersStarted) &&
+          (ownIdle > 0 || (!reader && receiveExecutors(executorId))) &&
+          freeCpus - allIdleCpus(executorId) + cpus * ownIdle >= cpus
       case None => !manager.taskSet.pipelinedGroupAdmissionRequired &&
         freeCpus - allIdleCpus(executorId) >= cpus
     }
@@ -266,8 +274,10 @@ private[spark] class StreamingShuffleGroupAdmission(
   }
 
   def removeExecutor(executorId: String): Unit = groups.toSeq.filter { g =>
-    !g.failed && g.slots.exists(_.executorId == executorId)
-  }.foreach(g => fail(g, s"Pipelined group lost reserved executor $executorId"))
+    !g.failed && (g.slots.exists(_.executorId == executorId) ||
+      // Completed producers can still own shuffle state needed by live readers or replay.
+      g.managers.values.exists(_.taskAttempts.iterator.flatten.exists(_.executorId == executorId)))
+  }.foreach(g => fail(g, s"Pipelined group lost participating executor $executorId"))
 
   def releaseJob(jobId: Int): Unit = {
     groups.filter(_.descriptor.jobId == jobId).toSeq.foreach { g =>

@@ -20,7 +20,8 @@ limitations under the License.
 ## Scope and example
 
 This prototype keeps Spark's task execution model. It reserves resources for every required
-reader task and a fixed rolling window of tasks from each pure producer stage. It does not
+reader task and a minimum rolling window of tasks from each pure producer stage. Additional
+producers can use unreserved CPU offers in the scheduler's FIFO/FAIR order. It does not
 suspend running tasks or multiplex operators on a smaller thread pool.
 
 Consider a read-only query with an independently materialized hash-join build input:
@@ -28,13 +29,15 @@ Consider a read-only query with an independently materialized hash-join build in
 | Work | Tasks | Scheduling treatment |
 | --- | ---: | --- |
 | Build-side scan and materialized shuffle | Plan-dependent | Finish the prerequisite before admitting the dependent pipeline |
-| Stage 1: probe-side scan/filter | 100 | Pure producer; four tasks at a time in this example |
+| Stage 1: probe-side scan/filter | 100 | Pure producer; four guaranteed slots, with expansion into unreserved capacity |
 | Stage 2: join | 8 | Reader and producer; eight resident tasks, counted once |
 | Stage 3: aggregation | 8 | Reader; eight resident tasks |
 
-The group needs 20 task slots when every task costs one CPU core. With 32 application slots,
-12 remain available for other work. When one scan task completes, another can use its reserved
-producer slot. There is no barrier between successive waves of scan tasks. Each join task still
+The group needs at least 20 task slots when every task costs one CPU core. With 32 application
+slots, 12 are unreserved: other work or additional scan tasks can use them in scheduler order.
+If no other work takes those slots, up to 16 scan tasks can run alongside the 16 readers.
+When one scan task completes, another can use its reserved producer slot. There is no barrier
+between successive waves of scan tasks. Each join task still
 builds its local hash table from the completed build-side shuffle before processing probe rows.
 
 For multiple pure producer branches, each branch has its own window. A busy branch cannot take
@@ -99,12 +102,16 @@ against each reader partition's launch history. A finished task can leave the ru
 its result is processed asynchronously; that interval must not rearm the startup timeout or stop
 new producer tasks from launching.
 
-Once the reader requirement is satisfied, pure producers may launch only within their own reserved
-windows and executor placements. Reader tasks may also produce data while starting; their required
-downstream receive endpoints are prepared asynchronously and their compute capacity is reserved.
+Once the reader requirement is satisfied, pure producers may use their own reserved placements
+or unreserved compatible CPU offers. Expansion never consumes another branch's or group's idle
+reservation. Additional producers require a registered receive service and remain subject to normal
+resource-profile, exclusion, and locality checks. Reader tasks may also produce data while starting;
+their required downstream receive endpoints are prepared asynchronously and their compute capacity is reserved.
 Successful reader partitions release their reservations. Producer slots are reused until that
-producer stage finishes. Successful stages return their reserved capacity, and job cleanup removes
-the complete group descriptor.
+producer stage finishes. Extra producer tasks acquire no lasting reservation: when they finish,
+their CPUs return to normal scheduling. Loss of an executor that launched extra producers fails
+the group even if those producers have finished, since shuffle state may still be needed.
+Successful stages return their reserved capacity, and job cleanup removes the group descriptor.
 
 ## Sharing the application with BSP
 
@@ -118,7 +125,10 @@ Idle reservations have a separate pool counter. FAIR comparisons include running
 reservations, while the actual running-task count remains unchanged. Launch converts an idle
 reservation into a running task for accounting purposes; it does not count the capacity twice.
 Within a group, readers receive launch priority without globally moving all pipelined readers ahead
-of other pools.
+of other pools. Extra producers retain ordinary running-task accounting. At the next offer, an
+underallocated FAIR pool can take CPUs released by extra producers; FIFO retains its existing
+priority behavior. This does not add preemption or per-task rebalancing within a resource-offer
+pass. The existing scheduler may launch multiple tasks from one task set before re-sorting pools.
 
 This is a conservative starvation-mitigation policy, not a bounded-wait or strict CPU-share
 guarantee. Ordinary tasks are non-preemptible. Reservations can temporarily leave CPUs idle while
@@ -152,15 +162,16 @@ All settings below are internal and application-scoped.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `spark.shuffle.streaming.groupAdmission.enabled` | `false` | Enable finite batch group reservations |
-| `spark.shuffle.streaming.groupAdmission.producerWindow` | `1` | Fixed reserved task window per pure producer stage |
+| `spark.shuffle.streaming.groupAdmission.producerWindow` | `1` | Minimum reserved tasks per pure producer stage; extra tasks may use unreserved CPUs |
 | `spark.shuffle.streaming.groupAdmission.maxConcurrentGroups` | `1` | Maximum admitted or partially reserved groups |
 | `spark.shuffle.streaming.groupAdmission.reservationDelay` | `5s` | Aging delay before reserving ahead of earlier pending work |
 | `spark.shuffle.streaming.groupAdmission.timeout` | `60s` | Wait limit after complete submission, including reader startup |
 
 The prepared receive service, positive reader queue memory, shared writer server, and shared
 connections must also be enabled. The group window supersedes the legacy elastic producer caps
-for registered groups. It is a fixed window, not a minimum that automatically grows into spare
-capacity. Enlarging or moving an admitted group's window is deferred.
+for registered groups. The configured minimum stays reserved on its original placements; extra
+producer execution does not enlarge that reservation. This separates admission feasibility from
+runtime parallelism without adding another hard producer cap.
 
 ## Validation and next phase
 
@@ -188,8 +199,10 @@ completed producer that would never submit tasks again. The fixes passed 255 foc
 The measurements also exposed a remaining performance limitation of a fixed producer window:
 Q1's 33 scan tasks form a second wave at window 32, increasing median time by 15.7%. A larger
 window removes that regression, but cannot be a universal setting for multi-branch groups.
-Minimum producer reservation and runtime producer parallelism need separate policies; expansion
-into available capacity remains unimplemented. Q3 also did not pass the final performance check,
+The subsequent elastic-producer change separates minimum reservation from runtime parallelism
+and permits expansion into available unreserved capacity. These fixed-window results remain
+historical evidence, not measurements of the elastic policy. Q3 also did not pass that performance
+check,
 with substantial sample variation and brief unrelated host activity.
 See [the SF1000 performance report](rtm_group_admission_performance_20261105.md) for the full
 protocol, retained samples, functional fixes, and qualification limits.

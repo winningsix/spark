@@ -2232,7 +2232,8 @@ package object config {
     ConfigBuilder("spark.shuffle.streaming.groupAdmission.producerWindow")
       .internal()
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .doc("Reserved concurrent tasks per pure producer stage in an admitted batch group.")
+      .doc("Minimum reserved tasks per pure producer stage in an admitted batch group. " +
+        "Additional producers may use unreserved CPU capacity in scheduler order.")
       .version("5.0.0")
       .intConf
       .checkValue(_ >= 1, "must be at least one")
