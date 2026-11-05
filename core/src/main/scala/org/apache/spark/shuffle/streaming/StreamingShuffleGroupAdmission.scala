@@ -66,7 +66,9 @@ private[spark] class StreamingShuffleGroupAdmission(
     def completed: Boolean = descriptor.stages.forall(s => s.numTasks == 0 || finished(s.stageId))
     def readersStarted: Boolean = descriptor.stages.filter(_.reader).forall { s =>
       finished(s.stageId) || s.numTasks == 0 || managers.get(s.stageId).exists { m =>
-        m.runningTasks + m.numCompletedTasks == s.numTasks
+        // A finished task leaves runningTasks before its result is processed asynchronously.
+        // Startup is monotonic; pending results must not rearm the timeout or stop producers.
+        m.taskAttempts.forall(_.nonEmpty)
       }
     }
     def stage(id: Int): PipelinedStageAdmission = descriptor.stages.find(_.stageId == id).get

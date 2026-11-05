@@ -3388,6 +3388,46 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
   }
 
+  test("reserved pipeline startup remains complete while a reader result is pending") {
+    withReservedPipeline() { (scheduler, requests) =>
+      val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(1, 2, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      Seq(producer, reader).foreach(scheduler.submitTasks)
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 3))
+      assert(scheduler.resourceOffers(offers).flatten.isEmpty)
+      val preparation = requests.poll(10, TimeUnit.SECONDS)
+      assert(preparation != null)
+      preparation._2.reply(true)
+      var launched = Seq.empty[TaskDescription]
+      eventually(timeout(10.seconds)) {
+        launched = scheduler.resourceOffers(offers).flatten
+        assert(launched.size === 3)
+      }
+      val readerManager = scheduler.taskSetManagerForAttempt(1, 0).get
+      val completedReader = launched.find { t =>
+        scheduler.taskIdToTaskSetManager.get(t.taskId) eq readerManager
+      }.get
+      // statusUpdate removes the running task before TaskResultGetter processes its result.
+      readerManager.removeRunningTask(completedReader.taskId)
+      assert(readerManager.runningTasks === 1)
+      assert(readerManager.numCompletedTasks === 0)
+      scheduler.pipelinedAdmission.expire(Long.MaxValue)
+      assert(!failedTaskSet, "result processing must not rearm the reader startup timeout")
+      val producerManager = scheduler.taskSetManagerForAttempt(0, 0).get
+      val firstProducer = launched.find { t =>
+        scheduler.taskIdToTaskSetManager.get(t.taskId) eq producerManager
+      }.get
+      val value = SparkEnv.get.serializer.newInstance().serialize(1)
+      producerManager.handleSuccessfulTask(firstProducer.taskId,
+        new DirectTaskResult[Int](value, Seq(), Array.empty[Long]))
+      val replacement = scheduler.resourceOffers(
+        IndexedSeq(WorkerOffer("executor0", "host0", 2))).flatten
+      assert(replacement.size === 1, "pending reader results must not stop producer progress")
+      assert(scheduler.taskIdToTaskSetManager.get(replacement.head.taskId) eq producerManager)
+    }
+  }
+
   test("reserved pipeline accumulates slots alongside BSP and releases on cancellation") {
     withReservedPipeline() { (scheduler, requests) =>
       val producer = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
