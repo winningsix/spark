@@ -50,6 +50,13 @@ A stage that reads any pipelined shuffle is a reader, including an intermediate 
 writes a pipelined shuffle. Only a stage that writes a pipelined shuffle without reading one is a
 pure producer. Narrow dependencies remain within their existing stages.
 
+Registration walks only the stages that still need execution. A completed shuffle output stops
+the walk, including a pipelined output retained under an existing internal replay lease. Range
+partitioning, for example, first samples a hash-shuffle output and then reads it again. The second
+job reserves slots for its new readers without waiting for the completed producer to submit tasks
+again. A group reading only replayed inputs can therefore contain readers and no pure producer.
+This reuses the existing replay contract; it does not enable arbitrary cross-job exchange reuse.
+
 A materialized shuffle edge separates components. Its producing stage runs as a prerequisite,
 using normal scheduling when it does not itself read a pipelined shuffle. An internal materialized
 edge whose endpoints also belong to the same pipelined component is rejected by this prototype:
@@ -87,7 +94,10 @@ Reserved reader tasks may launch after preparation acknowledgement even with emp
 Requiring input data here would deadlock startup because pure producers are held until all reader
 tasks have been launched or have completed. Task launch is the scheduler's criterion; it is not a
 separate executor-side acknowledgement that every reader has attached. Prepared endpoints exist
-before launch, and reserved compute allows those readers to run and attach.
+before launch, and reserved compute allows those readers to run and attach. Startup is checked
+against each reader partition's launch history. A finished task can leave the running count before
+its result is processed asynchronously; that interval must not rearm the startup timeout or stop
+new producer tasks from launching.
 
 Once the reader requirement is satisfied, pure producers may launch only within their own reserved
 windows and executor placements. Reader tasks may also produce data while starting; their required

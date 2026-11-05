@@ -7588,6 +7588,49 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     }
   }
 
+  test("reserved pipeline excludes completed replay producers from execution demand") {
+    val source = new MyRDD(sc, 2, Nil)
+    val dependency = new PipelinedShuffleDependency(source, new HashPartitioner(2))
+    dependency.markReplayLeaseAvailable()
+    val result = new MyRDD(sc, 2, List(dependency), tracker = mapOutputTracker)
+    val settings = Map(
+      config.STREAMING_SHUFFLE_GROUP_ADMISSION_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_READER_QUEUE_MAX_MEMORY.key -> "64k",
+      config.STREAMING_SHUFFLE_SHARED_CONNECTIONS_ENABLED.key -> "true",
+      config.STREAMING_SHUFFLE_SHARED_WRITER_SERVER_ENABLED.key -> "true")
+    val previous = settings.keys.map(k => k -> sc.conf.getOption(k)).toMap
+    settings.foreach { case (k, v) => sc.conf.set(k, v) }
+    try {
+      submit(result, Array(0, 1))
+      val producer = scheduler.shuffleIdToMapStage(dependency.shuffleId)
+      completeShuffleMapStageSuccessfully(producer.id, 0, 2)
+      complete(taskSets.last, Seq((Success, 42), (Success, 43)))
+      assert(producer.isAvailable)
+      assert(registeredAdmissionGroups.isEmpty)
+      val previousTaskSets = taskSets.size
+      val replay = new MyRDD(sc, 2, List(dependency), tracker = mapOutputTracker)
+      submit(replay, Array(0, 1))
+      assert(failure == null)
+      assert(taskSets.size === previousTaskSets + 1)
+      val members = registeredAdmissionGroups.flatMap(_.stages)
+      assert(members.size === 1)
+      assert(members.head.reader && !members.head.producer)
+      assert(members.head.stageId === taskSets.last.stageId)
+      complete(taskSets.last, Seq((Success, 42), (Success, 43)))
+      assert(results === Map(0 -> 42, 1 -> 43))
+      assert(registeredAdmissionGroups.isEmpty)
+      assertDataStructuresEmpty()
+    } finally {
+      previous.foreach { case (k, v) =>
+        v match {
+          case Some(value) => sc.conf.set(k, value)
+          case None => sc.conf.remove(k)
+        }
+      }
+    }
+  }
+
   test("reserved pipeline opt-in preserves the streaming submission path") {
     val source = new MyRDD(sc, 2, Nil)
     val dependency = new PipelinedShuffleDependency(source, new HashPartitioner(2))

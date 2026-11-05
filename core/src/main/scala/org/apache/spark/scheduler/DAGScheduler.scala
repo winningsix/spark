@@ -2656,12 +2656,33 @@ private[spark] class DAGScheduler(
       require(sc.resourceProfileManager.defaultResourceProfile.taskResources.keys
         .forall(_ == ResourceProfile.CPUS),
         "Pipelined group reservations currently support CPU only")
-      val stages = jobIdToStageIds(job.jobId).toSeq.map(stageIdToStage)
+      // Completed shuffle output (including a leased replay) needs no producer task set.
+      // Stop at that boundary: its ancestors are not part of this job's execution demand.
+      val stages = new mutable.ArrayBuffer[Stage]
+      val visited = new HashSet[Int]
+      val pendingStages = new mutable.Stack[Stage]
+      pendingStages.push(job.finalStage)
+      while (pendingStages.nonEmpty) {
+        val stage = pendingStages.pop()
+        val available = stage match {
+          case map: ShuffleMapStage => map.isAvailable
+          case _ => false
+        }
+        if (visited.add(stage.id) && !available) {
+          stages += stage
+          stage.parents.foreach(pendingStages.push(_))
+        }
+      }
+      val activeStageIds = stages.map(_.id).toSet
       val adjacent = new HashMap[Int, HashSet[Int]]
       stages.foreach { child =>
         child.parents.filter(isPipelinedProducer).foreach { parent =>
-          adjacent.getOrElseUpdate(child.id, new HashSet[Int]) += parent.id
-          adjacent.getOrElseUpdate(parent.id, new HashSet[Int]) += child.id
+          // A replay-only consumer still needs its reader slots reserved.
+          val parents = adjacent.getOrElseUpdate(child.id, new HashSet[Int])
+          if (activeStageIds(parent.id)) {
+            parents += parent.id
+            adjacent.getOrElseUpdate(parent.id, new HashSet[Int]) += child.id
+          }
         }
       }
       val remaining = new HashSet[Int] ++ adjacent.keys

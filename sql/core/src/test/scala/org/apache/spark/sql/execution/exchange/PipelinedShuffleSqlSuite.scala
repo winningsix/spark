@@ -346,6 +346,28 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("reserved pipeline replays completed hash input for range sampling") {
+    withDistributedPipelinedSession(adaptive = false, taskCpus = "0.5", extraConf = Map(
+        "spark.shuffle.streaming.groupAdmission.enabled" -> "true")) { spark =>
+      import spark.implicits._
+      val df = spark.range(0, 1000, 1, 2).withColumn("k", ($"id" % 7))
+        .groupBy($"k").count().orderBy($"k")
+
+      val rows = df.as[(Long, Long)].collect().toSeq
+      val expected = (0L until 1000L).groupBy(_ % 7).map { case (key, values) =>
+        (key, values.size.toLong)
+      }.toSeq.sortBy(_._1)
+      val exchanges = collect(df.queryExecution.executedPlan) {
+        case exchange: ShuffleExchangeExec => exchange
+      }
+
+      assert(exchanges.size >= 2 && exchanges.forall(_.pipelined))
+      assert(exchanges.exists(_.outputPartitioning.isInstanceOf[
+        org.apache.spark.sql.catalyst.plans.physical.RangePartitioning]))
+      assert(rows === expected)
+    }
+  }
+
   test("prepared inbox spill wakes consumers before the ready-bytes threshold") {
     withDistributedPipelinedSession(adaptive = false, extraConf = Map(
         "spark.shuffle.streaming.readerQueueMaxMemory" -> "1b",
