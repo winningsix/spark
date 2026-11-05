@@ -49,6 +49,9 @@ resource-based partition sizing is not implemented.
 ## Stage identification and registration
 
 DAGScheduler constructs connected components using pipelined shuffle dependencies between stages.
+The graph walk lives in `PipelinedStageGroup.admissionGroups`, which returns descriptors without
+submitting tasks or reserving resources. DAGScheduler registers those descriptors before stage
+submission; `StreamingShuffleGroupAdmission` owns mutable reservation and launch state.
 A stage that reads any pipelined shuffle is a reader, including an intermediate stage that also
 writes a pipelined shuffle. Only a stage that writes a pipelined shuffle without reading one is a
 pure producer. Narrow dependencies remain within their existing stages.

@@ -51,8 +51,10 @@ private[spark] class StreamingShuffleGroupAdmission(
   private val agingMs = conf.get(STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY)
   private val timeoutMs = conf.get(STREAMING_SHUFFLE_GROUP_ADMISSION_TIMEOUT)
 
-  private case class Slot(stageId: Int, index: Int, executorId: String, cpus: BigDecimal)
+  private case class Slot(stageId: Int, index: Int, executorId: String)
   private class Group(val descriptor: PipelinedGroupAdmission) {
+    private val stagesById = descriptor.stages.iterator.map(stage => stage.stageId -> stage).toMap
+    private val readerStages = descriptor.stages.filter(_.reader)
     val managers = mutable.HashMap.empty[Int, TaskSetManager]
     val finished = mutable.HashSet.empty[Int]
     val slots = mutable.ArrayBuffer.empty[Slot]
@@ -61,18 +63,19 @@ private[spark] class StreamingShuffleGroupAdmission(
     var readyAt: Option[Long] = None
     var pool: Option[Pool] = None
     var charged = 0
-    def complete: Boolean = descriptor.stages.forall { s =>
+    def allTaskSetsSubmitted: Boolean = descriptor.stages.forall { s =>
       s.numTasks == 0 || managers.contains(s.stageId)
     }
-    def completed: Boolean = descriptor.stages.forall(s => s.numTasks == 0 || finished(s.stageId))
-    def readersStarted: Boolean = descriptor.stages.filter(_.reader).forall { s =>
+    def allStagesFinished: Boolean =
+      descriptor.stages.forall(s => s.numTasks == 0 || finished(s.stageId))
+    def allReadersLaunched: Boolean = readerStages.forall { s =>
       finished(s.stageId) || s.numTasks == 0 || managers.get(s.stageId).exists { m =>
         // A finished task leaves runningTasks before its result is processed asynchronously.
         // Startup is monotonic; pending results must not rearm the timeout or stop producers.
         m.taskAttempts.forall(_.nonEmpty)
       }
     }
-    def stage(id: Int): PipelinedStageAdmission = descriptor.stages.find(_.stageId == id).get
+    def stage(id: Int): PipelinedStageAdmission = stagesById(id)
   }
   private val groups = mutable.ArrayBuffer.empty[Group]
   private val byStage = mutable.HashMap.empty[Int, Group]
@@ -166,7 +169,7 @@ private[spark] class StreamingShuffleGroupAdmission(
   }
 
   def expire(now: Long): Unit = groups.toSeq.filter { g =>
-    !g.failed && (!g.admitted || !g.readersStarted) &&
+    !g.failed && (!g.admitted || !g.allReadersLaunched) &&
       g.readyAt.exists(t => now - t >= timeoutMs)
   }.foreach(g => fail(g, "Timed out waiting for pipelined group admission or reader startup"))
 
@@ -185,16 +188,16 @@ private[spark] class StreamingShuffleGroupAdmission(
     groups.toSeq.filter(g => !g.failed && g.managers.values.exists { m =>
       !m.isActiveForScheduling && m.numCompletedTasks != m.numTasks
     }).foreach(g => fail(g, "A reserved pipelined task set was aborted"))
-    groups.filter(g => g.complete && !g.failed && g.readyAt.isEmpty)
+    groups.filter(g => g.allTaskSetsSubmitted && !g.failed && g.readyAt.isEmpty)
       .foreach(_.readyAt = Some(now))
     expire(now)
     val candidates = ordered.flatMap(m => byStage.get(m.stageId)).distinct
-      .filter(g => g.complete && !g.failed && !g.admitted && !g.completed)
+      .filter(g => g.allTaskSetsSubmitted && !g.failed && !g.admitted && !g.allStagesFinished)
       .filter { g =>
         g.slots.nonEmpty || ordered.headOption.exists(m => g.managers.contains(m.stageId)) ||
           g.readyAt.exists(t => now - t >= agingMs)
       }
-    val active = groups.count(g => !g.failed && !g.completed &&
+    val active = groups.count(g => !g.failed && !g.allStagesFinished &&
       (g.admitted || g.slots.nonEmpty))
     // Accumulate one reservation at a time. The next offer re-evaluates pool entitlement
     // after this reservation is charged, rather than selecting several groups from one pool.
@@ -202,34 +205,43 @@ private[spark] class StreamingShuffleGroupAdmission(
     val targets = if (partial.nonEmpty) partial.take(1) else {
       candidates.filter(_.slots.isEmpty).take(math.min(1, math.max(0, maxGroups - active)))
     }
-    targets.foreach { g =>
-      val demand = g.descriptor.stages.sortBy(s => (!s.reader, s.stageId)).flatMap { s =>
-        val count = if (s.reader) s.numTasks else math.min(minimumProducers, s.numTasks)
-        (0 until count).map(i => (s, i))
-      }
-      demand.foreach { case (stage, index) =>
-        if (!g.slots.exists(s => s.stageId == stage.stageId && s.index == index)) {
-          val manager = g.managers(stage.stageId)
-          val cpus = taskCpus(manager)
-          val compatible = offers.indices.filter { i =>
-            val o = offers(i)
-            receiveExecutors(o.executorId) &&
-              o.resourceProfileId == manager.taskSet.resourceProfileId &&
-              availableCpus(i) - allIdleCpus(o.executorId) >= cpus &&
-              (if (stage.reader) manager.canPrepareReaderOnExecutor(index, o.executorId, o.host)
-               else (0 until manager.numTasks).forall { taskIndex =>
-                 manager.canPrepareReaderOnExecutor(taskIndex, o.executorId, o.host)
-               })
-          }
-          compatible.sortBy(i => g.slots.count(_.executorId == offers(i).executorId))
-            .headOption.foreach { i =>
-              g.slots += Slot(stage.stageId, index, offers(i).executorId, cpus)
-            }
-        }
-      }
-      g.admitted = g.slots.size == demand.size
-    }
+    targets.foreach(reserve(_, offers, availableCpus))
     syncPoolAccounting()
+  }
+
+  /** Reserve reader placements and each producer's minimum without borrowing other slots. */
+  private def reserve(
+      group: Group,
+      offers: IndexedSeq[WorkerOffer],
+      availableCpus: Array[BigDecimal]): Unit = {
+    val demand = group.descriptor.stages.sortBy(s => (!s.reader, s.stageId)).flatMap { s =>
+      val count = if (s.reader) s.numTasks else math.min(minimumProducers, s.numTasks)
+      (0 until count).map(i => (s, i))
+    }
+    demand.foreach { case (stage, index) =>
+      if (!group.slots.exists(s => s.stageId == stage.stageId && s.index == index)) {
+        val manager = group.managers(stage.stageId)
+        val cpus = taskCpus(manager)
+        val compatible = offers.indices.filter { i =>
+          val o = offers(i)
+          receiveExecutors(o.executorId) &&
+            o.resourceProfileId == manager.taskSet.resourceProfileId &&
+            availableCpus(i) - allIdleCpus(o.executorId) >= cpus &&
+            (if (stage.reader) {
+              manager.canPrepareReaderOnExecutor(index, o.executorId, o.host)
+            } else {
+              (0 until manager.numTasks).forall { taskIndex =>
+                manager.canPrepareReaderOnExecutor(taskIndex, o.executorId, o.host)
+              }
+            })
+        }
+        compatible.sortBy(i => group.slots.count(_.executorId == offers(i).executorId))
+          .headOption.foreach { i =>
+            group.slots += Slot(stage.stageId, index, offers(i).executorId)
+          }
+      }
+    }
+    group.admitted = group.slots.size == demand.size
   }
 
   def launchAllowed(manager: TaskSetManager, executorId: String, freeCpus: BigDecimal): Boolean = {
@@ -244,7 +256,7 @@ private[spark] class StreamingShuffleGroupAdmission(
         // Their normal running-task accounting disappears when they finish; no extra
         // reservation is retained, so subsequent offers can serve other pools or BSP.
         g.admitted && !g.failed &&
-          (reader || g.readersStarted) &&
+          (reader || g.allReadersLaunched) &&
           (ownIdle > 0 || (!reader && receiveExecutors(executorId))) &&
           freeCpus - allIdleCpus(executorId) + cpus * ownIdle >= cpus
       case None => !manager.taskSet.pipelinedGroupAdmissionRequired &&

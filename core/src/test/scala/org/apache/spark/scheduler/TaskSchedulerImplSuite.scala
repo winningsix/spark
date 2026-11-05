@@ -3461,7 +3461,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
   }
 
-  test("reserved pipeline keeps a producer window for each input branch") {
+  test("reserved pipeline protects the producer minimum for each input branch") {
     withReservedPipeline() { (scheduler, requests) =>
       val left = reservedPipelineTasks(0, 10, Seq.empty, Some(7))
       val right = reservedPipelineTasks(1, 10, Seq.empty, Some(8))

@@ -50,8 +50,8 @@ import org.apache.spark.resource.{CpuAmount, ResourceProfile, TaskResourceProfil
 import org.apache.spark.resource.ResourceProfile.{CPUS, DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.rpc.RpcTimeoutException
-import org.apache.spark.shuffle.streaming.{PipelinedGroupAdmission, PipelinedStageAdmission,
-  StreamingShuffleStagePlanning}
+import org.apache.spark.scheduler.PipelinedStageGroup.isPipelinedProducer
+import org.apache.spark.shuffle.streaming.StreamingShuffleStagePlanning
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
 import org.apache.spark.util._
@@ -1997,11 +1997,6 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * Whether `stage` produces its output through a [[PipelinedShuffleDependency]] -- i.e. it is a
-   * pipelined producer, whose consumers may run concurrently with it. Callers that need the
-   * producer/consumer relationship check `child.parents.contains(stage)` separately.
-   */
-  /**
    * Whether the configured pipelined manager consumes the driver's live-reduce-partition hint and
    * per-run epoch (see `PipelinedShuffleManager.supportsLiveReducePartitionHints`). False for the
    * RPC streaming transport, whose writer reads neither -- so for a Real-Time Mode job the
@@ -2011,11 +2006,6 @@ private[spark] class DAGScheduler(
   private def pipelinedManagerWantsLiveReduceHints: Boolean = {
     val mgr = sc.env.pipelinedShuffleManager
     mgr != null && mgr.supportsLiveReducePartitionHints
-  }
-
-  private def isPipelinedProducer(stage: Stage): Boolean = stage match {
-    case m: ShuffleMapStage => m.shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]
-    case _ => false
   }
 
   /**
@@ -2656,60 +2646,8 @@ private[spark] class DAGScheduler(
       require(sc.resourceProfileManager.defaultResourceProfile.taskResources.keys
         .forall(_ == ResourceProfile.CPUS),
         "Pipelined group reservations currently support CPU only")
-      // Completed shuffle output (including a leased replay) needs no producer task set.
-      // Stop at that boundary: its ancestors are not part of this job's execution demand.
-      val stages = new mutable.ArrayBuffer[Stage]
-      val visited = new HashSet[Int]
-      val pendingStages = new mutable.Stack[Stage]
-      pendingStages.push(job.finalStage)
-      while (pendingStages.nonEmpty) {
-        val stage = pendingStages.pop()
-        val available = stage match {
-          case map: ShuffleMapStage => map.isAvailable
-          case _ => false
-        }
-        if (visited.add(stage.id) && !available) {
-          stages += stage
-          stage.parents.foreach(pendingStages.push(_))
-        }
-      }
-      val activeStageIds = stages.map(_.id).toSet
-      val adjacent = new HashMap[Int, HashSet[Int]]
-      stages.foreach { child =>
-        child.parents.filter(isPipelinedProducer).foreach { parent =>
-          // A replay-only consumer still needs its reader slots reserved.
-          val parents = adjacent.getOrElseUpdate(child.id, new HashSet[Int])
-          if (activeStageIds(parent.id)) {
-            parents += parent.id
-            adjacent.getOrElseUpdate(parent.id, new HashSet[Int]) += child.id
-          }
-        }
-      }
-      val remaining = new HashSet[Int] ++ adjacent.keys
-      val groups = new mutable.ArrayBuffer[PipelinedGroupAdmission]
-      while (remaining.nonEmpty) {
-        val members = new HashSet[Int]
-        val pending = new mutable.Stack[Int]
-        pending.push(remaining.head)
-        while (pending.nonEmpty) {
-          val id = pending.pop()
-          if (members.add(id)) {
-            remaining -= id
-            adjacent(id).foreach(next => pending.push(next))
-          }
-        }
-        require(members.forall { id =>
-          stageIdToStage(id).parents.forall(p => isPipelinedProducer(p) || !members(p.id))
-        }, "A materialized dependency cannot be internal to a reserved pipelined group")
-        val descriptors = members.toSeq.sorted.map { id =>
-          val stage = stageIdToStage(id)
-          PipelinedStageAdmission(id, stage.getNextAttemptId, stage.numTasks,
-            StreamingShuffleStagePlanning.shuffleIdsReadByStage(stage.rdd).nonEmpty,
-            isPipelinedProducer(stage))
-        }
-        groups += PipelinedGroupAdmission(job.jobId, descriptors)
-      }
-      taskScheduler.registerPipelinedGroups(groups.toSeq)
+      val groups = PipelinedStageGroup.admissionGroups(job.jobId, job.finalStage)
+      taskScheduler.registerPipelinedGroups(groups)
       true
     } catch {
       case NonFatal(error) =>
