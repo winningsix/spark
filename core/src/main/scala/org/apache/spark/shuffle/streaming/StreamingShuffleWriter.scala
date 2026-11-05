@@ -32,7 +32,6 @@ import scala.util.Try
 
 import io.netty.buffer.{ByteBuf, ByteBufOutputStream, CompositeByteBuf, Unpooled}
 import io.netty.channel.{ChannelFuture, ChannelOption}
-import net.jpountz.lz4.LZ4Factory
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkContext, SparkEnv,
   StreamingShuffleTaskLocation, TaskContext}
@@ -63,17 +62,6 @@ import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{JavaSerializerInstance, SerializationStream}
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriter}
 import org.apache.spark.util.{ErrorNotifier, Utils}
-
-/** Executor-JVM-wide stateless LZ4 primitives for independent streaming-shuffle blocks. */
-private[streaming] object StreamingShuffleCompression {
-  // Cache fastestInstance() once: repeated JNI discovery can serialize on LZ4Factory and retry a
-  // failed native load. The compressor and decompressor implementations are stateless.
-  private lazy val factory = LZ4Factory.fastestInstance()
-  lazy val compressor = factory.fastCompressor()
-  // The factory's fastDecompressor is a Java implementation for ByteBuffer input in lz4-java
-  // 1.11.1, while safeDecompressor is JNI-backed and can validate the compressed input length.
-  lazy val decompressor = factory.safeDecompressor()
-}
 
 private[streaming] object StreamingShuffleWriter {
   private val TERMINATION_RETRY_DELAY_MS = 500L
