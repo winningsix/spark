@@ -207,6 +207,14 @@ with substantial sample variation and brief unrelated host activity.
 See [the SF1000 performance report](rtm_group_admission_performance_20261105.md) for the full
 protocol, retained samples, functional fixes, and qualification limits.
 
+Elastic-producer qualification subsequently passed 262 related tests and 16 SF1000 query
+executions. With producer minimum 1, all 33 Q1 scan tasks launched within 2-5 ms. Q1 median
+was 22.743 s versus 23.197 s for legacy RTM; Q3 was 79.403 s versus 85.855 s. Both modes used
+the same artifact and physical plans, with one warm-up and three alternating measured pairs.
+These are single-host, two-executor results, not multi-host or general zero-overhead claims.
+See [the elastic-producer performance report](rtm_elastic_admission_performance_20261105.md)
+for samples, CPU and I/O evidence, correctness, and remaining limitations.
+
 A later phase may separate operator state residency from compute threads. Blocked execution
 instances could yield threads and resume when input or output capacity becomes available. That
 requires operator-level cooperative execution and memory management; it cannot be achieved merely
