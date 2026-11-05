@@ -84,6 +84,17 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("streaming-shuffle-cross-route-flush")
   private var closed = false
 
+  // Serializing publication is necessary only within one physical connection. Weak keys avoid
+  // retaining replaced clients after their queued and in-flight bodies have been released.
+  private val clientLocks = new java.util.WeakHashMap[TransportClient, AnyRef]()
+
+  private def withClientLock[T](client: TransportClient)(f: => T): T = {
+    val lock = synchronized {
+      clientLocks.computeIfAbsent(client, _ => new Object())
+    }
+    lock.synchronized { f }
+  }
+
   private def permitsFor(bytes: Int): Int = {
     // One oversized body must still be admissible. Charging the full window preserves the
     // best-effort bound without requesting a permit count that can never be satisfied.
@@ -115,38 +126,49 @@ private[streaming] final class StreamingShuffleTransportBatcher(
       body: ByteBuf,
       onComplete: () => Unit,
       owner: AnyRef,
-      bodyErrorNotifier: ErrorNotifier): Unit = synchronized {
-    if (closed) {
-      body.release()
-      onComplete()
-      return
-    }
-    var batch = pending.get(client)
-    if (batch != null && batch.bytes > 0 && batch.bytes + body.readableBytes() > maxBytes) {
-      flushLocked(client)
-      batch = null
-    }
-    if (batch == null) {
-      batch = PendingBatch(new mutable.ArrayBuffer[PendingBody](), 0)
-      pending.put(client, batch)
-      if (maxWaitTimeMs > 0) {
-        val scheduled = flushExecutor.schedule(
-          new Runnable { override def run(): Unit = flush(client) },
-          maxWaitTimeMs,
-          TimeUnit.MILLISECONDS)
-        scheduledFlushes.put(client, scheduled)
+      bodyErrorNotifier: ErrorNotifier): Unit = withClientLock(client) {
+    val ready = new mutable.ArrayBuffer[PendingBatch](2)
+    val rejected = synchronized {
+      if (closed) {
+        true
+      } else {
+        var batch = pending.get(client)
+        if (batch != null && batch.bytes > 0 &&
+            batch.bytes.toLong + body.readableBytes() > maxBytes) {
+          ready += takePendingBatch(client)
+          batch = null
+        }
+        if (batch == null) {
+          batch = PendingBatch(new mutable.ArrayBuffer[PendingBody](), 0)
+          pending.put(client, batch)
+          if (maxWaitTimeMs > 0) {
+            val scheduled = flushExecutor.schedule(
+              new Runnable { override def run(): Unit = flush(client) },
+              maxWaitTimeMs,
+              TimeUnit.MILLISECONDS)
+            scheduledFlushes.put(client, scheduled)
+          }
+        }
+        batch.bodies += PendingBody(body, onComplete, owner, bodyErrorNotifier)
+        batch.bytes += body.readableBytes()
+        if (batch.bytes >= maxBytes) ready += takePendingBatch(client)
+        false
       }
     }
-    batch.bodies += PendingBody(body, onComplete, owner, bodyErrorNotifier)
-    batch.bytes += body.readableBytes()
-    if (batch.bytes >= maxBytes) {
-      flushLocked(client)
+    if (rejected) {
+      body.release()
+      onComplete()
+    } else {
+      ready.foreach(batch => sendAdmitted(client, batch, tryAcquire(batch.bytes)))
     }
   }
 
   /** Flushes all bodies queued for one client before a later control frame is sent. */
-  def flush(client: TransportClient): Unit = synchronized {
-    flushLocked(client)
+  def flush(client: TransportClient): Unit = withClientLock(client) {
+    val batch = synchronized { takePendingBatch(client) }
+    if (batch != null && batch.bodies.nonEmpty) {
+      sendAdmitted(client, batch, tryAcquire(batch.bytes))
+    }
   }
 
   /** Whether this owner still has a body waiting for the current aggregate to be flushed. */
@@ -160,66 +182,62 @@ private[streaming] final class StreamingShuffleTransportBatcher(
   }
 
   /** Remove one writer's unsent bodies without affecting other writers on the channel. */
-  def discardOwner(owner: AnyRef): Unit = synchronized {
-    val clients = pending.keySet().iterator()
-    val emptyClients = new mutable.ArrayBuffer[TransportClient]()
-    while (clients.hasNext) {
-      val client = clients.next()
-      val batch = pending.get(client)
-      if (batch != null) {
-        val removed = batch.bodies.filter(_.owner eq owner)
-        if (removed.nonEmpty) {
-          batch.bodies --= removed
+  def discardOwner(owner: AnyRef): Unit = {
+    val removed = synchronized {
+      val bodies = new mutable.ArrayBuffer[PendingBody]()
+      val clients = pending.keySet().iterator()
+      val emptyClients = new mutable.ArrayBuffer[TransportClient]()
+      while (clients.hasNext) {
+        val client = clients.next()
+        val batch = pending.get(client)
+        val owned = batch.bodies.filter(_.owner eq owner)
+        if (owned.nonEmpty) {
+          batch.bodies --= owned
           batch.bytes = batch.bodies.iterator.map(_.body.readableBytes()).sum
-          removed.foreach { body =>
-            body.body.release()
-            try body.onComplete()
-            catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
-          }
+          bodies ++= owned
         }
         if (batch.bodies.isEmpty) emptyClients += client
       }
+      emptyClients.foreach(takePendingBatch)
+      bodies.toSeq
     }
-    emptyClients.foreach { client =>
-      pending.remove(client)
-      val scheduled = scheduledFlushes.remove(client)
-      if (scheduled != null) scheduled.cancel(false)
-    }
+    removed.foreach(releaseBody)
   }
 
   /** Drops unsent bodies during writer failure cleanup. */
-  def discard(): Unit = synchronized {
-    if (closed) return
-    closed = true
-    val scheduledIterator = scheduledFlushes.values().iterator()
-    while (scheduledIterator.hasNext) scheduledIterator.next().cancel(false)
-    scheduledFlushes.clear()
-    flushExecutor.shutdownNow()
-    val iterator = pending.values().iterator()
-    while (iterator.hasNext) {
-      iterator.next().bodies.foreach { body =>
-        body.body.release()
-        try body.onComplete()
-        catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
-      }
+  def discard(): Unit = {
+    val removed = synchronized {
+      closed = true
+      val scheduledIterator = scheduledFlushes.values().iterator()
+      while (scheduledIterator.hasNext) scheduledIterator.next().cancel(false)
+      scheduledFlushes.clear()
+      val bodies = new mutable.ArrayBuffer[PendingBody]()
+      val iterator = pending.values().iterator()
+      while (iterator.hasNext) bodies ++= iterator.next().bodies
+      pending.clear()
+      bodies.toSeq
     }
-    pending.clear()
+    flushExecutor.shutdownNow()
+    removed.foreach(releaseBody)
   }
 
-  private def flushLocked(client: TransportClient): Unit = {
+  private def releaseBody(body: PendingBody): Unit = {
+    body.body.release()
+    try body.onComplete()
+    catch { case t: Throwable => body.bodyErrorNotifier.markError(t) }
+  }
+
+  /** Detach a batch under the metadata monitor; the caller owns all of its bodies afterwards. */
+  private def takePendingBatch(client: TransportClient): PendingBatch = {
     val scheduled = scheduledFlushes.remove(client)
     if (scheduled != null) scheduled.cancel(false)
-    val batch = pending.remove(client)
-    if (batch == null || batch.bodies.isEmpty) return
-
-    // This method runs under the batcher's monitor, so calls to a given TransportClient retain
-    // their publication order. Transport completion is deliberately not an ordering fence: it
-    // would couple progress to downstream credit and can deadlock terminal delivery.
-    sendAdmittedLocked(client, batch, tryAcquire(batch.bytes))
+    pending.remove(client)
   }
 
   /** Send immediately, optionally holding capacity until transport completion. */
-  private def sendAdmittedLocked(
+  // The client lock preserves frame order while consolidation and send run outside the shared
+  // metadata monitor. Detached batches are in flight: discard only owns bodies still in pending.
+  private def sendAdmitted(
       client: TransportClient,
       batch: PendingBatch,
       admittedPermits: Int): Unit = {
@@ -228,6 +246,7 @@ private[streaming] final class StreamingShuffleTransportBatcher(
     try {
       if (batch.bodies.length == 1) {
         outbound = batch.bodies.head.body
+        addedBodies = 1
       } else {
         // Each framed body can contain several components. Reserve for the flattened count,
         // otherwise Netty consolidates and copies payloads as soon as that limit is exceeded.

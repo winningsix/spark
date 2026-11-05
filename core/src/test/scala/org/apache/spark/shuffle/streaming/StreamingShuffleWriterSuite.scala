@@ -411,6 +411,82 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  for (independentPeers <- Seq(true, false)) {
+    val description = if (independentPeers) "does not serialize independent peers" else {
+      "preserves same-peer order under concurrent submissions"
+    }
+    test(s"cross-route batch publication $description") {
+      val notifier = new ErrorNotifier()
+      val batcher = new StreamingShuffleTransportBatcher(
+        UnpooledByteBufAllocator.DEFAULT, 1, 0L, notifier)
+      val firstClient = mock[TransportClient]
+      val secondClient = if (independentPeers) mock[TransportClient] else firstClient
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val secondAttempted = new CountDownLatch(1)
+      val secondSent = new CountDownLatch(1)
+      val sent = new ConcurrentLinkedQueue[Long]()
+      val completions = new AtomicInteger()
+      val future = mock[ChannelFuture]
+      when(future.isSuccess).thenReturn(true)
+      when(future.addListener(any[GenericFutureListener[ChannelFuture]]))
+        .thenAnswer { invocation =>
+          invocation.getArgument[GenericFutureListener[ChannelFuture]](0).operationComplete(future)
+          future
+        }
+      def send(body: ByteBuf): ChannelFuture = {
+        val value = body.getLong(0)
+        if (value == 1L) {
+          entered.countDown()
+          assert(release.await(10, TimeUnit.SECONDS))
+        }
+        sent.add(value)
+        body.release()
+        if (value == 2L) secondSent.countDown()
+        future
+      }
+      when(firstClient.send(any[ByteBuf])).thenAnswer { invocation =>
+        send(invocation.getArgument[ByteBuf](0))
+      }
+      if (independentPeers) {
+        when(secondClient.send(any[ByteBuf])).thenAnswer { invocation =>
+          send(invocation.getArgument[ByteBuf](0))
+        }
+      }
+      val firstBody = Unpooled.buffer(8).writeLong(1L)
+      val secondBody = Unpooled.buffer(8).writeLong(2L)
+      val first = new Thread(() => batcher.submit(
+        firstClient, firstBody, () => { completions.incrementAndGet(); () }))
+      val second = new Thread(() => {
+        secondAttempted.countDown()
+        batcher.submit(secondClient, secondBody, () => { completions.incrementAndGet(); () })
+      })
+      try {
+        first.start()
+        assert(entered.await(10, TimeUnit.SECONDS))
+        second.start()
+        assert(secondAttempted.await(10, TimeUnit.SECONDS))
+        if (independentPeers) {
+          assert(secondSent.await(2, TimeUnit.SECONDS),
+            "An independent peer waited for the first peer's publication")
+        } else {
+          assert(!secondSent.await(200, TimeUnit.MILLISECONDS))
+        }
+      } finally {
+        release.countDown()
+        first.join(10000)
+        second.join(10000)
+        batcher.discard()
+        if (firstBody.refCnt() > 0) firstBody.release(firstBody.refCnt())
+        if (secondBody.refCnt() > 0) secondBody.release(secondBody.refCnt())
+      }
+      assert(!first.isAlive && !second.isAlive)
+      sent.asScala.toSeq shouldBe (if (independentPeers) Seq(2L, 1L) else Seq(1L, 2L))
+      completions.get() shouldBe 2
+      notifier.throwErrorIfExists()
+    }
+  }
+
   test("cross-route batching consolidates its payload prefix only once") {
     val notifier = new ErrorNotifier()
     val allocations = new ConcurrentLinkedQueue[Int]()
@@ -472,6 +548,33 @@ class StreamingShuffleWriterSuite
       batcher.discard()
       Option(sent.get()).filter(_.refCnt() > 0).foreach(_.release())
       bodies.filter(_.refCnt() > 0).foreach(_.release())
+    }
+  }
+
+  for (numBodies <- Seq(1, 2)) {
+    test(s"cross-route synchronous failure releases $numBodies bodies exactly once") {
+      val notifier = new ErrorNotifier()
+      val batcher = new StreamingShuffleTransportBatcher(
+        UnpooledByteBufAllocator.DEFAULT, 1024, 0L, notifier)
+      val client = mock[TransportClient]
+      val channel = mock[Channel]
+      val failure = new IllegalStateException("send failed")
+      when(client.getChannel).thenReturn(channel)
+      when(channel.isActive).thenReturn(true)
+      when(client.send(any[ByteBuf])).thenThrow(failure)
+      val bodies = (0 until numBodies).map(i => Unpooled.buffer(8).writeLong(i.toLong))
+      val completions = new AtomicInteger()
+      try {
+        bodies.foreach(body => batcher.submit(
+          client, body, () => { completions.incrementAndGet(); () }))
+        batcher.flush(client)
+        bodies.foreach(_.refCnt() shouldBe 0)
+        completions.get() shouldBe numBodies
+        notifier.getError() shouldBe Some(failure)
+      } finally {
+        batcher.discard()
+        bodies.filter(_.refCnt() > 0).foreach(_.release())
+      }
     }
   }
 
