@@ -265,7 +265,9 @@ private[streaming] class StreamingShuffleExecutorClient extends Logging {
   }
   private val clientConf = SparkTransportConf.fromSparkConf(
     conf, "streaming-shuffle-reader-multiplexed", math.max(1, conf.get(EXECUTOR_CORES)), role)
-  private val transportContext = new TransportContext(clientConf, rpcHandler, true, true)
+  // A live lane can be quiet while an operator computes or waits for downstream credit.
+  // Shuffle cleanup owns these connections; transport idleness is not end-of-stream.
+  private val transportContext = new TransportContext(clientConf, rpcHandler, false, true)
   private val clientFactory: TransportClientFactory = transportContext.createClientFactory()
   private val cumulativeCreditExecutor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor(

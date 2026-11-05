@@ -18,10 +18,11 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{Callable, CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import io.netty.buffer.Unpooled
+import io.netty.handler.timeout.IdleStateEvent
 import org.mockito.ArgumentMatchers.{any, eq => eqTo}
 import org.mockito.Mockito.{atLeastOnce, inOrder => inMockitoOrder, never, verify, when}
 import org.scalatest.concurrent.Eventually.eventually
@@ -403,6 +404,53 @@ class StreamingShuffleManagerSuite
         server.pendingCreditRouteCount shouldBe 0
       } finally {
         server.unregister(7, 3, handler)
+        server.close()
+      }
+    }
+  }
+
+  test("an idle shuffle lane stays open until shuffle cleanup") {
+    val module = "spark.streaming-shuffle-reader-multiplexed.io"
+    val conf = new SparkConf()
+      // Inject an overdue idle event without sleeping or racing a real idle timer.
+      .set(s"$module.connectionTimeout", "0s")
+      .set(s"$module.connectionCreationTimeout", "10s")
+    withSpark(new SparkContext("local", "idle-shuffle-lane", conf)) { _ =>
+      val server = new StreamingShuffleExecutorServer()
+      val client = new StreamingShuffleExecutorClient()
+      val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+      val reader = new StreamingShuffleClientHandler(
+        3, 0, queue, 7, 40L, null, new ErrorNotifier())
+      val writer = new StreamingShuffleServerHandler(
+        (_, _) => (), 7, 1, TaskContext.empty(), new ErrorNotifier())
+      try {
+        server.register(7, 3, writer)
+        val route = client.register(7, 3, 0, "127.0.0.1", server.port, reader)
+        eventually(Timeout(10.seconds)) {
+          writer.clientsFor(0).size shouldBe 1
+        }
+        val channel = route.getChannel
+        val activeAfterIdle = channel.eventLoop().submit(new Callable[Boolean] {
+          override def call(): Boolean = {
+            channel.pipeline().fireUserEventTriggered(IdleStateEvent.ALL_IDLE_STATE_EVENT)
+            channel.isActive
+          }
+        }).get(10, TimeUnit.SECONDS)
+        activeAfterIdle shouldBe true
+
+        StreamingShuffleUtils.sendControlMessages(
+          writer.clientsFor(0).head, Seq(new TerminationControlMessage(7, 3, 0)))
+        val terminal = queue.poll(10, TimeUnit.SECONDS)
+        terminal shouldBe a[TerminationControlMessage]
+        terminal.release()
+
+        client.unregisterShuffle(7)
+        eventually(Timeout(10.seconds)) {
+          channel.isActive shouldBe false
+        }
+      } finally {
+        client.close()
+        server.unregister(7, 3, writer)
         server.close()
       }
     }

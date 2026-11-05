@@ -217,8 +217,10 @@ private[spark] class StreamingShuffleManager
           "streaming-shuffle-reader-shared",
           math.max(1, conf.get(EXECUTOR_CORES)),
           role)
+        // Readers close their unmanaged connections explicitly. A quiet producer or consumer
+        // can still be computing, so the transport must not close a live stream on idleness.
         val clientContext = new TransportContext(
-          clientConf, new NoOpRpcHandler(), true, true)
+          clientConf, new NoOpRpcHandler(), false, true)
         factory = clientContext.createClientFactory()
         readerClientFactory = factory
       }
