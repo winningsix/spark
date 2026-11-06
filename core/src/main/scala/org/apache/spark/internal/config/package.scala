@@ -1922,6 +1922,17 @@ package object config {
   // Streaming shuffle writer configs
   // ---------------------------------------------------------------------------
 
+  private[spark] val STREAMING_SHUFFLE_COMPRESS =
+    ConfigBuilder("spark.shuffle.streaming.compress")
+      .doc("Whether streaming shuffle writers LZ4-compress each data message. When unset, " +
+        "follows spark.shuffle.compress. Readers detect compressed messages per message, so " +
+        "writers and readers need not agree. Disabling it saves CPU when producers and " +
+        "consumers share a host and the transport is not bandwidth bound.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createOptional
+
   private[spark] val STREAMING_SHUFFLE_CHECKSUM_ENABLED =
     ConfigBuilder("spark.shuffle.streaming.checksum.enabled")
       .doc("Whether to append a CRC32C checksum to each streaming shuffle data buffer. " +

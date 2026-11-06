@@ -76,6 +76,23 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
     val bloomFilterAgg =
       if (rowCount.isDefined && rowCount.get.longValue > 0L) {
         new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)), rowCount.get.longValue)
+      } else if (conf.pipelinedHashJoinPolicyEnabled) {
+        // Without a row count the default sizing (1M items in 8M bits) saturates on a large
+        // filtered dimension and passes nearly every row. Size for the policy's expected key
+        // count instead, within the configured maximum number of bits.
+        val expectedNumItems =
+          conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_EXPECTED_NUM_ITEMS)
+        // A creation side far larger than the filter's capacity yields a saturated filter that
+        // costs a full aggregation job and filters nothing, so do not build one.
+        if (pipelinedPolicyRowEstimate(filterCreationSidePlan, conf) >
+            conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MAX_ESTIMATED_ITEMS)) {
+          return filterApplicationSidePlan
+        }
+        val numBits = math.min(
+          org.apache.spark.util.sketch.BloomFilter.optimalNumOfBits(expectedNumItems, 0.03),
+          conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_BITS))
+        new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)),
+          Literal(expectedNumItems), Literal(numBits))
       } else {
         new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)))
       }

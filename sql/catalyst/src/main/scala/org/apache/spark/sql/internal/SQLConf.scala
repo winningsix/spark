@@ -1091,6 +1091,17 @@ object SQLConf {
       .checkValue(_ >= 0, "must be non-negative")
       .createOptional
 
+  val HASH_JOIN_EQUI_JOIN_SIZE_ESTIMATE =
+    buildConf("spark.sql.join.hashJoinEquiJoinSizeEstimate.enabled")
+      .internal()
+      .doc("When true, static shuffled hash join selection estimates an inner equi-join as " +
+        "producing at most as many rows as its larger input (key/foreign-key assumption) " +
+        "instead of the product of input sizes. Only the build-side eligibility and choice " +
+        "use this estimate; other statistics are unchanged.")
+      .version("4.4.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val SPLIT_STREAMED_SIDE_JOIN_CONDITION =
     buildConf("spark.sql.join.splitStreamedSideJoinCondition")
       .internal()
@@ -1310,6 +1321,119 @@ object SQLConf {
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_GROUP_SLOT_FRACTION =
+    buildConf("spark.sql.shuffle.distributedPipelined.groupSlotFraction")
+      .internal()
+      .doc("Fraction of the cluster's concurrent task slots that one connected group of " +
+        "distributed pipelined stages may require for its resident readers. Exchanges that " +
+        "would make a group exceed it are kept regular, splitting the group into batch-" +
+        "separated segments that can each be admitted. Zero or negative disables the bound.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doubleConf
+      .createWithDefault(0.75)
+
+  val PIPELINED_HASH_JOIN_POLICY_ENABLED =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.enabled")
+      .internal()
+      .doc("When true and spark.sql.shuffle.distributedPipelined.enabled is true, static join " +
+        "selection prefers shuffled hash joins over sort-merge joins whenever the estimated " +
+        "build input fits spark.sql.shuffle.distributedPipelined.hashJoinPolicy." +
+        "maxLocalMapThreshold per shuffle partition and is at least " +
+        "spark.sql.shuffle.distributedPipelined.hashJoinPolicy.factor times smaller than the " +
+        "streamed input. Equi-join outputs are estimated with the key/foreign-key assumption. " +
+        "Sort is a pipeline breaker, while a hash-join build side is already materialized " +
+        "before its pipelined probe starts. Queries that do not use distributed pipelined " +
+        "shuffle are unaffected. Experimental.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_HASH_JOIN_POLICY_LOCAL_MAP_THRESHOLD =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.maxLocalMapThreshold")
+      .internal()
+      .doc("Estimated build input bytes per shuffle partition below which the pipelined hash " +
+        "join policy may choose a shuffled hash join. This is an average input estimate, not " +
+        "a bound on a skewed partition or on hash-table memory.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefaultString("64m")
+
+  val PIPELINED_HASH_JOIN_POLICY_BROADCAST_THRESHOLD =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.broadcastThreshold")
+      .internal()
+      .doc("Under the pipelined hash join policy, the estimated build size at or below which " +
+        "a join is broadcast even when spark.sql.autoBroadcastJoinThreshold is lower. A tiny " +
+        "build keyed on a low-cardinality column would otherwise co-partition the probe side " +
+        "into a few skewed shuffle partitions.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("10MB")
+
+  val PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_CREATION_SIDE_THRESHOLD =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.runtimeFilterCreationSideThreshold")
+      .internal()
+      .doc("Under the pipelined hash join policy, the estimated size of a selective filtered " +
+        "scan at or below which it may create a runtime bloom filter for the other join side. " +
+        "Estimates without CBO ignore filter selectivity, so the default " +
+        "spark.sql.optimizer.runtime.bloomFilter.creationSideThreshold rarely admits a " +
+        "filtered fact or dimension scan. The effective threshold is the larger of the two.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("10GB")
+
+  val PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_EXPECTED_NUM_ITEMS =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.runtimeFilterExpectedNumItems")
+      .internal()
+      .doc("Under the pipelined hash join policy, the expected number of creation-side keys " +
+        "used to size a runtime bloom filter when the creation side has no row count. The " +
+        "number of bits is the optimal value for this many items at a 3% false-positive " +
+        "rate, capped by spark.sql.optimizer.runtime.bloomFilter.maxNumBits.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .longConf
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefault(10000000L)
+
+  val PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MAX_ESTIMATED_ITEMS =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy." +
+        "runtimeFilterMaxEstimatedItems")
+      .internal()
+      .doc("When the pipelined hash join policy sizes a runtime bloom filter without a row " +
+        "count, skip the filter if the policy's estimate of creation-side rows exceeds this.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .longConf
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefault(40000000L)
+
+  val PIPELINED_HASH_JOIN_POLICY_APPLY_TO_REGULAR =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.applyToRegular")
+      .internal()
+      .doc("Testing and attribution only: apply the pipelined join policy to queries that do " +
+        "not use distributed pipelined shuffle, so plan effects can be separated from " +
+        "transport effects.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_HASH_JOIN_POLICY_FACTOR =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.factor")
+      .internal()
+      .doc("Minimum ratio of the streamed side's estimated size to the build side's for the " +
+        "pipelined hash join policy to choose a shuffled hash join.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ >= 1, "must be at least 1")
+      .createWithDefault(2)
 
   val PIPELINED_SHUFFLE_FULL_PLAN_AQE_ENABLED =
     buildConf("spark.sql.adaptive.pipelinedShuffle.fullPlan.enabled")
@@ -8877,8 +9001,20 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def runtimeFilterBloomFilterEnabled: Boolean =
     getConf(RUNTIME_BLOOM_FILTER_ENABLED)
 
-  def runtimeFilterCreationSideThreshold: Long =
-    getConf(RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD)
+  def runtimeFilterCreationSideThreshold: Long = {
+    val threshold = getConf(RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD)
+    if (pipelinedHashJoinPolicyEnabled) {
+      math.max(threshold, getConf(PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_CREATION_SIDE_THRESHOLD))
+    } else {
+      threshold
+    }
+  }
+
+  /** Whether the pipelined join policy applies (see PIPELINED_HASH_JOIN_POLICY_ENABLED). */
+  def pipelinedHashJoinPolicyEnabled: Boolean =
+    getConf(PIPELINED_HASH_JOIN_POLICY_ENABLED) &&
+      (getConf(DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
+        getConf(PIPELINED_HASH_JOIN_POLICY_APPLY_TO_REGULAR))
 
   def runtimeFilterMaterializedCreationSideThreshold: Long =
     getConf(RUNTIME_BLOOM_FILTER_MATERIALIZED_CREATION_SIDE_THRESHOLD)

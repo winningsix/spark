@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.exchange
 
 import scala.collection.mutable
 
-import org.apache.spark.SparkEnv
+import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
@@ -183,11 +183,153 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       }.toSet
       logDebug("EnablePipelinedShuffle: using regular build inputs and pipelined streamed " +
         "inputs for shuffled hash joins.")
-      return rewriteExchanges(exchange =>
-        !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey))
+      return rewriteExchanges(capacityLimited(plan, exchange =>
+        !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey)))
     }
 
-    rewriteExchanges(_ => true)
+    rewriteExchanges(capacityLimited(plan, _ => true))
+  }
+
+  /**
+   * Bound each connected pipelined group by the cluster's concurrent task capacity.
+   *
+   * Group admission must place every task of every stage that reads a pipelined exchange at
+   * the same time (plus a minimum window for each pure producer). A long chain of pipelined
+   * joins therefore needs several times the available slots and can never be admitted. This
+   * mixes batch and pipelined execution instead: exchanges are kept pipelined bottom-up (the
+   * deepest exchanges move the most data) while the resulting group's reader demand fits the
+   * budget; an exchange that would exceed it is materialized as a regular shuffle, which cuts
+   * the group into independently admitted segments. Stage task counts are taken from the
+   * exchanges' partition counts.
+   */
+  private def capacityLimited(
+      plan: SparkPlan,
+      base: ShuffleExchangeExec => Boolean): ShuffleExchangeExec => Boolean = {
+    val fraction = conf.getConf(SQLConf.PIPELINED_SHUFFLE_GROUP_SLOT_FRACTION)
+    val budget = if (fraction <= 0 ||
+        SparkEnv.get.pipelinedShuffleManager.requiresSingleExecutor) {
+      0
+    } else {
+      SparkContext.getActive.map { sc =>
+        val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
+        math.floor(slots * fraction).toInt
+      }.getOrElse(0)
+    }
+    if (budget <= 0) return base
+
+    // Assign stage ids by walking exchange boundaries. A stage is the plan root, a subquery
+    // root, a broadcast build or an exchange's child; an exchange edge connects its producer
+    // stage (rooted at the exchange child) to the consumer stage that contains the exchange.
+    case class Edge(key: Int, consumer: Int, consumerTasks: Int, depth: Int)
+    val producerOf = mutable.HashMap.empty[Int, Int]
+    val exchangeOf = mutable.HashMap.empty[Int, ShuffleExchangeExec]
+    val edges = mutable.ArrayBuffer.empty[Edge]
+    // Materialized boundaries (broadcast builds, subqueries): (producer stage, consumer stage).
+    val barriers = mutable.ArrayBuffer.empty[(Int, Int)]
+    var nextStage = 0
+    def newStage(): Int = { nextStage += 1; nextStage }
+    def visit(node: SparkPlan, stage: Int, depth: Int): Unit = node match {
+      case e: ShuffleExchangeExec =>
+        edges += Edge(e.pipelinedReuseKey, stage, e.outputPartitioning.numPartitions, depth)
+        if (!producerOf.contains(e.pipelinedReuseKey)) {
+          val producer = newStage()
+          producerOf(e.pipelinedReuseKey) = producer
+          exchangeOf(e.pipelinedReuseKey) = e
+          visit(e.child, producer, depth + 1)
+        }
+      case ReusedExchangeExec(_, e: ShuffleExchangeExec) =>
+        edges += Edge(e.pipelinedReuseKey, stage, e.outputPartitioning.numPartitions, depth)
+      case b: BroadcastExchangeLike =>
+        val build = newStage()
+        barriers += ((build, stage))
+        visit(b.child, build, depth + 1)
+      case other =>
+        other.children.foreach(visit(_, stage, depth))
+        other.subqueries.foreach { sub =>
+          val subStage = newStage()
+          barriers += ((subStage, stage))
+          visit(sub, subStage, depth + 1)
+        }
+    }
+    visit(plan, newStage(), 0)
+
+    val parent = mutable.HashMap.empty[Int, Int]
+    def find(x: Int): Int = {
+      val p = parent.getOrElse(x, x)
+      if (p == x) x else { val r = find(p); parent(x) = r; r }
+    }
+    // Reader width per consumer stage over its kept pipelined inputs.
+    val readerTasks = mutable.HashMap.empty[Int, Int]
+    val kept = mutable.HashSet.empty[Int]
+    val rejected = mutable.HashSet.empty[Int]
+    // Deepest exchanges first; each reuse key is decided once for all of its consumers.
+    edges.groupBy(_.key).toSeq.sortBy { case (_, es) => -es.map(_.depth).max }.foreach {
+      case (key, es) if exchangeOf.contains(key) && base(exchangeOf(key)) =>
+        val producer = producerOf(key)
+        val stages = (producer +: es.map(_.consumer)).distinct
+        val roots = stages.map(find).distinct
+        // Tentatively merge: demand over the union of the affected groups.
+        val merged = roots.flatMap(r => (1 to nextStage).filter(find(_) == r)).distinct
+        val widths = mutable.HashMap.empty[Int, Int] ++= merged.flatMap(s => readerTasks.get(s).map(s -> _))
+        es.foreach(e => widths(e.consumer) = widths.getOrElse(e.consumer, 0) max e.consumerTasks)
+        val total = (merged ++ es.map(_.consumer)).distinct.iterator
+          .map(s => widths.get(s).map(_.toLong).getOrElse(1L)).sum
+        if (total <= budget) {
+          kept += key
+          es.foreach(e => readerTasks(e.consumer) =
+            readerTasks.getOrElse(e.consumer, 0) max e.consumerTasks)
+          stages.tail.foreach(s => parent(find(s)) = find(stages.head))
+        } else {
+          rejected += key
+        }
+      case _ =>
+    }
+    // A group is admitted only after all of its stages are submitted, and a stage is submitted
+    // only after its materialized parents finish. So no member may depend, through a regular
+    // exchange or another materialized boundary, on a member of its own group. Cutting a group
+    // can create such a path (e.g. through a reused exchange); detach the dependent reader.
+    var conflict = true
+    while (conflict) {
+      val group = mutable.HashMap.empty[Int, Int]
+      def root(x: Int): Int = {
+        val p = group.getOrElse(x, x)
+        if (p == x) x else { val r = root(p); group(x) = r; r }
+      }
+      val members = mutable.HashSet.empty[Int]
+      edges.filter(e => kept(e.key) && producerOf.contains(e.key)).foreach { e =>
+        members += producerOf(e.key) += e.consumer
+        val (a, b) = (root(producerOf(e.key)), root(e.consumer))
+        if (a != b) group(a) = b
+      }
+      val inputs = (edges.iterator.filter(e => producerOf.contains(e.key)).map { e =>
+        e.consumer -> (producerOf(e.key), kept(e.key))
+      } ++ barriers.iterator.map { case (p, c) => c -> (p, false) }).toSeq
+        .groupBy(_._1).view.mapValues(_.map(_._2)).toMap
+      def dependsRegularlyOnOwnGroup(stage: Int): Boolean = {
+        val seen = mutable.HashSet.empty[(Int, Boolean)]
+        def walk(s: Int, crossed: Boolean): Boolean = {
+          if (!seen.add((s, crossed))) return false
+          (crossed && members(s) && root(s) == root(stage)) ||
+            inputs.getOrElse(s, Nil).exists { case (p, pipelined) => walk(p, crossed || !pipelined) }
+        }
+        inputs.getOrElse(stage, Nil).exists { case (p, pipelined) => walk(p, !pipelined) }
+      }
+      val bad = members.toSeq.sorted.find(dependsRegularlyOnOwnGroup)
+      conflict = bad.isDefined
+      bad.foreach { stage =>
+        val keys = edges.filter(e => e.consumer == stage && kept(e.key)).map(_.key)
+        val detach = if (keys.nonEmpty) keys else {
+          edges.filter(e => kept(e.key) && producerOf.get(e.key).contains(stage)).map(_.key)
+        }
+        kept --= detach
+        rejected ++= detach
+      }
+    }
+    if (rejected.nonEmpty) {
+      logDebug(s"EnablePipelinedShuffle: ${rejected.size} exchange(s) kept regular so every " +
+        s"pipelined group fits $budget concurrent slots.")
+    }
+    exchange => base(exchange) && !rejected.contains(exchange.pipelinedReuseKey)
   }
 
   /** Check all child branches for a shuffle read through an unsupported consumer. */

@@ -24,7 +24,7 @@ import io.netty.buffer.{ByteBuf, ByteBufInputStream}
 
 import org.apache.spark.{SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
+import org.apache.spark.internal.config.{EXECUTOR_ID,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY,
   STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
@@ -202,11 +202,10 @@ class StreamingShuffleReader[K, C](
   } else {
     null
   }
-  private val compressionCodec = if (conf.get(SHUFFLE_COMPRESS)) {
-    Some(StreamingShuffleCompression.decompressor)
-  } else {
-    None
-  }
+  // Compression is detected per message (uncompressedSize != dataSize), and writers may use
+  // spark.shuffle.streaming.compress independently of spark.shuffle.compress. Keep a decoder
+  // available regardless of the local setting; the JNI codec loads lazily on first use.
+  private val compressionCodec = Some(StreamingShuffleCompression.decompressor)
   private val decompressionInput = new StreamingShuffleDecompressionInput
 
   private[spark] def terminationAckControlMessageSet =

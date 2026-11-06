@@ -37,7 +37,7 @@ import org.apache.spark.{PipelinedShuffleDependency, SparkContext, SparkEnv,
   StreamingShuffleTaskLocation, TaskContext}
 import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.config.{EXECUTOR_ID, SHUFFLE_COMPRESS,
-  STREAMING_SHUFFLE_CHECKSUM_ENABLED,
+  STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_COMPRESS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_CROSS_ROUTE_BATCH_SIZE,
   STREAMING_SHUFFLE_CROSS_ROUTE_MAX_IN_FLIGHT_BYTES,
@@ -187,7 +187,8 @@ class StreamingShuffleWriter[K, V](
   // Match the standard sort shuffle's spark.shuffle.compress behavior. Each DataMessage is one
   // independent raw block; this avoids constructing a framed OutputStream and copying through
   // it for every message.
-  private val compressionCodec = if (conf.get(SHUFFLE_COMPRESS)) {
+  private val compressionCodec =
+    if (conf.get(STREAMING_SHUFFLE_COMPRESS).getOrElse(conf.get(SHUFFLE_COMPRESS))) {
     Some(StreamingShuffleCompression.compressor)
   } else {
     None

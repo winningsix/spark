@@ -27,11 +27,14 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, ExtractFiltersAndInnerJoins, ExtractSingleColumnNullAwareAntiJoin}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.util.UnsafeRowUtils
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
 /**
@@ -323,7 +326,7 @@ trait JoinSelectionHelper extends Logging {
       if (hintOnly) {
         hintToShuffleHashJoinLeft(join.hint)
       } else {
-        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(join.left, conf) &&
+        (!preferSortMergeJoin(conf) && canBuildLocalHashMapBySize(join.left, conf) &&
           muchSmaller(join.left, join.right, conf)) || forceApplyShuffledHashJoin(conf)
       }
     }
@@ -331,13 +334,15 @@ trait JoinSelectionHelper extends Logging {
       if (hintOnly) {
         hintToShuffleHashJoinRight(join.hint)
       } else {
-        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(join.right, conf) &&
+        (!preferSortMergeJoin(conf) && canBuildLocalHashMapBySize(join.right, conf) &&
           muchSmaller(join.right, join.left, conf)) || forceApplyShuffledHashJoin(conf)
       }
     }
     getBuildSide(
-      canBuildShuffledHashJoinLeft(join.joinType) && shouldBuildLeft(),
-      canBuildShuffledHashJoinRight(join.joinType) && shouldBuildRight(),
+      canBuildShuffledHashJoinLeft(join.joinType) && shouldBuildLeft() &&
+        (hintOnly || !pipelinedHashJoinPolicy(conf) || join.joinType != LeftOuter),
+      canBuildShuffledHashJoinRight(join.joinType) && shouldBuildRight() &&
+        (hintOnly || !pipelinedHashJoinPolicy(conf) || join.joinType != RightOuter),
       join.left,
       join.right
     )
@@ -354,7 +359,12 @@ trait JoinSelectionHelper extends Logging {
   }
 
   def getSmallerSide(left: LogicalPlan, right: LogicalPlan): BuildSide = {
-    if (right.stats.sizeInBytes <= left.stats.sizeInBytes) BuildRight else BuildLeft
+    val conf = SQLConf.get
+    if (hashJoinSizeEstimate(right, conf) <= hashJoinSizeEstimate(left, conf)) {
+      BuildRight
+    } else {
+      BuildLeft
+    }
   }
 
   /**
@@ -364,6 +374,12 @@ trait JoinSelectionHelper extends Logging {
     val autoBroadcastJoinThreshold = if (plan.stats.isRuntime) {
       conf.getConf(SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD)
         .getOrElse(conf.autoBroadcastJoinThreshold)
+    } else if (pipelinedHashJoinPolicy(conf)) {
+      // A tiny build side keyed on a low-cardinality column (for example a filtered nation or
+      // region table) would co-partition the whole probe side into one or a few shuffle
+      // partitions. Broadcasting it instead keeps the probe side evenly parallel.
+      math.max(conf.autoBroadcastJoinThreshold,
+        conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_BROADCAST_THRESHOLD))
     } else {
       conf.autoBroadcastJoinThreshold
     }
@@ -547,9 +563,14 @@ trait JoinSelectionHelper extends Logging {
    * dynamic.
    */
   private def canBuildLocalHashMapBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
-    conf.getConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD) match {
+    val localMapThreshold = if (pipelinedHashJoinPolicy(conf)) {
+      Some(conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_LOCAL_MAP_THRESHOLD))
+    } else {
+      conf.getConf(SQLConf.MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD)
+    }
+    localMapThreshold match {
       case Some(threshold) =>
-        val size = plan.stats.sizeInBytes
+        val size = hashJoinSizeEstimate(plan, conf)
         !plan.isStreaming && threshold > 0 && size < conf.defaultSizeInBytes &&
           size <= BigInt(threshold) * conf.numShufflePartitions
       case None =>
@@ -566,7 +587,125 @@ trait JoinSelectionHelper extends Logging {
    * use the size of bytes here as estimation.
    */
   private def muchSmaller(a: LogicalPlan, b: LogicalPlan, conf: SQLConf): Boolean = {
-    a.stats.sizeInBytes * conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR) <= b.stats.sizeInBytes
+    val factor = if (pipelinedHashJoinPolicy(conf)) {
+      conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_FACTOR)
+    } else {
+      conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR)
+    }
+    hashJoinSizeEstimate(a, conf) * factor <= hashJoinSizeEstimate(b, conf)
+  }
+
+  /**
+   * Whether the pipelined-execution hash join policy applies to this query.
+   *
+   * A sort is a pipeline breaker: a sort-merge join cannot emit a row until both inputs are
+   * fully sorted, which defeats concurrent producer/consumer execution and forces large
+   * sorts to spill. Pipelined execution already materializes every shuffled-hash-join build
+   * subtree before its probe pipeline starts, so the build side is a bounded, durable input
+   * and the large side can stream through the probe without sorting. When distributed
+   * pipelined shuffle is enabled for the query and this policy is on, static join selection
+   * therefore prefers a shuffled hash join whenever the (join-aware) estimated build input
+   * fits the policy's per-partition threshold and is at least the policy factor smaller than
+   * the streamed side. It never builds the preserved side of an outer join, whose hash table
+   * must also track matches. Regular (non-pipelined) queries are unaffected.
+   */
+  private def pipelinedHashJoinPolicy(conf: SQLConf): Boolean =
+    conf.pipelinedHashJoinPolicyEnabled
+
+  private def preferSortMergeJoin(conf: SQLConf): Boolean =
+    conf.preferSortMergeJoin && !pipelinedHashJoinPolicy(conf)
+
+  /** Row estimate used by the pipelined hash join policy (filter- and join-aware). */
+  def pipelinedPolicyRowEstimate(plan: LogicalPlan, conf: SQLConf): BigInt =
+    hashJoinSizeEstimate(plan, conf) / EstimationUtils.getSizePerRow(plan.output).max(1)
+
+  /**
+   * Size estimate used only for static shuffled-hash-join selection (and, under the pipelined
+   * hash join policy, to skip saturated runtime bloom filters).
+   *
+   * Without CBO, an equi-join's sizeInBytes is the product of its children's sizes and a filter
+   * keeps its child's size, which makes every join output ineligible as a hash-join build side
+   * and makes a filtered fact table look as large as an unfiltered one. When
+   * SQLConf.HASH_JOIN_EQUI_JOIN_SIZE_ESTIMATE or the pipelined hash join policy is enabled:
+   *  - a filter scales its child's rows by a heuristic selectivity;
+   *  - an inner equi-join is treated as a key/foreign-key join: it keeps the larger input's rows
+   *    scaled by the fraction of base rows that survive the smaller input's filters (a filtered
+   *    dimension filters the fact side);
+   *  - a semi join keeps its left rows scaled by the right side's fraction, and an anti or outer
+   *    join keeps its preserved side's rows;
+   * all scaled by output row width and capped by the logical sizeInBytes. This only changes
+   * which side may be built; it does not alter logical statistics used by any other rule.
+   */
+  private def hashJoinSizeEstimate(plan: LogicalPlan, conf: SQLConf): BigInt = {
+    if (!conf.getConf(SQLConf.HASH_JOIN_EQUI_JOIN_SIZE_ESTIMATE) &&
+        !pipelinedHashJoinPolicy(conf)) {
+      return plan.stats.sizeInBytes
+    }
+    def width(p: LogicalPlan): BigInt = EstimationUtils.getSizePerRow(p.output)
+    def rows(p: LogicalPlan): BigInt = estimate(p) / width(p).max(1)
+    def scale(n: BigInt, f: Double): BigInt = (BigDecimal(n) * BigDecimal(f)).toBigInt.max(1)
+    // Fraction of the underlying base rows that survive filters (and filtered dimension joins).
+    // A foreign-key join keeps the larger side's rows scaled by the smaller side's fraction.
+    def fraction(p: LogicalPlan): Double = p match {
+      case Filter(condition, child) => fraction(child) * filterSelectivity(condition)
+      case Project(_, child) => fraction(child)
+      case ExtractEquiJoinKeys(joinType, _, _, _, _, left, right, _) => joinType match {
+        case Inner | LeftSemi => fraction(left) * fraction(right)
+        case LeftAnti | LeftOuter => fraction(left)
+        case RightOuter => fraction(right)
+        case _ => 1.0
+      }
+      case _ => 1.0
+    }
+    def estimate(p: LogicalPlan): BigInt = {
+      val estimated = p match {
+        case j @ ExtractEquiJoinKeys(joinType, _, _, _, _, left, right, _) => joinType match {
+          case Inner =>
+            val (l, r) = (rows(left), rows(right))
+            val smaller = if (l >= r) right else left
+            scale(l.max(r), fraction(smaller)) * width(j)
+          case LeftSemi => scale(rows(left), fraction(right)) * width(j)
+          case LeftAnti | LeftOuter => rows(left) * width(j)
+          case RightOuter => rows(right) * width(j)
+          case _ => p.stats.sizeInBytes
+        }
+        case Project(_, child) => rows(child) * width(p)
+        case Filter(condition, child) => scale(rows(child), filterSelectivity(condition)) * width(p)
+        case _ => p.stats.sizeInBytes
+      }
+      estimated.min(p.stats.sizeInBytes)
+    }
+    estimate(plan)
+  }
+
+  /**
+   * Heuristic selectivity of a filter condition, used only by [[hashJoinSizeEstimate]].
+   * Without column statistics, a filtered scan is otherwise estimated at its full size, which
+   * makes a heavily filtered fact table look larger than an unfiltered one and picks the wrong
+   * hash-join build side. Null checks are free; equality, IN lists, ranges and pattern
+   * matches each reduce the estimate by a fixed factor.
+   */
+  private def filterSelectivity(condition: Expression): Double = {
+    def selectivity(e: Expression): Double = e match {
+      case And(left, right) => selectivity(left) * selectivity(right)
+      case Or(left, right) =>
+        val (l, r) = (selectivity(left), selectivity(right))
+        math.min(1.0, l + r - l * r)
+      case Not(child) => math.max(0.5, 1.0 - selectivity(child))
+      case _: IsNotNull => 1.0
+      // Without column statistics an equality may hit a low-cardinality column (e.g. a flag),
+      // so stay conservative: underestimating a hash build side risks an executor OOM.
+      // Single-character string codes are typically status flags with a tiny domain.
+      case EqualTo(_, Literal(v: UTF8String, _: StringType)) if v.numChars() <= 1 => 0.5
+      case EqualTo(Literal(v: UTF8String, _: StringType), _) if v.numChars() <= 1 => 0.5
+      case _: EqualTo | _: EqualNullSafe => 0.25
+      case in: In => math.min(1.0, 0.25 * in.list.size)
+      case in: InSet => math.min(1.0, 0.25 * in.hset.size)
+      case _: LessThan | _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual => 0.5
+      case _: Like | _: StartsWith | _: EndsWith | _: Contains => 0.25
+      case _ => 1.0
+    }
+    math.max(0.001, selectivity(condition))
   }
 
   /**
