@@ -191,10 +191,15 @@ private[spark] class StreamingShuffleGroupAdmission(
     groups.filter(g => g.allTaskSetsSubmitted && !g.failed && g.readyAt.isEmpty)
       .foreach(_.readyAt = Some(now))
     expire(now)
+    // A member of a group whose task sets are not all submitted cannot launch, so it is not
+    // earlier pending work that a complete group should age behind.
+    val head = ordered.find { m =>
+      byStage.get(m.stageId).forall(g => g.allTaskSetsSubmitted && !g.failed)
+    }
     val candidates = ordered.flatMap(m => byStage.get(m.stageId)).distinct
       .filter(g => g.allTaskSetsSubmitted && !g.failed && !g.admitted && !g.allStagesFinished)
       .filter { g =>
-        g.slots.nonEmpty || ordered.headOption.exists(m => g.managers.contains(m.stageId)) ||
+        g.slots.nonEmpty || head.exists(m => g.managers.contains(m.stageId)) ||
           g.readyAt.exists(t => now - t >= agingMs)
       }
     val active = groups.count(g => !g.failed && !g.allStagesFinished &&

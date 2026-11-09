@@ -322,11 +322,21 @@ trait JoinSelectionHelper extends Logging {
       join: Join,
       hintOnly: Boolean,
       conf: SQLConf): Option[BuildSide] = {
+    // Building the left side of a left semi/anti join avoids sorting the (usually much larger)
+    // right side, and the relation holds only the projected left rows, so the policy allows a
+    // proportionally larger build there.
+    val leftBuildFactor = if (pipelinedHashJoinPolicy(conf) &&
+        (join.joinType == LeftSemi || join.joinType == LeftAnti)) {
+      conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_BUILD_LEFT_EXISTENCE_THRESHOLD_FACTOR)
+    } else {
+      1.0
+    }
     def shouldBuildLeft(): Boolean = {
       if (hintOnly) {
         hintToShuffleHashJoinLeft(join.hint)
       } else {
-        (!preferSortMergeJoin(conf) && canBuildLocalHashMapBySize(join.left, conf) &&
+        (!preferSortMergeJoin(conf) &&
+          canBuildLocalHashMapBySize(join.left, conf, leftBuildFactor) &&
           muchSmaller(join.left, join.right, conf)) || forceApplyShuffledHashJoin(conf)
       }
     }
@@ -338,8 +348,14 @@ trait JoinSelectionHelper extends Logging {
           muchSmaller(join.right, join.left, conf)) || forceApplyShuffledHashJoin(conf)
       }
     }
+    // Under the policy a left semi/anti join may also build its (smaller) left side, which
+    // ShuffledHashJoinExec supports by marking matches while streaming the right side.
+    val canBuildLeft = canBuildShuffledHashJoinLeft(join.joinType) ||
+      (!hintOnly && pipelinedHashJoinPolicy(conf) &&
+        conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_BUILD_LEFT_EXISTENCE) &&
+        (join.joinType == LeftSemi || join.joinType == LeftAnti))
     getBuildSide(
-      canBuildShuffledHashJoinLeft(join.joinType) && shouldBuildLeft() &&
+      canBuildLeft && shouldBuildLeft() &&
         (hintOnly || !pipelinedHashJoinPolicy(conf) || join.joinType != LeftOuter),
       canBuildShuffledHashJoinRight(join.joinType) && shouldBuildRight() &&
         (hintOnly || !pipelinedHashJoinPolicy(conf) || join.joinType != RightOuter),
@@ -562,7 +578,10 @@ trait JoinSelectionHelper extends Logging {
    * Note: this assume that the number of partition is fixed, requires additional work if it's
    * dynamic.
    */
-  private def canBuildLocalHashMapBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
+  private def canBuildLocalHashMapBySize(
+      plan: LogicalPlan,
+      conf: SQLConf,
+      thresholdFactor: Double = 1.0): Boolean = {
     val localMapThreshold = if (pipelinedHashJoinPolicy(conf)) {
       Some(conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_LOCAL_MAP_THRESHOLD))
     } else {
@@ -572,7 +591,7 @@ trait JoinSelectionHelper extends Logging {
       case Some(threshold) =>
         val size = hashJoinSizeEstimate(plan, conf)
         !plan.isStreaming && threshold > 0 && size < conf.defaultSizeInBytes &&
-          size <= BigInt(threshold) * conf.numShufflePartitions
+          BigDecimal(size) <= BigDecimal(threshold) * thresholdFactor * conf.numShufflePartitions
       case None =>
         plan.stats.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
     }
@@ -620,6 +639,23 @@ trait JoinSelectionHelper extends Logging {
     hashJoinSizeEstimate(plan, conf) / EstimationUtils.getSizePerRow(plan.output).max(1)
 
   /**
+   * Heuristic fraction of the underlying base rows that survive a plan's filters and filtered
+   * dimension joins, used by the pipelined hash join policy. A foreign-key join keeps the larger
+   * side's rows scaled by the smaller side's fraction.
+   */
+  def pipelinedPolicyRowFraction(plan: LogicalPlan): Double = plan match {
+    case Filter(condition, child) => pipelinedPolicyRowFraction(child) * filterSelectivity(condition)
+    case Project(_, child) => pipelinedPolicyRowFraction(child)
+    case ExtractEquiJoinKeys(joinType, _, _, _, _, left, right, _) => joinType match {
+      case Inner | LeftSemi => pipelinedPolicyRowFraction(left) * pipelinedPolicyRowFraction(right)
+      case LeftAnti | LeftOuter => pipelinedPolicyRowFraction(left)
+      case RightOuter => pipelinedPolicyRowFraction(right)
+      case _ => 1.0
+    }
+    case _ => 1.0
+  }
+
+  /**
    * Size estimate used only for static shuffled-hash-join selection (and, under the pipelined
    * hash join policy, to skip saturated runtime bloom filters).
    *
@@ -644,19 +680,7 @@ trait JoinSelectionHelper extends Logging {
     def width(p: LogicalPlan): BigInt = EstimationUtils.getSizePerRow(p.output)
     def rows(p: LogicalPlan): BigInt = estimate(p) / width(p).max(1)
     def scale(n: BigInt, f: Double): BigInt = (BigDecimal(n) * BigDecimal(f)).toBigInt.max(1)
-    // Fraction of the underlying base rows that survive filters (and filtered dimension joins).
-    // A foreign-key join keeps the larger side's rows scaled by the smaller side's fraction.
-    def fraction(p: LogicalPlan): Double = p match {
-      case Filter(condition, child) => fraction(child) * filterSelectivity(condition)
-      case Project(_, child) => fraction(child)
-      case ExtractEquiJoinKeys(joinType, _, _, _, _, left, right, _) => joinType match {
-        case Inner | LeftSemi => fraction(left) * fraction(right)
-        case LeftAnti | LeftOuter => fraction(left)
-        case RightOuter => fraction(right)
-        case _ => 1.0
-      }
-      case _ => 1.0
-    }
+    def fraction(p: LogicalPlan): Double = pipelinedPolicyRowFraction(p)
     def estimate(p: LogicalPlan): BigInt = {
       val estimated = p match {
         case j @ ExtractEquiJoinKeys(joinType, _, _, _, _, left, right, _) => joinType match {

@@ -88,6 +88,20 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
             conf.getConf(SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MAX_ESTIMATED_ITEMS)) {
           return filterApplicationSidePlan
         }
+        // A creation side larger than Spark's default threshold is only admitted by the policy.
+        // When its filters are estimated to keep most rows, the bloom filter cannot remove much
+        // of the application side, yet its creation job delays that side's scan. Skip it.
+        // Likewise, when the application side's own filters already keep few rows, the bloom
+        // filter can only remove little work beyond the application-side scan itself.
+        if (filterCreationSidePlan.stats.sizeInBytes >
+              conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD) &&
+            (pipelinedPolicyRowFraction(filterCreationSidePlan) > conf.getConf(
+                SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MAX_CREATION_FRACTION) ||
+             pipelinedPolicyRowFraction(filterApplicationSidePlan) <
+              conf.getConf(
+                SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MIN_APPLICATION_FRACTION))) {
+          return filterApplicationSidePlan
+        }
         val numBits = math.min(
           org.apache.spark.util.sketch.BloomFilter.optimalNumOfBits(expectedNumItems, 0.03),
           conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_BITS))

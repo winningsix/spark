@@ -23,7 +23,7 @@ import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -158,7 +158,8 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
     val memoryRetainingJoins = plan.collectWithSubqueries {
       case join: ShuffledHashJoinExec => join
     }
-    if (memoryRetainingJoins.nonEmpty && supportsUnmaterializedRegularBoundary) {
+    if (memoryRetainingJoins.nonEmpty && supportsUnmaterializedRegularBoundary &&
+        conf.getConf(SQLConf.PIPELINED_SHUFFLE_REGULAR_BUILD_INPUTS)) {
       val pipelineNestedProbes = conf.getConf(SQLConf.PIPELINED_SHUFFLE_NESTED_PROBE_ENABLED)
       // A durable exchange cuts the consumer's build dependency. Exchanges below that cut
       // belong to another execution segment and need not all be materialized. Still protect
@@ -169,9 +170,21 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
           Seq(exchange.pipelinedReuseKey)
         case other => other.children.flatMap(buildFrontier)
       }
+      // Optionally pipeline a build side whose subtree has no shuffle-based join: its producers
+      // then start together with the probe producers instead of materializing first, while the
+      // reader still consumes the whole build input before probing. A build subtree that itself
+      // contains a shuffled join stays regular (and so do any exchanges nested under it), which
+      // bounds how many memory-retaining operators run concurrently.
+      val pipelineSimpleBuilds = conf.getConf(SQLConf.PIPELINED_SHUFFLE_SIMPLE_BUILD_INPUTS)
+      def hasShuffledJoin(node: SparkPlan): Boolean = node.exists {
+        case _: ShuffledHashJoinExec | _: SortMergeJoinExec => true
+        case _ => false
+      }
       val regularBuildExchangeKeys: Set[Int] = memoryRetainingJoins.iterator.flatMap { join =>
         val buildPlan = if (join.buildSide == BuildLeft) join.left else join.right
-        if (pipelineNestedProbes) {
+        if (pipelineSimpleBuilds && !hasShuffledJoin(buildPlan)) {
+          Nil
+        } else if (pipelineNestedProbes) {
           buildFrontier(buildPlan)
         } else {
           buildPlan.collect {

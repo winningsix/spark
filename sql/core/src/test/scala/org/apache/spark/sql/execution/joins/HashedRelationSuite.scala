@@ -741,6 +741,47 @@ abstract class HashedRelationSuite extends SharedSparkSession {
     unsafeRelation.close()
   }
 
+  test("LongHashedRelation supports key index methods in dense and sparse modes") {
+    val key = Seq(BoundReference(0, LongType, false))
+    val unsafeProj = UnsafeProjection.create(
+      Seq(BoundReference(0, LongType, false), BoundReference(1, IntegerType, false)))
+    // Contiguous keys become a dense map; widely spread keys stay sparse.
+    Seq(1L, 1000003L).foreach { stride =>
+      val rows = (0 until 100).map(i => unsafeProj(InternalRow((i % 10) * stride, i)).copy())
+      val relation = LongHashedRelation(rows.iterator, key, 10, mm)
+        .asInstanceOf[LongHashedRelation]
+      assert(!relation.keyIsUnique)
+      val keyIndexOf = mutable.HashMap.empty[Long, Int]
+      val valuesOf = mutable.HashMap.empty[Int, Seq[Int]]
+      (0 until 10).foreach { k =>
+        val probe = unsafeProj(InternalRow(k * stride, 0))
+        val values = relation.getWithKeyIndex(probe).map(v => (v.getKeyIndex, v.getValue.getInt(1)))
+          .toSeq
+        val keyIndex = values.head._1
+        assert(keyIndex >= 0 && keyIndex < relation.maxNumKeysIndex)
+        assert(values.forall(_._1 == keyIndex))
+        assert(values.map(_._2).sorted === (0 until 10).map(j => j * 10 + k))
+        assert(relation.getValueWithKeyIndex(probe).getKeyIndex == keyIndex)
+        keyIndexOf(k * stride) = keyIndex
+        valuesOf(keyIndex) = values.map(_._2)
+      }
+      assert(keyIndexOf.values.toSet.size == 10)
+      // A key larger than every inserted key.
+      val absent = unsafeProj(InternalRow(10 * stride + 1, 0))
+      assert(relation.getWithKeyIndex(absent) == null)
+      assert(relation.getValueWithKeyIndex(absent) == null)
+      // Iterating all values yields the same key index and per-key value order as lookups.
+      val all = relation.valuesWithKeyIndex().map(v => (v.getKeyIndex, v.getValue.getLong(0),
+        v.getValue.getInt(1))).toSeq
+      assert(all.size == 100)
+      all.groupBy(_._1).foreach { case (keyIndex, group) =>
+        assert(keyIndexOf(group.head._2) == keyIndex)
+        assert(group.map(_._3) === valuesOf(keyIndex))
+      }
+      relation.close()
+    }
+  }
+
   test("LongToUnsafeRowMap support ignoresDuplicatedKey") {
     val unsafeProj = UnsafeProjection.create(Seq(BoundReference(0, LongType, false)))
     val keys = Seq(1L, 1L, 1L)

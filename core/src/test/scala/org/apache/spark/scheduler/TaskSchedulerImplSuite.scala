@@ -3667,6 +3667,28 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
   }
 
+  test("reserved pipeline does not age behind an incomplete group's submitted member") {
+    withReservedPipeline(Seq(
+        config.STREAMING_SHUFFLE_GROUP_RESERVATION_DELAY.key -> "5s")) { (scheduler, requests) =>
+      // The later group's producer is submitted first, but its reader is not, so it can't launch.
+      val laterProducer = reservedPipelineTasks(0, 2, Seq.empty, Some(8))
+      val laterReader = reservedPipelineTasks(1, 1, Seq(8), None)
+      val producer = reservedPipelineTasks(2, 2, Seq.empty, Some(7))
+      val reader = reservedPipelineTasks(3, 1, Seq(7), None)
+      registerReservedPipeline(scheduler, Seq(producer, reader))
+      registerReservedPipeline(scheduler, Seq(laterProducer, laterReader), jobId = 1)
+      Seq(laterProducer, producer, reader).foreach(scheduler.submitTasks)
+      val managers = Seq(0, 2, 3).map(id => scheduler.taskSetManagerForAttempt(id, 0).get)
+      val admission = scheduler.pipelinedAdmission
+      val offers = IndexedSeq(WorkerOffer("executor0", "host0", 4))
+      admission.prepare(managers, offers, Array(BigDecimal(4)), Set("executor0"), 0)
+      assert(admission.reservedSlots === 2)
+      assert(admission.admitted(2) && admission.admitted(3))
+      assert(!admission.admitted(0))
+      assert(requests.isEmpty)
+    }
+  }
+
   test("reserved pipeline limits concurrent groups and releases successful stages") {
     withReservedPipeline() { (scheduler, requests) =>
       val first = Seq(reservedPipelineTasks(0, 1, Seq.empty, Some(7)),

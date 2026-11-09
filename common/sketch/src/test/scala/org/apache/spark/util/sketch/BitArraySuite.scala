@@ -17,6 +17,8 @@
 
 package org.apache.spark.util.sketch
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
+
 import scala.util.Random
 
 import org.scalatest.funsuite.AnyFunSuite // scalastyle:ignore funsuite
@@ -54,6 +56,33 @@ class BitArraySuite extends AnyFunSuite { // scalastyle:ignore funsuite
     indexes.foreach(bitArray.set)
     indexes.foreach(i => assert(bitArray.get(i)))
     assert(bitArray.cardinality() == indexes.length)
+  }
+
+  test("serialization keeps the per-word big-endian format across buffer chunks") {
+    val r = new Random(37)
+    // Spans several I/O chunks plus a partial one.
+    for (numWords <- Seq(1, 8191, 8192, 8193, 3 * 8192 + 17)) {
+      val bitArray = new BitArray(64L * numWords)
+      (1 to 2000).foreach(_ => bitArray.set((r.nextLong() & Long.MaxValue) % (64L * numWords)))
+      val bytes = new ByteArrayOutputStream()
+      bitArray.writeTo(new DataOutputStream(bytes))
+
+      // Decode word by word as the previous per-word DataOutput format.
+      val in = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray))
+      assert(in.readInt() == numWords)
+      val decoded = new BitArray(64L * numWords)
+      for (w <- 0 until numWords) {
+        val word = in.readLong()
+        (0 until 64).filter(b => ((word >>> b) & 1L) == 1L).foreach(b => decoded.set(64L * w + b))
+      }
+      assert(in.read() == -1)
+      assert(decoded == bitArray)
+
+      val roundTrip = BitArray.readFrom(new DataInputStream(
+        new ByteArrayInputStream(bytes.toByteArray)))
+      assert(roundTrip == bitArray)
+      assert(roundTrip.cardinality() == bitArray.cardinality())
+    }
   }
 
   test("merge") {

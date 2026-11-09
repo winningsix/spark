@@ -21,10 +21,11 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.expressions.Cast.{toSQLExpr, toSQLId, toSQLType}
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode, JavaCode, TrueLiteral}
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, EmptyBlock, ExprCode, FalseLiteral, JavaCode, TrueLiteral}
 import org.apache.spark.sql.catalyst.expressions.codegen.Block.BlockHelper
 import org.apache.spark.sql.catalyst.optimizer.ScalarSubqueryReference
 import org.apache.spark.sql.catalyst.trees.TreePattern.OUTER_REFERENCE
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.util.sketch.BloomFilter
 
@@ -94,9 +95,16 @@ case class BloomFilterMightContain(
     if (bytes == null) null else deserialize(bytes)
   }
 
+  // A filter that is too full to remove many rows is not worth a hash and several random bit
+  // probes per input row. Returning true is always correct for "might contain".
+  @transient private lazy val saturated = bloomFilter != null &&
+    bloomFilter.expectedFpp() > SQLConf.get.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_EXPECTED_FPP)
+
   override def eval(input: InternalRow): Any = {
     if (bloomFilter == null) {
       null
+    } else if (saturated) {
+      true
     } else {
       val value = valueExpression.eval(input)
       if (value == null) null else bloomFilter.mightContainLong(value.asInstanceOf[Long])
@@ -106,6 +114,8 @@ case class BloomFilterMightContain(
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     if (bloomFilter == null) {
       ev.copy(isNull = TrueLiteral, value = JavaCode.defaultLiteral(dataType))
+    } else if (saturated) {
+      ev.copy(code = EmptyBlock, isNull = FalseLiteral, value = TrueLiteral)
     } else {
       val bf = ctx.addReferenceObj("bloomFilter", bloomFilter, classOf[BloomFilter].getName)
       val valueEval = valueExpression.genCode(ctx)

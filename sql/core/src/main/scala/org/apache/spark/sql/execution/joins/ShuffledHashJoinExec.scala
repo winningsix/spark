@@ -62,6 +62,8 @@ case class ShuffledHashJoinExec private (
     case FullOuter => Nil
     case LeftOuter if buildSide == BuildLeft => Nil
     case RightOuter if buildSide == BuildRight => Nil
+    // A left semi/anti join that builds the left side emits rows by iterating the hash relation.
+    case LeftSemi | LeftAnti if buildSide == BuildLeft => Nil
     case _ => super.outputOrdering
   }
 
@@ -92,7 +94,9 @@ case class ShuffledHashJoinExec private (
 
   // Exposed for testing
   @transient lazy val ignoreDuplicatedKey = joinType match {
-    case LeftExistence(_) =>
+    // Only an existence join that builds the right side may collapse duplicate build keys; a
+    // build-left semi/anti join outputs every build row.
+    case LeftExistence(_) if buildSide == BuildRight =>
       condition.forall(validCondForIgnoreDupKey(_))
     case _ => false
   }
@@ -110,9 +114,13 @@ case class ShuffledHashJoinExec private (
       buildBoundKeys,
       taskMemoryManager = context.taskMemoryManager(),
       // build-side or full outer join needs support for NULL key in HashedRelation.
+      // A build-left anti join must also emit NULL-keyed build rows (they never match). A
+      // build-left semi join never emits them, so it can drop them and use the compact long-key
+      // relation, which also supports the key indices used to track matches.
       allowsNullKey = joinType == FullOuter ||
         (joinType == LeftOuter && buildSide == BuildLeft) ||
-        (joinType == RightOuter && buildSide == BuildRight),
+        (joinType == RightOuter && buildSide == BuildRight) ||
+        (joinType == LeftAnti && buildSide == BuildLeft),
       ignoresDuplicatedKey = ignoreDuplicatedKey)
     buildTime += NANOSECONDS.toMillis(System.nanoTime() - start)
     buildDataSize += relation.estimatedSize
@@ -132,8 +140,87 @@ case class ShuffledHashJoinExec private (
           buildSideOrFullOuterJoin(streamIter, hashed, numOutputRows, isFullOuterJoin = false)
         case RightOuter if buildSide.equals(BuildRight) =>
           buildSideOrFullOuterJoin(streamIter, hashed, numOutputRows, isFullOuterJoin = false)
+        case LeftSemi | LeftAnti if buildSide.equals(BuildLeft) =>
+          buildLeftExistenceJoin(streamIter, hashed, numOutputRows)
         case _ => join(streamIter, hashed, numOutputRows)
       }
+    }
+  }
+
+  /**
+   * Left semi/anti join that builds the left side. The right side is streamed only to mark
+   * which build rows have a match; afterwards the hash relation is iterated and each left row
+   * is emitted once if it matched (semi) or did not match (anti).
+   *  - Without a join condition a row matches iff its key does, so matches are tracked per key
+   *    index in a bit set.
+   *  - With a condition each (key index, value index) pair is tracked, as in the build-side
+   *    outer join with non-unique keys.
+   * A NULL join key never matches: such right rows are skipped, and NULL-keyed left rows (kept
+   * in the relation only for anti joins) are never marked.
+   */
+  private def buildLeftExistenceJoin(
+      streamIter: Iterator[InternalRow],
+      hashedRelation: HashedRelation,
+      numOutputRows: SQLMetric): Iterator[InternalRow] = {
+    val emitMatched = joinType == LeftSemi
+    val joinKeys = streamSideKeyGenerator()
+    val joinRow = new JoinedRow
+
+    val emitted: Iterator[InternalRow] = if (condition.isEmpty) {
+      val matchedKeys = new BitSet(hashedRelation.maxNumKeysIndex)
+      longMetric("buildDataSize") += matchedKeys.capacity / 8
+      streamIter.foreach { srow =>
+        val keys = joinKeys(srow)
+        if (!keys.anyNull) {
+          val buildIter = hashedRelation.getWithKeyIndex(keys)
+          if (buildIter != null && buildIter.hasNext) {
+            matchedKeys.set(buildIter.next().getKeyIndex)
+          }
+        }
+      }
+      hashedRelation.valuesWithKeyIndex().collect {
+        case v if matchedKeys.get(v.getKeyIndex) == emitMatched => v.getValue
+      }
+    } else {
+      val matchedRows = new OpenHashSet[Long]
+      JoinHelper.recordOpenHashSetMemoryUsageOnTaskCompletion(
+        matchedRows, longMetric("buildDataSize"))
+      streamIter.foreach { srow =>
+        val keys = joinKeys(srow)
+        if (!keys.anyNull) {
+          val buildIter = hashedRelation.getWithKeyIndex(keys)
+          if (buildIter != null) {
+            var valueIndex = -1
+            while (buildIter.hasNext) {
+              val buildRowWithKeyIndex = buildIter.next()
+              valueIndex += 1
+              val rowIndex = (buildRowWithKeyIndex.getKeyIndex.toLong << 32) | valueIndex
+              // boundCondition is bound to left (build) output followed by right output.
+              if (!matchedRows.contains(rowIndex) &&
+                  boundCondition(joinRow(buildRowWithKeyIndex.getValue, srow))) {
+                matchedRows.add(rowIndex)
+              }
+            }
+          }
+        }
+      }
+      var prevKeyIndex = -1
+      var valueIndex = -1
+      hashedRelation.valuesWithKeyIndex().flatMap { v =>
+        val keyIndex = v.getKeyIndex
+        if (keyIndex != prevKeyIndex) {
+          valueIndex = 0
+          prevKeyIndex = keyIndex
+        } else {
+          valueIndex += 1
+        }
+        val matched = matchedRows.contains((keyIndex.toLong << 32) | valueIndex)
+        if (matched == emitMatched) Some(v.getValue) else None
+      }
+    }
+    emitted.map { r =>
+      numOutputRows += 1
+      r
     }
   }
 
@@ -361,6 +448,7 @@ case class ShuffledHashJoinExec private (
       conf.getConf(SQLConf.ENABLE_BUILD_SIDE_OUTER_SHUFFLED_HASH_JOIN_CODEGEN)
     case RightOuter if buildSide == BuildRight =>
       conf.getConf(SQLConf.ENABLE_BUILD_SIDE_OUTER_SHUFFLED_HASH_JOIN_CODEGEN)
+    case LeftSemi | LeftAnti if buildSide == BuildLeft => false
     case _ => true
   }
 

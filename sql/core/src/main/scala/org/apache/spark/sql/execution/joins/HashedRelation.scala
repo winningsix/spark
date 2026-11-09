@@ -706,6 +706,66 @@ private[execution] final class LongToUnsafeRowMap(
   }
 
   /**
+   * Upper bound (exclusive) of the key indices returned by [[getWithKeyIndex]] and
+   * [[valuesWithKeyIndex]]: the dense array index, or the sparse key slot number.
+   */
+  def maxNumKeysIndex: Int = if (isDense) array.size().toInt else (array.size() / 2).toInt
+
+  /**
+   * Returns an iterator over the values of `key` tagged with the key's index, or null if the key
+   * is absent. Values are returned in the same chain order as [[valuesWithKeyIndex]], so a value's
+   * position within its key is consistent between the two.
+   */
+  def getWithKeyIndex(
+      key: Long,
+      resultRow: UnsafeRow,
+      holder: ValueRowWithKeyIndex): Iterator[ValueRowWithKeyIndex] = {
+    var keyIndex = -1
+    var address = 0L
+    if (isDense) {
+      if (key >= minKey && key <= maxKey) {
+        val index = (key - minKey).toInt
+        val value = array.get(index)
+        if (value > 0) {
+          keyIndex = index
+          address = value
+        }
+      }
+    } else {
+      var pos = firstSlot(key)
+      while (keyIndex < 0 && array.get(pos + 1) != 0) {
+        if (array.get(pos) == key) {
+          keyIndex = pos >> 1
+          address = array.get(pos + 1)
+        } else {
+          pos = nextSlot(pos)
+        }
+      }
+    }
+    if (keyIndex < 0) {
+      null
+    } else {
+      holder.withNewKeyIndex(keyIndex)
+      valueIter(address, resultRow).map(holder.withNewValue)
+    }
+  }
+
+  /** Returns an iterator over every value tagged with its key's index. */
+  def valuesWithKeyIndex(
+      resultRow: UnsafeRow,
+      holder: ValueRowWithKeyIndex): Iterator[ValueRowWithKeyIndex] = {
+    val step = if (isDense) 1 else 2
+    val slots = Iterator.range(0, array.size().toInt, step).filter { pos =>
+      if (isDense) array.get(pos) > 0 else array.get(pos + 1) != 0
+    }
+    slots.flatMap { pos =>
+      val address = if (isDense) array.get(pos) else array.get(pos + 1)
+      holder.withNewKeyIndex(if (isDense) pos else pos >> 1)
+      valueIter(address, resultRow).map(holder.withNewValue)
+    }
+  }
+
+  /**
    * Builds an iterator on a sparse array.
    */
   def keys(): Iterator[InternalRow] = {
@@ -1044,21 +1104,26 @@ class LongHashedRelation(
    */
   override def keys(): Iterator[InternalRow] = map.keys()
 
+  // Reused holder for key-index lookups; a relation is used by one thread at a time.
+  @transient private lazy val valueRowWithKeyIndex = new ValueRowWithKeyIndex
+
   override def getWithKeyIndex(key: InternalRow): Iterator[ValueRowWithKeyIndex] = {
-    throw SparkUnsupportedOperationException()
+    if (key.isNullAt(0)) {
+      null
+    } else {
+      map.getWithKeyIndex(key.getLong(0), resultRow, valueRowWithKeyIndex)
+    }
   }
 
   override def getValueWithKeyIndex(key: InternalRow): ValueRowWithKeyIndex = {
-    throw SparkUnsupportedOperationException()
+    val iter = getWithKeyIndex(key)
+    if (iter == null) null else iter.next()
   }
 
-  override def valuesWithKeyIndex(): Iterator[ValueRowWithKeyIndex] = {
-    throw SparkUnsupportedOperationException()
-  }
+  override def valuesWithKeyIndex(): Iterator[ValueRowWithKeyIndex] =
+    map.valuesWithKeyIndex(resultRow, valueRowWithKeyIndex)
 
-  override def maxNumKeysIndex: Int = {
-    throw SparkUnsupportedOperationException()
-  }
+  override def maxNumKeysIndex: Int = map.maxNumKeysIndex
 }
 
 /**

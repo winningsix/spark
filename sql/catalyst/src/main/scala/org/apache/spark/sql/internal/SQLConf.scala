@@ -950,6 +950,19 @@ object SQLConf {
       .longConf
       .createWithDefault(67108864L)
 
+  val RUNTIME_BLOOM_FILTER_MAX_EXPECTED_FPP =
+    buildConf("spark.sql.optimizer.runtime.bloomFilter.maxExpectedFpp")
+      .internal()
+      .doc("A runtime bloom filter whose expected false positive probability, computed from its " +
+        "actual bit occupancy after it is built, exceeds this value passes every row without " +
+        "hashing it. A saturated filter removes few rows but still costs a hash and several " +
+        "random bit probes per row of the filtered (usually largest) table. Set to 1.0 to " +
+        "always apply the filter.")
+      .version("4.3.0")
+      .doubleConf
+      .checkValue(v => v > 0.0 && v <= 1.0, "The value must be in (0, 1].")
+      .createWithDefault(0.25)
+
   val RUNTIME_ROW_LEVEL_OPERATION_GROUP_FILTER_ENABLED =
     buildConf("spark.sql.optimizer.runtime.rowLevelOperationGroupFilter.enabled")
       .doc("Enables runtime filtering for group-based and delta-based row-level operations. " +
@@ -1328,11 +1341,13 @@ object SQLConf {
       .doc("Fraction of the cluster's concurrent task slots that one connected group of " +
         "distributed pipelined stages may require for its resident readers. Exchanges that " +
         "would make a group exceed it are kept regular, splitting the group into batch-" +
-        "separated segments that can each be admitted. Zero or negative disables the bound.")
+        "separated segments that can each be admitted. Zero or negative disables the bound " +
+        "(the default), keeping every eligible exchange pipelined; 0.75 was used for the " +
+        "single-host TPC-H SF1000 runs.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .doubleConf
-      .createWithDefault(0.75)
+      .createWithDefault(0.0)
 
   val PIPELINED_HASH_JOIN_POLICY_ENABLED =
     buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.enabled")
@@ -1413,6 +1428,59 @@ object SQLConf {
       .checkValue(_ > 0, "must be positive")
       .createWithDefault(40000000L)
 
+  val PIPELINED_HASH_JOIN_POLICY_BUILD_LEFT_EXISTENCE =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.buildLeftExistence")
+      .internal()
+      .doc("When the pipelined hash join policy is enabled, allow a left semi or left anti " +
+        "shuffled hash join to build its left side when that side is much smaller, instead of " +
+        "sort-merge joining a large right side.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  val PIPELINED_HASH_JOIN_POLICY_BUILD_LEFT_EXISTENCE_THRESHOLD_FACTOR =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy." +
+        "buildLeftExistenceThresholdFactor")
+      .internal()
+      .doc("Multiplier applied to the policy's local map threshold when a left semi or left " +
+        "anti join considers building its left side. That build replaces a sort of the larger " +
+        "right side and its relation holds only the projected left rows.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doubleConf
+      .checkValue(v => v >= 1.0 && v.isFinite, "must be a finite value of at least 1.0")
+      .createWithDefault(4.0)
+
+  val PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MAX_CREATION_FRACTION =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy." +
+        "runtimeFilterMaxCreationFraction")
+      .internal()
+      .doc("For a runtime bloom filter whose creation side exceeds " +
+        "spark.sql.optimizer.runtime.bloomFilter.creationSideThreshold (so only the pipelined " +
+        "hash join policy admits it), skip the filter when the policy's heuristic fraction of " +
+        "creation-side rows surviving its filters exceeds this value.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doubleConf
+      .checkValue(v => v > 0.0 && v <= 1.0, "must be in (0, 1]")
+      .createWithDefault(0.5)
+
+  val PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MIN_APPLICATION_FRACTION =
+    buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy." +
+        "runtimeFilterMinApplicationFraction")
+      .internal()
+      .doc("For a runtime bloom filter whose creation side exceeds " +
+        "spark.sql.optimizer.runtime.bloomFilter.creationSideThreshold (so only the pipelined " +
+        "hash join policy admits it), skip the filter when the policy's heuristic fraction of " +
+        "application-side rows surviving their own filters is below this value: the filter " +
+        "can then remove little work beyond the scan, while its creation job delays the scan.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doubleConf
+      .checkValue(v => v >= 0.0 && v <= 1.0, "must be in [0, 1]")
+      .createWithDefault(0.1)
+
   val PIPELINED_HASH_JOIN_POLICY_APPLY_TO_REGULAR =
     buildConf("spark.sql.shuffle.distributedPipelined.hashJoinPolicy.applyToRegular")
       .internal()
@@ -1457,6 +1525,32 @@ object SQLConf {
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_SIMPLE_BUILD_INPUTS =
+    buildConf("spark.sql.shuffle.pipelined.simpleBuildInputs.enabled")
+      .internal()
+      .doc("When true, a shuffled hash join's build exchanges are pipelined (instead of kept " +
+        "regular) if the build subtree contains no shuffle-based join. Its build producers then " +
+        "start together with the probe producers. Build subtrees containing a shuffled join " +
+        "stay regular. Requires the executor receive service.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PIPELINED_SHUFFLE_REGULAR_BUILD_INPUTS =
+    buildConf("spark.sql.shuffle.pipelined.regularBuildInputs.enabled")
+      .internal()
+      .doc("When true (default), every shuffle in a shuffled hash join's build subtree stays " +
+        "regular, so the build inputs materialize before the probe pipeline is admitted. When " +
+        "false, build exchanges are pipelined like any other exchange (subject only to the " +
+        "group capacity bound): build and probe producers start together, and the probe " +
+        "stream waits in the reader's inbox (which spills beyond its memory bound) while the " +
+        "reader builds its hash relation. Requires the executor receive service.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
 
   val ADAPTIVE_EXECUTION_ENABLED_IN_STATELESS_STREAMING =
     buildConf("spark.sql.adaptive.streaming.stateless.enabled")

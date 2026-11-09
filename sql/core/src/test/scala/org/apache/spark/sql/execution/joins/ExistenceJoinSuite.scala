@@ -269,6 +269,21 @@ class ExistenceJoinSuite extends SharedSparkSession {
       }
     }
 
+    if (joinType == LeftSemi || joinType == LeftAnti) {
+      testWithSplitStreamedSideCondOnAndOff(s"$testName using ShuffledHashJoin build left") { _ =>
+        extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
+          withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+            checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
+              EnsureRequirements.apply(
+                ShuffledHashJoinExec(
+                  leftKeys, rightKeys, joinType, BuildLeft, boundCondition, left, right)),
+              expectedAnswer,
+              sortAnswers = true)
+          }
+        }
+      }
+    }
+
     testWithSplitStreamedSideCondOnAndOff(s"$testName using BroadcastHashJoin") { _ =>
       extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {

@@ -20,6 +20,8 @@ package org.apache.spark.util.sketch;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.LongBuffer;
 import java.util.Arrays;
 
 final class BitArray {
@@ -96,18 +98,32 @@ final class BitArray {
     this.bitCount = bitCount;
   }
 
+  // Words are copied through a bounded big-endian buffer, matching DataOutput.writeLong and
+  // DataInput.readLong, so the format is unchanged without a stream call per word.
+  private static final int IO_BUFFER_WORDS = 8192;
+
   void writeTo(DataOutputStream out) throws IOException {
     out.writeInt(data.length);
-    for (long datum : data) {
-      out.writeLong(datum);
+    ByteBuffer buffer = ByteBuffer.allocate(Math.min(data.length, IO_BUFFER_WORDS) * 8);
+    LongBuffer words = buffer.asLongBuffer();
+    for (int offset = 0; offset < data.length; offset += IO_BUFFER_WORDS) {
+      int count = Math.min(IO_BUFFER_WORDS, data.length - offset);
+      words.clear();
+      words.put(data, offset, count);
+      out.write(buffer.array(), 0, count * 8);
     }
   }
 
   static BitArray readFrom(DataInputStream in) throws IOException {
     int numWords = in.readInt();
     long[] data = new long[numWords];
-    for (int i = 0; i < numWords; i++) {
-      data[i] = in.readLong();
+    ByteBuffer buffer = ByteBuffer.allocate(Math.min(numWords, IO_BUFFER_WORDS) * 8);
+    LongBuffer words = buffer.asLongBuffer();
+    for (int offset = 0; offset < numWords; offset += IO_BUFFER_WORDS) {
+      int count = Math.min(IO_BUFFER_WORDS, numWords - offset);
+      in.readFully(buffer.array(), 0, count * 8);
+      words.clear();
+      words.get(data, offset, count);
     }
     return new BitArray(data);
   }

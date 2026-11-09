@@ -897,6 +897,36 @@ class InjectRuntimeFilterSuite extends SharedSparkSession
     }
   }
 
+  test("Runtime bloom filter join: policy skips an already selective application side") {
+    withSQLConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD.key -> "3000",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "2000",
+      SQLConf.PIPELINED_HASH_JOIN_POLICY_ENABLED.key -> "true",
+      SQLConf.PIPELINED_HASH_JOIN_POLICY_APPLY_TO_REGULAR.key -> "true",
+      SQLConf.PIPELINED_HASH_JOIN_POLICY_BROADCAST_THRESHOLD.key -> "-1",
+      // Only the policy admits the creation side.
+      SQLConf.RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD.key -> "1",
+      SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_CREATION_SIDE_THRESHOLD.key -> "10GB") {
+      def filtersBf1(query: String): Boolean = {
+        val plan = sql(query).queryExecution.optimizedPlan
+        plan.collect { case Filter(condition, _) => condition.collect {
+          case b: BloomFilterMightContain => b.valueExpression.references.map(_.name)
+        }.flatten }.flatten.contains("c1")
+      }
+      val query = "select * from bf1 join bf2 on bf1.c1 = bf2.c2 where bf2.a2 = 62"
+      assertRewroteWithBloomFilter(query)
+      // Two equality filters keep an estimated 1/16 of the application side's rows.
+      val selective = query + " and bf1.a1 = 1 and bf1.b1 = 2"
+      withSQLConf(SQLConf.RUNTIME_BLOOM_FILTER_ENABLED.key -> "true") {
+        assert(filtersBf1(query))
+        assert(!filtersBf1(selective))
+        withSQLConf(
+            SQLConf.PIPELINED_HASH_JOIN_POLICY_RUNTIME_FILTER_MIN_APPLICATION_FRACTION.key -> "0") {
+          assert(filtersBf1(selective))
+        }
+      }
+    }
+  }
+
   test("Runtime bloom filter join: two joins") {
     withSQLConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD.key -> "3000",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "2000") {
