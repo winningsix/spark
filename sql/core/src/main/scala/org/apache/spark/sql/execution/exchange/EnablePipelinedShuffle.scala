@@ -21,6 +21,7 @@ import scala.collection.mutable
 
 import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
+import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
@@ -147,6 +148,19 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       return rewriteExchanges(_ => false)
     }
 
+    // A regular range-partitioned exchange samples its child in a separate job (RangePartitioner
+    // sketch) before its own map job. Pipelined exchanges feeding that child would be consumed by
+    // both jobs: the producers are recomputed (the whole scan runs twice) and the second job's
+    // readers depend on cross-job replay. Keep that frontier regular so both jobs read the same
+    // materialized output; deeper exchanges form an independent segment and may still pipeline.
+    // The range exchange itself also stays regular: its partitioner is built from that same
+    // sample, and a columnar transport may not support range partitioning on a pipelined route.
+    val rangeSampledKeys: Set[Int] = plan.collectWithSubqueries {
+      case s: ShuffleExchangeExec if s.outputPartitioning.isInstanceOf[RangePartitioning] => s
+    }.iterator.flatMap(s => s.pipelinedReuseKey +: exchangeFrontier(s.child)).toSet
+    def notRangeSampled(exchange: ShuffleExchangeExec): Boolean =
+      !rangeSampledKeys.contains(exchange.pipelinedReuseKey)
+
     // A shuffled hash join retains its build relation while it consumes the streamed side. Keep
     // every shuffle in each build subtree regular by default, so those smaller inputs materialize
     // before the corresponding probe pipeline starts. The experimental nested-probe mode keeps
@@ -184,10 +198,18 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       logDebug("EnablePipelinedShuffle: using regular build inputs and pipelined streamed " +
         "inputs for shuffled hash joins.")
       return rewriteExchanges(capacityLimited(plan, exchange =>
-        !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey)))
+        notRangeSampled(exchange) &&
+          !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey)))
     }
 
-    rewriteExchanges(capacityLimited(plan, _ => true))
+    rewriteExchanges(capacityLimited(plan, notRangeSampled))
+  }
+
+  /** The nearest shuffle exchanges below `node`, without crossing another exchange. */
+  private def exchangeFrontier(node: SparkPlan): Seq[Int] = node match {
+    case exchange: ShuffleExchangeExec => Seq(exchange.pipelinedReuseKey)
+    case ReusedExchangeExec(_, exchange: ShuffleExchangeExec) => Seq(exchange.pipelinedReuseKey)
+    case other => other.children.flatMap(exchangeFrontier)
   }
 
   /**
