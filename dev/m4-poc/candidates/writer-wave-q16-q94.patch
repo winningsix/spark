@@ -1,0 +1,37 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
+@@ -334,6 +334,7 @@
+     def segment(root: SparkPlan): Unit = {
+       val hashes = mutable.ArrayBuffer.empty[ShuffleExchangeExec]
+       val readerStages = mutable.HashSet.empty[Int]
++      val membershipBuilds = mutable.HashMap.empty[Int, Int]
+       var leaves = 0
+       def visit(p: SparkPlan, stage: Int): Unit = p match {
+         case e: ShuffleExchangeExec if (e.shuffleOrigin == ENSURE_REQUIREMENTS ||
+@@ -353,6 +354,13 @@
+           if (!localShared(e.canonicalized)) fixed += e.id
+         case leaf if leaf.children.isEmpty => leaves += 1
+         case other =>
++          other match {
++            case j: ShuffledHashJoinExec if j.buildSide == BuildRight &&
++                (j.joinType == org.apache.spark.sql.catalyst.plans.LeftSemi ||
++                 j.joinType == org.apache.spark.sql.catalyst.plans.LeftAnti) =>
++              membershipBuilds(stage) = membershipBuilds.getOrElse(stage, 0) + 1
++            case _ =>
++          }
+           val clustered = other.children.zip(other.requiredChildDistribution).collect {
+             case (c, _: org.apache.spark.sql.catalyst.plans.physical.ClusteredDistribution) => c
+           }
+@@ -372,7 +380,11 @@
+         // Readers remain resident until all writers drain. For the alternate
+         // placement, leave a full wave of slots for writers even when a stage
+         // needs to take over from its upstream readers.
+-        val totalCharge = charge * readerStages.size + (if (reserveWriterWave) 1.0 else 0.0)
++        // A reducer that must build two membership tables cannot drain its probe
++        // until both builds arrive. Leave writer capacity for the shared stage.
++        val stackedBuilds = readerStages.exists(stage => membershipBuilds.getOrElse(stage, 0) >= 2)
++        val writerCharge = if (reserveWriterWave || stackedBuilds) 1.0 else 0.0
++        val totalCharge = charge * readerStages.size + writerCharge
+         val width = math.floor(remaining / totalCharge).toInt
+         hashes.foreach { e =>
+           if (width < 1 || probeBytes.get(e.id).exists(_ > BigInt(width) * targetBytes) ||

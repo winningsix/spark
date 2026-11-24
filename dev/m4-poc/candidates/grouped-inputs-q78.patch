@@ -1,0 +1,89 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
+@@ -175,6 +175,51 @@
+     }
+   }
+ 
++  // A chain of outer joins can consume several grouped relations in one stage.
++  // If every group has a large upstream shuffled join, leave its scan shuffles
++  // materialized so those joins can use AQE's full parallelism independently.
++  private def largeGroupedJoinInputs(plan: SparkPlan): Set[Int] = {
++    def inputs(p: SparkPlan): Seq[ShuffleExchangeExec] = p match {
++      case e: ShuffleExchangeExec => Seq(e)
++      case _: Exchange | _: ReusedExchangeExec => Nil
++      case other => other.children.flatMap(inputs)
++    }
++    def projected(p: SparkPlan): Option[BigInt] = p match {
++      // Pruned inputs identify a scan but contribute no estimated bytes.
++      case f: FileSourceScanLike if f.partitionFilters.nonEmpty => Some(BigInt(0))
++      case f: FileSourceScanLike =>
++        Some(BigInt(f.relation.location.sizeInBytes) * f.requiredSchema.defaultSize /
++          f.relation.dataSchema.defaultSize.max(1))
++      case f: FilterExec => projected(f.child)
++      case p: ProjectExec => projected(p.child)
++      case _ => None
++    }
++    def grouped(e: ShuffleExchangeExec): Option[Seq[(Int, BigInt)]] = e.child match {
++      case a: BaseAggregateExec if a.groupingExpressions.nonEmpty &&
++          a.aggregateExpressions.nonEmpty && a.aggregateExpressions.forall(_.mode == Partial) =>
++        val pair = inputs(a)
++        if (pair.size != 2) None else {
++          val measured = pair.collect {
++            case h @ ShuffleExchangeExec(k: HashPartitioning, child, ENSURE_REQUIREMENTS, _, _)
++                if k.expressions.size >= 2 => projected(child).map(h.pipelinedReuseKey -> _)
++          }.flatten
++          Option.when(measured.size == pair.size)(measured)
++        }
++      case _ => None
++    }
++    val target = conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
++    plan.collect {
++      case j: ShuffledHashJoinExec if j.joinType == org.apache.spark.sql.catalyst.plans.LeftOuter =>
++        val outputs = inputs(j)
++        if (outputs.size < 3) Seq.empty else {
++          val groups = outputs.flatMap(grouped)
++          val scans = groups.flatten
++          if (groups.size == outputs.size && groups.forall(_.exists(_._2 > target)))
++            scans.map(_._1) else Seq.empty
++        }
++    }.flatten.toSet
++  }
++
+   // An explicit repartition or materialized input fixes the shape of its segment.
+   // Each fresh segment ends at a broadcast, range, or single-partition boundary.
+   // Hash exchanges in a segment use the same upper bound so a join retains
+@@ -331,6 +376,7 @@
+         streamedScanBytes(if (j.buildSide == BuildLeft) j.right else j.left)
+       case _ => None
+     }
++    val groupedInputs = largeGroupedJoinInputs(input)
+     def segment(root: SparkPlan): Unit = {
+       val hashes = mutable.ArrayBuffer.empty[ShuffleExchangeExec]
+       val readerStages = mutable.HashSet.empty[Int]
+@@ -342,7 +388,9 @@
+             e.outputPartitioning.isInstanceOf[HashPartitioning] =>
+           hashes += e
+           if (e.pipelined || (copies.getOrElse(e.canonicalized, 0) != 1 && !localShared(e.canonicalized))) fixed += e.id
+-          readerStages += stage
++          if (groupedInputs(e.pipelinedReuseKey)) {
++            fixed += e.id
++          } else readerStages += stage
+           visit(e.child, e.id)
+         case e: Exchange =>
+           leaves += 1
+@@ -697,6 +745,7 @@
+         val (build, probe) = if (j.buildSide == BuildLeft) (j.left, j.right) else (j.right, j.left)
+         if (exchangeFrontier(build).nonEmpty) nestedProbe(probe) else Nil
+     }.flatten.toSet
++    val groupedInputs = if (topology) largeGroupedJoinInputs(plan) else Set.empty[Int]
+     val blockedReaders = if (topology) plan.collectWithSubqueries {
+       case p if PipelinedShuffleEligibility.isUnsupportedConsumer(
+           p, supportsUnmaterializedRegularBoundary) => p
+@@ -877,6 +926,7 @@
+     def notRangeSampled(exchange: ShuffleExchangeExec): Boolean =
+       !sourceSetShuffle(exchange) && !filteringBuilds(exchange.pipelinedReuseKey) &&
+       !retainedJoinProbes.contains(exchange.pipelinedReuseKey) &&
++      !groupedInputs(exchange.pipelinedReuseKey) &&
+       !blockedReaders.contains(exchange.pipelinedReuseKey) &&
+         !rangeSampledKeys.contains(exchange.pipelinedReuseKey) &&
+         !reusedKeys.contains(exchange.pipelinedReuseKey) &&

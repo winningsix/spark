@@ -1,0 +1,118 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
+@@ -10,6 +10,7 @@
+ /** Place after the application's query-stage rewrites, before AQE creates shuffle stages. */
+ class HashPipelineExtension extends SparkSessionExtensionsProvider {
+   override def apply(extensions: SparkSessionExtensions): Unit = {
++    extensions.injectPostHocResolutionRule(_ => ShareRankedGroups)
+     extensions.injectPostHocResolutionRule(_ => CommonGroupThreshold)
+     extensions.injectOptimizerRule { session =>
+       val experimental = session.experimental
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/ShareRankedGroups.scala
+@@ -0,0 +1,105 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.aggregate.CollectList
++import org.apache.spark.sql.catalyst.plans.Inner
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.types.ArrayType
++
++/** Match the center and both neighbors by their original rank join keys in one scan. */
++private[adaptive] object ShareRankedGroups extends Rule[LogicalPlan] with PredicateHelper {
++  private def aliases(p: LogicalPlan): LogicalPlan = p match {
++    case SubqueryAlias(_, child) => aliases(child)
++    case other => other
++  }
++  private def leaf(p: LogicalPlan): Option[CTERelationRef] =
++    Some(aliases(p)).collect { case r: CTERelationRef => r }
++
++  private def triple(p: LogicalPlan): Option[Seq[CTERelationRef]] = p match {
++    case Join(Join(a,b,Inner,None,JoinHint.NONE),c,Inner,None,JoinHint.NONE) =>
++      for (x <- leaf(a); y <- leaf(b); z <- leaf(c) if x.cteId == y.cteId && x.cteId == z.cteId)
++        yield Seq(x,y,z)
++    case _ => None
++  }
++
++  private def rankDefinition(d: CTERelationDef): Option[(Seq[Int],Int)] = {
++    val ranks = d.child.collect { case w: Window => w.windowExpressions.collect {
++      case a @ Alias(WindowExpression(_: Rank,_),_) => (w,a.toAttribute)
++    }}.flatten
++    ranks match {
++      case Seq((w,a)) =>
++        val part = w.partitionSpec.map(e => d.output.indexWhere(_.semanticEquals(e)))
++        val rank = d.output.indexWhere(_.semanticEquals(a))
++        val unique = ExpressionSet(w.partitionSpec ++ w.orderSpec.map(_.child))
++        def grouped(p: LogicalPlan): Boolean = p match {
++          case a: Aggregate => a.groupingExpressions.nonEmpty && a.groupingExpressions.forall(
++            _.isInstanceOf[Attribute]) && ExpressionSet(a.groupingExpressions) == unique
++          case w: Window => grouped(w.child)
++          case p: Project if p.projectList.forall(_.isInstanceOf[Attribute]) => grouped(p.child)
++          case _ => false
++        }
++        Option.when(part.nonEmpty && part.forall(_ >= 0) && rank >= 0 && grouped(w.child))((part,rank))
++      case _ => None
++    }
++  }
++
++  private def rewrite(p: Project, f: Filter, defs: Map[Long, CTERelationDef]): Option[LogicalPlan] = for {
++    refs <- triple(f.child)
++    d <- defs.get(refs.head.cteId) if d.child.deterministic && d.materialized.isEmpty &&
++      !d.forceSkipInline && !d.hasSelfReferenceAsCTERef && !d.underSubquery
++    if refs.forall(_.output.size == d.output.size)
++    if p.projectList.forall { case _:Attribute | Alias(_:Attribute,_) => true; case _ => false }
++    (parts, rank) <- rankDefinition(d)
++    center = refs.head
++    neighbors = refs.tail
++    conditions = splitConjunctivePredicates(f.condition)
++    equalities = neighbors.flatMap(r => parts.map(i => EqualTo(center.output(i),r.output(i))))
++    if conditions.size == equalities.size + 2 && equalities.forall(e => conditions.exists(_.semanticEquals(e)))
++    shifts = neighbors.flatMap { r => conditions.collectFirst {
++      case EqualTo(a:Attribute, e:BinaryArithmetic) if a.semanticEquals(center.output(rank)) &&
++        (e.isInstanceOf[Add] || e.isInstanceOf[Subtract]) && e.left.semanticEquals(r.output(rank)) &&
++        e.right.isInstanceOf[Literal] && e.right.eval() == 1 => e.withNewChildren(Seq(center.output(rank),e.right))
++    }}
++    if shifts.size == 2 && shifts.head.getClass != shifts.last.getClass
++    columns = refs.map(_.output.zipWithIndex.filter { case (a,_) => p.references.contains(a) })
++    if columns.forall(_.nonEmpty)
++  } yield {
++    val keys = parts.map(center.output)
++    val input = Filter(keys.map(k => IsNotNull(k): Expression).reduceLeft(And), center)
++    val payloads = columns.map(cols => CreateNamedStruct(cols.flatMap { case (_,i) =>
++      Seq(Literal(s"field_$i"), center.output(i))
++    }))
++    val payloadCols = payloads.zipWithIndex.map { case (e,i) => AttributeReference(s"rank_rows_$i",e.dataType)() }
++    val target = AttributeReference("target_rank",center.output(rank).dataType)()
++    val targetValues = center.output(rank) +: shifts
++    val projections = payloads.indices.map { i =>
++      keys ++ Seq(targetValues(i)) ++ payloads.zipWithIndex.map { case (v,j) =>
++        if (i == j) v else Literal.create(null,v.dataType)
++      }
++    }
++    val group = keys :+ target
++    val expanded = Expand(projections,group ++ payloadCols,input)
++    val bags = payloadCols.map(a => Alias(CollectList(a).toAggregateExpression(),a.name)())
++    val aggregated = Aggregate(group,bags,expanded)
++    val rows = bags.map(b => AttributeReference(b.name,b.dataType.asInstanceOf[ArrayType].elementType,false)())
++    val joined = bags.zip(rows).foldLeft[LogicalPlan](aggregated) { case (child,(bag,row)) =>
++      Generate(Explode(bag.toAttribute),Nil,false,None,Seq(row),child)
++    }
++    val fields = AttributeMap(columns.zip(rows).flatMap { case (cols,row) =>
++      cols.zipWithIndex.map { case ((a,_),i) => a -> GetStructField(row,i) }
++    })
++    Project(p.projectList.map { e =>
++      val a = e match { case a: Attribute => a; case Alias(a: Attribute,_) => a }
++      Alias(fields(a),e.name)(exprId=e.exprId,qualifier=e.qualifier,explicitMetadata=Some(e.metadata))
++    },joined)
++  }
++
++  override def apply(plan: LogicalPlan): LogicalPlan = plan match {
++    case w: WithCTE if w.resolved && !w.isStreaming &&
++        conf.getConfString("spark.sql.optimizer.shareRankedGroups","true").toBoolean =>
++      val defs = w.cteDefs.map(d => d.id -> d).toMap
++      w.resolveOperatorsUp { case p @ Project(_,f:Filter) => rewrite(p,f,defs).getOrElse(p) }
++    case other => other
++  }
++}

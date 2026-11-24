@@ -1,0 +1,65 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
+@@ -13,7 +13,7 @@
+     extensions.injectPostHocResolutionRule(_ => CommonGroupThreshold)
+     extensions.injectOptimizerRule { session =>
+       val experimental = session.experimental
+-      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum)
++      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum, JoinFilteredDimension)
+       experimental.synchronized {
+         val previous = experimental.extraOptimizations
+         experimental.extraOptimizations = previous ++ rules.filterNot(previous.contains)
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/JoinFilteredDimension.scala
+@@ -0,0 +1,51 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.plans.Inner
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
++
++/** Apply a small, filtered dimension to a composite fact-join input before exchanging it. */
++private[adaptive] object JoinFilteredDimension extends Rule[LogicalPlan] with PredicateHelper {
++  private def fileScan(p: LogicalPlan): Boolean = p match {
++    case Project(cols, child) if cols.forall(_.isInstanceOf[Attribute]) => fileScan(child)
++    case Filter(condition, child) if condition.deterministic => fileScan(child)
++    case l: LogicalRelation => l.relation.isInstanceOf[HadoopFsRelation] && !l.isStreaming
++    case _ => false
++  }
++
++  private def connects(e: Expression, a: LogicalPlan, b: LogicalPlan): Boolean = e match {
++    case EqualTo(x: Attribute, y: Attribute) =>
++      (a.outputSet.contains(x) && b.outputSet.contains(y)) ||
++        (a.outputSet.contains(y) && b.outputSet.contains(x))
++    case _ => false
++  }
++
++  private def rewrite(outer: Join): Option[LogicalPlan] = for {
++    key <- outer.condition
++    dim = outer.right if fileScan(dim) && conf.autoBroadcastJoinThreshold > 0 &&
++      dim.stats.sizeInBytes <= conf.autoBroadcastJoinThreshold && dim.exists {
++        case f: Filter => splitConjunctivePredicates(f.condition).exists {
++          case EqualTo(_:Attribute,_:Literal) | EqualTo(_:Literal,_:Attribute) => true
++          case _ => false
++        }
++        case _ => false
++      }
++    input = outer.left match {
++      case Project(cols,child) if cols.forall(_.isInstanceOf[Attribute]) => child
++      case other => other
++    }
++    inner <- Some(input).collect { case j @ Join(_,_,Inner,Some(_),JoinHint.NONE) => j }
++    probe = inner.left
++    build = inner.right if fileScan(probe) && fileScan(build) && connects(key,build,dim)
++    keys = splitConjunctivePredicates(inner.condition.get) if keys.size >= 2 && keys.forall(connects(_,probe,build))
++  } yield {
++    val filtered = Join(build,dim,Inner,Some(key),JoinHint.NONE)
++    Project(outer.output,inner.copy(right=filtered))
++  }
++
++  override def apply(p: LogicalPlan): LogicalPlan =
++    if (p.isStreaming || !conf.getConfString("spark.sql.optimizer.filterCompositeBuildFirst","true").toBoolean) p
++    else p.transformUp { case j @ Join(_,_,Inner,_,JoinHint.NONE) => rewrite(j).getOrElse(j) }
++}

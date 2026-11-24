@@ -1,0 +1,276 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
+@@ -13,7 +13,7 @@
+     extensions.injectPostHocResolutionRule(_ => CommonGroupThreshold)
+     extensions.injectOptimizerRule { session =>
+       val experimental = session.experimental
+-      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum)
++      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum, ShareJoinMembership)
+       experimental.synchronized {
+         val previous = experimental.extraOptimizations
+         experimental.extraOptimizations = previous ++ rules.filterNot(previous.contains)
+@@ -24,6 +24,7 @@
+     extensions.injectQueryPostPlannerStrategyRule(_ => AlignJoinedRunningSums)
+     extensions.injectQueryPostPlannerStrategyRule(_ => PreferPipelineHashJoins)
+     extensions.injectQueryStagePrepRule(_ => HashPipelinePlanning)
++    extensions.injectQueryStageOptimizerRule(_ => FilteredPartitionHashJoin)
+   }
+ }
+ 
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/ShareRestrictedGroupSum.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/ShareRestrictedGroupSum.scala
+@@ -102,14 +102,22 @@
+       val ordinal = rows.output.last
+       // Use distinct SUM functions and buffer attributes for the two populations.
+       // Reusing one declarative aggregate under two FILTERs aliases its partial buffers.
++      // On every joined row at least one sum consumes the measure. Keeping a
++      // single projected product avoids evaluating decimal arithmetic twice on
++      // the common first-match path and preserves the unmatched-row behavior.
++      val sharedValue = Option.when(f.sum.child.exists(_.isInstanceOf[Multiply])) {
++        Alias(GuardedIntegralProduct(f.sum.child), "shared_sum_measure")()
++      }
++      val measured = sharedValue.map(v => Project(rows.output :+ v, rows)).getOrElse(rows)
++      val argument = sharedValue.map(_.toAttribute).getOrElse(f.sum.child)
+       def sumFor(predicate: Expression): AggregateExpression = {
+-        val measure = If(predicate,f.sum.child,Literal.create(null,f.sum.child.dataType))
++        val measure = If(predicate,argument,Literal.create(null,argument.dataType))
+         f.expression.copy(aggregateFunction=f.sum.copy(child=measure),resultId=NamedExpression.newExprId)
+       }
+       val all = f.name.withNewChildren(Seq(sumFor(Or(IsNull(ordinal),EqualTo(ordinal,Literal(1L))))))
+         .asInstanceOf[NamedExpression]
+       val part = Alias(sumFor(IsNotNull(ordinal)),"restricted_sum")()
+-      val together = f.a.copy(aggregateExpressions=Seq(f.key,all,part),child=rows)
++      val together = f.a.copy(aggregateExpressions=Seq(f.key,all,part),child=measured)
+       (together,part.toAttribute)
+     }
+   }
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/ShareJoinMembership.scala
+@@ -0,0 +1,52 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions.{Attribute, EqualTo}
++import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules.Rule
++
++/** An equijoin propagates membership across its key. Two identical semijoins
++ * on that key need only filter one input. Measure the filtered lookup before
++ * choosing how to join it with the fact rows.
++ */
++private[adaptive] object ShareJoinMembership extends Rule[LogicalPlan] {
++  private def equality(j: Join): Option[(Attribute, Attribute)] = j.condition match {
++    case Some(EqualTo(a: Attribute, b: Attribute)) =>
++      Seq((a,b),(b,a)).find { case (l,r) => j.left.outputSet.contains(l) && j.right.outputSet.contains(r) }
++    case _ => None
++  }
++
++  private def lookup(p: LogicalPlan): Boolean = p match {
++    case Project(columns, child) if columns.forall(_.isInstanceOf[Attribute]) => lookup(child)
++    case Filter(test, child) if test.deterministic && !test.exists(_.isInstanceOf[
++        org.apache.spark.sql.catalyst.expressions.SubqueryExpression]) => lookup(child)
++    case _: org.apache.spark.sql.execution.datasources.LogicalRelation => true
++    case _ => false
++  }
++
++  private def rewrite(parent: Join, l: Join, r: Join): Option[Join] = for {
++    (lk,rk) <- equality(parent)
++    (lf,lbuild) <- equality(l)
++    (rf,rbuild) <- equality(r)
++    if lk.semanticEquals(lf) && rk.semanticEquals(rf)
++    if l.right.output.size == 1 && r.right.output.size == 1 &&
++      lbuild.semanticEquals(l.right.output.head) && rbuild.semanticEquals(r.right.output.head)
++    if l.right.deterministic && r.right.deterministic && l.right.sameResult(r.right)
++    if lookup(l.left) != lookup(r.left)
++  } yield {
++    def measured(side: Join, key: Attribute) =
++      RebalancePartitions(Seq(key), side, Some(conf.numShufflePartitions))
++    if (lookup(r.left)) parent.copy(left=l.left,right=measured(r,rk))
++    else parent.copy(left=measured(l,lk),right=r.left)
++  }
++
++  override def apply(plan: LogicalPlan): LogicalPlan = {
++    if (plan.isStreaming || !conf.adaptiveExecutionEnabled) return plan
++    plan.transformUp {
++      case j @ Join(l: Join, r: Join, Inner, _, JoinHint.NONE)
++          if l.joinType == LeftSemi && r.joinType == LeftSemi &&
++            l.hint == JoinHint.NONE && r.hint == JoinHint.NONE =>
++        rewrite(j,l,r).getOrElse(j)
++    }
++  }
++}
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/GuardedIntegralProduct.scala
+@@ -0,0 +1,27 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.types.{DecimalType, LongType}
++
++/** Use unscaled multiplication when the input values fit a Long and Spark keeps the exact scale. */
++private[adaptive] object GuardedIntegralProduct {
++  private def compact(m: Multiply, cast: Cast, price: Attribute): Option[Expression] = for {
++    quantity <- Option(cast.child).collect {case a: Attribute if a.dataType == LongType => a}
++    whole <- Option(cast.dataType).collect {case d: DecimalType if d.scale == 0 && d.precision >= 19 => d}
++    amount <- Option(price.dataType).collect {case d: DecimalType if d.scale >= 0 && d.precision <= 18 => d}
++    result <- Option(m.dataType).collect {case d: DecimalType if d.scale == amount.scale &&
++        d.precision >= 19 + amount.precision => d}
++  } yield {
++    val maxPrice = BigInt(10).pow(amount.precision) - 1
++    val limit = (BigInt(Long.MaxValue) / maxPrice).toLong
++    val fits = And(GreaterThanOrEqual(quantity,Literal(-limit)),LessThanOrEqual(quantity,Literal(limit)))
++    val value = Multiply(quantity,UnscaledValue(price))
++    If(fits,MakeDecimal(value,result.precision,result.scale),m)
++  }
++
++  def apply(value: Expression): Expression = value match {
++    case m @ Multiply(c: Cast, p: Attribute, _) => compact(m,c,p).getOrElse(m)
++    case m @ Multiply(p: Attribute, c: Cast, _) => compact(m,c,p).getOrElse(m)
++    case other => other
++  }
++}
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/FilteredPartitionHashJoin.scala
+@@ -0,0 +1,76 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions.SortOrder
++import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, JoinSelectionHelper}
++import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
++import org.apache.spark.sql.catalyst.plans.logical.{Join, SHUFFLE_MERGE}
++import org.apache.spark.sql.execution.{CoalescedPartitionSpec, SortExec, SparkPlan}
++import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL, ShuffleOrigin}
++import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, HashJoin, ShuffledHashJoinExec, SortMergeJoinExec}
++import org.apache.spark.sql.internal.SQLConf
++
++/** A broadcast semi join can only remove rows from its streamed partition.
++ * Use the measured input size as a bound for picking the smaller hash build
++ * after AQE has assigned the final coalesced partitions.
++ */
++private[adaptive] object FilteredPartitionHashJoin extends AQEShuffleReadRule
++  with JoinSelectionHelper {
++  override protected def supportedShuffleOrigins: Seq[ShuffleOrigin] = Seq(ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL)
++
++  private case class Input(plan: SparkPlan, peakBytes: Long, filteredLookup: Boolean)
++
++  private def measuredInput(sort: SparkPlan): Option[Input] = sort match {
++    case SortExec(_, false, child, _) =>
++      val streamed = child match {
++        case semi: BroadcastHashJoinExec if semi.joinType == LeftSemi && semi.buildSide == BuildRight =>
++          semi.left
++        case other => other
++      }
++      streamed match {
++        case AQEShuffleReadExec(stage: ShuffleQueryStageExec, specs)
++            if isSupported(stage.shuffle) && stage.isMaterialized =>
++          val sizes = specs.collect { case p: CoalescedPartitionSpec => p.dataSize }.flatten
++          val stagedMembership = stage.shuffle.shuffleOrigin == REBALANCE_PARTITIONS_BY_COL &&
++            stage.shuffle.child.exists {
++              case h: HashJoin => h.joinType == LeftSemi
++              case _ => false
++            }
++          val filtered = (streamed ne child) || stagedMembership
++          if (sizes.size == specs.size && sizes.forall(_ >= 0)) Some(Input(child, sizes.max, filtered))
++          else None
++        case _ => None
++      }
++    case _ => None
++  }
++
++  private def choose(join: SortMergeJoinExec): SparkPlan = {
++    val candidate = for {
++      left <- measuredInput(join.left)
++      right <- measuredInput(join.right)
++      if left.filteredLookup || right.filteredLookup
++      if math.min(left.peakBytes, right.peakBytes) <= conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
++      if join.leftKeys.forall(_.references.subsetOf(left.plan.outputSet)) &&
++        join.rightKeys.forall(_.references.subsetOf(right.plan.outputSet))
++    } yield {
++      val side = if (right.peakBytes <= left.peakBytes) BuildRight else BuildLeft
++      val converted = ShuffledHashJoinExec(join.leftKeys, join.rightKeys, join.joinType,
++        side, join.condition, left.plan, right.plan)
++      converted.copyTagsFrom(join)
++      converted
++    }
++    candidate.getOrElse(join)
++  }
++
++  override def apply(plan: SparkPlan): SparkPlan = {
++    val respectMerge = plan.exists(_.logicalLink.exists {
++      case j: Join => Seq(j.hint.leftHint, j.hint.rightHint).flatten.exists(_.strategy.contains(SHUFFLE_MERGE))
++      case _ => false
++    })
++    if (respectMerge || plan.exists(_.logicalLink.exists(_.isStreaming))) return plan
++    val candidate = plan.transformUp {
++      case join: SortMergeJoinExec if !join.isSkewJoin && join.joinType == Inner &&
++          hashJoinSupported(join.leftKeys, join.rightKeys) => choose(join)
++    }
++    if (SortOrder.orderingSatisfies(candidate.outputOrdering, plan.outputOrdering)) candidate else plan
++  }
++}
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
+@@ -94,6 +94,45 @@
+               org.apache.spark.sql.catalyst.expressions.aggregate.BitOrAgg]
+         }
+     case _ => false
++  }
++
++  // A count grouped by attributes from both sides of a fact/lookup join can
++  // feed several independent key sets. A materialized exchange keeps the same
++  // bucket layout for every consumer and gives AQE one reusable set of partials.
++  private def materializeJoinedCount(e: ShuffleExchangeExec): Boolean = {
++    def strip(p: SparkPlan): SparkPlan = p match {
++      case f: FilterExec => strip(f.child)
++      case p: ProjectExec => strip(p.child)
++      case other => other
++    }
++    e.child match {
++      case a: BaseAggregateExec if e.shuffleOrigin == ENSURE_REQUIREMENTS &&
++          e.outputPartitioning.isInstanceOf[HashPartitioning] && a.groupingExpressions.size >= 2 &&
++          a.aggregateExpressions.size == 1 && a.aggregateExpressions.forall { v =>
++            v.mode == Partial && !v.isDistinct && v.filter.isEmpty && (v.aggregateFunction match {
++              case org.apache.spark.sql.catalyst.expressions.aggregate.Count(Seq(l: Literal)) =>
++                l.value != null
++              case _ => false
++            })
++          } =>
++        strip(a.child) match {
++          case j: org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
++              if j.joinType == org.apache.spark.sql.catalyst.plans.Inner =>
++            val (fact, dim) = if (j.buildSide == BuildRight) (j.left,j.right) else (j.right,j.left)
++            val keys = a.groupingExpressions.collect { case k: Attribute => k }
++            keys.size == a.groupingExpressions.size && keys.exists(fact.outputSet.contains) &&
++              keys.exists(dim.outputSet.contains) && (strip(fact) match {
++                case scan: FileSourceScanLike =>
++                  val sc = e.session.sparkContext
++                  val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
++                  slots > 0 && BigInt(scan.relation.location.sizeInBytes) >
++                    BigInt(slots) * conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
++                case _ => false
++              })
++          case _ => false
++        }
++      case _ => false
++    }
+   }
+ 
+   private val originalBucketCount = org.apache.spark.sql.catalyst.trees.TreeNodeTag[Int](
+@@ -225,7 +264,7 @@
+       family.tail.foreach(e => parent(group(e.id)) = group(family.head.id))
+     }
+     val fixed = mutable.HashSet.empty[Int]
+-    fixed ++= input.collect { case e: ShuffleExchangeExec if sourceSetShuffle(e) => e.id }
++    fixed ++= input.collect { case e: ShuffleExchangeExec if sourceSetShuffle(e) || materializeJoinedCount(e) => e.id }
+     val preferred = mutable.HashMap.empty[Int, Int]
+     val minimumWidth = mutable.HashMap.empty[Int, Int]
+     def front(p: SparkPlan): Seq[ShuffleExchangeExec] = p match {
+@@ -875,7 +914,7 @@
+       }.flatten.toSet
+     } else Set.empty[Int]
+     def notRangeSampled(exchange: ShuffleExchangeExec): Boolean =
+-      !sourceSetShuffle(exchange) && !filteringBuilds(exchange.pipelinedReuseKey) &&
++      !sourceSetShuffle(exchange) && !materializeJoinedCount(exchange) && !filteringBuilds(exchange.pipelinedReuseKey) &&
+       !retainedJoinProbes.contains(exchange.pipelinedReuseKey) &&
+       !blockedReaders.contains(exchange.pipelinedReuseKey) &&
+         !rangeSampledKeys.contains(exchange.pipelinedReuseKey) &&

@@ -1,0 +1,141 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleExchangeExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleExchangeExec.scala
+@@ -227,7 +227,7 @@
+     // the child on its own. Exchange's `[plan_id=...]` suffix is re-appended here.
+     val argsWithoutPipelined = productIterator.toSeq.dropRight(1).iterator
+     val pipelinedArg = if (pipelined) Iterator("isPipelined=true") else Iterator.empty
+-    val frames = if (usesFiniteMembershipFrames) Iterator("mapBatchDelivery=true") else Iterator.empty
++    val frames = if (usesFiniteMapFrames) Iterator("mapBatchDelivery=true") else Iterator.empty
+     argsWithoutPipelined ++ pipelinedArg ++ frames ++ Iterator(s"[plan_id=$id]")
+   }
+ 
+@@ -245,9 +245,10 @@
+ 
+   private[exchange] def pipelinedReuseKey: Int = pipelinedExchangeReuseKey
+ 
+-  private def usesFiniteMembershipFrames: Boolean =
++  private def usesFiniteMapFrames: Boolean =
+     pipelined && pipelinedReaderRouteMultiplicity == 1 && pipelinedSequentialReplayCount == 0 &&
+-      getTagValue(ShuffleExchangeExec.finiteMembershipFrames).contains(true)
++      (getTagValue(ShuffleExchangeExec.finiteMembershipFrames).contains(true) ||
++        getTagValue(ShuffleExchangeExec.finiteGroupedFrames).contains(true))
+ 
+ 
+   private[exchange] def setPipelinedReaderRouteMultiplicity(multiplicity: Int): Unit = {
+@@ -310,7 +311,7 @@
+         serializer,
+         writeMetrics,
+         pipelined,
+-        usesFiniteMembershipFrames)
++        usesFiniteMapFrames)
+       dep match {
+         case pipelinedDep: PipelinedShuffleDependency[_, _, _] =>
+           pipelinedDep.setReaderRouteMultiplicity(pipelinedReaderRouteMultiplicity)
+@@ -341,6 +342,8 @@
+ }
+ 
+ object ShuffleExchangeExec {
++  private[exchange] val finiteGroupedFrames =
++    org.apache.spark.sql.catalyst.trees.TreeNodeTag[Boolean]("org.apache.spark.sql.finiteGroupedFrames")
+   private[exchange] val finiteMembershipFrames =
+     org.apache.spark.sql.catalyst.trees.TreeNodeTag[Boolean]("org.apache.spark.sql.finiteMembershipFrames")
+ 
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/EnablePipelinedShuffle.scala
+@@ -606,6 +606,31 @@
+         Option.when(isRawMembershipMerge(a, exchange))(exchange.pipelinedReuseKey)
+     }.flatten.toSet
+ 
++    // A whole-partition average above a final aggregate cannot consume a group
++    // before all of its partial sums have arrived. Batch that single hash input.
++    val windowMergeKeys = plan.collect {
++      case w: org.apache.spark.sql.execution.window.WindowExec if w.orderSpec.isEmpty &&
++          w.partitionSpec.size == 1 && w.windowExpression.exists(_.exists(
++            _.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.Average])) =>
++        val child = w.child match {
++          case sort: SortExec if !sort.global => sort.child
++          case other => other
++        }
++        child match {
++          case a: BaseAggregateExec if a.groupingExpressions.size > 1 && a.aggregateExpressions.nonEmpty &&
++              a.aggregateExpressions.forall(_.mode == org.apache.spark.sql.catalyst.expressions.aggregate.Final) =>
++            a.child match {
++              case x: ShuffleExchangeExec if x.shuffleOrigin == ENSURE_REQUIREMENTS &&
++                  x.outputPartitioning.isInstanceOf[HashPartitioning] &&
++                  x.outputPartitioning.asInstanceOf[HashPartitioning].expressions.size == 1 &&
++                  x.outputPartitioning.asInstanceOf[HashPartitioning].expressions.head.semanticEquals(w.partitionSpec.head) &&
++                  x.child.isInstanceOf[BaseAggregateExec] => Some(x.pipelinedReuseKey)
++              case _ => None
++            }
++          case _ => None
++        }
++    }.flatten.toSet
++
+     def rewriteExchanges(decided: ShuffleExchangeExec => Boolean): SparkPlan = {
+       // After stage creation (AQE result-stage rerun) only rewire reuse: changing an inline
+       // exchange's transport there would leave a subtree that never went through stage creation.
+@@ -629,6 +654,11 @@
+                 !sameScopeReuseCountByExchangeKey.contains(exchange.pipelinedReuseKey) &&
+                 !sequentialReplayCountByExchangeKey.contains(exchange.pipelinedReuseKey)) {
+               copied.setTagValue(ShuffleExchangeExec.finiteMembershipFrames, true)
++            }
++            if (windowMergeKeys.contains(exchange.pipelinedReuseKey) &&
++                !sameScopeReuseCountByExchangeKey.contains(exchange.pipelinedReuseKey) &&
++                !sequentialReplayCountByExchangeKey.contains(exchange.pipelinedReuseKey)) {
++              copied.setTagValue(ShuffleExchangeExec.finiteGroupedFrames, true)
+             }
+             copied.setPipelinedReaderRouteMultiplicity(
+               1 + sameScopeReuseCountByExchangeKey.getOrElse(exchange.pipelinedReuseKey, 0))
+--- /dev/null
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/adaptive/WindowMergeFrameCheck.scala
+@@ -0,0 +1,50 @@
++package org.apache.spark.sql.execution.adaptive
++
++import java.nio.file.Paths
++import scala.jdk.CollectionConverters._
++import com.fasterxml.jackson.databind.ObjectMapper
++import org.apache.spark.shuffle.streaming.MapBatchPartitioner
++import org.apache.spark.sql.classic.SparkSession
++import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
++import org.apache.spark.util.Utils
++
++object WindowMergeFrameCheck extends AdaptiveSparkPlanHelper {
++  def main(args: Array[String]): Unit = {
++    val builder = SparkSession.builder().master("local-cluster[2,8,1024]").appName("framed window aggregate")
++    new ObjectMapper().readTree(Paths.get(args(0)).toFile).fields().asScala
++      .foreach(entry => builder.config(entry.getKey, entry.getValue.asText))
++    val s = builder.config("spark.executor.memory", "768m")
++      .config("spark.executor.extraClassPath", System.getProperty("java.class.path"))
++      .config("spark.executor.extraJavaOptions", "-XX:ActiveProcessorCount=4")
++      .config("spark.ui.enabled", false)
++      .config("spark.sql.shuffle.partitions", 17)
++      .config("spark.sql.files.minPartitionNum", 4)
++      .getOrCreate()
++    val dir = Utils.createTempDir()
++    try {
++      val dest=new java.io.File(dir,"input").getPath
++      s.sql("""select if(id%191=0,null,id%23) shop, id%97 item,
++        cast(if(id%37=0,null,id%53-27) as decimal(9,2)) price from range(0,120000,1,8)""")
++        .write.parquet(dest)
++      s.read.parquet(dest).createOrReplaceTempView("sales")
++      def run(live: Boolean, mean: Boolean) = {
++        s.conf.set("spark.sql.shuffle.distributedPipelined.enabled", live)
++        val fun=if (mean) "avg" else "max"
++        val df=s.sql(s"""select shop,item,total,$fun(total) over (partition by shop) window_value
++          from (select shop,item,sum(price) total from sales group by shop,item)""")
++        val rows=df.collect().map(_.toString).sorted.toList
++        val aqe=df.queryExecution.executedPlan.asInstanceOf[AdaptiveSparkPlanExec]
++        val framed=collect(aqe){case e:ShuffleExchangeExec if e.pipelined &&
++          e.shuffleDependency.partitioner.isInstanceOf[MapBatchPartitioner]=>e}
++        require(framed.size==(if(live && mean) 1 else 0),aqe.treeString)
++        println(s"CHECK live=$live mean=$mean rows=${rows.size} framed=${framed.size}")
++        (df.schema,rows)
++      }
++      for (mean<-Seq(true,false)) require(run(false,mean)==run(true,mean))
++      println("PASS distributed framed window merge")
++    } finally {
++      s.stop()
++      Utils.deleteRecursively(dir)
++    }
++  }
++}

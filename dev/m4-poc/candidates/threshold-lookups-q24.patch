@@ -1,0 +1,243 @@
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/HashPipelineExtension.scala
+@@ -10,10 +10,11 @@
+ /** Place after the application's query-stage rewrites, before AQE creates shuffle stages. */
+ class HashPipelineExtension extends SparkSessionExtensionsProvider {
+   override def apply(extensions: SparkSessionExtensions): Unit = {
++    extensions.injectPostHocResolutionRule(_ => SinglePassGroupThreshold)
+     extensions.injectPostHocResolutionRule(_ => CommonGroupThreshold)
+     extensions.injectOptimizerRule { session =>
+       val experimental = session.experimental
+-      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum)
++      val rules = Seq(DistinctCountWitnesses, ShareRestrictedGroupSum, ProjectInvariantSum, CompactGroupingKeys, ReuseQualifiedSum, FixedDecimalHalf, JoinRelatedLookups)
+       experimental.synchronized {
+         val previous = experimental.extraOptimizations
+         experimental.extraOptimizations = previous ++ rules.filterNot(previous.contains)
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/FixedDecimalHalf.scala
+@@ -0,0 +1,44 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.types.{Decimal, DecimalType}
++
++/** Evaluate exact sums and differences of fixed-scale inputs before division by two. */
++private[adaptive] object FixedDecimalHalf extends Rule[LogicalPlan] {
++  private case class Fixed(value: Expression, scale: Int, magnitude: BigInt)
++
++  private def fixed(e: Expression): Option[Fixed] = (e, e.dataType) match {
++    case (a: Attribute, t: DecimalType) if t.precision <= 18 && t.scale >= 0 =>
++      Some(Fixed(UnscaledValue(a), t.scale, BigInt(10).pow(t.precision) - 1))
++    case (b: BinaryArithmetic, t: DecimalType) if b.isInstanceOf[Add] || b.isInstanceOf[Subtract] =>
++      for {
++        l <- fixed(b.left)
++        r <- fixed(b.right)
++        if l.scale == r.scale && l.scale == t.scale
++        bound = l.magnitude + r.magnitude
++        if bound <= Long.MaxValue && bound < BigInt(10).pow(t.precision)
++      } yield Fixed(b.withNewChildren(Seq(l.value, r.value)), t.scale, bound)
++    case _ => None
++  }
++
++  private def half(d: Divide): Option[Expression] = for {
++    t <- Option(d.dataType).collect { case dec: DecimalType => dec }
++    if (d.right match {
++      case Literal(n: Decimal, _) => n.toJavaBigDecimal.compareTo(java.math.BigDecimal.valueOf(2L)) == 0
++      case _ => false
++    })
++    if d.left.isInstanceOf[Add] || d.left.isInstanceOf[Subtract]
++    n <- fixed(d.left)
++    scale = n.scale + 1
++    bound = n.magnitude * 5
++    precision = math.max(scale, bound.toString.length)
++    if precision <= 18 && scale <= t.scale && precision - scale <= t.precision - t.scale
++  } yield Cast(MakeDecimal(Multiply(n.value, Literal(5L)), precision, scale, false), t)
++
++  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUp {
++    case a: Aggregate if !a.isStreaming =>
++      a.transformExpressionsUp { case d: Divide => half(d).getOrElse(d) }
++  }
++}
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/SinglePassGroupThreshold.scala
+@@ -0,0 +1,89 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Average, Complete, Max, Sum}
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.types.{ByteType, NumericType}
++
++/** Compute a global average and the selected groups' sums from one read of a grouped CTE. */
++private[sql] object SinglePassGroupThreshold extends Rule[LogicalPlan] {
++  val thresholdMetadata = "org.apache.spark.sql.singlePassThreshold"
++  private def bare(p: LogicalPlan): LogicalPlan = p match {
++    case SubqueryAlias(_,c) => bare(c)
++    case Project(cols,c) if cols.forall(_.isInstanceOf[Attribute]) => bare(c)
++    case _ => p
++  }
++
++  private def rewrite(f: Filter, d: CTERelationDef): Option[LogicalPlan] = for {
++    a <- Some(bare(f.child)).collect { case g:Aggregate => g }
++    keys = a.groupingExpressions.collect { case k:Attribute=>k }
++    if keys.nonEmpty && keys.size==a.groupingExpressions.size && keys.distinct.size==keys.size
++    if a.aggregateExpressions.forall {
++      case k:Attribute => keys.exists(_.semanticEquals(k))
++      case Alias(AggregateExpression(Sum(_:Attribute,_),Complete,false,None,_),_) => true
++      case _ => false
++    }
++    keep <- Some(bare(a.child)).collect { case v:Filter if v.condition.deterministic=>v }
++    used <- Some(bare(keep.child)).collect { case r:CTERelationRef if r.cteId==d.id=>r }
++    if keep.condition.references.subsetOf(used.outputSet) && a.references.subsetOf(used.outputSet)
++    scalar <- f.condition.collect { case s:ScalarSubquery=>s } match {
++      case Seq(s) if !s.isCorrelated && s.hint.isEmpty => Some(s)
++      case _ => None
++    }
++    global <- Some(bare(scalar.plan)).collect {case g:Aggregate if g.groupingExpressions.isEmpty=>g}
++    value <- global.aggregateExpressions match {
++      case Seq(alias:Alias) if alias.deterministic && alias.dataType.isInstanceOf[NumericType] &&
++          alias.collect {case ae:AggregateExpression=>ae}.size==1 && alias.exists {
++            case AggregateExpression(Average(_:Attribute,_),Complete,false,None,_)=>true
++            case _=>false
++          } => Some(alias.child)
++      case _=>None
++    }
++    other <- Some(bare(global.child)).collect {case r:CTERelationRef if r.cteId==d.id=>r}
++    if used.output.map(_.dataType)==other.output.map(_.dataType) && value.references.subsetOf(other.outputSet)
++    if f.outputSet.subsetOf(a.outputSet)
++  } yield {
++    val lane=AttributeReference("threshold_group",ByteType,nullable=false,
++      metadata=new org.apache.spark.sql.types.MetadataBuilder().putBoolean(thresholdMetadata,true).build())()
++    val total=Literal(0.toByte);val detail=Literal(1.toByte)
++    val grouped=keys.map(k=>k.newInstance().withNullability(true))
++    val expanded=Expand(Seq(used.output ++ keys.map(k=>Literal.create(null,k.dataType)) :+ total,
++      used.output ++ keys :+ detail),used.output ++ grouped :+ lane,used)
++    val isTotal=EqualTo(lane,total);val isDetail=EqualTo(lane,detail)
++    val filtered=Filter(Or(isTotal,keep.condition),expanded)
++    val groups=AttributeMap(keys.zip(grouped))
++    val columns=a.aggregateExpressions.map {
++      case k:Attribute=>Alias(groups(k),k.name)(k.exprId,k.qualifier,Some(k.metadata))
++      case n=>n.transformDown {case ae:AggregateExpression=>ae.copy(filter=Some(isDetail))}
++        .asInstanceOf[NamedExpression]
++    }
++    val mapping=AttributeMap(other.output.zip(used.output))
++    val avg=value.transformUp {
++      case k:Attribute=>mapping(k)
++      case ae:AggregateExpression=>ae.copy(filter=Some(isTotal))
++    }
++    val threshold=Alias(avg,"all_group_threshold")()
++    val agg=Aggregate(grouped :+ lane,(columns :+ lane) :+ threshold,filtered)
++    val frame=WindowSpecDefinition(Nil,Nil,SpecifiedWindowFrame(RowFrame,UnboundedPreceding,UnboundedFollowing))
++    // Only the one global row contributes. Ordinary groups maintain their original SUM buffers.
++    val cell=If(isTotal,threshold.toAttribute,Literal.create(null,threshold.dataType))
++    val shared=Alias(WindowExpression(Max(cell).toAggregateExpression(),frame),"shared_group_threshold")()
++    val annotated=Window(Seq(shared),Nil,Nil,agg)
++    val having=f.condition.transformDown {case x:ScalarSubquery if x.exprId==scalar.exprId=>shared.toAttribute}
++    Project(f.output,Filter(And(isDetail,having),annotated))
++  }
++
++  override def apply(input: LogicalPlan): LogicalPlan = input match {
++    case w:WithCTE if input.resolved && !input.isStreaming &&
++        conf.getConfString(CommonGroupThreshold.setting,"keyed")=="keyed" =>
++      val changed=w.cteDefs.filter(d=>d.materialized.isEmpty && d.child.deterministic &&
++        bare(d.child).isInstanceOf[Aggregate] && w.plan.collectWithSubqueries {
++          case r:CTERelationRef if r.cteId==d.id=>r
++        }.size==2).foldLeft(w.plan) { (p,d)=>
++          p.resolveOperatorsUp {case f:Filter=>rewrite(f,d).getOrElse(f)}
++        }
++      if (changed.fastEquals(w.plan)) w else w.copy(plan=changed)
++    case p=>p
++  }
++}
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/JoinRelatedLookups.scala
+@@ -0,0 +1,86 @@
++package org.apache.spark.sql.execution.adaptive
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.plans.Inner
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.execution.datasources.LogicalRelation
++import org.apache.spark.sql.types.StringType
++
++/** Join two related dimensions with their common lookup before shuffling the facts.
++ * Only flatten attribute projections and deterministic, unhinted inner equijoins.
++ */
++private[adaptive] object JoinRelatedLookups extends Rule[LogicalPlan] with PredicateHelper {
++  private case class Chain(leaves: Vector[LogicalPlan], predicates: Vector[Expression])
++  private def scan(p: LogicalPlan): Boolean = p match {
++    case _: LogicalRelation => true
++    case Project(cols, child) if cols.forall(_.isInstanceOf[Attribute]) => scan(child)
++    case Filter(cond, child) if cond.deterministic => scan(child)
++    case _ => false
++  }
++
++  private def chain(p: LogicalPlan): Option[Chain] = p match {
++    case leaf if scan(leaf) => Some(Chain(Vector(leaf),Vector.empty))
++    case Project(cols, child) if cols.forall(_.isInstanceOf[Attribute]) => chain(child)
++    case Join(l,r,Inner,Some(cond),JoinHint.NONE) if cond.deterministic &&
++        !SubqueryExpression.hasSubquery(cond) && scan(r) =>
++      chain(l).map(c => Chain(c.leaves :+ r, c.predicates ++ splitConjunctivePredicates(cond)))
++    case _ => None
++  }
++
++  private def matches(a: LogicalPlan,b: LogicalPlan,e: Expression): Boolean = e match {
++    case EqualTo(x: Attribute,y: Attribute) =>
++      (a.outputSet.contains(x) && b.outputSet.contains(y)) ||
++        (a.outputSet.contains(y) && b.outputSet.contains(x))
++    case _ => false
++  }
++
++  private def filteredLookup(p: LogicalPlan): Boolean = p.exists {
++    case Filter(c,_) => splitConjunctivePredicates(c).exists {
++      case EqualTo(_: Attribute, l: Literal) => l.value != null
++      case EqualTo(l: Literal, _: Attribute) => l.value != null
++      case _ => false
++    }
++    case _ => false
++  }
++
++  private def reorder(j: Join): Option[LogicalPlan] = for {
++    c <- chain(j.left) if c.leaves.size >= 4 && c.leaves.size <= 8
++    if scan(j.right) && j.right.deterministic && j.condition.exists(_.deterministic)
++    if c.leaves.forall(_.deterministic) && !SubqueryExpression.hasSubquery(j.condition.get)
++    fact = c.leaves.head
++    dims = c.leaves.tail
++    closing = splitConjunctivePredicates(j.condition.get)
++    peers = dims.filter(d => closing.exists(matches(d,j.right,_)))
++    if peers.size == 2 && peers.forall(d => c.predicates.exists(matches(fact,d,_)))
++    small <- peers.find(d => filteredLookup(d) && closing.exists {
++      case e @ EqualTo(x: Attribute,_) => x.dataType == StringType && matches(d,j.right,e)
++      case _ => false
++    })
++    other = peers.find(_ ne small).get
++    if dims.exists(d => (d ne small) && (d ne other) && c.predicates.count(matches(fact,d,_)) >= 2)
++    rebuilt <- assemble(Vector(small,j.right,other,fact) ++ dims.filterNot(peers.contains),
++      c.predicates ++ closing)
++    if j.outputSet.subsetOf(rebuilt.outputSet)
++  } yield Project(j.output,rebuilt)
++
++  private def assemble(inputs: Vector[LogicalPlan], conditions: Seq[Expression]): Option[LogicalPlan] = {
++    var result = inputs.head
++    var remaining = conditions
++    for (next <- inputs.tail) {
++      val available = result.outputSet ++ next.outputSet
++      val (ready,later) = remaining.partition(_.references.subsetOf(available))
++      if (!ready.exists(matches(result,next,_))) return None
++      result = Join(result,next,Inner,Some(ready.reduceLeft(And)),JoinHint.NONE)
++      remaining = later
++    }
++    Option.when(remaining.isEmpty)(result)
++  }
++
++  override def apply(plan: LogicalPlan): LogicalPlan = {
++    if (!plan.resolved || plan.isStreaming) return plan
++    plan.transformUp {
++      case j @ Join(_,_,Inner,Some(_),JoinHint.NONE) => reorder(j).getOrElse(j)
++    }
++  }
++}
