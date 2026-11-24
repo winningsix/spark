@@ -2414,9 +2414,9 @@ class Dataset[T] private[sql](
   }
 
   private def withCollectAction[U](name: String)(action: SparkPlan => U): U = {
-    queryExecution.withDistributedShuffleCollect { (qe, prepareBuild) =>
+    queryExecution.withDistributedShuffleCollect { (qe, prepareInputs) =>
       withAction(name, qe) { plan =>
-        prepareBuild()
+        prepareInputs()
         action(plan)
       }
     }

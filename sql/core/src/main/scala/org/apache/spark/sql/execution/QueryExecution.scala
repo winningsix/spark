@@ -451,7 +451,7 @@ class QueryExecution(
             override def executedPlan: SparkPlan = group.plan
           }
           try {
-            return run(qe, () => group.materializeBuild())
+            return run(qe, () => group.materializeInputs())
           } finally {
             group.cleanup()
           }

@@ -25,7 +25,7 @@ import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.execution.{QueryExecution, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.QueryExecutionListener
@@ -118,14 +118,48 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         val Seq(second) = observed.filter(_.pipelined)
         assert(second.shuffleId != probe.shuffleId && !tracker.containsShuffle(second.shuffleId))
 
-        assert(query.orderBy("id").limit(3).collect().length == 3)
+        Files.delete(Path.of(marker))
+        assert(query.orderBy("id").limit(3).collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        assert(observed.nonEmpty && !observed.exists(_.pipelined))
+        assert(observed.count(_.pipelined) == 1)
+        assert(Files.exists(Path.of(marker)), "unordered Top-K did not drain a remote probe")
+
+        // The merge join has an empty buffered partition. Its streamed sort must still drain
+        // every row. The aggregate's input shuffle and the join sibling are ordinary prefixes.
+        for (codegen <- Seq(true, false)) {
+          spark.conf.set(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key, codegen)
+          val nested = spark.sql(
+            """SELECT /*+ MERGE(p, b) */ p.k
+              |FROM (SELECT id % 7 AS k, COUNT(*) AS n FROM range(0, 20, 1, 2)
+              |      GROUP BY id % 7) p
+              |JOIN range(3, 4, 1, 2) b ON p.n = b.id
+              |ORDER BY p.k DESC LIMIT 3""".stripMargin)
+          assert(nested.collect().map(_.getLong(0)).toSeq == Seq(5L, 4L, 3L))
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.size >= 3)
+          assert(observed.count(_.pipelined) == 1)
+          assert(observed.count(_.getTagValue(SelectBatchPipelinedShuffle.candidate).isDefined) > 1)
+        }
+        spark.conf.unset(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key)
+
+        val window = spark.sql(
+          """SELECT id, SUM(id) OVER (PARTITION BY id % 2) AS total
+            |FROM range(0, 6, 1, 2) ORDER BY id DESC LIMIT 2""".stripMargin)
+        assert(window.collect().map(r => (r.getLong(0), r.getLong(1))).toSeq ==
+          Seq((5L, 9L), (4L, 6L)))
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.size == 1 && observed.head.pipelined)
 
         val ids = spark.range(0, 10, 1, 2).repartition(2, col("id"))
         assert(ids.collect().sorted.toSeq == (0L until 10L))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         assert(observed.size == 1 && observed.head.pipelined)
+
+        val ordered = ids.sortWithinPartitions("id").queryExecution.executedPlan
+        assert(ordered.outputOrdering.nonEmpty)
+        val orderedTopK = TakeOrderedAndProjectExec(1, ordered.outputOrdering,
+          ordered.output, ordered)
+        assert(DistributedBatchShuffle.forCollect(orderedTopK).isEmpty)
 
         val wide = spark.range(0, 10, 1, 5).repartition(2, col("id"))
         assert(wide.collect().sorted.toSeq == (0L until 10L))

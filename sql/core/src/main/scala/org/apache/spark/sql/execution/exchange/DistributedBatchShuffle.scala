@@ -22,40 +22,92 @@ import scala.concurrent.duration.Duration
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.config
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager
+import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
-import org.apache.spark.sql.catalyst.plans.{LeftOuter, RightOuter}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.util.ThreadUtils
 
-/** One action owns both exchanges. Concurrent collects use independent shuffle IDs. */
-private[sql] class DistributedBatchShuffle(
-    val plan: SparkPlan,
-    probe: ShuffleExchangeExec,
-    build: Option[ShuffleExchangeExec]) {
-  def materializeBuild(): Unit = {
-    build.foreach(s => ThreadUtils.awaitResult(s.submitShuffleJob(), Duration.Inf))
+/** A collect owns its cloned exchanges, including the ordinary inputs to the group. */
+private[sql] class DistributedBatchShuffle(val plan: SparkPlan) {
+  def materializeInputs(): Unit = {
+    def prepare(node: SparkPlan): Unit = node match {
+      case s: ShuffleExchangeExec if !s.pipelined =>
+        ThreadUtils.awaitResult(s.submitShuffleJob(), Duration.Inf)
+      case b: BroadcastExchangeExec => b.executeBroadcast[Any]()
+      case other => other.children.foreach(prepare)
+    }
+    prepare(plan)
   }
 
   def cleanup(): Unit = {
     plan.session.sparkContext.cleaner.foreach { cleaner =>
-      (build.toList :+ probe).foreach(s => cleaner.doCleanupShuffle(s.shuffleId, blocking = true))
+      plan.foreach {
+        case s: ShuffleExchangeExec =>
+          s.initializedShuffleId.foreach(cleaner.doCleanupShuffle(_, blocking = true))
+        case _ =>
+      }
     }
   }
 }
 
 private[sql] object DistributedBatchShuffle {
-  // Project and filter consume their entire input during collect. Operators such as limit
-  // may leave partitions unread, even if their input exchange has exactly one reader.
+  // These unary operators preserve the task-to-partition mapping and a full collect drains
+  // their inputs. In particular a local sort reads its entire input before yielding a row.
   private def boundary(plan: SparkPlan): SparkPlan = plan match {
-    case _: ProjectExec | _: FilterExec | _: WholeStageCodegenExec |
-        _: InputAdapter | _: ColumnarToRowExec => boundary(plan.children.head)
+    case _: ProjectExec | _: FilterExec | _: WholeStageCodegenExec | _: HashAggregateExec |
+        _: WindowExec | _: SortExec | _: ExpandExec | _: InputAdapter | _: ColumnarToRowExec =>
+      boundary(plan.children.head)
     case other => other
   }
 
-  private def scan(exchange: ShuffleExchangeExec): Boolean = boundary(exchange.child) match {
-    case _: RangeExec | _: FileSourceScanExec => true
-    case _ => false
+  // Get the producer task count without executing the joins (which could start broadcast jobs).
+  // Ordinary exchanges cut the stage. A shuffled join zips two equally partitioned RDDs.
+  private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
+    case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
+    case r: RangeExec => Some(r.execute().getNumPartitions)
+    case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
+    case j: BroadcastHashJoinExec =>
+      val (streamed, build) = if (j.buildSide == BuildLeft) (j.right, j.left) else (j.left, j.right)
+      boundary(build) match {
+        case _: BroadcastExchangeExec => stageWidth(streamed)
+        case _ => None
+      }
+    case j @ (_: SortMergeJoinExec | _: ShuffledHashJoinExec) =>
+      stageWidth(j.children.head).filter(n => stageWidth(j.children.last).contains(n))
+    case _ => None
+  }
+
+  private def candidate(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
+    case s: ShuffleExchangeExec
+        if s.getTagValue(SelectBatchPipelinedShuffle.candidate).isDefined =>
+      Some(s)
+    case _ => None
+  }
+
+  private def sortedInput(plan: SparkPlan): Option[ShuffleExchangeExec] = plan match {
+    case s: SortExec if !s.global => candidate(s.child)
+    case _: WholeStageCodegenExec | _: InputAdapter => sortedInput(plan.children.head)
+    case _ => None
+  }
+
+  private def probe(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
+    case j: ShuffledHashJoinExec =>
+      (j.joinType, j.buildSide) match {
+        case (LeftOuter, BuildRight) if boundary(j.right).isInstanceOf[ShuffleExchangeExec] =>
+          candidate(j.left)
+        case (RightOuter, BuildLeft) if boundary(j.left).isInstanceOf[ShuffleExchangeExec] =>
+          candidate(j.right)
+        case _ => None
+      }
+    case j: SortMergeJoinExec if j.joinType == Inner && stageWidth(j.right).isDefined =>
+      // Inner merge joins request the streamed (left) input even for an empty right
+      // partition. Its local sort drains the reader before the join can stop early.
+      sortedInput(j.left)
+    case other => candidate(other)
   }
 
   def forCollect(plan: SparkPlan): Option[DistributedBatchShuffle] = {
@@ -64,45 +116,29 @@ private[sql] object DistributedBatchShuffle {
         sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
         !sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED) ||
         !SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager] ||
-        plan.exists(_.subqueries.nonEmpty)) {
+        plan.exists(p => p.subqueries.nonEmpty || p.isInstanceOf[ReusedExchangeExec])) {
       return None
     }
 
-    def activate(probePlan: SparkPlan): Option[DistributedBatchShuffle] = {
-      boundary(probePlan) match {
-        case s: ShuffleExchangeExec if s.getTagValue(SelectBatchPipelinedShuffle.candidate)
-            .isDefined && scan(s) =>
-          val maps = s.inputRDD.getNumPartitions
-          val reducers = s.outputPartitioning.numPartitions
-          val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
-          if (maps <= 0 || reducers <= 0 || maps.toLong + reducers > slots) return None
-          val rewritten = plan.clone().transformUp {
-            case exchange: ShuffleExchangeExec
-                if exchange.getTagValue(SelectBatchPipelinedShuffle.candidate).isDefined =>
-              exchange.copy(pipelined = true)
-          }
-          val exchanges = rewritten.collect { case e: ShuffleExchangeExec => e }
-          Some(new DistributedBatchShuffle(rewritten, exchanges.find(_.pipelined).get,
-            exchanges.find(!_.pipelined)))
-        case _ => None
-      }
+    val selected = plan match {
+      // Only the root uses TakeOrderedAndProjectExec.executeCollect. With ordered input it
+      // takes at most K rows per partition, and nested Top-K can introduce another shuffle.
+      case k: TakeOrderedAndProjectExec if k.limit > 0 &&
+          !SortOrder.orderingSatisfies(k.child.outputOrdering, k.sortOrder) => probe(k.child)
+      case other => probe(other)
     }
-
-    boundary(plan) match {
-      case s: ShuffleExchangeExec => activate(s)
-      case j: ShuffledHashJoinExec =>
-        val sides = (j.joinType, j.buildSide) match {
-          case (LeftOuter, BuildRight) => Some((j.left, j.right))
-          case (RightOuter, BuildLeft) => Some((j.right, j.left))
-          case _ => None
-        }
-        sides.flatMap { case (probe, build) =>
-          boundary(build) match {
-            case s: ShuffleExchangeExec if !s.pipelined && scan(s) => activate(probe)
-            case _ => None
-          }
-        }
-      case _ => None
+    val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
+    selected.filter { exchange =>
+      val readers = exchange.outputPartitioning.numPartitions
+      stageWidth(exchange.child).exists(maps => maps > 0 && readers > 0 &&
+        maps.toLong + readers <= slots)
+    }.map { exchange =>
+      // Only this edge belongs to the admitted group. Candidates inside regular prefix jobs
+      // and on sibling inputs must remain ordinary shuffles.
+      val rewritten = plan.transformUp {
+        case s: ShuffleExchangeExec if s eq exchange => s.copy(pipelined = true)
+      }
+      new DistributedBatchShuffle(rewritten.clone())
     }
   }
 }

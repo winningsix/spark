@@ -249,6 +249,10 @@ case class ShuffleExchangeExec(
 
   override def shuffleId: Int = shuffleDependency.shuffleId
 
+  // Cleanup after a failed prefix must not construct dependencies or start broadcast jobs.
+  @transient @volatile private var allocatedShuffleId: Option[Int] = None
+  private[exchange] def initializedShuffleId: Option[Int] = allocatedShuffleId
+
   /**
    * A [[ShuffleDependency]] that will partition rows of its child based on
    * the partitioning scheme defined in `newPartitioning`. Those partitions of
@@ -267,6 +271,7 @@ case class ShuffleExchangeExec(
         serializer,
         writeMetrics,
         pipelined)
+      allocatedShuffleId = Some(dep.shuffleId)
       metrics("numPartitions").set(dep.partitioner.numPartitions)
       val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
       SQLMetrics.postDriverMetricUpdates(
