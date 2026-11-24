@@ -47,7 +47,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, Adapti
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
 import org.apache.spark.sql.execution.datasources.v2.{TransactionalExec, V2TableRefreshUtil}
 import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
-import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, SelectBatchPipelinedShuffle, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ChoosePerPartitionRuntimeFilters
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
@@ -888,7 +888,7 @@ object QueryExecution {
       (if (subquery) {
         Nil
       } else {
-        Seq(ReuseExchangeAndSubquery)
+        Seq(ReuseExchangeAndSubquery, SelectBatchPipelinedShuffle)
       }) ++
       // Opt-in (SPARK-57399): runs last so it observes the final reuse decision (a reused
       // exchange means fan-out, which it refuses to make pipelined).

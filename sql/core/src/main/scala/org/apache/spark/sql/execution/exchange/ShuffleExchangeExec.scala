@@ -213,7 +213,9 @@ case class ShuffleExchangeExec(
     // the child on its own. Exchange's `[plan_id=...]` suffix is re-appended here.
     val argsWithoutPipelined = productIterator.toSeq.dropRight(1).iterator
     val pipelinedArg = if (pipelined) Iterator("isPipelined=true") else Iterator.empty
-    argsWithoutPipelined ++ pipelinedArg ++ Iterator(s"[plan_id=$id]")
+    val candidate = getTagValue(SelectBatchPipelinedShuffle.candidate)
+      .iterator.map(_ => "batchPipelinedCandidate=true")
+    argsWithoutPipelined ++ pipelinedArg ++ candidate ++ Iterator(s"[plan_id=$id]")
   }
 
   private lazy val serializer: Serializer =
