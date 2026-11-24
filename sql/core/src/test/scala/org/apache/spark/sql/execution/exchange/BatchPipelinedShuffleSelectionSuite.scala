@@ -18,8 +18,10 @@
 package org.apache.spark.sql.execution.exchange
 
 import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
+import org.apache.spark.sql.execution.{SortExec, SparkPlan, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf
@@ -82,15 +84,16 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
     }
   }
 
-  test("reused exchange forces whole-query fallback") {
+  test("an unrelated aggregation remains a candidate above a reused join input") {
     withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
       val plan = sql(
-        """SELECT /*+ SHUFFLE_HASH(r) */ l.id
-          |FROM range(0, 8, 1, 4) l JOIN range(0, 8, 1, 4) r ON l.id = r.id
+        """SELECT /*+ SHUFFLE_HASH(r) */ l.id % 3, count(*)
+          |FROM range(0, 8, 1, 4) l JOIN range(0, 8, 1, 4) r ON l.id = r.id GROUP BY l.id % 3
           |""".stripMargin).queryExecution.executedPlan
       assert(plan.exists(_.isInstanceOf[ReusedExchangeExec]))
-      assert(candidates(plan).isEmpty)
+      val Seq(selected) = candidates(plan)
+      assert(selected.child.exists(_.isInstanceOf[ShuffledHashJoinExec]))
     }
   }
 
@@ -104,21 +107,22 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
       val shared = join.withNewChildren(Seq(join.left, join.left))
       assert(join.left.exists(_.isInstanceOf[ShuffleExchangeExec]))
       withSQLConf(selection -> "true") {
+        assert(candidates(SelectBatchPipelinedShuffle(join)).nonEmpty)
         assert(candidates(SelectBatchPipelinedShuffle(shared)).isEmpty)
       }
     }
   }
 
-  test("subqueries are prepared separately and excluded from selection") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+  test("a scalar subquery leaves an independent main-query edge eligible") {
+    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
       val plan = sql(
         s"""SELECT k, n FROM ($aggregate) t
            |WHERE n > (SELECT max(n) FROM ($aggregate) s)
            |""".stripMargin).queryExecution.executedPlan
       assert(plan.exists(_.subqueries.nonEmpty))
-      assert(plan.collectWithSubqueries {
-        case s: ShuffleExchangeExec => s
-      }.forall(_.getTagValue(SelectBatchPipelinedShuffle.candidate).isEmpty))
+      assert(candidates(plan).size == 1)
+      assert(plan.subqueriesAll.forall(candidates(_).isEmpty))
     }
   }
 
@@ -126,6 +130,34 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
     withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
       val plan = sql(aggregate).coalesce(1).queryExecution.executedPlan
       assert(plan.exists(_.isInstanceOf[ShuffleExchangeExec]))
+      assert(candidates(plan).isEmpty)
+    }
+  }
+
+  test("Top-K can read a single-reader aggregation with ordered or unordered input") {
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val query = s"$aggregate ORDER BY n DESC, k LIMIT 2"
+      val expected = sql(query).collect()
+      val top = sql(query).queryExecution.executedPlan.asInstanceOf[TakeOrderedAndProjectExec]
+      val sorted = SortExec(top.sortOrder, global = false, top.child)
+      for (child <- Seq(top.child, sorted)) {
+        val ordered = SortOrder.orderingSatisfies(child.outputOrdering, top.sortOrder)
+        assert(ordered == (child == sorted))
+        withSQLConf(selection -> "true") {
+          val selected = SelectBatchPipelinedShuffle(top.copy(child = child.clone()))
+          assert(candidates(selected).size == 1)
+          assert(selected.executeCollectPublic().toSeq == expected.toSeq)
+        }
+      }
+    }
+  }
+
+  test("sampling for a range exchange reads its input before the shuffle map pass") {
+    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val plan = sql(s"$aggregate ORDER BY k").queryExecution.executedPlan
+      val exchanges = plan.collect { case s: ShuffleExchangeExec => s }
+      assert(exchanges.size == 2)
+      assert(exchanges.head.outputPartitioning.isInstanceOf[RangePartitioning])
       assert(candidates(plan).isEmpty)
     }
   }

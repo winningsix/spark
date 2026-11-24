@@ -17,16 +17,15 @@
 
 package org.apache.spark.sql.execution.exchange
 
-import scala.collection.mutable
-
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
-import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
+import org.apache.spark.sql.catalyst.plans.logical.Command
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
-import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
-import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
+import org.apache.spark.sql.execution.joins.{HashJoin, SortMergeJoinExec}
+import org.apache.spark.sql.execution.window.{WindowExec, WindowGroupLimitExec}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -44,38 +43,44 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
       return plan
     }
 
-    val seen = mutable.Set.empty[Int]
-    val selected = mutable.ArrayBuffer.empty[ShuffleExchangeExec]
-
-    // Validate both join inputs. A build subtree can contain a second reference to an
-    // exchange on the probe side, even though its own exchanges must stay materialized.
-    def visit(node: SparkPlan, materialized: Boolean): Boolean = {
-      if (node.subqueries.nonEmpty || node.logicalLink.exists(_.isStreaming)) return false
-      node match {
-        case s: ShuffleExchangeExec =>
-          if (s.pipelined || !seen.add(s.id)) return false
-          if (!materialized) {
-            if (!s.outputPartitioning.isInstanceOf[HashPartitioning]) return false
-            selected += s
-          }
-          visit(s.child, materialized)
-        case j: ShuffledHashJoinExec =>
-          val buildLeft = j.buildSide == BuildLeft
-          visit(j.left, materialized || buildLeft) && visit(j.right, materialized || !buildLeft)
-        case _: ProjectExec | _: FilterExec | _: BaseAggregateExec | _: SortExec |
-            _: InputAdapter | _: WholeStageCodegenExec | _: ColumnarToRowExec =>
-          visit(node.children.head, materialized)
-        case _: FileSourceScanExec | _: BatchScanExec | _: LocalTableScanExec | _: RangeExec =>
-          true
-        // Other operators can merge partitions, open a partition repeatedly, hide shuffle
-        // dependencies or stop reading early. A reused exchange also fails this check.
-        case _ => false
-      }
+    if (plan.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
+      return plan
     }
 
-    if (visit(plan, materialized = false)) {
-      selected.foreach(_.setTagValue(candidate, ()))
+    // Count owners and references before selecting. An unvisited build side or subquery can
+    // share the same shuffle as the main query. ReusedExchangeExec is a leaf in the plan tree.
+    val readers = plan.collectWithSubqueries {
+      case s: ShuffleExchangeExec =>
+        s.unsetTagValue(candidate)
+        s.id
+      case ReusedExchangeExec(_, s: ShuffleExchangeExec) => s.id
+    }.groupMapReduce(identity)(_ => 1)(_ + _)
+
+    def visit(node: SparkPlan, singleReader: Boolean): Unit = node match {
+      case s: ShuffleExchangeExec =>
+        if (singleReader && readers(s.id) == 1 && !s.pipelined &&
+            s.outputPartitioning.isInstanceOf[HashPartitioning]) {
+          s.setTagValue(candidate, ())
+        }
+        // A shuffle starts a new producer stage. RangePartitioner samples that stage's input
+        // before the map pass, so the first exchange below it can be read more than once.
+        visit(s.child, !s.outputPartitioning.isInstanceOf[RangePartitioning])
+      case j: HashJoin =>
+        visit(if (j.buildSide == BuildLeft) j.right else j.left, singleReader)
+      case _: ProjectExec | _: FilterExec | _: BaseAggregateExec | _: SortExec |
+          _: InputAdapter | _: WholeStageCodegenExec | _: ColumnarToRowExec |
+          _: ExpandExec | _: GenerateExec | _: WindowExec | _: WindowGroupLimitExec |
+          _: SortMergeJoinExec | _: TakeOrderedAndProjectExec =>
+        // Top-K consumes each child partition once. An ordered child can stop after K rows;
+        // handling early completion is an execution requirement for the transport.
+        node.children.foreach(visit(_, singleReader))
+      case other =>
+        // An unknown consumer may merge, skip, or reread partitions. Its restriction reaches
+        // the first shuffle on each branch. Stages feeding that shuffle have their own readers.
+        other.children.foreach(visit(_, singleReader = false))
     }
+
+    visit(plan, singleReader = true)
     plan
   }
 }
