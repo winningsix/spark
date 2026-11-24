@@ -21,8 +21,8 @@ import scala.annotation.tailrec
 
 import org.apache.spark.MapOutputStatistics
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, CaseWhen, Cast, Coalesce, Expression, If, Literal, String2TrimExpression, Substring, UnsafeRow}
-import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, JoinSelectionHelper}
-import org.apache.spark.sql.catalyst.plans.LeftExistence
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftExistence, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, SHUFFLE_MERGE}
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -103,6 +103,54 @@ case class ConvertSortMergeJoinToShuffledHashJoin(ensureRequirements: EnsureRequ
     case _ => false
   }
 
+  private def preferOutputSideSemiJoin(smj: SortMergeJoinExec): Boolean = {
+    if (smj.joinType != LeftSemi || smj.condition.nonEmpty ||
+        !conf.getConfString("spark.sql.adaptive.buildSmallSemiJoinOutput.enabled", "false")
+          .toBoolean) return false
+    smallOutputSide(smj.left, smj.right)
+  }
+
+  private def preferOutputSideAntiJoin(join: BaseJoinExec): Boolean = {
+    join.joinType == LeftAnti && join.condition.isEmpty &&
+      conf.getConfString("spark.sql.adaptive.buildSmallAntiJoinOutput.enabled", "false").toBoolean &&
+      !join.logicalLink.exists {
+        case j: Join => j.hint.leftHint.exists(_.strategy.isDefined) ||
+          j.hint.rightHint.exists(_.strategy.isDefined)
+        case _ => false
+      } && smallOutputSide(join.left, join.right)
+  }
+
+  private def smallOutputSide(left: SparkPlan, right: SparkPlan): Boolean = {
+    (stripSort(left), stripSort(right)) match {
+      case (l: ShuffleQueryStageExec, r: ShuffleQueryStageExec) =>
+        MaterializedExistenceJoinInputs.leftFits(l,r,conf)
+      case _ => false
+    }
+  }
+
+  // For a fixed-width integral equi-key, a committed small build can replace
+  // sorting the much larger probe. Compare every partition, including the largest.
+  private def materializedInnerBuild(smj: SortMergeJoinExec): Option[BuildSide] = {
+    if (smj.joinType != Inner || smj.condition.nonEmpty || smj.leftKeys.size != 1 ||
+        !conf.getConfString("spark.sql.adaptive.buildSmallInnerJoinInput.enabled", "false").toBoolean ||
+        smj.logicalLink.exists {
+          case j: Join => j.hint.leftHint.exists(_.strategy.isDefined) ||
+            j.hint.rightHint.exists(_.strategy.isDefined)
+          case _ => false
+        }) return None
+    import org.apache.spark.sql.types.{IntegerType, LongType}
+    if (!Set[org.apache.spark.sql.types.DataType](IntegerType, LongType)
+        .contains(smj.leftKeys.head.dataType)) return None
+    (stripSort(smj.left), stripSort(smj.right)) match {
+      case (l: ShuffleQueryStageExec, r: ShuffleQueryStageExec) =>
+        def fits(build: ShuffleQueryStageExec, probe: ShuffleQueryStageExec): Boolean =
+          build.output.forall(a => UnsafeRow.isFixedLength(a.dataType)) &&
+            MaterializedExistenceJoinInputs.leftFits(build, probe, conf)
+        if (fits(l, r)) Some(BuildLeft) else if (fits(r, l)) Some(BuildRight) else None
+      case _ => None
+    }
+  }
+
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!conf.convertSortMergeJoinToShuffledHashJoinEnabled) {
       return plan
@@ -110,6 +158,9 @@ case class ConvertSortMergeJoinToShuffledHashJoin(ensureRequirements: EnsureRequ
     val lookThroughOperatorsEnabled =
       conf.convertSortMergeJoinToShuffledHashJoinLookThroughOperatorsEnabled
     val optimizedPlan = plan.transformUp {
+      case shj: ShuffledHashJoinExec if shj.buildSide == BuildRight && !shj.isSkewJoin &&
+          preferOutputSideAntiJoin(shj) =>
+        shj.copy(buildSide = BuildLeft)
       case smj @ SortMergeJoinExec(leftKeys, rightKeys, joinType, condition, left, right, false)
           // Do not convert if the join keys are not hash-join-compatible (e.g. collated or other
           // non-binary-stable string keys), since a hash join matches keys by binary equality and
@@ -127,7 +178,12 @@ case class ConvertSortMergeJoinToShuffledHashJoin(ensureRequirements: EnsureRequ
           preferShuffledHashJoin(leftStage.get.mapStats.get, leftFactor.get)
         val canBuildRight = rightStage.isDefined && canBuildShuffledHashJoinRight(smj.joinType) &&
           preferShuffledHashJoin(rightStage.get.mapStats.get, rightFactor.get)
-        val buildSide = if (canBuildLeft && canBuildRight) {
+        val innerBuild = materializedInnerBuild(smj)
+        val buildSide = if (innerBuild.isDefined) {
+          innerBuild
+        } else if (preferOutputSideSemiJoin(smj) || preferOutputSideAntiJoin(smj)) {
+          Some(BuildLeft)
+        } else if (canBuildLeft && canBuildRight) {
           val leftSize = leftStage.get.mapStats.get.bytesByPartitionId.sum * leftFactor.get
           val rightSize = rightStage.get.mapStats.get.bytesByPartitionId.sum * rightFactor.get
           if (leftSize < rightSize) Some(BuildLeft) else Some(BuildRight)
@@ -254,6 +310,30 @@ case class ConvertSortMergeJoinToShuffledHashJoin(ensureRequirements: EnsureRequ
       case CaseWhen(branches, elseValue) =>
         branches.forall(b => isSizeBoundedExpr(b._2)) && elseValue.forall(isSizeBoundedExpr)
       case Coalesce(children) => children.forall(isSizeBoundedExpr)
+      case _ => false
+    }
+  }
+}
+
+
+/** Compare committed hash partitions; a compressed map status alone understates hash build size. */
+object MaterializedExistenceJoinInputs {
+  def leftFits(l: ShuffleQueryStageExec, r: ShuffleQueryStageExec, conf: SQLConf): Boolean = {
+    if (!l.isMaterialized || !r.isMaterialized || l.shuffle.shuffleOrigin != ENSURE_REQUIREMENTS ||
+        r.shuffle.shuffleOrigin != ENSURE_REQUIREMENTS) return false
+    val cap = conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
+    val factor = conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR)
+    (l.mapStats, r.mapStats) match {
+      case (Some(left), Some(right)) =>
+        val a = left.bytesByPartitionId
+        val b = right.bytesByPartitionId
+        val total = a.foldLeft(BigInt(0))(_ + _)
+        val logicalBytes = l.getRuntimeStatistics.sizeInBytes.max(total)
+        // Map status sizes can be compressed. Scale the largest partition by the
+        // observed whole-stage expansion before committing to a local hash build.
+        total > 0 && a.length == b.length &&
+          BigInt(a.max) * logicalBytes <= BigInt(cap) * total &&
+          a.indices.forall(i => a(i) <= b(i) / factor)
       case _ => false
     }
   }

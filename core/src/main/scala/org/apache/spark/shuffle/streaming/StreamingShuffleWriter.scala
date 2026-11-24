@@ -64,6 +64,30 @@ import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriter}
 import org.apache.spark.util.{ErrorNotifier, Utils}
 
 private[streaming] object StreamingShuffleWriter {
+  // Only a latency hint is shared. Retry, replay and data ownership stay with the map attempt.
+  // Keep a single active stage entry per JVM. Eviction can only cause extra early frames.
+  private var recentRoutes: MapBatchRoutes = _
+
+  private[streaming] def batchRoutes(owner: AnyRef, stage: Int, attempt: Int, shuffle: Int,
+      partitions: Int): MapBatchRoutes = synchronized {
+    if (recentRoutes == null || !recentRoutes.matches(owner, stage, attempt, shuffle, partitions)) {
+      recentRoutes = new MapBatchRoutes(owner, stage, attempt, shuffle, partitions)
+    }
+    recentRoutes
+  }
+
+  private[streaming] final class MapBatchRoutes(owner: AnyRef, stage: Int, attempt: Int,
+      shuffle: Int, partitions: Int) {
+    private val service = new java.lang.ref.WeakReference(owner)
+    private val flags = new java.util.concurrent.atomic.AtomicIntegerArray(partitions)
+    private val remaining = new AtomicInteger(partitions)
+    def matches(s: AnyRef, st: Int, a: Int, sh: Int, n: Int): Boolean =
+      (service.get eq s) && st == stage && a == attempt && sh == shuffle && n == partitions
+    def pending: Boolean = remaining.get() != 0
+    def ready(route: Int): Boolean = flags.get(route) != 0
+    def publish(route: Int): Unit = if (flags.compareAndSet(route, 0, 1)) remaining.decrementAndGet()
+  }
+
   private val TERMINATION_RETRY_DELAY_MS = 500L
   private val effectiveBudgetWarningLogged = new AtomicBoolean(false)
   // A single daemon scheduler per executor JVM prevents one native thread per completed writer
@@ -77,6 +101,12 @@ private[streaming] object StreamingShuffleWriter {
   })
 
   cleanupScheduler.setRemoveOnCancelPolicy(true)
+}
+
+/** Signals an opted-in, finite SQL hash exchange whose partial maps can stream independently. */
+private[spark] final class MapBatchPartitioner(partitions: Int, val shareStartup: Boolean)
+    extends org.apache.spark.PartitionIdPassthrough(partitions) {
+  def this(partitions: Int) = this(partitions, false)
 }
 
 class StreamingShuffleWriter[K, V](
@@ -131,6 +161,15 @@ class StreamingShuffleWriter[K, V](
   }
   private val partitioner = streamingShuffleHandle.dependency.partitioner
   private val numPartitions = partitioner.numPartitions
+  private val mapBatchDelivery = TIME_BASED_FLUSH_ENABLED &&
+    partitioner.isInstanceOf[MapBatchPartitioner] && !REPLAYABLE_FOR_INTERNAL_CONSUMER
+  private val sharedRoutes = if (mapBatchDelivery &&
+      partitioner.asInstanceOf[MapBatchPartitioner].shareStartup && sharedExecutorServer.nonEmpty) {
+    StreamingShuffleWriter.batchRoutes(sharedExecutorServer.get, context.stageId(),
+      context.stageAttemptNumber(), handle.shuffleId, numPartitions)
+  } else null
+  private val adopted = if (sharedRoutes == null) null else new Array[Boolean](numPartitions)
+  private val coldRoutes = new AtomicInteger(numPartitions)
   // Replay history is stored independently by reducer shard, but the configuration is a budget
   // for the whole writer task.  Applying it to every shard multiplies the effective limit by the
   // partition count (for p52, 16 MiB silently becomes 832 MiB per map task).  Divide it here; an
@@ -284,11 +323,23 @@ class StreamingShuffleWriter[K, V](
   // material CPU cost for UnsafeRow-heavy shuffles. The atomic ShardState buffers remain the
   // correctness path whenever the flush thread is enabled.
   private val singleThreadedBuffers: Array[TimestampedBuffer] =
-    if (TIME_BASED_FLUSH_ENABLED) null else new Array[TimestampedBuffer](numPartitions)
+    if (TIME_BASED_FLUSH_ENABLED && sharedRoutes == null) null else new Array[TimestampedBuffer](numPartitions)
 
   private val allocatedBufferBytesSemaphore: Semaphore = new Semaphore(MAX_BUFFER_BYTES.toInt)
   private val rawBytesSent = new AtomicLong(0L)
   private val wireBytesSent = new AtomicLong(0L)
+  // Shared map writers use one executor slab pool across all reducer routes.
+  // Retain a compact copy of a sparse frame so other producers can reuse its slab.
+  private val detachSparseFrames = sharedRoutes != null ||
+    conf.getBoolean("spark.shuffle.streaming.detachSparseFrames.enabled", false)
+  private val collectFrameMetrics =
+    conf.getBoolean("spark.shuffle.streaming.frameFlushMetrics.enabled", false)
+  private val timerFrames = new AtomicLong(0L)
+  private val pressureFrames = new AtomicLong(0L)
+  private val closeFrames = new AtomicLong(0L)
+  private val fullFrames = new AtomicLong(0L)
+  private val ageFrames = new AtomicLong(0L)
+  private val detachedFrames = new AtomicLong(0L)
   private val dataMessagesSent = new AtomicLong(0L)
   private val replaySpilledBytes = new AtomicLong(0L)
   // Counts messages whose TransportClient write callback has not completed. In the relaxed
@@ -334,6 +385,32 @@ class StreamingShuffleWriter[K, V](
   // every completed map task in a wide full-streaming DAG.  Stop recycling as soon as the input
   // loop can no longer request another buffer.  Replay envelopes keep their independent leases.
   private val writeInputFinished = new AtomicBoolean(false)
+
+  private val pressureSpill = numPartitions > 0 && sharedExecutorServer.isDefined &&
+    conf.getBoolean("spark.shuffle.streaming.rawBufferPressureSpill.enabled", false)
+  // A retained raw replay frame can release a scarce executor buffer. Keep one hint per
+  // shard, independent of how many frames or concurrent borrowers target the writer.
+  private val pressureRoutes = if (pressureSpill &&
+      (sharedRoutes != null || conf.getBoolean("spark.shuffle.streaming.indexReclaimableRoutes.enabled", false))) {
+    new java.util.concurrent.ConcurrentLinkedQueue[ShardState]()
+  } else null
+
+  private val reclaimCursor = new java.util.concurrent.atomic.AtomicInteger(0)
+  private[streaming] val reclaimOneRaw: () => Boolean = () => {
+    // Spread pressure over routes. Each shard serializes spill against replay and Netty.
+    if (pressureRoutes == null) {
+      val start = Math.floorMod(reclaimCursor.getAndIncrement(), shards.length)
+      (0 until shards.length).exists(i => shards((start + i) % shards.length).spillRetainedRaw())
+    } else {
+      var route = pressureRoutes.poll()
+      var spilled = false
+      while (route != null && !spilled) {
+        spilled = route.spillIndexedRaw()
+        if (!spilled) route = pressureRoutes.poll()
+      }
+      spilled
+    }
+  }
 
   private def recycleRawBuffer(buffer: ByteBuf): Unit = {
     sharedExecutorServer match {
@@ -481,7 +558,8 @@ class StreamingShuffleWriter[K, V](
         var fileLength: Int = 0,
         var resourcesReleased: Boolean = false,
         var activeUsers: Int = 0,
-        var retirementRequested: Boolean = false) {
+        var retirementRequested: Boolean = false,
+        rawFrame: Boolean = false) {
       def length: Int = if (buffer != null) buffer.readableBytes() else fileLength
     }
     private val replayHistory = new mutable.ArrayDeque[ReplayEntry]()
@@ -547,6 +625,25 @@ class StreamingShuffleWriter[K, V](
         target: TransportClient,
         maxSequenceNum: Long,
         retryTerminal: Option[ReplayEntry] = None) extends OutboundAction
+    // The first visible frame preserves early reader startup. Subsequent data in a finite
+    // map is published when the route fills, the writer needs memory, or the map finishes.
+    @volatile private var initialFramePublished = false
+
+    def needsTimedFrame: Boolean = !mapBatchDelivery ||
+      (!initialFramePublished && (sharedRoutes == null || !sharedRoutes.ready(id)))
+
+    private def markInitialFrame(): Unit = {
+      if (mapBatchDelivery && !initialFramePublished) {
+        initialFramePublished = true
+        if (sharedRoutes != null) sharedRoutes.publish(id)
+        coldRoutes.decrementAndGet()
+      }
+    }
+
+    def flushOnTimer(): Unit = synchronized {
+      if (needsTimedFrame) flushBuffer(timerFrames)
+    }
+
     private val pendingBatch = new mutable.ArrayBuffer[PendingSend]()
     private var pendingBatchBytes = 0
     // State changes (sequence numbers, replay cursors, and the action queue) stay serialized on
@@ -1235,7 +1332,18 @@ class StreamingShuffleWriter[K, V](
         done: () => Unit = () => (),
         releaseReplayResources: () => Unit = () => (),
         releaseInputResources: () => Unit = () => (),
-        networkComplete: () => Unit = () => ()): Unit = synchronized {
+        networkComplete: () => Unit = () => ()): Unit = {
+      sendOwned(message, done, releaseReplayResources, releaseInputResources, networkComplete,
+        mayPinRawBuffer = true)
+    }
+
+    private def sendOwned(
+        message: StreamingShuffleMessage,
+        done: () => Unit,
+        releaseReplayResources: () => Unit,
+        releaseInputResources: () => Unit,
+        networkComplete: () => Unit,
+        mayPinRawBuffer: Boolean): Unit = synchronized {
       // No downstream task owns this reducer route (for example, a TakeOrdered result stage may
       // read only a prefix). Retire producer-side ownership immediately instead of queuing an
       // action behind a connection future that can never complete.
@@ -1289,7 +1397,11 @@ class StreamingShuffleWriter[K, V](
         sequenceNum,
         message.isInstanceOf[DataMessage],
         buf.retainedDuplicate(),
-        releaseReplayResources)
+        releaseReplayResources,
+        rawFrame = message match {
+          case d: DataMessage => mayPinRawBuffer && d.uncompressedSize == d.dataSize
+          case _ => false
+        })
       replayHistory += replayEntry
       inMemoryReplayBytes += replayEntry.length
 
@@ -1302,6 +1414,10 @@ class StreamingShuffleWriter[K, V](
         // same payload; retiring both copies is what lets a blocked route release direct memory.
         if (reserveReplay && reservation.isEmpty) spillReplayEntry(replayEntry)
         spillReplayHistoryIfNeeded()
+        if (pressureRoutes != null && replayEntry.rawFrame && replayEntry.buffer != null) {
+          lastRawSequence = sequenceNum
+          enqueuePressureRoute()
+        }
         if (pendingBatchBytes >= BATCH_SIZE) flushPendingBatch()
         return
       }
@@ -1478,8 +1594,14 @@ class StreamingShuffleWriter[K, V](
     def send(timestampedBuffer: TimestampedBuffer): Unit =
       admitTimestampedBuffer(timestampedBuffer, flushBatch = true)
 
-    private[streaming] def enqueue(timestampedBuffer: TimestampedBuffer): Unit =
-      admitTimestampedBuffer(timestampedBuffer, flushBatch = false)
+    private[streaming] def enqueue(timestampedBuffer: TimestampedBuffer): Unit = {
+      if (mapBatchDelivery) synchronized {
+        admitTimestampedBuffer(timestampedBuffer, flushBatch = true)
+        markInitialFrame()
+      } else {
+        admitTimestampedBuffer(timestampedBuffer, flushBatch = false)
+      }
+    }
 
     /** Release a detached buffer that never reached DataMessage ownership. */
     private def releaseUnadmittedBuffer(timestampedBuffer: TimestampedBuffer): Unit = {
@@ -1534,7 +1656,8 @@ class StreamingShuffleWriter[K, V](
         return
       }
       rawBuffer.clear()
-      if (writeInputFinished.get() || context.isFailed() || context.isCompleted() ||
+      if (pressureSpill ||
+          writeInputFinished.get() || context.isFailed() || context.isCompleted() ||
           rawBuffer.capacity() != BUFFER_SIZE) {
         recycleRawBuffer(rawBuffer)
       } else {
@@ -1593,7 +1716,7 @@ class StreamingShuffleWriter[K, V](
       val dataSize = rawBuffer.writerIndex()
       timestampedBuffer.updateChecksum()
       val checksumValue = timestampedBuffer.getChecksumValue()
-      val wireBuffer = compressionCodec match {
+      val encoded = compressionCodec match {
         case Some(compressor) =>
           // Compress directly between NIO views of the Netty buffers. If compression is not
           // beneficial, discard the destination and send the original buffer.
@@ -1618,6 +1741,23 @@ class StreamingShuffleWriter[K, V](
           }
         case None => rawBuffer
       }
+      // A partial frame can otherwise pin a full executor-pool slab through both network
+      // completion and replay retirement. Use the independent payload ownership path when
+      // copying saves at least half a slab. Its replay reservation and per-shard limits still
+      // apply; the executor's raw-buffer reclaimer should only visit frames that own a slab.
+      val wireBuffer = if (detachSparseFrames && pressureSpill && (encoded eq rawBuffer) &&
+          dataSize > 0 && dataSize.toLong * 2 <= rawBuffer.capacity().toLong) {
+        val payload = server.getPooledByteBufAllocator.directBuffer(dataSize, dataSize)
+        try {
+          payload.writeBytes(rawBuffer, rawBuffer.readerIndex(), dataSize)
+          if (collectFrameMetrics) detachedFrames.incrementAndGet()
+          payload
+        } catch {
+          case t: Throwable =>
+            payload.release()
+            throw t
+        }
+      } else encoded
       val wireSize = wireBuffer.readableBytes()
       rawBytesSent.addAndGet(dataSize)
       wireBytesSent.addAndGet(wireSize)
@@ -1671,9 +1811,17 @@ class StreamingShuffleWriter[K, V](
         // completion calls this same hook, so the permit must share the raw owner's once fence.
         releaseRawAfterSend
       }
-      send(dataMessage, () => {
-        // Completion is accounted separately from input-buffer ownership.
-      }, releaseReplayResources, releaseInputResources, networkComplete)
+      try {
+        sendOwned(dataMessage, () => (), releaseReplayResources, releaseInputResources,
+          networkComplete, mayPinRawBuffer = wireBuffer eq rawBuffer)
+      } catch {
+        case t: Throwable =>
+          if (wireBuffer ne rawBuffer) {
+            releaseReplayResources()
+            releaseInputResources()
+          }
+          throw t
+      }
       // DataMessage.encode() installs a retained payload slice in the encoded frame before
       // send() returns. When compression produced a separate wire buffer, rawBuffer is no
       // longer part of either the pending send or replay history and can immediately go back to
@@ -1684,12 +1832,16 @@ class StreamingShuffleWriter[K, V](
     }
 
     // Consume the current buffer, if it exists, and send it as a DataMessage.
-    def send(): Unit = synchronized {
+    def send(): Unit = flushBuffer(null)
+
+    private[streaming] def flushBuffer(reason: AtomicLong): Unit = synchronized {
       // Detaching a timed buffer and admitting it must be atomic with close's terminal admission.
       // Otherwise close can observe an empty buffer before this thread appends the detached data.
       val b = takeBuffer()
       if (b != null) {
+        if (collectFrameMetrics && reason != null) reason.incrementAndGet()
         admitTimestampedBuffer(b, flushBatch = true)
+        markInitialFrame()
       } else if (asyncCompression) {
         synchronized {
           if (pendingBatch.nonEmpty || !admissionTail.isDone) {
@@ -1709,7 +1861,10 @@ class StreamingShuffleWriter[K, V](
 
     def close(): Unit = synchronized {
       val b = takeBuffer()
-      if (b != null) admitTimestampedBuffer(b, flushBatch = false)
+      if (b != null) {
+        if (collectFrameMetrics) closeFrames.incrementAndGet()
+        admitTimestampedBuffer(b, flushBatch = false)
+      }
       if (asyncCompression) {
         appendAdmission(() => synchronized {
           if (!outboundClosed && errorNotifier.getError().isEmpty) {
@@ -1773,6 +1928,41 @@ class StreamingShuffleWriter[K, V](
       uncompressedBufferLeases.toSeq.foreach(_.forceRelease())
       uncompressedBufferLeases.clear()
       if (activeReplayUsers == 0) closeReplayFile()
+    }
+
+    private var pressureSequence = 0L
+    private var lastRawSequence = -1L
+    private var pressureRouteQueued = false
+
+    // Called with the shard monitor held. A borrower can take the hint while the owner
+    // appends or acknowledges data. Recheck the real replay entries under the same lock.
+    private def enqueuePressureRoute(): Unit = {
+      if (!pressureRouteQueued) {
+        pressureRouteQueued = true
+        pressureRoutes.offer(this)
+      }
+    }
+
+    private[streaming] def spillIndexedRaw(): Boolean = synchronized {
+      pressureRouteQueued = false
+      val spilled = spillRetainedRaw()
+      if (spilled && pressureSequence <= lastRawSequence) enqueuePressureRoute()
+      spilled
+    }
+
+    private[streaming] def spillRetainedRaw(): Boolean = synchronized {
+      if (replayHistory.isEmpty) return false
+      var i = math.max(0L, pressureSequence - replayHistory.head.sequenceNum)
+      while (i < replayHistory.length) {
+        val entry = replayHistory(i.toInt)
+        pressureSequence = entry.sequenceNum + 1
+        if (entry.rawFrame && entry.buffer != null) {
+          spillReplayEntry(entry)
+          return true
+        }
+        i += 1
+      }
+      false
     }
 
     private def spillReplayHistoryIfNeeded(): Unit = {
@@ -2116,6 +2306,7 @@ class StreamingShuffleWriter[K, V](
   }
 
   private def cleanupResourcesNow(): Unit = {
+    if (pressureSpill) sharedExecutorServer.foreach(_.rawBufferPool.unregisterReclaimer(reclaimOneRaw))
     val cleanupStartTime = System.currentTimeMillis()
     // Release any cross-route bodies that were queued but never reached Netty after a failed
     // writer. The normal shared-server path removes only this writer's unsent bodies; in-flight
@@ -2163,7 +2354,10 @@ class StreamingShuffleWriter[K, V](
     logDebug(s"Streaming shuffle writer transfer summary: messages=${dataMessagesSent.get()}, " +
       s"rawBytes=$rawBytes, wireBytes=$wireBytes, " +
       f"wireRatio=${if (rawBytes == 0) 1.0 else wireBytes.toDouble / rawBytes}%.4f, " +
-      s"replaySpilledBytes=${replaySpilledBytes.get()}")
+      s"replaySpilledBytes=${replaySpilledBytes.get()}, timerFrames=${timerFrames.get()}, " +
+      s"pressureFrames=${pressureFrames.get()}, closeFrames=${closeFrames.get()}, " +
+      s"fullFrames=${fullFrames.get()}, ageFrames=${ageFrames.get()}, " +
+      s"detachedFrames=${detachedFrames.get()}")
   }
 
   private def unwrapCompletionException(error: Throwable): Throwable = error match {
@@ -2223,14 +2417,37 @@ class StreamingShuffleWriter[K, V](
     schedule()
   }
 
+  private def flushForMemory(): Unit = {
+    if (sharedRoutes != null) drainOwned(pressureFrames)
+    shards.foreach(_.flushBuffer(pressureFrames))
+  }
+
+  // This method runs on the producer thread, only between serializations. The timer no
+  // longer accesses an adopted route. Mark the buffer detached before admission can fail.
+  private def drainOwned(reason: AtomicLong): Unit = {
+    var i = 0
+    while (i < singleThreadedBuffers.length) {
+      val b = singleThreadedBuffers(i)
+      if (b != null) {
+        singleThreadedBuffers(i) = null
+        if (collectFrameMetrics) reason.incrementAndGet()
+        shards(i).enqueue(b)
+      }
+      i += 1
+    }
+  }
+
   private def newBuffer(): TimestampedBuffer = {
+    val pool = StreamingCpuGate.readyPool
+    if (pool != null) pool.checkpoint()
     // Back-pressure is accounted per network buffer (BUFFER_SIZE permits each), not by exact
     // byte size, so this bounds in-flight memory only on a best-effort basis: a single
     // serialized row larger than BUFFER_SIZE (rows are not split across buffers, see write())
     // grows its buffer past BUFFER_SIZE and thus exceeds the tracked budget.
     if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
-      shards.foreach(_.send())
-      while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
+      flushForMemory()
+      while (!StreamingCpuGate.transportWait("output")(
+          allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS))) {
         val spilled = shards.iterator.map(_.spillOnePendingData()).exists(identity)
         if (!spilled) {
           throwErrorIfExists()
@@ -2242,13 +2459,23 @@ class StreamingShuffleWriter[K, V](
       sharedExecutorServer match {
         case Some(shared) =>
           buffer = shared.rawBufferPool.tryBorrow()
+          if (buffer == null && mapBatchDelivery) {
+            // No other task can detach this map's partially filled route buffers. Publish
+            // them before waiting for a global slab; this also flushes already queued batches.
+            flushForMemory()
+          }
           while (buffer == null) {
             // Retiring a queued frame may return its raw owner to this writer's local deque.
             // Prefer that immediately reusable buffer before waiting on a global pool slot.
             shards.iterator.exists(_.spillOnePendingData())
             buffer = bufferPool.pollLast()
             if (buffer == null) buffer = shared.rawBufferPool.tryBorrow()
-            if (buffer == null) buffer = shared.rawBufferPool.awaitBorrow(10L)
+            if (buffer == null && pressureSpill && shared.rawBufferPool.reclaimOne()) {
+              buffer = shared.rawBufferPool.tryBorrow()
+            }
+            if (buffer == null) {
+              buffer = StreamingCpuGate.transportWait("output")(shared.rawBufferPool.awaitBorrow(10L))
+            }
             if (buffer == null) throwErrorIfExists()
           }
         case None => buffer = Unpooled.directBuffer(BUFFER_SIZE)
@@ -2268,12 +2495,17 @@ class StreamingShuffleWriter[K, V](
    * Netty connection.
    */
   override def write(records: Iterator[Product2[K, V]]): Unit = {
+    if (pressureSpill) sharedExecutorServer.foreach(_.rawBufferPool.registerReclaimer(reclaimOneRaw))
     val isWriteFinished = new CountDownLatch(1)
-    val flushThread = if (TIME_BASED_FLUSH_ENABLED) {
+    val flushThread = if (TIME_BASED_FLUSH_ENABLED && (sharedRoutes == null || sharedRoutes.pending)) {
       Some(new Thread(() =>
         Try {
-          while (!isWriteFinished.await(MAX_BUFFERING_TIME_MS, TimeUnit.MILLISECONDS))
-            shards.foreach(_.send())
+          while ((!mapBatchDelivery || coldRoutes.get() > 0) &&
+              (sharedRoutes == null || sharedRoutes.pending) &&
+              !isWriteFinished.await(MAX_BUFFERING_TIME_MS, TimeUnit.MILLISECONDS)) {
+            if (mapBatchDelivery) shards.foreach(_.flushOnTimer())
+            else shards.foreach(_.flushBuffer(timerFrames))
+          }
         }.recover { case e => errorNotifier.markError(unwrapCompletionException(e)) },
         "time-based-flush-for-shuffle-writer-" +
           s"${streamingShuffleHandle.shuffleId}-${shuffleWriterId}"))
@@ -2288,14 +2520,24 @@ class StreamingShuffleWriter[K, V](
       flushThread.foreach(_.start())
       records.foreach { record =>
         val shard = shards(partitioner.getPartition(record._1))
-        var timestampedBuffer = if (TIME_BASED_FLUSH_ENABLED) {
+        val id = shard.id
+        if (sharedRoutes != null && !adopted(id) && !shard.needsTimedFrame) {
+          // A timer already inside its first admission holds the same shard lock. Transfer
+          // ownership once so no timer can take the producer's newly created buffer.
+          shard.synchronized {
+            singleThreadedBuffers(id) = shard.takeBuffer()
+            adopted(id) = true
+          }
+        }
+        val owned = !TIME_BASED_FLUSH_ENABLED || (sharedRoutes != null && adopted(id))
+        var timestampedBuffer = if (!owned) {
           shard.takeBuffer()
         } else {
           singleThreadedBuffers(shard.id)
         }
         if (timestampedBuffer == null) {
           timestampedBuffer = newBuffer()
-          if (!TIME_BASED_FLUSH_ENABLED) {
+          if (owned) {
             // Publish immediately to the task-owned array so failure cleanup can release it even
             // if serialization throws before this record finishes.
             singleThreadedBuffers(shard.id) = timestampedBuffer
@@ -2339,17 +2581,26 @@ class StreamingShuffleWriter[K, V](
 
         // Flush immediately if the buffer is almost full or stale.
         if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&
-            (!TIME_BASED_FLUSH_ENABLED ||
+            (owned || !shard.needsTimedFrame ||
               timestampedBuffer.ageMs() < MAX_BUFFERING_TIME_MS)) {
-          if (TIME_BASED_FLUSH_ENABLED) shard.putBuffer(timestampedBuffer)
+          if (!owned) shard.putBuffer(timestampedBuffer)
         } else {
-          if (!TIME_BASED_FLUSH_ENABLED) singleThreadedBuffers(shard.id) = null
+          if (owned) singleThreadedBuffers(shard.id) = null
+          if (collectFrameMetrics) {
+            if (timestampedBuffer.totalByteSize() >= BUFFER_SIZE * 9 / 10) {
+              fullFrames.incrementAndGet()
+            } else {
+              ageFrames.incrementAndGet()
+            }
+          }
           shard.enqueue(timestampedBuffer)
           throwErrorIfExists()
         }
       }
       isWriteFinished.countDown()
-      if (!TIME_BASED_FLUSH_ENABLED) {
+      if (sharedRoutes != null) {
+        drainOwned(closeFrames)
+      } else if (!TIME_BASED_FLUSH_ENABLED) {
         var partitionId = 0
         while (partitionId < singleThreadedBuffers.length) {
           val pending = singleThreadedBuffers(partitionId)
@@ -2377,7 +2628,7 @@ class StreamingShuffleWriter[K, V](
           // executor CPU while the downstream readers are doing the useful work needed to
           // produce these acknowledgements. Keep the wait interruptible so task cancellation
           // and failures retain their existing prompt escape path.
-          Thread.sleep(10L)
+          StreamingCpuGate.transportWait("output")(Thread.sleep(10L))
         }
         logDebug(log"Received all termination acks for shuffle writer ${MDC(
           LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Closing server channel.")

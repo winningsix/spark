@@ -39,6 +39,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, ReturnAnswer}
 import org.apache.spark.sql.catalyst.plans.physical.{Distribution, UnspecifiedDistribution}
 import org.apache.spark.sql.catalyst.rules.{PlanChangeLogger, Rule}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE, LEFT_SEMI_OR_ANTI_JOIN, SCALAR_SUBQUERY}
 import org.apache.spark.sql.catalyst.util.sideBySide
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -137,6 +138,7 @@ case class AdaptiveSparkPlanExec(
       ensureRequirements,
       // This rule must be run after `EnsureRequirements`.
       InsertSortForLimitAndOffset,
+      GatherSmallGroupedSort,
       AdjustShuffleExchangePosition,
       ValidateSparkPlan,
       // Must run before `ReplaceHashWithSortAgg`: converting a sort merge join to a shuffled hash
@@ -162,7 +164,8 @@ case class AdaptiveSparkPlanExec(
       // Flips the final unmaterialized tail's exchanges to pipelined (SPARK-57399 pipelined
       // channel, opt-in). Runs last so skew handling and sort cleanup have settled
       // before placement is decided.
-      AQEEnablePipelinedShuffle
+      AQEEnablePipelinedShuffle,
+      SizeSortedExistenceInputs(requiredDistribution, () => context.stageCache.keySet.toSet)
     ) ++ context.session.sessionState.adaptiveRulesHolder.queryStagePrepRules
   }
 
@@ -234,12 +237,100 @@ case class AdaptiveSparkPlanExec(
     )
   }
 
-  @transient val initialPlan = context.session.withActive {
+  // If the chosen backend lacks a materialization point, keep the filtered keys in both
+  // representations of the plan. Later AQE passes start from this same logical boundary.
+  @transient private var initialKeyLogicalPlan: Option[LogicalPlan] = None
+
+  @transient val initialPlan: SparkPlan = context.session.withActive {
     QueryPlanningTracker.withTracker(context.qe.tracker) {
-      applyPhysicalRules(
+      val prepared = applyPhysicalRules(
         applyQueryPostPlannerStrategyRules(inputPlan),
         queryStagePreparationRules,
         "AQE Preparations")
+      val revised = if (conf.exchangeReuseEnabled && conf.getConfString(
+          "spark.sql.adaptive.pipelinedShuffle.reuseFilteredSemiJoinKeys", "false").toBoolean) {
+        inputPlan.logicalLink.filter(_.containsAllPatterns(LEFT_SEMI_OR_ANTI_JOIN, AGGREGATE))
+          .flatMap(ReuseUnmaterializedSemiJoinKeys.rewrite(_, prepared))
+          .flatMap(reOptimize)
+      } else {
+        None
+      }
+      val mergedInputs = if (conf.exchangeReuseEnabled &&
+          conf.getConfString("spark.sql.adaptive.reuseNullRejectingJoinInputs",
+            "false").toBoolean) {
+        val before = revised.map(_._1).getOrElse(prepared)
+        revised.map(_._2).orElse(inputPlan.logicalLink)
+          .flatMap(ReuseNullRejectingJoinInput.rewrite)
+          .flatMap(reOptimize)
+          .filter { case (after, _) =>
+            ReuseNullRejectingJoinInput.distinctShuffles(after) <
+              ReuseNullRejectingJoinInput.distinctShuffles(before)
+          }
+      } else {
+        None
+      }
+      val initial = mergedInputs.orElse(revised)
+      val sharedResidual = if (conf.exchangeReuseEnabled && conf.getConfString(
+          "spark.sql.adaptive.shareFilteredShuffleInput.enabled", "false").toBoolean) {
+        val before = initial.map(_._1).getOrElse(prepared)
+        initial.map(_._2).orElse(inputPlan.logicalLink)
+          .flatMap(ShareFilteredShuffleInput.rewrite(_, before, conf.numShufflePartitions))
+          .flatMap(reOptimize)
+          .filter { case (after, _) =>
+            ReuseNullRejectingJoinInput.distinctShuffles(after) <
+              ReuseNullRejectingJoinInput.distinctShuffles(before)
+          }
+      } else None
+      val beforeExtremum = sharedResidual.orElse(initial)
+      val sharedExtremum = if (conf.exchangeReuseEnabled && conf.getConfString(
+          "spark.sql.adaptive.shareScalarGroupedInput.enabled", "false").toBoolean) {
+        val before = beforeExtremum.map(_._1).getOrElse(prepared)
+        beforeExtremum.map(_._2).orElse(inputPlan.logicalLink)
+          .flatMap(ShareScalarGroupedInput.rewrite)
+          .flatMap(reOptimize)
+          .filter { case (after, _) =>
+            val previous = ShareScalarGroupedInput.shuffleCount(before)
+            val next = ShareScalarGroupedInput.shuffleCount(after)
+            next < previous
+          }
+      } else None
+      val current = sharedExtremum.orElse(beforeExtremum)
+      val sharedAggregate = if (conf.exchangeReuseEnabled && conf.getConfString(
+          "spark.sql.adaptive.shareGroupedSemiJoinShuffle.enabled", "false").toBoolean) {
+        val before = current.map(_._1).getOrElse(prepared)
+        current.map(_._2).orElse(inputPlan.logicalLink)
+          .flatMap(ShareGroupedSemiJoinShuffle.rewrite)
+          .flatMap(reOptimize)
+          .filter { case (after, _) =>
+            ReuseNullRejectingJoinInput.distinctShuffles(after) <
+              ReuseNullRejectingJoinInput.distinctShuffles(before)
+          }
+      } else None
+      // Sharing the raw rows can remove the stage that supplied filtered keys to AQE.
+      // Recheck the rewritten physical plan for duplicate, unmaterialized semi-join builds.
+      val sharedKeys = sharedAggregate.flatMap { case (physical, logical) =>
+        if (conf.getConfString("spark.sql.adaptive.shareGroupedSemiJoinShuffle.materializeKeys",
+            "false").toBoolean) {
+          ReuseUnmaterializedSemiJoinKeys.rewrite(logical, physical).flatMap(reOptimize)
+        } else None
+      }
+      val withSharedInput = sharedKeys.orElse(sharedAggregate).orElse(current)
+      val windowed = if (conf.getConfString(
+          "spark.sql.adaptive.combineGroupedAverage.enabled", "false").toBoolean) {
+        val before = withSharedInput.map(_._1).getOrElse(prepared)
+        withSharedInput.map(_._2).orElse(inputPlan.logicalLink)
+          .flatMap(CombineGroupedAverage.rewrite)
+          .flatMap(reOptimize)
+          .filter { case (after, _) =>
+            CombineGroupedAverage.scans(after) < CombineGroupedAverage.scans(before)
+          }
+      } else None
+      windowed.orElse(withSharedInput) match {
+        case Some((physical, logical)) =>
+          initialKeyLogicalPlan = Some(logical)
+          physical
+        case None => prepared
+      }
     }
   }
 
@@ -296,6 +387,49 @@ case class AdaptiveSparkPlanExec(
     !isSubquery && getExecutionId.exists(SQLExecution.getQueryExecution(_) eq context.qe)
   }
 
+  /**
+   * A reused scalar aggregate has its own adaptive plan and can run while its consumers
+   * materialize their other inputs. Start the same future the ordinary stage optimizer
+   * will consume. Do this on execution only, after the initial stage submissions.
+   */
+  private def prepareSharedScalarInputs(plan: SparkPlan): Unit = {
+    val uses = mutable.LinkedHashMap.empty[SparkPlan, (SubqueryExec, Int)]
+    plan.foreach { node =>
+      node.expressions.foreach(_.foreach {
+        case scalar: ScalarSubquery =>
+          val sub = scalar.plan match {
+            case s: SubqueryExec => Some(s)
+            case ReusedSubqueryExec(s: SubqueryExec) => Some(s)
+            case _ => None
+          }
+          sub.foreach { s =>
+            s.child match {
+              case a: AdaptiveSparkPlanExec if a.context.eq(context) &&
+                  s.maxNumRows.isDefined && a.inputPlan.logicalLink.exists { logical =>
+                    logical.exists {
+                      case agg: org.apache.spark.sql.catalyst.plans.logical.Aggregate =>
+                        agg.groupingExpressions.isEmpty
+                      case _ => false
+                    } && !logical.exists(p => p.expressions.exists(e => !e.deterministic))
+                  } =>
+                val key = s.canonicalized
+                val (owner, count) = uses.getOrElse(key, (s, 0))
+                uses.update(key, (owner, count + 1))
+              case _ =>
+            }
+          }
+        case _ =>
+      })
+    }
+    uses.foreach { case (key, (sub, count)) =>
+      if (count > 1) {
+        val owner = context.subqueryCache.getOrElseUpdate(key, sub)
+        owner.prepare()
+        logInfo(s"Prepared shared adaptive scalar input owner=${owner.id} uses=$count")
+      }
+    }
+  }
+
   def finalPhysicalPlan: SparkPlan = withFinalPlanUpdate(identity)
 
   /**
@@ -313,11 +447,17 @@ case class AdaptiveSparkPlanExec(
         val executionId = getExecutionId
         // Use inputPlan logicalLink here in case some top level physical nodes may be removed
         // during `initialPlan`
-        var currentLogicalPlan = inputPlan.logicalLink.get
+        var currentLogicalPlan = initialKeyLogicalPlan.getOrElse(inputPlan.logicalLink.get)
         var result = createQueryStages(fun, currentPhysicalPlan, firstRun = true)
         val events = new LinkedBlockingQueue[StageMaterializationEvent]()
         val errors = new mutable.ArrayBuffer[Throwable]()
         val obsoleteCancelledStageIds = new mutable.HashSet[Int]
+        var startSharedScalars = !isSubquery && executionId.isDefined && conf.subqueryReuseEnabled &&
+          conf.pipelinedShuffleFullPlanAQEEnabled &&
+          // AQE already has the optimized logical plan. If it contains no scalar, neither
+          // mode needs to walk the physical tree or look for reusable scalar owners.
+          context.qe.optimizedPlan.containsPattern(SCALAR_SUBQUERY) &&
+          conf.getConfString("spark.sql.adaptive.pipelinedShuffle.prepareSharedScalars", "false").toBoolean
         var stagesToReplace = Seq.empty[QueryStageExec]
         while (!result.allChildStagesMaterialized) {
           currentPhysicalPlan = result.newPlan
@@ -360,6 +500,11 @@ case class AdaptiveSparkPlanExec(
                   cleanUpAndThrowException(Seq(e), Some(stage.id))
               }
             }
+          }
+
+          if (startSharedScalars) {
+            startSharedScalars = false
+            prepareSharedScalarInputs(initialPlan)
           }
 
           // Wait on the next completed stage, which indicates new stats are available and probably
@@ -409,8 +554,19 @@ case class AdaptiveSparkPlanExec(
               val (newPhysicalPlan, newLogicalPlan) = afterReOptimize.get
               val origCost = costEvaluator.evaluateCost(currentPhysicalPlan)
               val newCost = costEvaluator.evaluateCost(newPhysicalPlan)
-              if (newCost < origCost ||
-                (newCost == origCost && currentPhysicalPlan != newPhysicalPlan) ||
+              // A tied AQE cost can hide the loss of streaming between stages.
+              // Keep the original plan when the alternative adds a materialization
+              // boundary. A cheaper adaptive plan still wins on its own merits.
+              def pendingRegularShuffles(plan: SparkPlan): Int = plan.collect {
+                case e: ShuffleExchangeExec if !e.pipelined => e.id
+                case ReusedExchangeExec(_, e: ShuffleExchangeExec) if !e.pipelined => e.id
+              }.toSet.size
+              val acceptTie = newCost == origCost && currentPhysicalPlan != newPhysicalPlan &&
+                (!conf.pipelinedShuffleFullPlanAQEEnabled || !currentPhysicalPlan.exists {
+                  case e: ShuffleExchangeExec => e.pipelined
+                  case _ => false
+                } || pendingRegularShuffles(newPhysicalPlan) <= pendingRegularShuffles(currentPhysicalPlan))
+              if (newCost < origCost || acceptTie ||
                 testTriggerForceCancellation) {
                 lazy val plans = sideBySide(
                   currentPhysicalPlan.treeString, newPhysicalPlan.treeString).mkString("\n")
@@ -785,6 +941,8 @@ case class AdaptiveSparkPlanExec(
    * - Try to create result query stage when there is no new non-result query stage created and all
    *   stages are materialized.
    */
+  @transient private lazy val measuredComposite = new MeasuredCompositeJoin
+
   private def createQueryStages(
       resultHandler: SparkPlan => Any,
       plan: SparkPlan,
@@ -812,7 +970,9 @@ case class AdaptiveSparkPlanExec(
         }
       case _ =>
         // 2. Create non result query stage
-        val result = createNonResultQueryStages(plan)
+        val candidate = measuredComposite.rewrite(plan, requiredDistribution.getOrElse(UnspecifiedDistribution),
+          key => context.stageCache.contains(key))
+        val result = createNonResultQueryStages(candidate)
         var allNewStages = result.newStages
         var newPlan = result.newPlan
         var allChildStagesMaterialized = result.allChildStagesMaterialized
@@ -854,6 +1014,52 @@ case class AdaptiveSparkPlanExec(
         newPlan = s.withNewChildren(Seq(result.newPlan)),
         allChildStagesMaterialized = result.allChildStagesMaterialized,
         newStages = result.newStages)
+
+    // The full-plan pipelined rule runs ReuseExchangeAndSubquery before AQE creates stages, so a
+    // duplicate exchange can already be a ReusedExchangeExec leaf. Its wrapped exchange subtree
+    // has not been through stage creation (no columnar rules, transitions or codegen), so it must
+    // not be executed as is. Give the wrapped exchange the normal stage lifecycle (the stage cache
+    // shares it with the original occurrence) and expose it under this branch's output.
+    // A pipelined exchange stays inline: prepare its child stages, the result-stage rerun of
+    // the transport rule rewires the leaf to the single direct producer.
+    case r @ ReusedExchangeExec(_, s: ShuffleExchangeExec) if s.pipelined =>
+      val result = createNonResultQueryStages(s)
+      CreateStageResult(
+        newPlan = r.copy(child = result.newPlan.asInstanceOf[Exchange]),
+        allChildStagesMaterialized = result.allChildStagesMaterialized,
+        newStages = result.newStages)
+
+    case r @ ReusedExchangeExec(_, e: Exchange) =>
+      val result = createNonResultQueryStages(e)
+      result.newPlan match {
+        case stage: ExchangeQueryStageExec =>
+          context.markSharedStageResult(stage.resultOption, this)
+          val reuse = stage.newReuseInstance(currentStageId, r.output)
+          currentStageId += 1
+          // The leaf normally carries its own branch's link (ReuseExchangeAndSubquery); a leaf
+          // created without one (e.g. its duplicate subtree had no link) falls back to the
+          // wrapped exchange, like AQE's own reuse of an equivalent stage.
+          val leafLink = r.getTagValue(TEMP_LOGICAL_PLAN_TAG).orElse(r.logicalLink)
+          setLogicalLinkForNewQueryStage(reuse, if (leafLink.isDefined) r else e)
+          recordStageId(reuse)
+          val isMaterialized = reuse.isMaterialized
+          CreateStageResult(
+            newPlan = reuse,
+            allChildStagesMaterialized = isMaterialized,
+            newStages = if (isMaterialized) {
+              Seq.empty
+            } else {
+              result.newStages.filterNot(_ eq stage) :+ reuse
+            })
+        case prepared: Exchange =>
+          CreateStageResult(
+            newPlan = r.copy(child = prepared),
+            allChildStagesMaterialized = false,
+            newStages = result.newStages)
+        case other =>
+          throw SparkException.internalError(
+            s"Unexpected plan for reused exchange: ${other.getClass.getName}")
+      }
 
     case e: Exchange =>
       // First have a quick check in the `stageCache` without having to traverse down the node.
@@ -924,7 +1130,16 @@ case class AdaptiveSparkPlanExec(
       if (plan.children.isEmpty) {
         CreateStageResult(newPlan = plan, allChildStagesMaterialized = true, newStages = Seq.empty)
       } else {
-        val results = plan.children.map(createNonResultQueryStages)
+        val results = FactBuildFirst.ordinal(plan).orElse(measuredComposite.buildFirst(plan)) match {
+          case Some(index) =>
+            val build = createNonResultQueryStages(plan.children(index))
+            plan.children.zipWithIndex.map {
+              case (_, i) if i == index => build
+              case (other, _) if build.allChildStagesMaterialized => createNonResultQueryStages(other)
+              case (other, _) => CreateStageResult(other, allChildStagesMaterialized = false, Seq.empty)
+            }
+          case None => plan.children.map(createNonResultQueryStages)
+        }
         CreateStageResult(
           newPlan = plan.withNewChildren(results.map(_.newPlan)),
           allChildStagesMaterialized = results.forall(_.allChildStagesMaterialized),
@@ -963,8 +1178,9 @@ case class AdaptiveSparkPlanExec(
     // Whole-stage codegen above may copy a direct pipelined exchange while a ReusedExchangeExec
     // leaf still wraps its pre-codegen instance. Re-run the full-plan transport rule after those
     // final copies so reuse is rewired to one producer before DAGScheduler sees the RDD graph.
-    val optimizedRootPlan = if (conf.pipelinedShuffleFullPlanAQEEnabled) {
-      AQEEnablePipelinedShuffle.apply(postProcessedRootPlan)
+    val optimizedRootPlan = if (conf.pipelinedShuffleFullPlanAQEEnabled &&
+        PipelinedShuffleEligibility.enabled(postProcessedRootPlan, conf)) {
+      EnablePipelinedShuffle.rewireReuseOnly(postProcessedRootPlan)
     } else {
       postProcessedRootPlan
     }

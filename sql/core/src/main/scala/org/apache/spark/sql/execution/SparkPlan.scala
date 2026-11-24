@@ -296,9 +296,16 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
    * Blocks the thread until all subqueries finish evaluation and update the results.
    */
   protected def waitForSubqueries(): Unit = prepareLock.synchronized {
+    // Runtime bloom filters are optional pruning: a backend that can bind them late does not
+    // need to hold the stage until they are built (see LateRuntimeFilter).
+    val late = LateRuntimeFilter.lateBindableSubqueries(this)
     // fill in the result of subqueries
-    runningSubqueries.foreach { sub =>
-      sub.updateResult()
+    runningSubqueries.foreach {
+      case s: org.apache.spark.sql.execution.ScalarSubquery
+          if late.contains(s) && !LateRuntimeFilter.readyNow(s) =>
+        LateRuntimeFilter.defer(s)
+      case sub =>
+        sub.updateResult()
     }
     runningSubqueries.clear()
   }

@@ -30,6 +30,7 @@ import org.apache.spark.internal.LogKeys.{CURRENT_FILE, PATH}
 import org.apache.spark.memory.MemoryMode
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.rdd.{InputFileBlockHolder, RDD}
+import org.apache.spark.shuffle.streaming.StreamingCpuGate
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, GenericInternalRow, JoinedRow, Literal, UnsafeProjection, UnsafeRow}
@@ -225,6 +226,8 @@ class FileScanRDD(
         // don't need to run this `if` for every record.
         nextElement match {
           case batch: ColumnarBatch =>
+            val pool = StreamingCpuGate.readyPool
+            if (pool != null) pool.checkpoint()
             incTaskInputMetricsBytesRead()
             inputMetrics.incRecordsRead(batch.numRows())
           case _ =>

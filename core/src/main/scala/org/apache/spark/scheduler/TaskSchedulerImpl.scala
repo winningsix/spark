@@ -247,9 +247,25 @@ private[spark] class TaskSchedulerImpl(
         ResourceProfile.getTaskCpusOrDefaultForProfile(
           sc.resourceProfileManager.resourceProfileFromId(
             manager.taskSet.resourceProfileId), conf)),
-      (manager, executorId) => manager.runningTasksSet.count { id =>
-        manager.taskInfos(id).executorId == executorId
-      })
+      (manager, executorId) => runningOnExecutor(manager, executorId))
+
+  // Per task set, running-task counts by executor. Admission asks for these for every
+  // (executor, stage) pair on every offer and status update; counting the running set each time
+  // made the scheduler thread quadratic in group size. Recompute only when the task set's
+  // launch / running / success counters change.
+  private val runningByExecutor =
+    new java.util.WeakHashMap[TaskSetManager, ((Int, Int, Int), Map[String, Int])]()
+  private def runningOnExecutor(manager: TaskSetManager, executorId: String): Int = {
+    val key = (manager.taskInfos.size, manager.runningTasksSet.size, manager.numCompletedTasks)
+    val cached = runningByExecutor.get(manager)
+    val counts = if (cached != null && cached._1 == key) cached._2 else {
+      val c = manager.runningTasksSet.iterator.map(id => manager.taskInfos(id).executorId)
+        .toSeq.groupBy(identity).view.mapValues(_.size).toMap
+      runningByExecutor.put(manager, (key, c))
+      c
+    }
+    counts.getOrElse(executorId, 0)
+  }
 
   private lazy val pipelinedScheduling = new StreamingShuffleSchedulingPolicy(
     conf, abortTimer, () => backend.reviveOffers(), Some(pipelinedAdmission))
@@ -499,6 +515,46 @@ private[spark] class TaskSchedulerImpl(
    * @param tasks tasks scheduled per offer, value at index 'i' corresponds to shuffledOffers[i]
    * @return tuple of (no delay schedule rejects?, option of min locality of launched task)
    */
+  // Elastic pipelined shuffle flow control: a pure producer may only use capacity beyond what its
+  // not-yet-launched direct readers need. Readers launch when their prepared inbox receives data;
+  // if producers took every slot first, full inboxes would block the producers while the readers
+  // that drain them could never start. Charged at each reader's own task CPUs, so fractional
+  // readers leave producers almost the whole cluster while still guaranteeing liveness.
+  private val elasticReaderReserveEnabled =
+    conf.get(config.STREAMING_SHUFFLE_EXECUTOR_RECEIVE_SERVICE_ENABLED) &&
+      conf.getBoolean("spark.shuffle.streaming.elasticProducers.readerReserve", true)
+
+  private def elasticReaderReserveCpus(
+      producer: TaskSetManager,
+      taskSets: Iterable[TaskSetManager]): BigDecimal = {
+    val ts = producer.taskSet
+    val streamingQuery = Option(ts.properties).exists(
+      _.getProperty(StructuredStreamingIdAwareSchedulerLogging.QUERY_ID_KEY) != null)
+    if (streamingQuery || !elasticReaderReserveEnabled || !ts.isPipelinedShuffleProducer ||
+        ts.isPipelinedShuffleReader || pipelinedAdmission.contains(producer.stageId)) {
+      return BigDecimal(0)
+    }
+    ts.shuffleId match {
+      case Some(shuffleId) =>
+        val readers = taskSets.iterator.filter { r =>
+          r.isActiveForScheduling && r.taskSet.isPipelinedShuffleReader &&
+            r.taskSet.pipelinedReaderShuffleIds.contains(shuffleId)
+        }.toSeq
+        // submitTasks(producer) can trigger an offer before DAGScheduler submits the co-scheduled
+        // reader. Do not let producers take the cluster in that window: hold them until a reader
+        // task set is visible (it follows within the same submission).
+        if (readers.isEmpty) return BigDecimal(Int.MaxValue)
+        readers.map { r =>
+          val prof = sc.resourceProfileManager.resourceProfileFromId(r.taskSet.resourceProfileId)
+          val cpus = StreamingShuffleTaskResources.taskCpus(
+            conf, r.taskSet, ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf))
+          val pending = math.max(0, r.numTasks - r.numCompletedTasks - r.runningTasks)
+          cpus * pending
+        }.sum
+      case None => BigDecimal(0)
+    }
+  }
+
   private def resourceOfferSingleTaskSet(
       taskSet: TaskSetManager,
       maxLocality: TaskLocality,
@@ -506,7 +562,8 @@ private[spark] class TaskSchedulerImpl(
       availableCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
-      soleActivePureProducer: Boolean)
+      soleActivePureProducer: Boolean,
+      readerReserveCpus: BigDecimal = BigDecimal(0))
     : (Boolean, Option[TaskLocality]) = {
     if (!pipelinedScheduling.preTaskReaderTaskSetReady(taskSet)) return (true, None)
     var noDelayScheduleRejects = true
@@ -528,6 +585,7 @@ private[spark] class TaskSchedulerImpl(
       // check whether the task can be scheduled to the executor base on resource profile.
       if (pipelinedAdmission.launchAllowed(taskSet, execId, availableCpus(i)) &&
           pipelinedScheduling.elasticProducerLaunchAllowed(taskSet, soleActivePureProducer) &&
+          (readerReserveCpus <= 0 || availableCpus.sum - taskCpus >= readerReserveCpus) &&
           sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
@@ -633,6 +691,43 @@ private[spark] class TaskSchedulerImpl(
   def resourceOffers(
       offers: IndexedSeq[WorkerOffer],
       isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
+    resourceOffersForStages(offers, isAllFreeResources, None)
+  }
+
+  /** Validate parked attempts against current ownership before lending any extra placements. */
+  private[spark] def parkedShuffleOffers(
+      offer: WorkerOffer,
+      balance: BigDecimal,
+      parked: Seq[Long],
+      executorCores: Int): Seq[Seq[TaskDescription]] = synchronized {
+    if (CPUS_PER_TASK != BigDecimal(1) || balance > 0 ||
+        offer.resourceProfileId != ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) return Nil
+    val donors = parked.distinct.iterator.filter { tid =>
+      taskIdToExecutorId.get(tid).contains(offer.executorId)
+    }.flatMap(tid => Option(taskIdToTaskSetManager.get(tid))).filter { manager =>
+      !manager.isBarrier && manager.isActiveForScheduling &&
+        manager.taskSet.resourceProfileId == offer.resourceProfileId &&
+        StreamingShuffleTaskResources.taskCpus(conf, manager.taskSet, CPUS_PER_TASK) == 1
+    }.toVector
+    val extra = balance + math.min(executorCores, donors.size)
+    if (extra < 1) return Nil
+    val members = donors.iterator.flatMap(m => pipelinedAdmission.loanStages(m.stageId)).toSet
+    // AQE can run sibling stages in separate Spark jobs under the same SQL execution.
+    // Keep each loan inside its scheduling pool and query. Plain RDD jobs use stage scope.
+    def scope(m: TaskSetManager): Option[(Pool, String)] = Option(m.taskSet.properties)
+      .flatMap(p => Option(p.getProperty("spark.sql.execution.id"))).map(id => (m.parent, id))
+    val scopes = donors.iterator.flatMap(scope).toSet
+    val siblings = if (scopes.isEmpty) Set.empty[Int] else rootPool.getSortedTaskSetQueue
+      .iterator.filter(m => scope(m).exists(scopes)).map(_.stageId).toSet
+    val stages = members ++ siblings
+    if (stages.isEmpty) return Nil
+    resourceOffersForStages(IndexedSeq(offer.copy(cores = extra)), false, Some(stages))
+  }
+
+  private def resourceOffersForStages(
+      offers: IndexedSeq[WorkerOffer],
+      isAllFreeResources: Boolean,
+      loanStages: Option[Set[Int]]): Seq[Seq[TaskDescription]] = {
     // Mark each worker as alive and remember its hostname
     // Also track if new executor is added
     var newExecAvail = false
@@ -680,7 +775,7 @@ private[spark] class TaskSchedulerImpl(
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
     pipelinedAdmission.syncPoolAccounting()
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
-    if (pipelinedAdmission.enabled) {
+    if (pipelinedAdmission.enabled && loanStages.isEmpty) {
       val receiveExecutors = SparkEnv.get.streamingShuffleOutputTracker.collect {
         case tracker: org.apache.spark.StreamingShuffleOutputTrackerMaster =>
           tracker.receiveCoordinator.executorIds.toSet
@@ -708,7 +803,10 @@ private[spark] class TaskSchedulerImpl(
     // Take each TaskSet in our scheduling order, and then offer it to each node in increasing order
     // of locality levels so that it gets a chance to launch local tasks on all of them.
     // NOTE: the preferredLocality order: PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY
-    for (taskSet <- offerPlan.taskSets) {
+    for (taskSet <- offerPlan.taskSets if loanStages.forall(stages => stages(taskSet.stageId) &&
+        !taskSet.isBarrier && taskSet.taskSet.resourceProfileId ==
+          ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID &&
+        StreamingShuffleTaskResources.taskCpus(conf, taskSet.taskSet, CPUS_PER_TASK) == 1)) {
       // we only need to calculate available slots if using barrier scheduling, otherwise the
       // value is -1
       val numBarrierSlotsAvailable = if (taskSet.isBarrier) {
@@ -734,12 +832,13 @@ private[spark] class TaskSchedulerImpl(
         // Compute this once per task set and offer pass. Ready readers were moved ahead of their
         // producers above, so their freshly-launched runningTasks are already visible here.
         val useSoleProducerWindow = offerPlan.useSoleProducerWindow(taskSet)
+        val readerReserve = elasticReaderReserveCpus(taskSet, offerPlan.taskSets)
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks, useSoleProducerWindow)
+              availableResources, tasks, useSoleProducerWindow, readerReserve)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject

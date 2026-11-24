@@ -20,9 +20,13 @@ package org.apache.spark.util.sketch;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.LongBuffer;
 import java.util.Arrays;
 
 final class BitArray {
+  private static final int WORDS_PER_BLOCK = 8192 / Long.BYTES;
+
   private final long[] data;
   private long bitCount;
 
@@ -98,16 +102,40 @@ final class BitArray {
 
   void writeTo(DataOutputStream out) throws IOException {
     out.writeInt(data.length);
-    for (long datum : data) {
-      out.writeLong(datum);
+    if (data.length < WORDS_PER_BLOCK) {
+      for (long datum : data) {
+        out.writeLong(datum);
+      }
+      return;
+    }
+
+    // A big-endian bulk view preserves the DataOutputStream wire format.
+    byte[] bytes = new byte[WORDS_PER_BLOCK * Long.BYTES];
+    LongBuffer words = ByteBuffer.wrap(bytes).asLongBuffer();
+    for (int pos = 0; pos < data.length;) {
+      int count = Math.min(WORDS_PER_BLOCK, data.length - pos);
+      words.put(0, data, pos, count);
+      out.write(bytes, 0, count * Long.BYTES);
+      pos += count;
     }
   }
 
   static BitArray readFrom(DataInputStream in) throws IOException {
     int numWords = in.readInt();
     long[] data = new long[numWords];
-    for (int i = 0; i < numWords; i++) {
-      data[i] = in.readLong();
+    if (numWords < WORDS_PER_BLOCK) {
+      for (int i = 0; i < numWords; i++) {
+        data[i] = in.readLong();
+      }
+    } else {
+      byte[] bytes = new byte[WORDS_PER_BLOCK * Long.BYTES];
+      LongBuffer words = ByteBuffer.wrap(bytes).asLongBuffer();
+      for (int pos = 0; pos < numWords;) {
+        int count = Math.min(WORDS_PER_BLOCK, numWords - pos);
+        in.readFully(bytes, 0, count * Long.BYTES);
+        words.get(0, data, pos, count);
+        pos += count;
+      }
     }
     return new BitArray(data);
   }

@@ -27,6 +27,7 @@ import org.apache.spark.metrics.source.Source
 import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.scheduler.Task
 import org.apache.spark.shuffle.FetchFailedException
+import org.apache.spark.shuffle.streaming.StreamingCpuGate
 import org.apache.spark.util.{AccumulatorV2, PostStatusUpdateListener, TaskCompletionListener, TaskFailureListener, TaskInterruptListener}
 
 
@@ -220,7 +221,12 @@ abstract class TaskContext extends Serializable {
       // context too within run(). If that's the case, kill the thread before it starts executing
       // the actual task.
       killTaskIfInterrupted()
-      task.runTask(this)
+      val pool = StreamingCpuGate.sharedPool
+      if (pool == null) task.runTask(this) else {
+        pool.run(stageId(), taskAttemptId(), () => killTaskIfInterrupted()) {
+          task.runTask(this)
+        }
+      }
     } catch {
       case e: Throwable =>
         // Catch all errors; run task failure and completion callbacks, and rethrow the exception.

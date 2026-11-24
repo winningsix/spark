@@ -233,6 +233,20 @@ private[streaming] final class StreamingShuffleRawBufferPool(
     Int.MaxValue.toLong, math.max(1L, maxMemoryBytes / bufferSize)).toInt
   // A permit represents an allocation slot not yet materialized. Once allocated, the slot moves
   // between borrowers and the available deque until the pool closes or rejects an oversized buf.
+  private val reclaimers = ConcurrentHashMap.newKeySet[() => Boolean]()
+  def registerReclaimer(f: () => Boolean): Unit = reclaimers.add(f)
+  def unregisterReclaimer(f: () => Boolean): Unit = reclaimers.remove(f)
+
+  // A retained replay frame may belong to an already completed producer. Borrowers can
+  // spill its encoded representation through its original owner without changing sequence IDs.
+  def reclaimOne(): Boolean = {
+    val owners = reclaimers.iterator()
+    while (owners.hasNext) {
+      if (owners.next()()) return true
+    }
+    false
+  }
+
   private val unallocated = new Semaphore(maxBuffers)
   private val available = new LinkedBlockingDeque[ByteBuf]()
   @volatile private var closed = false

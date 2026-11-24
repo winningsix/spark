@@ -192,12 +192,28 @@ class ResolveDataSource(sparkSession: SparkSession) extends Rule[LogicalPlan] {
     }
 
     // Code path for data source v1.
-    LogicalRelation(
-      DataSource.apply(
-        sparkSession,
-        paths = finalPaths,
-        userSpecifiedSchema = userSpecifiedSchema,
-        className = source,
-        options = finalOptions.originalMap).resolveRelation(readOnly = true))
+    def resolve() = DataSource.apply(
+      sparkSession,
+      paths = finalPaths,
+      userSpecifiedSchema = userSpecifiedSchema,
+      className = source,
+      options = finalOptions.originalMap).resolveRelation(readOnly = true)
+    // A DataFrame read registered as a temp view is re-resolved on every reference, which lists
+    // the files and infers the schema again for each query. Optionally reuse the resolved relation
+    // (as an eagerly resolved DataFrame would): each reference still gets a fresh LogicalRelation
+    // with its own output attributes.
+    val relation = if (sparkSession.sessionState.conf.getConfString(
+        "spark.sql.dataSource.reuseResolvedRelation", "false").toBoolean) {
+      val key = (source.toLowerCase(Locale.ROOT), userSpecifiedSchema,
+        finalOptions.originalMap, finalPaths.toSeq)
+      resolvedRelations.computeIfAbsent(key, _ => resolve())
+    } else {
+      resolve()
+    }
+    LogicalRelation(relation)
   }
+
+  private val resolvedRelations = new java.util.concurrent.ConcurrentHashMap[
+    (String, Option[StructType], Map[String, String], Seq[String]),
+    org.apache.spark.sql.sources.BaseRelation]()
 }

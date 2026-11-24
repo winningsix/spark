@@ -53,6 +53,7 @@ import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.scheduler._
 import org.apache.spark.serializer.SerializerHelper
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleBlockPusher}
+import org.apache.spark.shuffle.streaming.StreamingCpuGate
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
 import org.apache.spark.util._
@@ -410,6 +411,11 @@ private[spark] class Executor(
   // SPARK-21928.  SerializerManager's internal instance of Kryo might get used in netty threads
   // for fetching remote cached RDD blocks, so need to make sure it uses the right classloader too.
   env.serializerManager.setDefaultClassLoader(defaultSessionState.replClassLoader)
+
+  // Optional executor-wide CPU tokens for pipelined shuffle (see StreamingCpuGate).
+  if (!isLocal) {
+    StreamingCpuGate.configure(conf.getInt("spark.shuffle.streaming.cpuGate.permits", 0))
+  }
 
   // Max size of direct result. If task result is bigger than this, we use the block manager
   // to send the result back. This is guaranteed to be smaller than array bytes limit (2GB)
@@ -903,6 +909,7 @@ private[spark] class Executor(
           rName -> new ResourceInformation(rName, addressesAmounts.keys.toSeq.sorted.toArray)
         }
         var value: Any = Utils.tryWithSafeFinally {
+          StreamingCpuGate.enter(fullTask = taskDescription.cpus >= BigDecimal(1))
           val res = task.run(
             taskAttemptId = taskId,
             attemptNumber = taskDescription.attemptNumber,
@@ -913,6 +920,7 @@ private[spark] class Executor(
           threwException = false
           res
         } {
+          StreamingCpuGate.exit()
           val releasedLocks = env.blockManager.releaseAllLocksForTask(taskId)
           val freedMemory = taskMemoryManager.cleanUpAllAllocatedMemory()
 

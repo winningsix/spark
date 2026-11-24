@@ -292,6 +292,17 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
       } else {
 
         final BigInteger integer = value.toJavaBigDecimal().unscaledValue();
+        int bits = integer.bitLength();
+        if (bits < Long.SIZE) {
+          final int length = (bits >>> 3) + 1;
+          long unscaled = integer.longValue();
+          for (int i = length - 1; i >= 0; i--) {
+            Platform.putByte(baseObject, baseOffset + cursor + i, (byte) unscaled);
+            unscaled >>= Byte.SIZE;
+          }
+          setLong(ordinal, (cursor << 32) | length);
+          return;
+        }
         byte[] bytes = integer.toByteArray();
         assert(bytes.length <= 16);
 
@@ -427,6 +438,16 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
     if (precision <= Decimal.MAX_LONG_DIGITS()) {
       return Decimal.createUnsafe(getLong(ordinal), precision, scale);
     } else {
+      final long offsetAndSize = getLong(ordinal);
+      final int size = (int) offsetAndSize;
+      if (size > 0 && size <= Long.BYTES) {
+        final long address = baseOffset + (int) (offsetAndSize >> 32);
+        long unscaled = Platform.getByte(baseObject, address);
+        for (int i = 1; i < size; i++) {
+          unscaled = (unscaled << Byte.SIZE) | (Platform.getByte(baseObject, address + i) & 0xffL);
+        }
+        return Decimal.apply(BigDecimal.valueOf(unscaled, scale), precision, scale);
+      }
       byte[] bytes = getBinary(ordinal);
       BigInteger bigInteger = new BigInteger(bytes);
       BigDecimal javaDecimal = new BigDecimal(bigInteger, scale);

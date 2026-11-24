@@ -21,6 +21,8 @@ import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
+import org.apache.spark.ShuffleLocationResponse
+import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.util.{ThreadUtils, Utils}
 
@@ -52,7 +54,7 @@ private[spark] case class StreamingShuffleReaderReadiness(
  * access a TaskSetManager. Preparation failure is retained until the scheduler retires the stage,
  * so a subsequent offer cannot silently replace an inbox containing the only copy of live data.
  */
-private[spark] class StreamingShuffleReadinessCoordinator {
+private[spark] class StreamingShuffleReadinessCoordinator extends Logging {
   private class Entry(
       val request: StreamingShuffleReaderPreparation,
       val endpoint: RpcEndpointRef) {
@@ -191,6 +193,29 @@ private[spark] class StreamingShuffleReadinessCoordinator {
 
   def unregisterShuffle(shuffleId: Int): Unit = synchronized {
     retire(_.request.shuffleIds.contains(shuffleId))
+  }
+
+  /**
+   * Push a writer-location snapshot to every executor with a receive endpoint. Most readers do
+   * not use a prepared inbox: they are launched directly and discover writers from their task
+   * thread through the executor's location cache, so the push must refresh that cache on every
+   * executor that may host a reader, not only on executors holding prepared entries.
+   */
+  def pushWriterLocations(shuffleId: Int, response: ShuffleLocationResponse): Unit = {
+    // Only pick targets under the monitor: send() serializes the snapshot on this thread, and
+    // resource offers take this monitor while holding the TaskSchedulerImpl lock.
+    // Keep one ref per executor id. Executor RpcEnvs run in client mode, so their endpoint refs
+    // have no address and compare equal to each other: never dedupe them through a Set.
+    val targets: Seq[RpcEndpointRef] = synchronized {
+      if (closed) Seq.empty else endpoints.values.toSeq
+    }
+    logInfo(s"LocationPush send shuffle=$shuffleId " +
+      s"writers=${response.shuffleTaskLocations.size}/${response.numShuffleWriterTasks} " +
+      s"targets=${targets.size}")
+    if (targets.nonEmpty) {
+      val message = StreamingShuffleWriterLocationsUpdate(shuffleId, response)
+      targets.foreach { endpoint => Utils.tryLogNonFatalError { endpoint.send(message) } }
+    }
   }
 
   def removeExecutor(executorId: String): Unit = synchronized {

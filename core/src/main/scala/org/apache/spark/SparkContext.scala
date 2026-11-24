@@ -640,9 +640,11 @@ class SparkContext(config: SparkConf) extends Logging {
     _env.initializeShuffleManager()
     // The driver in non-local deployments never runs tasks or stores off-heap blocks, and its
     // container memory is not sized for spark.memory.offHeap.size, so don't reserve off-heap
-    // memory there.
+    // memory there. A plugin that runs native code on the driver (e.g. Gluten plan validation)
+    // can opt in with spark.driver.memory.offHeap.enabled.
     _env.initializeMemoryManager(
-      SparkContext.numDriverCores(master, conf), offHeapAllowed = isLocal)
+      SparkContext.numDriverCores(master, conf),
+      offHeapAllowed = isLocal || conf.getBoolean("spark.driver.memory.offHeap.enabled", false))
 
     // Create and start the scheduler
     val (sched, ts) = SparkContext.createTaskScheduler(this, master)

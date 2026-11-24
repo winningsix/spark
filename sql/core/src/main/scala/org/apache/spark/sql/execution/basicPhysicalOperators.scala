@@ -1452,6 +1452,21 @@ case class SubqueryExec(name: String, child: SparkPlan, maxNumRows: Option[Int] 
     ThreadUtils.awaitResult(relationFuture, Duration.Inf)
   }
 
+  /** True once the result is available without blocking (requires a prior prepare()). */
+  def resultReady: Boolean = relationFuture.isDone
+
+  /** Wait up to `millis` for the result; true when it is available. */
+  def awaitReady(millis: Long): Boolean = {
+    if (millis <= 0) return relationFuture.isDone
+    try {
+      relationFuture.get(millis, java.util.concurrent.TimeUnit.MILLISECONDS)
+      true
+    } catch {
+      case _: java.util.concurrent.TimeoutException => false
+      case _: Throwable => true // completed exceptionally: let updateResult() surface it
+    }
+  }
+
   protected override def doExecute(): RDD[InternalRow] = {
     throw SparkException.internalError("SubqueryExec.doExecute should never be called")
   }

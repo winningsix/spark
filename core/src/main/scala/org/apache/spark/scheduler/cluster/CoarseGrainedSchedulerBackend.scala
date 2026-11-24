@@ -42,6 +42,7 @@ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend.ENDPOINT_NAME
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.status.api.v1.ThreadStackTrace
+import org.apache.spark.shuffle.streaming.ParkedShuffleTasks
 import org.apache.spark.util.{RpcUtils, SerializableBuffer, ThreadUtils, Utils}
 import org.apache.spark.util.ArrayImplicits._
 
@@ -193,6 +194,23 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
               logWarning(log"Ignored task status update (${MDC(TASK_ID, taskId)} " +
                 log"state ${MDC(TASK_STATE, state)}) " +
                 log"from unknown executor with ID ${MDC(LogKeys.EXECUTOR_ID, executorId)}")
+          }
+        }
+
+      case ParkedShuffleTasks(executorId, tasks) =>
+        if (conf.getBoolean("spark.shuffle.streaming.parkedOffers.enabled", false)) {
+          val borrowed = withLock {
+            executorDataMap.get(executorId).filter(_ => isExecutorActive(executorId)).map { e =>
+              scheduler.parkedShuffleOffers(buildWorkerOffer(executorId, e),
+                e.freeCores, tasks, e.totalCores)
+            }.getOrElse(Nil)
+          }
+          if (borrowed.exists(_.nonEmpty)) {
+            if (conf.getBoolean("spark.shuffle.streaming.sharedTaskPermits.trace", false)) {
+              logInfo(s"ShuffleParkedLoan executor=$executorId parked=${tasks.size} " +
+                s"donors=${tasks.mkString(",")} tasks=${borrowed.flatten.map(_.taskId).mkString(",")}")
+            }
+            launchTasks(borrowed)
           }
         }
 
@@ -420,7 +438,7 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
       WorkerOffer(
         executorId,
         executorData.executorHost,
-        executorData.freeCores,
+        executorData.freeCores.max(BigDecimal(0)),
         Some(executorData.executorAddress.hostPort),
         resources,
         executorData.resourceProfileId)
@@ -960,7 +978,7 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
   // this function is for testing only
   private[spark] def getExecutorAvailableCpus(
       executorId: String): Option[BigDecimal] = synchronized {
-    executorDataMap.get(executorId).map(_.freeCores)
+    executorDataMap.get(executorId).map(_.freeCores.max(BigDecimal(0)))
   }
 
   // this function is for testing only

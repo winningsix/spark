@@ -46,6 +46,10 @@ private[spark] class StreamingShuffleSchedulingPolicy(
     conf.get(STREAMING_SHUFFLE_ELASTIC_PRODUCER_SOLE_STAGE_MAX_TASKS)
   private val preparedReaderDiagonalAssignment =
     conf.get(STREAMING_SHUFFLE_PREPARED_READER_DIAGONAL_ASSIGNMENT_ENABLED)
+  private val executorReady =
+    conf.getBoolean("spark.shuffle.streaming.groupAdmission.executorReady.enabled", false) &&
+      conf.getBoolean("spark.shuffle.streaming.readyQuota.enabled", false) &&
+      conf.getBoolean("spark.shuffle.streaming.sharedTaskPermits.enabled", false)
   private val inboxReadyRevivePending = new AtomicBoolean(false)
 
   private lazy val shuffleReadiness: Option[StreamingShuffleReadinessCoordinator] = {
@@ -78,6 +82,7 @@ private[spark] class StreamingShuffleSchedulingPolicy(
     shuffleReadiness.foreach { coordinator =>
       val activeExecutorHosts = executorHosts
       val receiveExecutors = coordinator.executorIds.filter(activeExecutorHosts.contains).sorted
+      val receiveExecutorSet = receiveExecutors.toSet
       val existing = coordinator.snapshot
       val pending = new ArrayBuffer[StreamingShuffleReaderPreparation]
       taskSets.iterator.filter { taskSet =>
@@ -90,11 +95,15 @@ private[spark] class StreamingShuffleSchedulingPolicy(
           val key = StreamingShuffleReaderKey(
             taskSet.stageId, taskSet.taskSet.stageAttemptId, taskIndex)
           if (taskSet.isActiveForScheduling && taskSet.isTaskPendingForOffer(taskIndex)) {
-            val eligibleExecutors = receiveExecutors.filter { executorId =>
+            // Admission has already committed an executor for this partition. Recheck its
+            // current endpoint and locality on each offer, including loss after preparation.
+            val candidates = if (taskSet.taskSet.pipelinedGroupAdmissionRequired) {
+              admission.flatMap(_.readerPlacement(taskSet.stageId, taskIndex))
+                .filter(receiveExecutorSet).toSeq
+            } else receiveExecutors
+            val eligibleExecutors = candidates.filter { executorId =>
               taskSet.canPrepareReaderOnExecutor(
-                taskIndex, executorId, activeExecutorHosts(executorId)) &&
-                (!taskSet.taskSet.pipelinedGroupAdmissionRequired || admission.exists(a =>
-                  a.readerPlacement(taskSet.stageId, taskIndex).contains(executorId)))
+                taskIndex, executorId, activeExecutorHosts(executorId))
             }
             existing.get(key) match {
               case Some(state) if state.failure.isDefined =>
@@ -133,10 +142,20 @@ private[spark] class StreamingShuffleSchedulingPolicy(
       (manager.stageId, manager.taskSet.stageAttemptId) -> manager
     }.toMap
     shuffleReadiness.foreach { coordinator =>
-      coordinator.snapshot.foreach { case (key, state) =>
+      val states = coordinator.snapshot
+      if (admission.exists(a => managersByStage.keysIterator.exists(k => a.waitsForData(k._1)))) {
+        val counts = states.iterator.collect { case (key, state) if state.prepared =>
+          (key.stageId, key.stageAttemptId)
+        }.toSeq.groupMapReduce(identity)(_ => 1)(_ + _)
+        admission.foreach(_.updatePreparedReaders(counts))
+      }
+      states.foreach { case (key, state) =>
         managersByStage.get((key.stageId, key.stageAttemptId)).foreach { manager =>
+          val startOnPreparation =
+            admission.exists(a => a.admitted(key.stageId) &&
+              (executorReady || !a.waitsForData(key.stageId)))
           if (manager.isActiveForScheduling && manager.isTaskPendingForOffer(key.taskIndex) &&
-              (if (admission.exists(_.admitted(key.stageId))) state.prepared else state.ready)) {
+              (if (startOnPreparation) state.prepared else state.ready)) {
             offerReadyPreTaskReaderIndices.getOrElseUpdate(
               (key.stageId, key.stageAttemptId, state.executorId), new HashSet[Int]) +=
               key.taskIndex

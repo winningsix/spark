@@ -116,6 +116,12 @@ class SparkOptimizer(
       ConstantFolding,
       EliminateLimits),
     Batch("User Provided Optimizers", fixedPoint, experimentalMethods.extraOptimizations: _*),
+    Batch("String key filters on remaining scans", Once, InjectStringFilterAfterProbeFilters),
+    Batch("Reuse scan Bloom filters on inner join keys", Once, ReuseJoinKeyBloomFilter),
+    Batch("Share completed grouped extrema", Once, adaptive.ShareScalarGroupedInput),
+    Batch("Narrow inputs of grouped outer counts", Once, NarrowOuterCount),
+    Batch("Delay wide join payload", Once, DelayWideJoinInput),
+    Batch("Bounded exact integral runtime filters", Once, UseIntegralRuntimeFilter),
     Batch("Replace CTE with Repartition", Once, ReplaceCTERefWithRepartition),
     // Must run last: it inspects the final plan shape to mark scans that can run in a single task,
     // and no subsequent rule should reshape the plan or copy the marked scan nodes.

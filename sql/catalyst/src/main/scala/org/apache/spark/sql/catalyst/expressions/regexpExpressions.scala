@@ -194,7 +194,47 @@ case class Like(left: Expression, right: Expression, escapeChar: Char)
     s"${left.sql} ${prettyName.toUpperCase(Locale.ROOT)} ${right.sql}" + escapeSuffix
   }
 
+  // For binary LIKE, the earliest complete first literal leaves all possible
+  // matches for the second one. Search byte offsets so multibyte input does not
+  // require conversion into a JVM String. Restrict the literal alphabet to ASCII.
+  @transient private lazy val orderedLiterals: Option[(UTF8String, UTF8String)] = {
+    val enabled = org.apache.spark.sql.internal.SQLConf.get.getConfString(
+      "spark.sql.execution.binaryLike.orderedLiterals.enabled", "false").toBoolean
+    right match {
+      case Literal(pattern: UTF8String, _) if enabled &&
+          collationId == org.apache.spark.sql.catalyst.util.CollationFactory.UTF8_BINARY_COLLATION_ID =>
+        val text = pattern.toString
+        if (text.contains(escapeChar) || text.contains('_') || !text.startsWith("%") ||
+            !text.endsWith("%") || !text.forall(_ < 128)) None
+        else text.split("%+").filter(_.nonEmpty) match {
+          case Array(a, b) => Some((UTF8String.fromString(a), UTF8String.fromString(b)))
+          case _ => None
+        }
+      case _ => None
+    }
+  }
+
+  override protected def nullSafeEval(input1: Any, input2: Any): Any = orderedLiterals match {
+    case Some((a, b)) =>
+      val value = input1.asInstanceOf[UTF8String]
+      val start = value.find(a, 0)
+      start >= 0 && value.find(b, start + a.numBytes()) >= 0
+    case None => super.nullSafeEval(input1, input2)
+  }
+
   override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    orderedLiterals match {
+      case Some((a, b)) =>
+        val first = ctx.addReferenceObj("firstLikeLiteral", a)
+        val second = ctx.addReferenceObj("secondLikeLiteral", b)
+        val pos = ctx.freshName("firstLikeOffset")
+        return nullSafeCodeGen(ctx, ev, (value, _) =>
+          s"""
+             |int $pos = $value.find($first, 0);
+             |${ev.value} = $pos >= 0 && $value.find($second, $pos + ${a.numBytes()}) >= 0;
+           """.stripMargin)
+      case None =>
+    }
     val patternClass = classOf[Pattern].getName
     val escapeFunc = StringUtils.getClass.getName.stripSuffix("$") + ".escapeLikeRegex"
 

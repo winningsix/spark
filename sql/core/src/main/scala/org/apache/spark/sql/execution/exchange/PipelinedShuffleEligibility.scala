@@ -36,6 +36,21 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
   // every query planned in the session.
   private val mismatchWarned = new AtomicBoolean(false)
 
+  /**
+   * Slots charged per pipelined reader task, relative to a default task, when reader tasks are
+   * given a fractional CPU charge (spark.shuffle.streaming.reader.taskCpus and
+   * readerProducer.taskCpus, see StreamingShuffleTaskResources). Uses the larger of the two so a
+   * stage whose role is not known yet is not under-counted. 1.0 when neither is set.
+   */
+  def readerSlotCharge(conf: org.apache.spark.SparkConf): Double = {
+    val taskCpus = BigDecimal(conf.get("spark.task.cpus", "1"))
+    val charges = Seq("spark.shuffle.streaming.reader.taskCpus",
+      "spark.shuffle.streaming.readerProducer.taskCpus").map { key =>
+      conf.getOption(key).map(BigDecimal(_)).getOrElse(taskCpus)
+    }
+    if (taskCpus <= 0) 1.0 else math.min(1.0, (charges.max / taskCpus).toDouble)
+  }
+
   /** Limits require a transport that supports their hidden materialized shuffle boundary. */
   def isUnsupportedConsumer(
       plan: SparkPlan,

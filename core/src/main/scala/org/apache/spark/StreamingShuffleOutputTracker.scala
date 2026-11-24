@@ -17,7 +17,8 @@
 
 package org.apache.spark
 
-import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, ScheduledExecutorService,
+  ThreadPoolExecutor, TimeUnit}
 
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
@@ -25,6 +26,7 @@ import scala.util.control.NonFatal
 
 import org.apache.spark.internal.{Logging, LogKeys}
 import org.apache.spark.internal.config.{SHUFFLE_MAPOUTPUT_DISPATCHER_NUM_THREADS,
+  STREAMING_SHUFFLE_LOCATION_PUSH_DELAY, STREAMING_SHUFFLE_LOCATION_PUSH_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.shuffle.streaming.{StreamingShuffleReadinessCoordinator,
@@ -291,6 +293,62 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   private val shuffleInfos = new ConcurrentHashMap[Int, StreamingShuffleInfo]()
   private[spark] val receiveCoordinator = new StreamingShuffleReadinessCoordinator
 
+  // Event-driven writer discovery: coalesce registrations of one shuffle within a short window
+  // and push one snapshot to each executor holding prepared inboxes for it. Without this, a
+  // prepared reader learns about writers only at its executor's next periodic poll, which adds
+  // up to one refresh interval before the first credit (and hence any data) can flow.
+  private val locationPushEnabled = conf.get(STREAMING_SHUFFLE_LOCATION_PUSH_ENABLED)
+  private val locationPushDelayMs = conf.get(STREAMING_SHUFFLE_LOCATION_PUSH_DELAY)
+  private val pendingLocationPushes = ConcurrentHashMap.newKeySet[Int]()
+  private lazy val locationPushExecutor: ScheduledExecutorService =
+    ThreadUtils.newDaemonSingleThreadScheduledExecutor("streaming-shuffle-location-push")
+
+  // Small shuffles (the case whose fixed discovery latency dominates) get a debounced push on
+  // every registration. Larger ones push only once all writers are known: intermediate
+  // snapshots of hundreds of writers to every reader executor would cost more than the periodic
+  // poll they replace, and a few-ms head start does not matter for a multi-second stage.
+  private val locationPushIncrementalMaxWriters = 64
+
+  private def maybeScheduleLocationPush(shuffleId: Int): Unit = {
+    if (locationPushEnabled) {
+      val info = shuffleInfos.get(shuffleId)
+      val locations = taskLocations.get(shuffleId)
+      if (info != null && (info.numMaps <= locationPushIncrementalMaxWriters ||
+          (locations != null && locations.size() >= info.numMaps))) {
+        scheduleLocationPush(shuffleId)
+      }
+    }
+  }
+
+  private def scheduleLocationPush(shuffleId: Int): Unit = {
+    if (locationPushEnabled && pendingLocationPushes.add(shuffleId)) {
+      try {
+        locationPushExecutor.schedule(new Runnable {
+          override def run(): Unit = pushLocations(shuffleId)
+        }, locationPushDelayMs, TimeUnit.MILLISECONDS)
+      } catch {
+        case NonFatal(e) =>
+          pendingLocationPushes.remove(shuffleId)
+          logDebug(s"Could not schedule writer-location push for shuffle $shuffleId", e)
+      }
+    }
+  }
+
+  private def pushLocations(shuffleId: Int): Unit = {
+    // Clear the pending flag before reading the snapshot: a registration racing with this read
+    // schedules another push, so no registration is ever left unpublished.
+    pendingLocationPushes.remove(shuffleId)
+    try {
+      if (shuffleInfos.containsKey(shuffleId)) {
+        getAvailableShuffleWriterTaskLocations(shuffleId).foreach { response =>
+          receiveCoordinator.pushWriterLocations(shuffleId, response)
+        }
+      }
+    } catch {
+      case NonFatal(e) => logWarning(s"Writer-location push for shuffle $shuffleId failed", e)
+    }
+  }
+
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
 
@@ -466,6 +524,8 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       logWarning(
         log"Shuffle ${MDC(LogKeys.SHUFFLE_ID, shuffleId)} was unregistered " +
           log"during registration of writer task ${MDC(LogKeys.MAP_ID, mapId)}")
+    } else {
+      maybeScheduleLocationPush(shuffleId)
     }
     registered
   }
@@ -493,6 +553,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   }
 
   override def stop(): Unit = {
+    if (locationPushEnabled) locationPushExecutor.shutdownNow()
     receiveCoordinator.close()
     trackerMasterMessages.offer(PoisonPill)
     threadpool.shutdown()
@@ -579,6 +640,23 @@ private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
             shuffleId, CachedAvailableLocations(response, System.nanoTime()))
           response
         }
+      }
+    }
+  }
+
+  /** Install a driver-pushed snapshot so readers polling this executor's cache see it. */
+  private[spark] def acceptPushedLocations(
+      shuffleId: Int,
+      response: ShuffleLocationResponse): Unit = {
+    // Pushes and asks can complete out of order. Writer sets only grow (a retried attempt
+    // replaces its predecessor), so never let a smaller pushed snapshot replace a cached one.
+    val refreshLock = availableLocationRefreshLocks.computeIfAbsent(shuffleId, _ => new Object)
+    refreshLock.synchronized {
+      val cachedSize = Option(availableLocationCache.get(shuffleId))
+        .flatMap(_.response).map(_.shuffleTaskLocations.size).getOrElse(-1)
+      if (response.shuffleTaskLocations.size >= cachedSize) {
+        availableLocationCache.put(
+          shuffleId, CachedAvailableLocations(Some(response), System.nanoTime()))
       }
     }
   }

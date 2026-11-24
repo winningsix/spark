@@ -100,6 +100,34 @@ private[spark] object TaskDescription {
     }
   }
 
+  private val lastEncodedProperties =
+    new java.util.concurrent.atomic.AtomicReference[(Properties, Int, Array[Byte])](null)
+
+  private def encodedProperties(properties: Properties): Array[Byte] = {
+    val cached = lastEncodedProperties.get()
+    // Same instance and same size: properties are only ever extended (e.g. barrier addresses),
+    // never rewritten in place, after a task set is submitted.
+    if (cached != null && (cached._1 eq properties) && cached._2 == properties.size()) {
+      cached._3
+    } else {
+      val bytesOut = new java.io.ByteArrayOutputStream(16384)
+      val out = new DataOutputStream(bytesOut)
+      out.writeInt(properties.size())
+      properties.asScala.foreach { case (key, value) =>
+        out.writeUTF(key)
+        // SPARK-19796 -- writeUTF doesn't work for long strings, which can happen for property
+        // values
+        val bytes = value.getBytes(StandardCharsets.UTF_8)
+        out.writeInt(bytes.length)
+        out.write(bytes)
+      }
+      out.flush()
+      val encoded = bytesOut.toByteArray
+      lastEncodedProperties.set((properties, properties.size(), encoded))
+      encoded
+    }
+  }
+
   def encode(taskDescription: TaskDescription): ByteBuffer = {
     val bytesOut = new ByteBufferOutputStream(4096)
     val dataOut = new DataOutputStream(bytesOut)
@@ -114,15 +142,10 @@ private[spark] object TaskDescription {
     // Write artifacts
     serializeArtifacts(taskDescription.artifacts, dataOut)
 
-    // Write properties.
-    dataOut.writeInt(taskDescription.properties.size())
-    taskDescription.properties.asScala.foreach { case (key, value) =>
-      dataOut.writeUTF(key)
-      // SPARK-19796 -- writeUTF doesn't work for long strings, which can happen for property values
-      val bytes = value.getBytes(StandardCharsets.UTF_8)
-      dataOut.writeInt(bytes.length)
-      dataOut.write(bytes)
-    }
+    // Write properties. All tasks of a task set share one Properties instance and are usually
+    // encoded back to back, so reuse the previous encoding for the same instance instead of
+    // re-encoding (typically ~10 KB of session conf) per task on the scheduler thread.
+    dataOut.write(encodedProperties(taskDescription.properties))
 
     // Write cpus in its minimal (trailing-zero-trimmed) decimal string form; it is re-normalized
     // to the fixed CPU scale on read, so fractional values round-trip exactly.

@@ -227,7 +227,8 @@ case class ShuffleExchangeExec(
     // the child on its own. Exchange's `[plan_id=...]` suffix is re-appended here.
     val argsWithoutPipelined = productIterator.toSeq.dropRight(1).iterator
     val pipelinedArg = if (pipelined) Iterator("isPipelined=true") else Iterator.empty
-    argsWithoutPipelined ++ pipelinedArg ++ Iterator(s"[plan_id=$id]")
+    val frames = if (usesFiniteMembershipFrames) Iterator("mapBatchDelivery=true") else Iterator.empty
+    argsWithoutPipelined ++ pipelinedArg ++ frames ++ Iterator(s"[plan_id=$id]")
   }
 
   private lazy val serializer: Serializer =
@@ -243,6 +244,11 @@ case class ShuffleExchangeExec(
   @transient private var pipelinedSequentialReplayCount: Int = 0
 
   private[exchange] def pipelinedReuseKey: Int = pipelinedExchangeReuseKey
+
+  private def usesFiniteMembershipFrames: Boolean =
+    pipelined && pipelinedReaderRouteMultiplicity == 1 && pipelinedSequentialReplayCount == 0 &&
+      getTagValue(ShuffleExchangeExec.finiteMembershipFrames).contains(true)
+
 
   private[exchange] def setPipelinedReaderRouteMultiplicity(multiplicity: Int): Unit = {
     require(multiplicity > 0, s"Reader route multiplicity must be positive: $multiplicity")
@@ -297,13 +303,14 @@ case class ShuffleExchangeExec(
     // preparation (e.g. by prepareShuffleDependency's mapPartitionsInternal calls) get this
     // exchange's scope ID.
     RDDOperationScope.withScope(sparkContext, nodeName, false, true, rddScopeId) {
-      val dep = ShuffleExchangeExec.prepareShuffleDependency(
+      val dep = ShuffleExchangeExec.prepareWithDelivery(
         inputRDD,
         child.output,
         outputPartitioning,
         serializer,
         writeMetrics,
-        pipelined)
+        pipelined,
+        usesFiniteMembershipFrames)
       dep match {
         case pipelinedDep: PipelinedShuffleDependency[_, _, _] =>
           pipelinedDep.setReaderRouteMultiplicity(pipelinedReaderRouteMultiplicity)
@@ -334,6 +341,9 @@ case class ShuffleExchangeExec(
 }
 
 object ShuffleExchangeExec {
+  private[exchange] val finiteMembershipFrames =
+    org.apache.spark.sql.catalyst.trees.TreeNodeTag[Boolean]("org.apache.spark.sql.finiteMembershipFrames")
+
 
   private[execution] val executionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("shuffle-exchange",
@@ -414,6 +424,18 @@ object ShuffleExchangeExec {
       writeMetrics: Map[String, SQLMetric],
       pipelined: Boolean = false)
     : ShuffleDependency[Int, InternalRow, InternalRow] = {
+    prepareWithDelivery(rdd, outputAttributes, newPartitioning, serializer, writeMetrics,
+      pipelined, finiteFrames = false)
+  }
+
+  private def prepareWithDelivery(
+      rdd: RDD[InternalRow],
+      outputAttributes: Seq[Attribute],
+      newPartitioning: Partitioning,
+      serializer: Serializer,
+      writeMetrics: Map[String, SQLMetric],
+      pipelined: Boolean,
+      finiteFrames: Boolean): ShuffleDependency[Int, InternalRow, InternalRow] = {
     val part: Partitioner = newPartitioning match {
       case RoundRobinPartitioning(numPartitions) => new HashPartitioner(numPartitions)
       case HashPartitioning(_, n) =>
@@ -659,9 +681,17 @@ object ShuffleExchangeExec {
         // streaming shuffle manager and pipelined-group co-scheduling both follow from it. The
         // checksum-mismatch retry knobs are intentionally not carried over: a transient shuffle is
         // never recomputed, so PipelinedShuffleDependency does not expose them (they stay off).
+        val batch = finiteFrames && newPartitioning.isInstanceOf[HashPartitioning] &&
+          rdd.sparkContext.getLocalProperty(
+            org.apache.spark.sql.execution.streaming.runtime.StreamExecution.QUERY_ID_KEY) == null
+        val delivery = if (batch) {
+          new org.apache.spark.shuffle.streaming.MapBatchPartitioner(part.numPartitions, shareStartup = true)
+        } else {
+          new PartitionIdPassthrough(part.numPartitions)
+        }
         new PipelinedShuffleDependency[Int, InternalRow, InternalRow](
           rddWithPartitionIds,
-          new PartitionIdPassthrough(part.numPartitions),
+          delivery,
           serializer,
           shuffleWriterProcessor = createShuffleWriteProcessor(writeMetrics),
           rowBasedChecksums = UnsafeRowChecksum.createUnsafeRowChecksums(checksumSize))

@@ -43,6 +43,7 @@ import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.rpc._
 import org.apache.spark.scheduler.{ExecutorLossMessage, ExecutorLossReason, TaskDescription}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
+import org.apache.spark.shuffle.streaming.{ParkedShuffleTasks, StreamingCpuGate, StreamingParkedTaskReporter}
 import org.apache.spark.util.{ChildFirstURLClassLoader, MutableURLClassLoader, SignalUtils, ThreadUtils, Utils}
 
 private[spark] class CoarseGrainedExecutorBackend(
@@ -65,6 +66,7 @@ private[spark] class CoarseGrainedExecutorBackend(
 
   private var _resources = Map.empty[String, ResourceInformation]
 
+  private var parkedReporter: StreamingParkedTaskReporter = _
   private var decommissioned = false
 
   // Track the last time in ns that at least one task is running. If no task is running and all
@@ -168,6 +170,24 @@ private[spark] class CoarseGrainedExecutorBackend(
     case RegisteredExecutor =>
       logInfo("Successfully registered with driver")
       try {
+        if (env.conf.getBoolean("spark.shuffle.streaming.sharedTaskPermits.enabled", false)) {
+          require(env.conf.getInt("spark.shuffle.streaming.cpuGate.permits", 0) == 0,
+            "The legacy CPU gate and shared task permits cannot run together")
+          StreamingCpuGate.configureShared(
+            cores, env.conf.getBoolean("spark.shuffle.streaming.sharedTaskPermits.trace", false))
+        }
+        if (env.conf.getBoolean("spark.shuffle.streaming.readyQuota.enabled", false)) {
+          require(StreamingCpuGate.sharedPool != null, "Ready quotas require shared task permits")
+          StreamingCpuGate.sharedPool.readyQuota = true
+        }
+        if (env.conf.getBoolean("spark.shuffle.streaming.parkedOffers.enabled", false)) {
+          val pool = StreamingCpuGate.readyPool
+          require(pool != null, "Parked offers require the ready quota pool")
+          parkedReporter = new StreamingParkedTaskReporter(ids =>
+            driver.foreach(_.send(ParkedShuffleTasks(executorId, ids))),
+            () => executor != null && executor.runningTasks.size() >= cores && pool.hasIdleQuota)
+          pool.parkedReporter = parkedReporter
+        }
         executor = new Executor(executorId, hostname, env, getUserClassPath, isLocal = false,
           resources = _resources)
         driver.get.send(LaunchedExecutor(executorId))
@@ -202,6 +222,7 @@ private[spark] class CoarseGrainedExecutorBackend(
       self.send(Shutdown)
 
     case Shutdown =>
+      if (parkedReporter != null) parkedReporter.close()
       stopping.set(true)
       new Thread("CoarseGrainedExecutorBackend-stop-executor") {
         override def run(): Unit = {

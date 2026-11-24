@@ -213,10 +213,15 @@ private[spark] abstract class Task[T](
   def collectAccumulatorUpdates(taskFailed: Boolean = false): Seq[AccumulatorV2[_, _]] = {
     if (context != null) {
       // Note: internal accumulators representing task metrics always count failed values
+      // Zero value external accumulators may still be useful, e.g. SQLMetrics (UI min/median
+      // statistics), so they are kept by default. A backend with hundreds of per-operator metrics
+      // makes every task report them all; each is deserialized, merged and turned into listener
+      // events on the driver's scheduler threads. Optionally drop untouched ones.
+      val dropZero = Option(SparkEnv.get).exists(
+        _.conf.getBoolean("spark.executor.accumulators.dropZeroExternal", false))
       context.taskMetrics().nonZeroInternalAccums() ++
-        // zero value external accumulators may still be useful, e.g. SQLMetrics, we should not
-        // filter them out.
-        context.taskMetrics().withExternalAccums(_.filter(a => !taskFailed || a.countFailedValues))
+        context.taskMetrics().withExternalAccums(_.filter(a =>
+          (!taskFailed || a.countFailedValues) && !(dropZero && a.isZero)))
     } else {
       Seq.empty
     }

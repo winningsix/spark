@@ -45,7 +45,14 @@ case object ReuseExchangeAndSubquery extends Rule[SparkPlan] {
           case exchange: Exchange if conf.exchangeReuseEnabled =>
             val cachedExchange = exchanges.getOrElseUpdate(exchange.canonicalized, exchange)
             if (cachedExchange.ne(exchange)) {
-              ReusedExchangeExec(exchange.output, cachedExchange)
+              val reused = ReusedExchangeExec(exchange.output, cachedExchange)
+              // Keep this branch's logical link: the duplicate subtree is dropped here, and AQE
+              // (full-plan pipelined mode runs this rule before stage creation) maps the stage
+              // created for this leaf back to this branch's logical node.
+              exchange.logicalLink.orElse(exchange.collectFirst {
+                case p if p.logicalLink.isDefined => p.logicalLink.get
+              }).foreach(reused.setLogicalLink)
+              reused
             } else {
               cachedExchange
             }

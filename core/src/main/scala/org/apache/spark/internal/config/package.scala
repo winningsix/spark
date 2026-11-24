@@ -2348,6 +2348,29 @@ package object config {
       .checkValue(_ >= 1L, "must be at least one millisecond")
       .createWithDefault(100L)
 
+  private[spark] val STREAMING_SHUFFLE_LOCATION_PUSH_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.locationPush.enabled")
+      .doc("Push writer-location snapshots from the driver to executors that hold prepared " +
+        "receive inboxes for the shuffle as soon as writers register, and refresh a newly " +
+        "prepared inbox immediately, instead of waiting for the next periodic location poll. " +
+        "The periodic poll remains as a fallback.")
+      .version("4.4.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val STREAMING_SHUFFLE_LOCATION_PUSH_DELAY =
+    ConfigBuilder("spark.shuffle.streaming.locationPush.delay")
+      .doc("Debounce window for driver writer-location pushes of one shuffle. Registrations " +
+        "within the window are coalesced into one snapshot per executor.")
+      .version("4.4.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 0L, "must be non-negative")
+      .createWithDefault(2L)
+
   private[spark] val SHUFFLE_DETECT_CORRUPT =
     ConfigBuilder("spark.shuffle.detectCorrupt")
       .doc("Whether to detect any corruption in fetched blocks.")

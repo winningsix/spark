@@ -25,10 +25,12 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
-import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{ShuffleLocationResponse, SparkConf, SparkEnv,
+  StreamingShuffleOutputTrackerWorker, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{EXECUTOR_CORES,
   STREAMING_SHUFFLE_ELASTIC_PRODUCER_MAX_TASKS_PER_STAGE,
+  STREAMING_SHUFFLE_LOCATION_PUSH_ENABLED,
   STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL,
   STREAMING_SHUFFLE_PREPARED_INBOX_READY_BYTES,
   STREAMING_SHUFFLE_READER_MAX_MEMORY,
@@ -53,6 +55,11 @@ private[spark] case class PrepareStreamingShuffleReceiveInboxes(
 
 private[spark] case class ReleaseStreamingShuffleReceiveInbox(
     id: StreamingShuffleReceiveInboxId)
+
+/** Driver-pushed writer-location snapshot for one shuffle (see locationPush.enabled). */
+private[spark] case class StreamingShuffleWriterLocationsUpdate(
+    shuffleId: Int,
+    response: ShuffleLocationResponse)
 
 private[streaming] case class StreamingShuffleReceiveInboxStats(
     spilledBytes: Long,
@@ -216,6 +223,11 @@ private[streaming] class StreamingShuffleReceiveService(
     }
   }
 
+  def onWriterLocationsPushed(shuffleId: Int, response: ShuffleLocationResponse): Unit = {
+    val resources = preparedResources
+    if (resources != null) resources.discovery.acceptPushedSnapshot(shuffleId, response)
+  }
+
   def releasePrepared(id: StreamingShuffleReceiveInboxId): Boolean = synchronized {
     val inbox = inboxes.get(id)
     inbox != null && inboxes.remove(id, inbox) && {
@@ -311,6 +323,13 @@ private[streaming] class StreamingShuffleReceiveServiceEndpoint(
     service: StreamingShuffleReceiveService) extends RpcEndpoint {
   override def receive: PartialFunction[Any, Unit] = {
     case ReleaseStreamingShuffleReceiveInbox(id) => service.releasePrepared(id)
+    case StreamingShuffleWriterLocationsUpdate(shuffleId, response) =>
+      Option(SparkEnv.get).flatMap(_.streamingShuffleOutputTracker).foreach {
+        case worker: StreamingShuffleOutputTrackerWorker =>
+          worker.acceptPushedLocations(shuffleId, response)
+        case _ =>
+      }
+      service.onWriterLocationsPushed(shuffleId, response)
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
@@ -342,6 +361,9 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
   private val snapshotRequests = new AtomicLong(0L)
   private val snapshotDeliveries = new AtomicLong(0L)
   private val refreshIntervalMs = conf.get(STREAMING_SHUFFLE_LOCATION_REFRESH_INTERVAL)
+  private val pushEnabled = conf.get(STREAMING_SHUFFLE_LOCATION_PUSH_ENABLED)
+  private val pendingImmediateRefresh = ConcurrentHashMap.newKeySet[Int]()
+  private val pushedDeliveries = new AtomicLong(0L)
   private val executor: ScheduledExecutorService =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor(
       "streaming-shuffle-prepared-discovery")
@@ -357,6 +379,43 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
     require(added, s"Prepared receive session ${session.shuffleId} is already registered")
     val current = activeSessions.incrementAndGet()
     peakActiveSessions.accumulateAndGet(current, Math.max)
+    // A new inbox would otherwise wait for the next periodic poll (up to refreshIntervalMs) even
+    // when a pushed snapshot is already in the executor cache. Serve it from that cache (asking
+    // the driver only if the cache is stale); one such delivery per shuffle is queued at a time.
+    // Never force a driver ask here: it would install a fresh, still-empty snapshot that hides
+    // writers from cache readers for a whole refresh interval.
+    if (pushEnabled && pendingImmediateRefresh.add(session.shuffleId)) {
+      try {
+        executor.execute(() => {
+          pendingImmediateRefresh.remove(session.shuffleId)
+          deliver(session.shuffleId, () => {
+            val r = snapshotProvider(session.shuffleId)
+            logInfo(s"LocationPush refresh shuffle=${session.shuffleId} " +
+              s"writers=${r.map(_.shuffleTaskLocations.size).getOrElse(-1)}")
+            r
+          })
+        })
+      } catch {
+        case NonFatal(_) => pendingImmediateRefresh.remove(session.shuffleId)
+      }
+    }
+  }
+
+  /** Deliver a driver-pushed snapshot on the discovery thread (sessions are not thread-safe). */
+  def acceptPushedSnapshot(shuffleId: Int, snapshot: ShuffleLocationResponse): Unit = {
+    if (closed.get()) return
+    try {
+      executor.execute(() => {
+        pushedDeliveries.incrementAndGet()
+        val n = Option(sessions.get(shuffleId)).map(_.size()).getOrElse(0)
+        logInfo(s"LocationPush recv shuffle=$shuffleId " +
+          s"writers=${snapshot.shuffleTaskLocations.size}/${snapshot.numShuffleWriterTasks} " +
+          s"sessions=$n")
+        deliver(shuffleId, () => Some(snapshot))
+      })
+    } catch {
+      case NonFatal(_) => // closed concurrently; the periodic poll is gone too
+    }
   }
 
   def unregister(session: StreamingShufflePreparedReceiveSession): Unit = {
@@ -368,12 +427,20 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
   }
 
   private def poll(): Unit = {
-    sessions.entrySet().asScala.foreach { entry =>
-      val active = entry.getValue.asScala.filterNot(_.isClosed).toSeq
+    sessions.keySet().asScala.foreach { shuffleId =>
+      deliver(shuffleId, () => snapshotProvider(shuffleId))
+    }
+  }
+
+  private def deliver(
+      shuffleId: Int,
+      provider: () => Option[ShuffleLocationResponse]): Unit = {
+    Option(sessions.get(shuffleId)).foreach { shuffleSessions =>
+      val active = shuffleSessions.asScala.filterNot(_.isClosed).toSeq
       if (active.nonEmpty) {
         try {
           snapshotRequests.incrementAndGet()
-          snapshotProvider(entry.getKey).foreach { snapshot =>
+          provider().foreach { snapshot =>
             snapshotDeliveries.addAndGet(active.size)
             active.foreach { session =>
               try {
@@ -402,7 +469,7 @@ private[streaming] class StreamingShufflePreparedReceiveDiscovery(
         s"Closing prepared shuffle discovery: activeSessions=${activeSessions.get()} " +
           s"peakActiveSessions=${peakActiveSessions.get()} " +
           s"snapshotRequests=${snapshotRequests.get()} " +
-          s"snapshotDeliveries=${snapshotDeliveries.get()}")
+          s"snapshotDeliveries=${snapshotDeliveries.get()} pushedDeliveries=${pushedDeliveries.get()}")
       sessions.clear()
       activeSessions.set(0)
     }

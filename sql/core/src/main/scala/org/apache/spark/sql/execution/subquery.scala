@@ -92,7 +92,12 @@ case class ScalarSubquery(
     if (rows.length == 1) {
       assert(rows(0).numFields == 1,
         s"Expects 1 field, but got ${rows(0).numFields}; something went wrong in analysis")
-      result = rows(0).get(0, dataType)
+      val value = rows(0).get(0, dataType)
+      result = value match {
+        case bytes: Array[Byte] if plan.output.head.metadata.contains(IntegralKeyBroadcast.marker) =>
+          IntegralKeyBroadcast.forPlan(plan, bytes)
+        case other => other
+      }
     } else {
       // If there is no rows returned, the result should be null.
       result = null
@@ -102,8 +107,19 @@ case class ScalarSubquery(
 
   override def eval(input: InternalRow): Any = {
     require(updated, s"$this has not finished")
-    result
+    result match {
+      case keys: IntegralKeyBroadcast => keys.value
+      case other => other
+    }
   }
+
+  private[execution] def integralKeyBroadcast: Option[IntegralKeyBroadcast] = result match {
+    case keys: IntegralKeyBroadcast => Some(keys)
+    case _ => None
+  }
+
+  /** Whether updateResult() has completed (the value can be read without blocking). */
+  def isResultUpdated: Boolean = updated
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     toLiteral.doGenCode(ctx, ev)
@@ -111,7 +127,7 @@ case class ScalarSubquery(
 
   def toLiteral: Literal = {
     require(updated, s"$this has not finished")
-    Literal.create(result, dataType)
+    Literal.create(eval(null), dataType)
   }
 }
 

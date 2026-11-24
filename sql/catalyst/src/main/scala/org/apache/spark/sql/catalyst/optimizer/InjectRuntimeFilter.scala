@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.annotation.tailrec
 
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate, Count}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -44,21 +44,77 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
       materializedRowCount: Option[BigInt] = None,
       materializedSizeInBytes: Option[BigInt] = None)
 
-  private def injectFilter(
-      filterApplicationSideKey: Expression,
-      filterApplicationSidePlan: LogicalPlan,
-      filterCreationSide: FilterCreationSide): LogicalPlan = {
-    injectBloomFilter(
-      filterApplicationSideKey,
-      filterApplicationSidePlan,
-      filterCreationSide
-    )
+  private def deferStringFilters: Boolean = conf.getConfString(
+    "spark.sql.optimizer.runtime.bloomFilter.afterProbeFilters.enabled", "false").toBoolean
+
+  private def boundedFilteredKeys(
+      creation: LogicalPlan,
+      buildKey: Expression,
+      application: LogicalPlan,
+      probeKey: Expression,
+      stringFilter: Boolean): Boolean = {
+    val setting = if (stringFilter) {
+      "spark.sql.optimizer.runtime.bloomFilter.stringFilteredKeyProjection.enabled"
+    } else {
+      "spark.sql.optimizer.runtime.bloomFilter.boundedKeyProjection.enabled"
+    }
+    if (!conf.getConfString(setting, "false").toBoolean || !buildKey.isInstanceOf[Attribute] ||
+        !probeKey.isInstanceOf[Attribute] || application.output.size <= 1) return false
+
+    def scan(plan: LogicalPlan): Option[LeafNode] = plan match {
+      case Project(cols, child) if cols.forall(_.isInstanceOf[Attribute]) => scan(child)
+      case Filter(test, child) if test.deterministic && isSimpleExpression(test) &&
+          !SubqueryExpression.hasSubquery(test) => scan(child)
+      case leaf: LeafNode if !leaf.isStreaming && leaf.deterministic &&
+          leaf.stats.sizeInBytes < conf.defaultSizeInBytes => Some(leaf)
+      case _ => None
+    }
+    def literalFilter(p: LogicalPlan): Boolean = p.exists {
+      case Filter(pred, _) => splitConjunctivePredicates(pred).exists {
+        case test: StringPredicate if stringFilter =>
+          (test.left, test.right) match {
+            case (a: Attribute, lit: Literal) =>
+              !a.semanticEquals(buildKey) && lit.value != null && lit.value.toString.nonEmpty
+            case _ => false
+          }
+        case EqualTo(a: Attribute, lit: Literal) if !stringFilter => lit.value != null && !a.semanticEquals(buildKey)
+        case EqualTo(lit: Literal, a: Attribute) if !stringFilter => lit.value != null && !a.semanticEquals(buildKey)
+        case _ => false
+      }
+      case _ => false
+    }
+    // A probe already narrowed by a value predicate may write far fewer rows than
+    // its file sizes suggest. Estimate avoided shuffle only for a direct, unfiltered scan.
+    def groupInput(agg: Aggregate): Option[LogicalPlan] =
+      Option.when(agg.deterministic && agg.groupingExpressions.exists(_.semanticEquals(probeKey)) &&
+        agg.child.output.exists(_.semanticEquals(probeKey)))(agg.child)
+    val probeInput = application match {
+      case Filter(_: IsNotNull, agg: Aggregate) => groupInput(agg).getOrElse(application)
+      case agg: Aggregate => groupInput(agg).getOrElse(application)
+      case other => other
+    }
+    val unfilteredProbe = !probeInput.exists {
+      case Filter(pred, _) => splitConjunctivePredicates(pred).exists {
+        case IsNotNull(_: Attribute) => false
+        case _ => true
+      }
+      case _ => false
+    }
+    unfilteredProbe && creation.output.size == 1 && creation.output.head.semanticEquals(buildKey) &&
+      literalFilter(creation) && ((scan(creation), scan(probeInput)) match {
+        case (Some(build), Some(probe)) =>
+          val bytes = build.stats.sizeInBytes
+          bytes > 0 && bytes * conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR) <
+            probe.stats.sizeInBytes
+        case _ => false
+      })
   }
 
   private def injectBloomFilter(
       filterApplicationSideKey: Expression,
       filterApplicationSidePlan: LogicalPlan,
-      filterCreationSide: FilterCreationSide): LogicalPlan = {
+      filterCreationSide: FilterCreationSide,
+      stringsOnly: Boolean): LogicalPlan = {
     val filterCreationSideKey = filterCreationSide.key
     val filterCreationSidePlan = filterCreationSide.plan
     val creationSideThreshold = if (filterCreationSide.useMaterializedThreshold) {
@@ -67,14 +123,32 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
       conf.runtimeFilterCreationSideThreshold
     }
     // Skip if the filter creation side is too big
-    if (filterCreationSide.materializedSizeInBytes
-        .getOrElse(filterCreationSidePlan.stats.sizeInBytes) > creationSideThreshold) {
+    val exceeds = filterCreationSide.materializedSizeInBytes
+      .getOrElse(filterCreationSidePlan.stats.sizeInBytes) > creationSideThreshold
+    def hasBoundedKeys(stringFilter: Boolean): Boolean = exceeds &&
+      !filterCreationSide.useMaterializedThreshold &&
+      boundedFilteredKeys(filterCreationSidePlan, filterCreationSideKey,
+        filterApplicationSidePlan, filterApplicationSideKey, stringFilter)
+    val exactLiteral = !stringsOnly && hasBoundedKeys(stringFilter = false)
+    val stringLiteral = (stringsOnly || !deferStringFilters) && !exactLiteral &&
+      hasBoundedKeys(stringFilter = true)
+    if (stringsOnly && !stringLiteral) return filterApplicationSidePlan
+    val boundedKeys = exactLiteral || stringLiteral
+    if (exceeds && !boundedKeys) {
       return filterApplicationSidePlan
     }
     val rowCount = filterCreationSide.materializedRowCount
       .orElse(filterCreationSidePlan.stats.rowCount)
     val bloomFilterAgg =
-      if (rowCount.isDefined && rowCount.get.longValue > 0L) {
+      if (stringLiteral) {
+        // Substring and prefix filters may keep many distinct keys. Build within the
+        // existing maximum sketch budget and check its expected saturation at runtime.
+        new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)),
+          Literal(conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_ITEMS)),
+          Literal(conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_BITS)))
+      } else if (boundedKeys) {
+        new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)))
+      } else if (rowCount.isDefined && rowCount.get.longValue > 0L) {
         new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)), rowCount.get.longValue)
       } else if (conf.pipelinedHashJoinPolicyEnabled) {
         // Without a row count the default sizing (1M items in 8M bits) saturates on a large
@@ -97,7 +171,24 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
         new BloomFilterAggregate(new XxHash64(Seq(filterCreationSideKey)))
       }
 
-    val alias = Alias(bloomFilterAgg.toAggregateExpression(), "bloomFilter")()
+    val bits = bloomFilterAgg.toAggregateExpression()
+    val result = if (boundedKeys) {
+      // Count the actual surviving keys in the same aggregation. An oversized creation
+      // side returns NULL; the probe then passes through and the original join stays exact.
+      val count = Count(Seq(filterCreationSideKey)).toAggregateExpression()
+      val items = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_ITEMS)
+      val limit = if (stringLiteral) {
+        val bitCount = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_BITS).toDouble
+        val hashes = math.max(1L, math.round(bitCount / items * math.log(2.0)))
+        // Invert (1 - exp(-k * n / m))^k = 0.5. Beyond this load more than
+        // half the absent keys are expected to pass the sketch. Duplicate keys
+        // increase the count conservatively and never affect join correctness.
+        (-bitCount / hashes * math.log1p(-math.pow(0.5, 1.0 / hashes))).toLong
+      } else items
+      If(LessThanOrEqual(count, Literal(limit)),
+        bits, Literal.create(null, bits.dataType))
+    } else bits
+    val alias = Alias(result, "bloomFilter")()
     val aggregate =
       ConstantFolding(ColumnPruning(Aggregate(Nil, Seq(alias), filterCreationSidePlan)))
     // Runtime filters are introduced after subquery optimization, so Python UDFs in a new
@@ -106,9 +197,14 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
       return filterApplicationSidePlan
     }
     val bloomFilterSubquery = ScalarSubquery(aggregate, Nil)
+    if (stringLiteral && conf.getConfString(
+        "spark.sql.optimizer.runtime.integralKeyBitmap.enabled", "false").toBoolean) {
+      bloomFilterSubquery.setTagValue(GeneratedIntegralKeyDomain.tag, true)
+    }
     val filter = BloomFilterMightContain(bloomFilterSubquery,
       new XxHash64(Seq(filterApplicationSideKey)))
-    Filter(filter, filterApplicationSidePlan)
+    val predicate = if (boundedKeys) Coalesce(Seq(filter, Literal.TrueLiteral)) else filter
+    Filter(predicate, filterApplicationSidePlan)
   }
 
   /**
@@ -419,14 +515,19 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
         splitConjunctivePredicates(condition).exists {
           case BloomFilterMightContain(_, XxHash64(Seq(valueExpression), _))
             if valueExpression.fastEquals(key) => true
+          case Coalesce(Seq(BloomFilterMightContain(_, XxHash64(Seq(valueExpression), _)),
+              Literal.TrueLiteral)) if valueExpression.fastEquals(key) => true
           case _ => false
         }
       case _ => false
     }
   }
 
-  private def tryInjectRuntimeFilter(plan: LogicalPlan): LogicalPlan = {
-    var filterCounter = 0
+  private def tryInjectRuntimeFilter(plan: LogicalPlan, stringsOnly: Boolean = false): LogicalPlan = {
+    // The later pass shares the existing query budget with predicates already in the plan.
+    var filterCounter = if (stringsOnly) plan.collect {
+      case Filter(condition, _) => condition.collect { case _: BloomFilterMightContain => 1 }.sum
+    }.sum else 0
     val numFilterThreshold = conf.getConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD)
     plan transformUp {
       case join @ ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, _, _, left, right, hint) =>
@@ -450,7 +551,7 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
             if (canPruneLeft(joinType) && (hasShuffle || probablyHasShuffle(left)) &&
               !hasBloomFilter(newLeft, l)) {
               extractBeneficialFilterCreatePlan(left, right, l, r).foreach { creationSide =>
-                newLeft = injectFilter(l, newLeft, creationSide)
+                newLeft = injectBloomFilter(l, newLeft, creationSide, stringsOnly)
               }
             }
             // Did we actually inject on the left? If not, try on the right
@@ -462,7 +563,7 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
             if (newLeft.fastEquals(oldLeft) && canPruneRight(joinType) &&
               (hasShuffle || probablyHasShuffle(right)) && !hasBloomFilter(newRight, r)) {
               extractBeneficialFilterCreatePlan(right, left, r, l).foreach { creationSide =>
-                newRight = injectFilter(r, newRight, creationSide)
+                newRight = injectBloomFilter(r, newRight, creationSide, stringsOnly)
               }
             }
             if (!newLeft.fastEquals(oldLeft) || !newRight.fastEquals(oldRight)) {
@@ -474,10 +575,35 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
     }
   }
 
+  private[sql] def applyAfterProbeFilters(plan: LogicalPlan): LogicalPlan = {
+    if (!deferStringFilters || !conf.runtimeFilterBloomFilterEnabled ||
+        !conf.getConfString("spark.sql.optimizer.runtime.bloomFilter.stringFilteredKeyProjection.enabled",
+          "false").toBoolean || !plan.exists(_.expressions.exists(_.exists(_.isInstanceOf[StringPredicate])))) {
+      return plan
+    }
+    plan match {
+      // The parent can still decorrelate a predicate subquery into a semi join and
+      // propagate cheaper filters onto this probe. Decide once its parent is optimized.
+      case _: Subquery => plan
+      case _ => tryInjectRuntimeFilter(plan, stringsOnly = true)
+    }
+  }
+
   override def apply(plan: LogicalPlan): LogicalPlan = plan match {
     case s: Subquery if s.correlated => plan
     case _ if !conf.runtimeFilterBloomFilterEnabled => plan
     case _ => tryInjectRuntimeFilter(plan)
   }
 
+}
+
+/** Consider an additional large key sketch only after the other rules have pruned scan inputs. */
+object InjectStringFilterAfterProbeFilters extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = InjectRuntimeFilter.applyAfterProbeFilters(plan)
+}
+
+
+/** Only optimizer-created positive join prefilters may replace approximate membership by exact. */
+object GeneratedIntegralKeyDomain {
+  val tag = org.apache.spark.sql.catalyst.trees.TreeNodeTag[Boolean]("generatedIntegralJoinKeyDomain")
 }

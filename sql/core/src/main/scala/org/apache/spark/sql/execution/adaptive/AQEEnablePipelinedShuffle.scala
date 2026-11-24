@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.adaptive
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
 import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ShuffledJoin
@@ -36,6 +37,65 @@ import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
  * group cannot recover those outputs. Reused exchanges and unsupported consumers also retain
  * regular execution. The shared environment gate excludes streaming, RDD and cache boundaries.
  */
+/**
+ * For a backend that executes every sort-merge join as a shuffled hash join (Gluten with
+ * forceShuffledHashJoin), fix the build side here, before pipelined placement, instead of letting
+ * the backend pick it later from logical statistics. Without runtime statistics for a pipelined
+ * (never materialized) input, an un-CBO'd join's size is the product of its inputs, so the backend
+ * would build on the fact table. The estimate used here is the key/foreign-key aware one of the
+ * pipelined hash join policy, which also uses runtime statistics of already materialized stages.
+ * The backend must be told to keep this build side
+ * (spark.gluten.sql.columnar.shuffledHashJoin.optimizeBuildSide=false).
+ */
+object PipelinedHashJoinConversion extends Rule[SparkPlan]
+  with org.apache.spark.sql.catalyst.optimizer.JoinSelectionHelper {
+  import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
+  import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
+  import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
+  import org.apache.spark.sql.execution.SortExec
+  import org.apache.spark.sql.execution.exchange.EnsureRequirements
+  import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
+
+  val Key = "spark.sql.shuffle.distributedPipelined.sortMergeJoinAsHashJoin"
+
+  def applyIfEnabled(plan: SparkPlan): SparkPlan =
+    if (conf.getConfString(Key, "false").toBoolean) apply(plan) else plan
+
+  private def size(p: LogicalPlan): BigInt =
+    pipelinedPolicyRowEstimate(p, conf) * EstimationUtils.getSizePerRow(p.output).max(1)
+
+  private def stripSort(plan: SparkPlan): SparkPlan = plan match {
+    case s: SortExec if !s.global => s.child
+    case other => other
+  }
+
+  override def apply(plan: SparkPlan): SparkPlan = {
+    val converted = plan.transformUp {
+      case smj @ SortMergeJoinExec(lk, rk, jt, cond, left, right, false)
+          if hashJoinSupported(lk, rk) =>
+        val leftOk = canBuildShuffledHashJoinLeft(jt)
+        val rightOk = canBuildShuffledHashJoinRight(jt)
+        val side = if (!leftOk && !rightOk) {
+          None
+        } else if (!leftOk) {
+          Some(BuildRight)
+        } else if (!rightOk) {
+          Some(BuildLeft)
+        } else {
+          smj.logicalLink.collect {
+            case j: Join => if (size(j.right) <= size(j.left)) BuildRight else BuildLeft
+          }.orElse(Some(BuildRight))
+        }
+        side.map { b =>
+          val shj = ShuffledHashJoinExec(lk, rk, jt, b, cond, stripSort(left), stripSort(right))
+          shj.copyTagsFrom(smj)
+          shj
+        }.getOrElse(smj)
+    }
+    if (converted.fastEquals(plan)) plan else EnsureRequirements().apply(converted)
+  }
+}
+
 object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
@@ -51,7 +111,14 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
       // let the distributed transport attach every logical consumer to the shared producer.
       // This changes only exchange wrappers and transport flags; join algorithms and build sides
       // are untouched.
-      EnablePipelinedShuffle.apply(ReuseExchangeAndSubquery(plan))
+      // Exchange reuse only: AQE plans dynamic-pruning subqueries (SubqueryAdaptiveBroadcastExec)
+      // per stage and does not recognize them once wrapped in ReusedSubqueryExec.
+      val exchangeReuseOnly = conf.clone()
+      exchangeReuseOnly.setConf(SQLConf.SUBQUERY_REUSE_ENABLED, false)
+      val reused = SQLConf.withExistingConf(exchangeReuseOnly) {
+        ReuseExchangeAndSubquery(PipelinedHashJoinConversion.applyIfEnabled(plan))
+      }
+      EnablePipelinedShuffle.apply(reused)
     } else {
       flipEligibleExchanges(plan)
     }

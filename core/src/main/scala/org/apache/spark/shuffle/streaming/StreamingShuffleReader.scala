@@ -56,6 +56,16 @@ class StreamingShuffleReaderIteratorFactory {
       private var lastRepairNanos = 0L
       private val repairIntervalNanos = TimeUnit.MILLISECONDS.toNanos(500L)
 
+      private def repairOnIdle(): Unit = {
+        val now = System.nanoTime()
+        if (idleSinceNanos == 0L) idleSinceNanos = now
+        if (now - idleSinceNanos >= repairIntervalNanos &&
+            now - lastRepairNanos >= repairIntervalNanos) {
+          repairIdleCreditWindows()
+          lastRepairNanos = now
+        }
+      }
+
       def getNext(): Product2[K, C] = {
         while (!rowIterator.hasNext) {
           checkTaskFailure()
@@ -65,12 +75,22 @@ class StreamingShuffleReaderIteratorFactory {
             finished = true
             return null.asInstanceOf[Product2[K, C]]
           }
+          val pool = StreamingCpuGate.readyPool
+          if (pool != null) pool.checkpoint()
           val immediate = messageQueue.poll()
           val message = if (immediate != null) {
             immediate
           } else {
             val waitStartNanos = System.nanoTime()
-            val awaited = messageQueue.poll(10, TimeUnit.MILLISECONDS)
+            val awaited = StreamingCpuGate.transportWait("input") {
+              var next = messageQueue.poll(10, TimeUnit.MILLISECONDS)
+              while (pool != null && next == null && !inputExhausted()) {
+                checkTaskFailure()
+                repairOnIdle()
+                next = messageQueue.poll(10, TimeUnit.MILLISECONDS)
+              }
+              next
+            }
             recordQueueWaitNanos(System.nanoTime() - waitStartNanos)
             awaited
           }
@@ -85,13 +105,7 @@ class StreamingShuffleReaderIteratorFactory {
               idleSinceNanos = 0L
               rowIterator = handleDataMessage(dataMessage)
             case null =>
-              val now = System.nanoTime()
-              if (idleSinceNanos == 0L) idleSinceNanos = now
-              if (now - idleSinceNanos >= repairIntervalNanos &&
-                  now - lastRepairNanos >= repairIntervalNanos) {
-                repairIdleCreditWindows()
-                lastRepairNanos = now
-              }
+              repairOnIdle()
             case other =>
               throw new IllegalArgumentException(
                 s"Unexpected message type in reader queue: ${other.getClass.getName}")
@@ -462,7 +476,8 @@ class StreamingShuffleReader[K, C](
         // strict behavior as the default for compatibility, but allow the chained path to finish
         // after all ACKs have been submitted.
         if (conf.get(STREAMING_SHUFFLE_READER_WAIT_FOR_TERMINATION_ACKS)) {
-          while (!allTermAcksSentNotice.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+          while (!StreamingCpuGate.transportWait("input")(
+              allTermAcksSentNotice.tryAcquire(100, TimeUnit.MILLISECONDS))) {
             checkTaskFailure()
           }
         }

@@ -42,6 +42,7 @@ import org.apache.spark.network.shuffle._
 import org.apache.spark.network.shuffle.checksum.{Cause, ShuffleChecksumHelper}
 import org.apache.spark.network.util.{NettyUtils, TransportConf}
 import org.apache.spark.shuffle.ShuffleReadMetricsReporter
+import org.apache.spark.shuffle.streaming.StreamingCpuGate
 import org.apache.spark.util.{Clock, CompletionIterator, SystemClock, TaskCompletionListener, Utils}
 
 /**
@@ -822,7 +823,14 @@ final class ShuffleBlockFetcherIterator(
     // is also corrupt, so the previous stage could be retried.
     // For local shuffle block, throw FailureFetchResult for the first IOException.
     while (result == null) {
-      result = withFetchWaitTimeTracked[FetchResult](results.take())
+      val pool = StreamingCpuGate.readyPool
+      result = withFetchWaitTimeTracked[FetchResult] {
+        if (pool == null) results.take() else {
+          pool.checkpoint()
+          val immediate = results.poll()
+          if (immediate != null) immediate else pool.transportWait("block")(results.take())
+        }
+      }
 
       result match {
         case SuccessFetchResult(blockId, mapIndex, address, size, buf, isNetworkReqDone) =>
