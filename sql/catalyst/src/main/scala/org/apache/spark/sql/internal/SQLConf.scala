@@ -1489,6 +1489,17 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED =
+    buildConf("spark.sql.shuffle.batchPipelined.execution.enabled")
+      .internal()
+      .doc("Allow a full batch collect to stream a selected single-reader hash shuffle " +
+        "over the distributed transport. Requires shuffle selection, a supported plan " +
+        "that drains its probe and sufficient concurrent task slots.")
+      .version("4.5.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   val LOCAL_PIPELINED_SHUFFLE_ENABLED = buildConf("spark.sql.shuffle.localPipelined.enabled")
     .internal()
     .doc("When true in local mode, eligible shuffle exchanges use the in-process channel " +
