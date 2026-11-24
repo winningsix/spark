@@ -21,6 +21,8 @@ import java.nio.file.{FileAlreadyExistsException, Files, Path}
 
 import scala.concurrent.duration._
 
+import org.scalatest.concurrent.Eventually
+
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.QueryExecution
@@ -30,7 +32,7 @@ import org.apache.spark.sql.util.QueryExecutionListener
 import org.apache.spark.tags.ExtendedSQLTest
 
 @ExtendedSQLTest
-class DistributedBatchShuffleSuite extends SparkFunSuite {
+class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
   test("full collect drains a remote probe before its final producer can finish") {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
@@ -44,6 +46,10 @@ class DistributedBatchShuffleSuite extends SparkFunSuite {
         .config(SQLConf.BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED.key, "true")
         .getOrCreate()
       try {
+        val sc = spark.sparkContext
+        eventually(timeout(60.seconds)) {
+          assert(sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile) == 4)
+        }
         // Last probe row cannot leave its producer until a different executor has decoded
         // a probe row and joined it with the materialized build. A regular shuffle times out.
         val writer = udf { (id: Long) =>
