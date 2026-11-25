@@ -7055,7 +7055,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a regular-shuffle prefix finishes before its pipelined producer starts") {
+  test("pipelined shuffle: a regular-shuffle prefix finishes before " +
+      "its pipelined producer starts") {
     val regularRoot = new MyRDD(sc, 2, Nil)
     val regularDep = new ShuffleDependency(regularRoot, new HashPartitioner(2))
     val producerRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)

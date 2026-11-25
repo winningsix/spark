@@ -23,7 +23,8 @@ import scala.concurrent.duration._
 
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
+import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite}
+import org.apache.spark.StreamingShuffleOutputTrackerMaster
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.functions.udf

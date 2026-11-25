@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
 import org.apache.spark.sql.execution.exchange.{DistributedPipelinedShuffle, ShuffleExchangeLike}
-import org.apache.spark.sql.execution.ui.{SparkListenerSQLAdaptiveExecutionUpdate, SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
+import org.apache.spark.sql.execution.ui.{SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.SQL_EVENT_TRUNCATE_LENGTH
 import org.apache.spark.util.{Utils, UUIDv7Generator}
@@ -96,7 +96,7 @@ object SQLExecution extends Logging {
   private[execution] def updatePhysicalPlan(id: Long, qe: QueryExecution): Unit = {
     executionIdToQueryExecution.put(id, qe)
     val session = qe.sparkSession
-    session.sparkContext.listenerBus.post(SparkListenerSQLAdaptiveExecutionUpdate(
+    session.sparkContext.listenerBus.post(ui.SparkListenerSQLAdaptiveExecutionUpdate(
       id, planDescription(qe, session.sessionState.conf.uiExplainMode),
       SparkPlanInfo.fromSparkPlan(qe.executedPlan)))
   }
