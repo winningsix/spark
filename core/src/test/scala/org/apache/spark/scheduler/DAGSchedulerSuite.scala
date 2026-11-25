@@ -7096,18 +7096,18 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  for (outcome <- Seq("occupied slots", "prefix failure", "cancel all")) {
+  for (outcome <- Seq("occupied slots", "prefix failure", "cancel all", "cancel one")) {
     test(s"pipelined shuffle: $outcome while waiting for a shared regular prefix") {
       val partitioner = new HashPartitioner(2)
       val prefix = new ShuffleDependency(new MyRDD(sc, 2, Nil), partitioner)
-      val listeners = (1 to 2).map { _ =>
+      val jobs = (1 to 2).map { _ =>
         val dependency = new PipelinedShuffleDependency(new MyRDD(sc, 2, Nil), partitioner)
         val result = new MyRDD(sc, 2, List(prefix, dependency), tracker = mapOutputTracker)
         val listener = new SimpleListener
-        submit(result, Array(0, 1), listener = listener)
-        listener
+        submit(result, Array(0, 1), listener = listener) -> listener
       }
       assert(taskSets.size == 1 && !taskSets.head.isPipelined)
+      val listeners = jobs.map(_._2)
       outcome match {
         case "occupied slots" =>
           scheduler.asInstanceOf[MyDAGScheduler].outstandingTasksForOtherWorkForTest = (_, _) => 999
@@ -7115,9 +7115,20 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
           assert(listeners.forall(_.failure.getMessage.contains("INSUFFICIENT_SLOT")))
         case "prefix failure" => failed(taskSets.head, "injected prefix failure")
         case "cancel all" => runEvent(AllJobsCancelled())
+        case "cancel one" =>
+          cancel(jobs.head._1)
+          assert(listeners.head.failure != null)
+          assert(scheduler.pendingPipelinedPrefixes.keySet == Set(jobs.last._1))
+          completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+          assert(taskSets.size == 3 && taskSets.drop(1).forall(_.isPipelined))
+          completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
+          complete(taskSets.last, Seq((Success, 42), (Success, 43)))
+          assert(listeners.last.failure == null && listeners.last.results == Map(0 -> 42, 1 -> 43))
       }
-      assert(listeners.forall(_.failure != null))
-      assert(taskSets.size == 1)
+      if (outcome != "cancel one") {
+        assert(listeners.forall(_.failure != null))
+        assert(taskSets.size == 1)
+      }
       assertDataStructuresEmpty()
     }
   }

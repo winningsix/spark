@@ -23,10 +23,10 @@ import scala.concurrent.duration._
 
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite}
+import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite}
 import org.apache.spark.StreamingShuffleOutputTrackerMaster
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
 import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.QueryExecutionListener
@@ -72,27 +72,59 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
     }
   }
 
+  private def withCluster(cores: Int)(body: SparkSession => Unit): Unit = {
+    val spark = SparkSession.builder().master(s"local-cluster[2,$cores,1536]")
+      .appName(getClass.getSimpleName)
+      .config("spark.executor.cores", cores.toString)
+      .config("spark.executor.memory", "1g")
+      .config("spark.scheduler.pipelinedGroup.slotCheck.enabled", "true")
+      .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+      .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
+      .config(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, "true")
+      .getOrCreate()
+    try {
+      val sc = spark.sparkContext
+      eventually(timeout(60.seconds)) {
+        val profile = sc.resourceProfileManager.defaultResourceProfile
+        assert(sc.maxNumConcurrentTasks(profile) == 2 * cores)
+      }
+      body(spark)
+    } finally {
+      spark.stop()
+    }
+  }
+
+  test("cluster batch and laptop flags together use the distributed transport for a file scan") {
+    withCluster(2) { spark =>
+      withTempDir { dir =>
+        spark.conf.set(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED.key, true)
+        val path = dir.toPath.resolve("input").toString
+        spark.range(0, 12, 1, 2).write.parquet(path)
+        val data = spark.read.parquet(path)
+        val qe = data.repartition(2, data("id")).queryExecution
+        SQLExecution.withNewExecutionId(qe, Some("collect iterator")) {
+          val (count, rows) = qe.executedPlan.executeCollectIterator()
+          assert(count == 12 && rows.map(_.getLong(0)).toList.sorted == (0L until 12L))
+          val id = spark.sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY).toLong
+          val executed = SQLExecution.getQueryExecution(id).executedPlan
+          val Seq(exchange) = executed.collect { case s: ShuffleExchangeExec => s }
+          assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+        }
+        spark.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+        assert(data.repartition(2, data("id")).queryExecution.executedPlan.nodeName ==
+          "AdaptiveSparkPlan")
+      }
+    }
+  }
+
   private def checkFullInput(
       sqlText: String,
       pipelinedExchanges: Int,
       rightBuild: Boolean = false): Unit = {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
-      val cores = pipelinedExchanges + 1
-      val spark = SparkSession.builder().master(s"local-cluster[2,$cores,1536]")
-        .appName(getClass.getSimpleName)
-        .config("spark.executor.cores", cores.toString)
-        .config("spark.executor.memory", "1g")
-        .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
-        .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
-        .config(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, "true")
-        .getOrCreate()
-      try {
+      withCluster(pipelinedExchanges + 1) { spark =>
         val sc = spark.sparkContext
-        eventually(timeout(60.seconds)) {
-          val profile = sc.resourceProfileManager.defaultResourceProfile
-          assert(sc.maxNumConcurrentTasks(profile) == 2 * cores)
-        }
         // The writer cannot finish until a different executor decodes a row.
         val writer = udf { (id: Long) =>
           if (id == 19999) {
@@ -103,6 +135,9 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           SparkEnv.get.executorId
         }.asNondeterministic()
         val reader = udf { (producer: String, id: Long) =>
+          if (id == 0 && Files.exists(Path.of(marker + ".fail"))) {
+            throw new IllegalStateException("injected reader failure")
+          }
           val executor = SparkEnv.get.executorId
           if (producer != executor && !Files.exists(Path.of(marker))) {
             Files.writeString(Path.of(marker), s"$producer -> $executor, row $id")
@@ -116,7 +151,9 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           override def onSuccess(name: String, qe: QueryExecution, nanos: Long): Unit = {
             observed = qe.executedPlan.collect { case s: ShuffleExchangeExec => s }
           }
-          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit = ()
+          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit = {
+            observed = qe.executedPlan.collect { case s: ShuffleExchangeExec => s }
+          }
         })
         val query = spark.sql(sqlText)
         sc.setJobGroup("full-input", "run both shuffle stages in one job")
@@ -142,8 +179,19 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           assert(!tracker.containsShuffle(exchange.shuffleId))
         }
         info(s"Shuffles ${active.map(_.shuffleId)}: ${Files.readString(Path.of(marker))}")
-        // A wider source raises the whole group's demand to 3 + 2 + 2 with only six slots.
         if (pipelinedExchanges == 2) {
+          val fail = Files.createFile(Path.of(marker + ".fail"))
+          val error = intercept[SparkException](query.collect())
+          assert(error.toString.contains("injected reader failure"))
+          sc.listenerBus.waitUntilEmpty(30000)
+          val failed = observed.filter(_.pipelined).map(_.shuffleId)
+          assert(failed.size == 2 && !failed.exists(tracker.containsShuffle))
+          Files.delete(fail)
+          assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
+          sc.listenerBus.waitUntilEmpty(30000)
+          val retried = observed.filter(_.pipelined).map(_.shuffleId)
+          assert(retried.size == 2 && retried.intersect(failed).isEmpty)
+          assert(!retried.exists(tracker.containsShuffle))
           for (sql <- Seq(singleSource(3, 2), singleSource(2, 2, "REPARTITION_BY_RANGE"))) {
             val rows = spark.sql(sql).collect().sortBy(_.getLong(0))
             assert(rows.sameElements(actual))
@@ -162,6 +210,22 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(observed.count(_.pipelined) == pipelinedExchanges)
 
         if (rightBuild) {
+          val broadcast = spark.sql(
+            """SELECT /*+ REPARTITION(2, id) */ id, matched FROM (
+              |  SELECT /*+ BROADCAST(b) */ a.id, b.id AS matched FROM range(0, 8, 1, 2) a
+              |  LEFT JOIN range(0, 4, 1, 2) b ON a.id = b.id)""".stripMargin)
+          val rows = broadcast.collect().sortBy(_.getLong(0))
+          assert(rows.map(_.getLong(0)).toSeq == (0L until 8L))
+          assert(rows.take(4).forall(r => r.getLong(0) == r.getLong(1)))
+          assert(rows.drop(4).forall(_.isNullAt(1)))
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.size == 1 && observed.head.pipelined)
+          val reused = spark.sql("SELECT /*+ MERGE(a, b) */ a.id FROM range(0, 8, 1, 2) a " +
+            "JOIN range(0, 8, 1, 2) b ON a.id = b.id")
+          assert(reused.queryExecution.executedPlan.exists(_.isInstanceOf[ReusedExchangeExec]))
+          assert(reused.collect().map(_.getLong(0)).sorted.toSeq == (0L until 8L))
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.nonEmpty && !observed.exists(_.pipelined))
           val inner = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8, 1, 2) a " +
             "JOIN range(0, 4, 1, 2) b ON a.id % 5 = b.id")
           val innerPlan = inner.queryExecution.executedPlan
@@ -188,8 +252,6 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         assert(observed.nonEmpty && !observed.exists(_.pipelined))
-      } finally {
-        spark.stop()
       }
     }
   }

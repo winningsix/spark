@@ -120,6 +120,9 @@ private[spark] class ShuffleMapStage(
    */
   def isAvailable: Boolean = numAvailableOutputs == numPartitions
 
+  /** All map outputs and, when enabled, the merged shuffle output are ready for readers. */
+  def isReadyForReduce: Boolean = isAvailable && shuffleDep.shuffleMergeFinalized
+
   /** Returns the sequence of partition ids that are missing (i.e. needs to be computed). */
   override def findMissingPartitions(): Seq[Int] = {
     if (isPipelined) {

@@ -1145,7 +1145,7 @@ private[spark] class DAGScheduler(
               // Mark mapStage as available with shuffle outputs only after shuffle merge is
               // finalized with push based shuffle. If not, subsequent ShuffleMapStage won't
               // read from merged output as the MergeStatuses are not available.
-              if (!mapStage.isAvailable || !mapStage.shuffleDep.shuffleMergeFinalized) {
+              if (!mapStage.isReadyForReduce) {
                 missing += mapStage
               } else {
                 // Forward the nextAttemptId if skipped and visited for the first time.
@@ -2102,7 +2102,7 @@ private[spark] class DAGScheduler(
   }
 
   private def submitPrefixOrGroup(job: ActiveJob, prefix: Seq[ShuffleMapStage]): Unit = {
-    val missing = prefix.filter(s => !s.isAvailable || !s.shuffleDep.shuffleMergeFinalized)
+    val missing = prefix.filterNot(_.isReadyForReduce)
     if (missing.nonEmpty) {
       missing.foreach(submitStage)
     } else {
