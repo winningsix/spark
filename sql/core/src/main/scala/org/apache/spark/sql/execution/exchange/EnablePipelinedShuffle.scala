@@ -118,9 +118,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       return plan
     }
 
-    plan.transformUp {
-      case s: ShuffleExchangeExec if !s.pipelined => s.copy(pipelined = true)
-    }
+    PipelinedShuffleEligibility.markExchanges(plan)(_ => true)
   }
 
   /**

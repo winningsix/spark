@@ -65,14 +65,10 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
         log"but it requires ${MDC(CONFIG2, SQLConf.ADAPTIVE_EXECUTION_ENABLED.key)}=false.")
       return plan
     }
-    if (conf.localPipelinedShuffleEnabled) {
-      return plan
-    }
+    if (conf.localPipelinedShuffleEnabled && plan.session.sparkContext.isLocal) return plan
 
-    // A single input chain cannot share an exchange. Subqueries and reused exchanges are
-    // additional consumers even when their inputs are hidden from SparkPlan.children.
-    if (input.exists(p => p.children.size > 1 || p.subqueries.nonEmpty ||
-        p.isInstanceOf[ReusedExchangeExec])) return plan
+    // Subqueries and reused exchanges can introduce another reader outside the unary chain.
+    if (input.exists(p => p.subqueries.nonEmpty || p.isInstanceOf[ReusedExchangeExec])) return plan
 
     val isResult = input eq plan
     val consumer = consumerInput(input, collectTopK = isResult)
@@ -84,13 +80,11 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
         sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
         !sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED) ||
         !SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager]) return plan
-    val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
-    // Count the source once and the reader stage of each exchange once. An intermediate
-    // stage consumes one exchange and produces the next using the same tasks.
-    val widths = group.map(_.outputPartitioning.numPartitions)
-    if (!widths.forall(_ > 0) || !stageWidth(group.head.child).exists { maps =>
-        maps > 0 && maps.toLong + widths.map(_.toLong).sum <= slots
-      }) return plan
+    val readers = group.map(_.outputPartitioning.numPartitions)
+    val fits = stageWidth(group.head.child).exists { source =>
+      PipelinedShuffleEligibility.fitsCapacity(plan, source +: readers)
+    }
+    if (!fits) return plan
     val ids = group.iterator.map(_.id).toSet
     if (isResult) {
       PipelinedShuffleResultExec(input, ids)
@@ -139,10 +133,8 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     case other => other
   }
 
-  private[exchange] def pipeline(plan: SparkPlan, ids: Set[Int]): SparkPlan = plan.transformUp {
-    case s: ShuffleExchangeExec if s.getTagValue(candidate).exists(ids.contains) =>
-      s.withPipelinedShuffle
-  }
+  private[exchange] def pipeline(plan: SparkPlan, ids: Set[Int]): SparkPlan =
+    PipelinedShuffleEligibility.markExchanges(plan)(_.getTagValue(candidate).exists(ids.contains))
 
   def cleanup(plan: SparkPlan): Unit = {
     plan.session.sparkContext.cleaner.foreach { cleaner =>
@@ -166,7 +158,7 @@ private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeIds
 
   private def collectPlan(): SparkPlan = {
     if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
-        conf.adaptiveExecutionEnabled || conf.localPipelinedShuffleEnabled) return child
+        conf.adaptiveExecutionEnabled) return child
     val id = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     if (id == null) return child
     val qe = SQLExecution.getQueryExecution(id.toLong)

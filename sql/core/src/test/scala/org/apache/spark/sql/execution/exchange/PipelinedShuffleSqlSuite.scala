@@ -62,6 +62,20 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
     }
   }
 
+  test("the laptop channel remains active when the distributed batch flag is also enabled") {
+    withPipelinedSession { spark =>
+      spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", true)
+      val ids = spark.range(0, 12, 1, 2)
+      val result = ids.repartition(2, ids("id"))
+      val Seq(exchange) = collect(result.queryExecution.executedPlan) {
+        case s: ShuffleExchangeExec => s
+      }
+      assert(exchange.pipelined && !result.queryExecution.executedPlan
+        .isInstanceOf[PipelinedShuffleResultExec])
+      assert(result.collect().sorted.toSeq == (0L until 12L))
+    }
+  }
+
   test("a single keyed groupBy runs end-to-end through the pipelined channel shuffle") {
     withPipelinedSession { spark =>
       import spark.implicits._

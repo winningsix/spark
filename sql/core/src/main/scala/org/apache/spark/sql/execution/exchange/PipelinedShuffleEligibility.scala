@@ -31,14 +31,8 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Shared environment gate for the two pipelined-shuffle enabling rules
- * ([[EnablePipelinedShuffle]] non-AQE and `AQEEnablePipelinedShuffle` under AQE). This is a
- * CORRECTNESS gate, not cosmetics: flipping an exchange to pipelined while the incremental manager
- * is still the RPC streaming one would route it to an untested transport that reports
- * `requiresDetachedRecords = false`, so the SQL layer would skip the row copy and silently corrupt
- * rows shared across the writer/reader threads. Both rules must apply the identical gate, so it
- * lives here rather than being copy-pasted into each `apply` (where the two could drift and split
- * AQE vs non-AQE behavior). Each rule keeps only its own plan-shape logic.
+ * The laptop rules share their environment gate. Batch planning in both modes uses the same
+ * full-group capacity check and exchange rewrite; each rule determines its eligible inputs.
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
@@ -65,15 +59,26 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
     }.groupBy(_.id).values.map(_.head).toSeq
     val widths = plan.outputPartitioning.numPartitions +:
       exchanges.map(_.child.outputPartitioning.numPartitions)
+    fitsCapacity(plan, widths)
+  }
+
+  def fitsCapacity(plan: SparkPlan, widths: Seq[Int]): Boolean = {
     val sc = plan.session.sparkContext
     val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
     val demand = widths.map(_.toLong).sum
     val fits = widths.forall(_ > 0) && demand <= slots
     if (!fits) {
       logDebug(s"Pipelined shuffle: estimated stage widths ${widths.mkString(",")} cannot " +
-        s"fit $slots local task slots; retaining regular shuffles.")
+        s"fit $slots task slots; retaining regular shuffles.")
     }
     fits
+  }
+
+  /** Visit original node IDs before rebuilding nested exchanges. */
+  def markExchanges(plan: SparkPlan)(selected: ShuffleExchangeExec => Boolean): SparkPlan = {
+    plan.transformDown {
+      case s: ShuffleExchangeExec if !s.pipelined && selected(s) => s.withPipelinedShuffle
+    }
   }
 
   /**
