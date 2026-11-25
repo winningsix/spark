@@ -1951,6 +1951,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     test("a deferred pipelined barrier job rejected up front on re-post clears its retry count " +
         s"(prefixLost=$prefixLost)") {
       conf.set(config.BARRIER_MAX_CONCURRENT_TASKS_CHECK_INTERVAL.key, "1h")
+      conf.set(config.BARRIER_MAX_CONCURRENT_TASKS_CHECK_MAX_FAILURES, 1)
       // A pipelined group with a barrier producer over a materialized regular prefix. The group
       // fits the 1000 slots the test scheduler reports, but its 3 barrier tasks exceed the
       // local[2] backend, so the barrier slot check defers the job.
@@ -1967,8 +1968,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       val jobId = submit(result, Array(0, 1, 2), listener = listener)
       assert(scheduler.deferredBarrierJobs.containsKey(jobId))
       assert(scheduler.barrierJobIdToNumTasksCheckFailures.get(jobId) === 1)
-      // Before the re-post, either the prefix loses its outputs, so the job is an unsupported mix,
-      // or other work takes the free slots, so gang admission rejects it.
+      // A lost prefix is eligible to run again, but stage creation still checks the barrier.
+      // With the prefix intact the up-front group slot check still runs.
       val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
       try {
         if (prefixLost) {
@@ -1981,8 +1982,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       } finally {
         myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
       }
-      val reason = if (prefixLost) "fully-materialized prefix" else "INSUFFICIENT_SLOT"
-      assert(listener.failure.getMessage.contains(reason))
+      if (prefixLost) {
+        assert(listener.failure.isInstanceOf[BarrierJobSlotsNumberCheckFailed])
+      } else {
+        assert(listener.failure.getMessage.contains("INSUFFICIENT_SLOT"))
+      }
       assert(scheduler.deferredBarrierJobs.isEmpty)
       assert(scheduler.barrierJobIdToNumTasksCheckFailures.isEmpty)
       assertDataStructuresEmpty()
@@ -6925,6 +6929,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   }
 
   private def assertDataStructuresEmpty(): Unit = {
+    assert(scheduler.pendingPipelinedPrefixes.isEmpty)
     assert(scheduler.activeJobs.isEmpty)
     assert(scheduler.failedStages.isEmpty)
     assert(scheduler.jobIdToActiveJob.isEmpty)
@@ -7050,54 +7055,54 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a job mixing a pipelined and a regular shuffle is rejected up front") {
-    // A consumer depending on BOTH a pipelined producer AND an UNMATERIALIZED regular producer
-    // is an unsupported mix and must be rejected up front (before any stage is submitted),
-    // leaving no scheduler state behind. (A fully-MATERIALIZED regular prefix is the supported
-    // exception -- see the materialized-prefix test below.)
-    val pipelinedProducerRdd = new MyRDD(sc, 2, Nil)
-    val pipelinedDep = new PipelinedShuffleDependency(pipelinedProducerRdd, new HashPartitioner(2))
-    val regularProducerRdd = new MyRDD(sc, 2, Nil)
-    val regularDep = new ShuffleDependency(regularProducerRdd, new HashPartitioner(2))
-    val consumerRdd =
-      new MyRDD(sc, 2, List(pipelinedDep, regularDep), tracker = mapOutputTracker)
-    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
-    val failListener = new JobListener {
-      override def taskSucceeded(index: Int, result: Any): Unit = {}
-      override def jobFailed(exception: Exception): Unit = failure.set(exception)
-    }
-    submit(consumerRdd, Array(0, 1), listener = failListener)
-
-    assert(failure.get() != null, "a mixed pipelined+regular job must fail")
-    assert(failure.get().getMessage.contains("all-regular or all-pipelined"),
-      s"expected a mixed-job rejection, got: ${failure.get().getMessage}")
-    assert(taskSets.isEmpty, "no stage should be submitted for a rejected mixed job")
+  test("pipelined shuffle: wait for every regular input before launching any group member") {
+    scheduler.asInstanceOf[MyDAGScheduler].maxConcurrentTasksForTest = 4
+    val partitioner = new HashPartitioner(2)
+    val left = new ShuffleDependency(new MyRDD(sc, 5, Nil), partitioner)
+    val right = new ShuffleDependency(new MyRDD(sc, 3, Nil), partitioner)
+    val producer = new MyRDD(sc, 2, List(left), tracker = mapOutputTracker)
+    val pipeline = new PipelinedShuffleDependency(producer, partitioner)
+    val result = new MyRDD(sc, 2, List(pipeline, right), tracker = mapOutputTracker)
+    submit(result, Array(0, 1))
+    assert(taskSets.size == 2 && taskSets.forall(!_.isPipelined))
+    completeShuffleMapStageSuccessfully(scheduler.shuffleIdToMapStage(left.shuffleId).id, 0, 2)
+    assert(taskSets.size == 2)
+    // Losing an earlier branch while waiting for its sibling must defer the entire group.
+    mapOutputTracker.unregisterAllMapAndMergeOutput(left.shuffleId)
+    completeShuffleMapStageSuccessfully(scheduler.shuffleIdToMapStage(right.shuffleId).id, 0, 2)
+    assert(taskSets.size == 3 && !taskSets.last.isPipelined)
+    completeShuffleMapStageSuccessfully(scheduler.shuffleIdToMapStage(left.shuffleId).id, 1, 2)
+    assert(taskSets.size == 5 && taskSets.drop(3).forall(_.isPipelined))
+    completeShuffleMapStageSuccessfully(taskSets(3).stageId, 0, 2)
+    complete(taskSets(4), Seq((Success, 42), (Success, 43)))
+    assert(results === Map(0 -> 42, 1 -> 43))
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a regular-shuffle prefix feeding a pipelined producer is rejected") {
-    // An UNMATERIALIZED regular shuffle in the PREFIX that feeds a pipelined producer
-    // (regularRoot --regular--> producer(pipelined) --pipelined--> consumer) is rejected: the
-    // prefix stage would have to run while gang-admitted producers hold slots blocked on
-    // transport backpressure, which admission does not account for. Once the prefix is
-    // MATERIALIZED the same shape is accepted (see the materialized-prefix test below).
-    val regularRoot = new MyRDD(sc, 2, Nil)
-    val regularDep = new ShuffleDependency(regularRoot, new HashPartitioner(2))
-    val producerRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
-    val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
-    val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
-    val failListener = new JobListener {
-      override def taskSucceeded(index: Int, result: Any): Unit = {}
-      override def jobFailed(exception: Exception): Unit = failure.set(exception)
+  for (outcome <- Seq("occupied slots", "prefix failure", "cancel all")) {
+    test(s"pipelined shuffle: $outcome while waiting for a shared regular prefix") {
+      val partitioner = new HashPartitioner(2)
+      val prefix = new ShuffleDependency(new MyRDD(sc, 2, Nil), partitioner)
+      val listeners = (1 to 2).map { _ =>
+        val dependency = new PipelinedShuffleDependency(new MyRDD(sc, 2, Nil), partitioner)
+        val result = new MyRDD(sc, 2, List(prefix, dependency), tracker = mapOutputTracker)
+        val listener = new SimpleListener
+        submit(result, Array(0, 1), listener = listener)
+        listener
+      }
+      assert(taskSets.size == 1 && !taskSets.head.isPipelined)
+      outcome match {
+        case "occupied slots" =>
+          scheduler.asInstanceOf[MyDAGScheduler].outstandingTasksForOtherWorkForTest = (_, _) => 999
+          completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
+          assert(listeners.forall(_.failure.getMessage.contains("INSUFFICIENT_SLOT")))
+        case "prefix failure" => failed(taskSets.head, "injected prefix failure")
+        case "cancel all" => runEvent(AllJobsCancelled())
+      }
+      assert(listeners.forall(_.failure != null))
+      assert(taskSets.size == 1)
+      assertDataStructuresEmpty()
     }
-    submit(consumerRdd, Array(0, 1), listener = failListener)
-
-    assert(failure.get() != null, "a pipelined job with a regular-shuffle prefix must fail")
-    assert(failure.get().getMessage.contains("all-regular or all-pipelined"),
-      s"expected a mixed-job rejection, got: ${failure.get().getMessage}")
-    assert(taskSets.isEmpty, "no stage should be submitted for a rejected mixed job")
-    assertDataStructuresEmpty()
   }
 
   test("pipelined shuffle: a fully-materialized regular prefix below the suffix is accepted") {
@@ -7230,7 +7235,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     // shape depend on the precise walk for these graphs, these equalities break.
     def shapeOf(rdd: MyRDD): (Boolean, Boolean, Boolean) = {
       val sh = scheduler.classifyJobShuffleShape(rdd)
-      (sh.hasPipelined, sh.hasUnmaterializedRegularBoundary, sh.hasPipelinedBelowRegular)
+      (sh.hasPipelined, sh.prefixToSchedule.nonEmpty, sh.hasPipelinedBelowRegular)
     }
 
     // (1) all-regular, boundary unmaterialized: not a mix -> nothing to report.
@@ -7261,7 +7266,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     val mixedShape = scheduler.classifyJobShuffleShape(mixed)
     assert(mixedShape.hasPipelinedBelowRegular,
       "the precise walk must still detect a pipelined dependency below a regular boundary")
-    assert(mixedShape.isUnsupportedMix, "and such a job must be rejected as an unsupported mix")
+    submit(mixed, Array(0, 1))
+    assert(failure.getMessage.contains("below a regular shuffle"))
+    assert(taskSets.isEmpty)
+    assertDataStructuresEmpty()
   }
 
   test("pipelined shuffle: a manager that does not consume the live-reduce hint gets no hint") {
@@ -7834,7 +7842,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: a group whose demand exactly equals free capacity is admitted") {
     // Boundary: demand == free capacity must be admitted, not rejected by an off-by-one (the check
     // is `demand > freeSlots`, not `>=`). 4 total slots, other-work occupancy 0 -> free 4 >= demand
-    // 4 -> admitted. NOTE: the DAGScheduler up-front admission (rejectUnadmittablePipelinedGroup)
+    // 4 -> admitted. NOTE: the DAGScheduler up-front admission (pipelinedGroupAdmissionFailure)
     // passes excludeStageIds = Set.empty (no job stage exists yet at admission time), so the
     // group's-own-members exclusion is NOT exercised here; that exclusion is genuinely covered by
     // TaskSchedulerImplSuite ("outstandingTasksForOtherWorkInProfile excludes the given stages").
@@ -7863,7 +7871,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     // Fan-out/diamond: ONE PipelinedShuffleDependency (one producer, one shuffle id) is read by TWO
     // consumers that are then narrow-joined into the result. Fan-out is unsupported, so the group
     // is ultimately rejected -- but WHICH rejection it gets proves the admission demand is deduped.
-    // The up-front slot admission (rejectUnadmittablePipelinedGroup) runs BEFORE the fan-out idiom
+    // The up-front slot admission (pipelinedGroupAdmissionFailure) runs BEFORE the fan-out idiom
     // check (checkPipelinedJobSupported). Execution creates ONE producer stage
     // (getOrCreateShuffleMapStage keys on shuffle id), so the real concurrent demand is
     // producer(2) + result(2) = 4. Counting the producer once per consumer EDGE would inflate it
