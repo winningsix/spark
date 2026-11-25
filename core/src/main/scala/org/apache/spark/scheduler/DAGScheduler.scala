@@ -2679,11 +2679,7 @@ private[spark] class DAGScheduler(
       case None => return
     }
 
-    // A job's shuffle graph must be all-regular, all-pipelined, or the materialized-prefix mixed
-    // shape (every regular boundary fully materialized and below the pipelined suffix -- see
-    // JobShuffleShape). Anything else is rejected up front (before any stage is created): an
-    // unmaterialized regular stage would have to run while gang-admitted producers hold slots
-    // blocked on transport backpressure, which admission does not account for and can deadlock.
+    // A cold regular prefix can run before admission in a single-input graph.
     val hasPipelined = shape.hasPipelined
     if (shape.isUnsupportedMix) {
       logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
@@ -2698,12 +2694,7 @@ private[spark] class DAGScheduler(
       return
     }
 
-    // Gang admission for a pipelined job: the runnable stage graph is one pipelined group (a
-    // materialized prefix's stages never run), so check up front (before any stage is created)
-    // that the cluster can run the entire group concurrently. If it cannot fit, fail the job now
-    // -- no partial scheduler state, and no member ever left running while a sibling waits on
-    // slots (true all-or-nothing gang admission). Inert for a regular job (no pipelined
-    // dependency).
+    // A job waiting for ordinary inputs checks group capacity when its last input completes.
     if (hasPipelined && shape.prefixToSchedule.isEmpty &&
         rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions.length)(listener.jobFailed)) {
       // Clear the slot-check retry count an earlier deferral may have left.
