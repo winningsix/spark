@@ -206,6 +206,12 @@ case class ShuffleExchangeExec(
 
   override def nodeName: String = "Exchange"
 
+  private[sql] def withPipelinedShuffle: ShuffleExchangeExec = {
+    val marked = copy(pipelined = true)
+    marked.copyTagsFrom(this)
+    marked
+  }
+
   // The default arg string is positional, so printing `pipelined` unconditionally would add a bare
   // `false` to every shuffle in every plan. Show it only when set, and name it when shown.
   override def stringArgs: Iterator[Any] = {

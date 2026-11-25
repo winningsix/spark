@@ -34,12 +34,27 @@ import org.apache.spark.tags.ExtendedSQLTest
 
 @ExtendedSQLTest
 class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
+  private def singleSource(
+      partitions: Int,
+      exchanges: Int,
+      innerHint: String = "REPARTITION"): String = {
+    val source = s"SELECT id FROM range(0, 20000, 1, $partitions)"
+    val prefix = (1 until exchanges).foldLeft(source) { (input, salt) =>
+      s"""SELECT /*+ $innerHint(2, bucket) */ id, bucket
+         |FROM (SELECT id, hash(producer(id), id, $salt) AS bucket FROM ($input))""".stripMargin
+    }
+    s"""SELECT observe(writer, id) AS id
+       |FROM (SELECT /*+ REPARTITION(2, id) */ id, producer(id) AS writer FROM ($prefix))"""
+      .stripMargin
+  }
+
+  for (count <- Seq(2, 4)) {
+    test(s"$count pipelined shuffles drain a remote row before the source finishes") {
+      checkFullInput(singleSource(2, count), pipelinedExchanges = count)
+    }
+  }
+
   private val inputs = Seq(
-    "single source" ->
-      """SELECT observe(writer, id) AS id
-        |FROM (SELECT /*+ REPARTITION(2, id) */ id, producer(id) AS writer
-        |      FROM (SELECT /*+ REPARTITION(2, bucket) */ id, bucket
-        |            FROM (SELECT id, id + 1 AS bucket FROM range(0, 20000, 1, 2))))""",
     "right build" ->
       """SELECT /*+ SHUFFLE_HASH(b) */ observe(p.writer, p.id) AS id, b.id AS matched
         |FROM (SELECT id, producer(id) AS writer FROM range(0, 20000, 1, 2)) p
@@ -52,16 +67,21 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
 
   inputs.foreach { case (name, sqlText) =>
     test(s"$name drains a remote row before the last producer finishes") {
-      checkFullInput(sqlText.stripMargin, name)
+      checkFullInput(sqlText.stripMargin, pipelinedExchanges = 1,
+        rightBuild = name == "right build")
     }
   }
 
-  private def checkFullInput(sqlText: String, name: String): Unit = {
+  private def checkFullInput(
+      sqlText: String,
+      pipelinedExchanges: Int,
+      rightBuild: Boolean = false): Unit = {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
-      val spark = SparkSession.builder().master("local-cluster[2,2,1536]")
+      val cores = pipelinedExchanges + 1
+      val spark = SparkSession.builder().master(s"local-cluster[2,$cores,1536]")
         .appName(getClass.getSimpleName)
-        .config("spark.executor.cores", "2")
+        .config("spark.executor.cores", cores.toString)
         .config("spark.executor.memory", "1g")
         .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
         .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
@@ -70,7 +90,8 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
       try {
         val sc = spark.sparkContext
         eventually(timeout(60.seconds)) {
-          assert(sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile) == 4)
+          val profile = sc.resourceProfileManager.defaultResourceProfile
+          assert(sc.maxNumConcurrentTasks(profile) == 2 * cores)
         }
         // The writer cannot finish until a different executor decodes a row.
         val writer = udf { (id: Long) =>
@@ -104,18 +125,32 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         sc.listenerBus.waitUntilEmpty(30000)
         assert(sc.statusTracker.getJobIdsForGroup("full-input").length == 1)
         assert(actual.iterator.map(_.getLong(0)).sameElements(0L until 20000L))
-        assert(observed.size == 2)
-        if (query.schema.size == 2) {
+        if (pipelinedExchanges == 1) {
+          assert(observed.size == 2)
           actual.zipWithIndex.foreach { case (row, id) =>
             if (id % 101 == 100) assert(row.isNullAt(1)) else assert(row.getLong(1) == id % 101)
           }
+        } else {
+          assert(observed.size == pipelinedExchanges)
         }
-        val Seq(probe) = observed.filter(_.pipelined)
-        assert(probe.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+        val active = observed.filter(_.pipelined)
+        assert(active.size == pipelinedExchanges)
         val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
           .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-        assert(!tracker.containsShuffle(probe.shuffleId))
-        info(s"Shuffle ${probe.shuffleId}: ${Files.readString(Path.of(marker))}")
+        active.foreach { exchange =>
+          assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+          assert(!tracker.containsShuffle(exchange.shuffleId))
+        }
+        info(s"Shuffles ${active.map(_.shuffleId)}: ${Files.readString(Path.of(marker))}")
+        // A wider source raises the whole group's demand to 3 + 2 + 2 with only six slots.
+        if (pipelinedExchanges == 2) {
+          for (sql <- Seq(singleSource(3, 2), singleSource(2, 2, "REPARTITION_BY_RANGE"))) {
+            val rows = spark.sql(sql).collect().sortBy(_.getLong(0))
+            assert(rows.sameElements(actual))
+            sc.listenerBus.waitUntilEmpty(30000)
+            assert(observed.size == 2 && !observed.exists(_.pipelined))
+          }
+        }
 
         val top = query.orderBy("id").limit(3)
         assert(top.toLocalIterator().next().getLong(0) == 0L)
@@ -124,9 +159,9 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(top.take(1).head.getLong(0) == 0L)
         assert(top.collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
         sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.count(_.pipelined) == 1)
+        assert(observed.count(_.pipelined) == pipelinedExchanges)
 
-        if (name == "right build") {
+        if (rightBuild) {
           val inner = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8, 1, 2) a " +
             "JOIN range(0, 4, 1, 2) b ON a.id % 5 = b.id")
           val innerPlan = inner.queryExecution.executedPlan
