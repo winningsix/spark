@@ -113,7 +113,7 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           SparkEnv.get.executorId
         }.asNondeterministic()
         val reader = udf { (producer: String, id: Long) =>
-          if (id == 0 && Files.exists(Path.of(marker + ".fail"))) {
+          if (id == 0 && Files.deleteIfExists(Path.of(marker + ".fail"))) {
             throw new IllegalStateException("injected reader failure")
           }
           val executor = SparkEnv.get.executorId
@@ -152,12 +152,11 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         info(s"Shuffles ${active.map(_.shuffleId)}: ${Files.readString(Path.of(marker))}")
         if (pipelinedExchanges == 2) {
           val fail = Files.createFile(Path.of(marker + ".fail"))
-          val error = intercept[SparkException](query.collect())
-          assert(error.toString.contains("injected reader failure"))
+          intercept[SparkException](query.collect())
+          assert(!Files.exists(fail))
           sc.listenerBus.waitUntilEmpty(30000)
           val failed = observed.filter(_.pipelined).map(_.shuffleId)
           assert(failed.size == 2 && !failed.exists(tracker.containsShuffle))
-          Files.delete(fail)
           assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
           sc.listenerBus.waitUntilEmpty(30000)
           val retried = observed.filter(_.pipelined).map(_.shuffleId)
