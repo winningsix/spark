@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.plans.logical.Command
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning}
@@ -38,12 +39,18 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Unit]("batchPipelinedShuffleCandidate")
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    if (!conf.getConf(SQLConf.BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED) ||
-        conf.adaptiveExecutionEnabled || conf.localPipelinedShuffleEnabled) {
+    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
+        plan.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
       return plan
     }
 
-    if (plan.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
+    if (conf.adaptiveExecutionEnabled) {
+      logWarning(log"Skipping distributed pipelined shuffle for this batch query. " +
+        log"${MDC(CONFIG, SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key)} is enabled, " +
+        log"but it requires ${MDC(CONFIG2, SQLConf.ADAPTIVE_EXECUTION_ENABLED.key)}=false.")
+      return plan
+    }
+    if (conf.localPipelinedShuffleEnabled) {
       return plan
     }
 

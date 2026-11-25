@@ -1478,23 +1478,15 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
-  val BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED =
-    buildConf("spark.sql.shuffle.batchPipelined.selection.enabled")
+  val DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED =
+    buildConf("spark.sql.shuffle.distributedPipelined.enabled")
       .internal()
-      .doc("Mark single-reader hash exchanges in supported batch plans as candidates for " +
-        "distributed pipelined shuffle in EXPLAIN. Requires AQE to be disabled. " +
-        "Selection alone does not change shuffle execution.")
-      .version("4.5.0")
-      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .booleanConf
-      .createWithDefault(false)
-
-  val BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED =
-    buildConf("spark.sql.shuffle.batchPipelined.execution.enabled")
-      .internal()
-      .doc("Allow a full batch collect to stream a selected single-reader hash shuffle " +
-        "over the distributed transport. Requires shuffle selection, a supported plan " +
-        "that drains its probe and sufficient concurrent task slots.")
+      .doc("When true and AQE is disabled, a batch Dataset.collect or collectAsList can " +
+        "pipeline one single-reader hash shuffle across executors. The reader can consume " +
+        "rows before all map tasks finish. The action uses this path only when it can drain " +
+        "every reader partition and the producer and reader tasks fit in the cluster's " +
+        "concurrent task slots. With AQE enabled, Spark logs a warning and skips distributed " +
+        "pipelined shuffle. Experimental.")
       .version("4.5.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf

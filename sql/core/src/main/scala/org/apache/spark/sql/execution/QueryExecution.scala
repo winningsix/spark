@@ -440,8 +440,7 @@ class QueryExecution(
   private[sql] def withDistributedShuffleCollect[T](
       run: (QueryExecution, () => Unit) => T): T = {
     val conf = sparkSession.sessionState.conf
-    if (conf.getConf(SQLConf.BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED) &&
-        conf.getConf(SQLConf.BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED) &&
+    if (conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) &&
         !conf.adaptiveExecutionEnabled && !conf.localPipelinedShuffleEnabled &&
         transactionOpt.isEmpty) {
       sparkSession.withActive(DistributedBatchShuffle.forCollect(executedPlan)) match {

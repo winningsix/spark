@@ -42,8 +42,7 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         .config("spark.executor.memory", "1g")
         .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
         .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
-        .config(SQLConf.BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED.key, "true")
-        .config(SQLConf.BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED.key, "true")
+        .config(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, "true")
         .getOrCreate()
       try {
         val sc = spark.sparkContext
@@ -166,7 +165,7 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         assert(observed.size == 1 && !observed.head.pipelined)
 
-        spark.conf.set(SQLConf.BATCH_PIPELINED_SHUFFLE_EXECUTION_ENABLED.key, false)
+        spark.conf.set(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, false)
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         assert(observed.nonEmpty && !observed.exists(_.pipelined))

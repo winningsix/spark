@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import org.apache.logging.log4j.Level
+
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
@@ -28,7 +30,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSession {
-  private val selection = SQLConf.BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED.key
+  private val pipelinedShuffle = SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key
 
   private def candidates(plan: SparkPlan): Seq[ShuffleExchangeExec] = plan.collect {
     case s: ShuffleExchangeExec if s.getTagValue(SelectBatchPipelinedShuffle.candidate).isDefined =>
@@ -40,11 +42,11 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
 
   test("single-reader aggregation is opt-in and visible on the exchange") {
     withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
-      assert(!spark.sessionState.conf.getConf(SQLConf.BATCH_PIPELINED_SHUFFLE_SELECTION_ENABLED))
+      assert(!spark.sessionState.conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED))
       val regular = sql(aggregate)
       val expected = regular.collect()
       assert(candidates(regular.queryExecution.executedPlan).isEmpty)
-      withSQLConf(selection -> "true") {
+      withSQLConf(pipelinedShuffle -> "true") {
         val selected = sql(aggregate)
         val Seq(exchange) = candidates(selected.queryExecution.executedPlan)
         assert(!exchange.pipelined)
@@ -56,7 +58,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
         val equivalent = spark.range(0, 32, 1, 4).groupBy((col("id") % 3).as("k")).count()
         val Seq(dfExchange) = candidates(equivalent.queryExecution.executedPlan)
         assert(dfExchange.sameResult(exchange))
-        withSQLConf(selection -> "false") {
+        withSQLConf(pipelinedShuffle -> "false") {
           assert(candidates(sql(aggregate).queryExecution.executedPlan).isEmpty)
         }
       }
@@ -65,7 +67,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
 
   for (build <- Seq("l", "r")) {
     test(s"shuffled hash join selects the probe when $build is the build side") {
-      withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
         val plan = sql(
           s"""SELECT /*+ SHUFFLE_HASH($build) */ l.id
              |FROM range(0, 32, 1, 4) l JOIN range(0, 8, 1, 2) r ON l.id = r.id
@@ -85,7 +87,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
   }
 
   test("an unrelated aggregation remains a candidate above a reused join input") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+    withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
       val plan = sql(
         """SELECT /*+ SHUFFLE_HASH(r) */ l.id % 3, count(*)
@@ -106,7 +108,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
       val Seq(join) = plan.collect { case j: ShuffledHashJoinExec => j }
       val shared = join.withNewChildren(Seq(join.left, join.left))
       assert(join.left.exists(_.isInstanceOf[ShuffleExchangeExec]))
-      withSQLConf(selection -> "true") {
+      withSQLConf(pipelinedShuffle -> "true") {
         assert(candidates(SelectBatchPipelinedShuffle(join)).nonEmpty)
         assert(candidates(SelectBatchPipelinedShuffle(shared)).isEmpty)
       }
@@ -114,7 +116,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
   }
 
   test("a scalar subquery leaves an independent main-query edge eligible") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+    withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.EXCHANGE_REUSE_ENABLED.key -> "false") {
       val plan = sql(
         s"""SELECT k, n FROM ($aggregate) t
@@ -127,7 +129,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
   }
 
   test("coalescing multiple partitions in one reader prevents selection") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+    withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
       val plan = sql(aggregate).coalesce(1).queryExecution.executedPlan
       assert(plan.exists(_.isInstanceOf[ShuffleExchangeExec]))
       assert(candidates(plan).isEmpty)
@@ -143,7 +145,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
       for (child <- Seq(top.child, sorted)) {
         val ordered = SortOrder.orderingSatisfies(child.outputOrdering, top.sortOrder)
         assert(ordered == (child == sorted))
-        withSQLConf(selection -> "true") {
+        withSQLConf(pipelinedShuffle -> "true") {
           val selected = SelectBatchPipelinedShuffle(top.copy(child = child.clone()))
           assert(candidates(selected).size == 1)
           assert(selected.executeCollectPublic().toSeq == expected.toSeq)
@@ -153,7 +155,7 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
   }
 
   test("sampling for a range exchange reads its input before the shuffle map pass") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+    withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
       val plan = sql(s"$aggregate ORDER BY k").queryExecution.executedPlan
       val exchanges = plan.collect { case s: ShuffleExchangeExec => s }
       assert(exchanges.size == 2)
@@ -162,12 +164,25 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
     }
   }
 
-  test("AQE owns its shuffle boundaries") {
-    withSQLConf(selection -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
-      val explain = sql("EXPLAIN " + aggregate).head().getString(0)
-      assert(explain.contains("AdaptiveSparkPlan"))
-      assert(explain.contains("Exchange"))
-      assert(!explain.contains("batchPipelinedCandidate"))
+  test("warn when distributed pipelined shuffle and AQE are both enabled") {
+    val aqe = SQLConf.ADAPTIVE_EXECUTION_ENABLED.key
+    for (enabled <- Seq(false, true); adaptive <- Seq(false, true)) {
+      withSQLConf(pipelinedShuffle -> enabled.toString, aqe -> adaptive.toString) {
+        val appender = new LogAppender("distributed pipelined shuffle")
+        withLogAppender(appender, loggerNames = Seq(SelectBatchPipelinedShuffle.ruleName)) {
+          val plan = sql(aggregate).queryExecution.executedPlan
+          assert(candidates(plan).nonEmpty == (enabled && !adaptive))
+          if (adaptive) assert(plan.nodeName == "AdaptiveSparkPlan")
+        }
+        val warnings = appender.loggingEvents.filter(_.getLevel == Level.WARN)
+          .map(_.getMessage.getFormattedMessage)
+        if (enabled && adaptive) {
+          assert(warnings.size == 1)
+          assert(warnings.head.contains(pipelinedShuffle) && warnings.head.contains(s"$aqe=false"))
+        } else {
+          assert(warnings.isEmpty)
+        }
+      }
     }
   }
 }
