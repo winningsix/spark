@@ -102,10 +102,18 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(!tracker.containsShuffle(probe.shuffleId))
         info(s"Shuffle ${probe.shuffleId}: ${Files.readString(Path.of(marker))}")
 
+        val top = query.orderBy("id").limit(3)
+        assert(top.toLocalIterator().next().getLong(0) == 0L)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.nonEmpty && !observed.exists(_.pipelined))
+        assert(top.take(1).head.getLong(0) == 0L)
+        assert(top.collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.count(_.pipelined) == 1)
+
         val join = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8) a " +
           "LEFT JOIN range(0, 4) b ON a.id = b.id")
-        assert(join.queryExecution.executedPlan.getTagValue(DistributedPipelinedShuffle.fullResult)
-          .isEmpty)
+        assert(!join.queryExecution.executedPlan.isInstanceOf[PipelinedShuffleResultExec])
         spark.conf.set(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, false)
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
