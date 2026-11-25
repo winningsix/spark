@@ -20,12 +20,14 @@ package org.apache.spark.sql.execution.exchange
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.config
 import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager
-import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.Command
-import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution._
@@ -43,14 +45,9 @@ import org.apache.spark.sql.internal.SQLConf
  * full-result plan with the chosen exchange; the scheduler admits the group at submission.
  */
 private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
-  val candidate = TreeNodeTag[Unit]("batchPipelinedShuffleCandidate")
+  val candidate = TreeNodeTag[Int]("batchPipelinedShuffleCandidate")
 
-  // The cached result plan also serves partial/RDD consumers. Plan the full-result variant here
-  // and give each full action a fresh copy. The template is only used on the driver.
-  private[exchange] final class FullResult(
-      @transient val plan: SparkPlan,
-      val supportsIterator: Boolean) extends Serializable
-  private[exchange] val fullResult = TreeNodeTag[FullResult]("batchPipelinedFullResult")
+  val ownsShuffles = TreeNodeTag[Unit]("ownsDistributedPipelinedShuffles")
 
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) return plan
@@ -76,7 +73,6 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     if (input.exists(p => p.subqueries.nonEmpty || p.isInstanceOf[ReusedExchangeExec])) return plan
     val exchanges = input.collect { case s: ShuffleExchangeExec => s.id }
     val isResult = input eq plan
-    plan.unsetTagValue(fullResult)
     val consumer = consumerInput(input, collectTopK = isResult)
     boundary(consumer) match {
       case j: SortMergeJoinExec if stageWidth(j.right).isEmpty => return plan
@@ -87,7 +83,7 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
           exchanges.count(_ == s.id) == 1 => s
       case _ => return plan
     }
-    exchange.setTagValue(candidate, ())
+    exchange.setTagValue(candidate, exchange.id)
     val sc = plan.session.sparkContext
     if (sc.isLocal || sc.cleaner.isEmpty || sc.conf.get(config.SPECULATION_ENABLED) ||
         sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
@@ -97,15 +93,10 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     val readers = exchange.outputPartitioning.numPartitions
     if (!stageWidth(exchange.child).exists(maps =>
         maps > 0 && readers > 0 && maps.toLong + readers <= slots)) return plan
-    val selected = input.transformUp {
-      case s: ShuffleExchangeExec if s eq exchange => s.copy(pipelined = true)
-    }
     if (isResult) {
-      plan.setTagValue(fullResult, new FullResult(selected,
-        supportsIterator = !plan.isInstanceOf[TakeOrderedAndProjectExec]))
-      plan
+      PipelinedShuffleResultExec(input, exchange.id)
     } else {
-      val write = plan.withNewChildren(Seq(selected.clone()))
+      val write = plan.withNewChildren(Seq(pipeline(input, exchange.id).clone()))
       write.setTagValue(ownsShuffles, ())
       write
     }
@@ -173,26 +164,9 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     case other => other
   }
 
-  val ownsShuffles = TreeNodeTag[Unit]("ownsDistributedPipelinedShuffles")
-
-  def resultPlan(plan: SparkPlan, iterator: Boolean = false): SparkPlan = {
-    val template = plan.getTagValue(fullResult) match {
-      case Some(result) if !iterator || result.supportsIterator => result.plan
-      case _ => return plan
-    }
-    // The session can opt out between actions on an already prepared Dataset.
-    val conf = plan.conf
-    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
-        conf.adaptiveExecutionEnabled || conf.localPipelinedShuffleEnabled) return plan
-    val id = plan.session.sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-    if (id == null) return plan
-    val qe = SQLExecution.getQueryExecution(id.toLong)
-    // A prefix or broadcast job can run under the outer execution ID.
-    if (qe == null || !(qe.executedPlan eq plan)) return plan
-    val selected = template.clone()
-    selected.setTagValue(ownsShuffles, ())
-    SQLExecution.updatePhysicalPlan(id.toLong, qe.withExecutedPlan(selected))
-    selected
+  private[exchange] def pipeline(plan: SparkPlan, exchangeId: Int): SparkPlan = plan.transformUp {
+    case s: ShuffleExchangeExec if s.getTagValue(candidate).contains(exchangeId) =>
+      s.copy(pipelined = true)
   }
 
   def cleanup(plan: SparkPlan): Unit = {
@@ -204,4 +178,36 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
       }
     }
   }
+}
+
+/** Collect a job-owned copy of the planned pipeline. Partial readers use the ordinary child. */
+private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeId: Int)
+  extends UnaryExecNode {
+  override def output: Seq[Attribute] = child.output
+  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  @transient private val fullInput = DistributedPipelinedShuffle.pipeline(child, exchangeId)
+
+  private def collectPlan(): SparkPlan = {
+    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
+        conf.adaptiveExecutionEnabled || conf.localPipelinedShuffleEnabled) return child
+    val id = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+    if (id == null) return child
+    val qe = SQLExecution.getQueryExecution(id.toLong)
+    if (qe == null || !(qe.executedPlan eq this)) return child
+    val selected = fullInput.clone()
+    selected.setTagValue(DistributedPipelinedShuffle.ownsShuffles, ())
+    SQLExecution.updatePhysicalPlan(id.toLong, qe.withExecutedPlan(selected))
+    selected
+  }
+
+  override def executeCollect(): Array[InternalRow] = collectPlan().executeCollect()
+  override private[spark] def executeCollectIterator(): (Long, Iterator[InternalRow]) = {
+    val plan = if (child.isInstanceOf[TakeOrderedAndProjectExec]) child else collectPlan()
+    plan.executeCollectIterator()
+  }
+  override protected def doExecute(): RDD[InternalRow] = child.execute()
+  override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
+    copy(child = newChild)
 }

@@ -318,7 +318,7 @@ case class TakeOrderedAndProjectExec(
     projectList.map(_.toAttribute)
   }
 
-  override protected def doExecuteCollect(): Array[InternalRow] = executeQuery {
+  override def executeCollect(): Array[InternalRow] = executeQuery {
     val orderingSatisfies = SortOrder.orderingSatisfies(child.outputOrdering, sortOrder)
     val ord = new LazilyGeneratedOrdering(sortOrder, child.output)
     val limited = if (orderingSatisfies) {

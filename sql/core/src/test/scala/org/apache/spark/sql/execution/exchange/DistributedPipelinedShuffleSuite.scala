@@ -116,12 +116,21 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(!tracker.containsShuffle(probe.shuffleId))
         info(s"Shuffle ${probe.shuffleId}: ${Files.readString(Path.of(marker))}")
 
+        val top = query.orderBy("id").limit(3)
+        assert(top.toLocalIterator().next().getLong(0) == 0L)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.nonEmpty && !observed.exists(_.pipelined))
+        assert(top.take(1).head.getLong(0) == 0L)
+        assert(top.collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.count(_.pipelined) == 1)
+
         if (name == "right build") {
           val inner = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8, 1, 2) a " +
             "JOIN range(0, 4, 1, 2) b ON a.id % 5 = b.id")
           val innerPlan = inner.queryExecution.executedPlan
           assert(innerPlan.collect { case s: ShuffleExchangeExec => s }.size == 2)
-          assert(innerPlan.getTagValue(DistributedPipelinedShuffle.fullResult).isEmpty)
+          assert(!innerPlan.isInstanceOf[PipelinedShuffleResultExec])
           // The merge join has an empty buffered partition. Its streamed sort must still drain
           // every row. The aggregate's input shuffle and the join sibling are ordinary prefixes.
           for (codegen <- Seq(true, false)) {
