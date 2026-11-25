@@ -22,6 +22,8 @@ import org.apache.spark.internal.config
 import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager
 import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.Command
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -30,6 +32,7 @@ import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.{InsertIntoHadoopFsRelationCommand, WriteFilesExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
@@ -69,16 +72,19 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
       return plan
     }
 
-    // A single input chain cannot share an exchange. Subqueries and reused exchanges are
-    // additional consumers even when their inputs are hidden from SparkPlan.children.
-    if (input.exists(p => p.children.size > 1 || p.subqueries.nonEmpty ||
-        p.isInstanceOf[ReusedExchangeExec])) return plan
-
+    // An exchange can be shared across branches even without a ReusedExchangeExec wrapper.
+    if (input.exists(p => p.subqueries.nonEmpty || p.isInstanceOf[ReusedExchangeExec])) return plan
+    val exchanges = input.collect { case s: ShuffleExchangeExec => s.id }
     val isResult = input eq plan
     plan.unsetTagValue(fullResult)
     val consumer = consumerInput(input, collectTopK = isResult)
+    boundary(consumer) match {
+      case j: SortMergeJoinExec if stageWidth(j.right).isEmpty => return plan
+      case _ =>
+    }
     val exchange = probe(consumer) match {
-      case Some(s) if !s.pipelined && s.outputPartitioning.isInstanceOf[HashPartitioning] => s
+      case Some(s) if !s.pipelined && s.outputPartitioning.isInstanceOf[HashPartitioning] &&
+          exchanges.count(_ == s.id) == 1 => s
       case _ => return plan
     }
     exchange.setTagValue(candidate, ())
@@ -114,16 +120,48 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     case other => other
   }
 
+  // Get the producer task count without executing the joins (which could start broadcast jobs).
+  // Ordinary exchanges cut the stage. A shuffled join zips two equally partitioned RDDs.
   private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
     case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
     case r: RangeExec => Some(r.outputPartitioning.numPartitions)
     case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
+    case j: BroadcastHashJoinExec =>
+      val (streamed, build) = if (j.buildSide == BuildLeft) (j.right, j.left) else (j.left, j.right)
+      boundary(build) match {
+        case _: BroadcastExchangeExec => stageWidth(streamed)
+        case _ => None
+      }
+    case j @ (_: SortMergeJoinExec | _: ShuffledHashJoinExec) =>
+      stageWidth(j.children.head).filter(n => stageWidth(j.children.last).contains(n))
     case _ => None
   }
 
-  private def probe(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
+  private def exchange(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
     case s: ShuffleExchangeExec => Some(s)
     case _ => None
+  }
+
+  private def sortedInput(plan: SparkPlan): Option[ShuffleExchangeExec] = plan match {
+    case s: SortExec if !s.global => exchange(s.child)
+    case _: WholeStageCodegenExec | _: InputAdapter => sortedInput(plan.children.head)
+    case _ => None
+  }
+
+  private def probe(input: SparkPlan): Option[ShuffleExchangeExec] = boundary(input) match {
+    case j: ShuffledHashJoinExec =>
+      (j.joinType, j.buildSide) match {
+        case (LeftOuter, BuildRight) if boundary(j.right).isInstanceOf[ShuffleExchangeExec] =>
+          exchange(j.left)
+        case (RightOuter, BuildLeft) if boundary(j.left).isInstanceOf[ShuffleExchangeExec] =>
+          exchange(j.right)
+        case _ => None
+      }
+    case j: SortMergeJoinExec if j.joinType == Inner =>
+      // Inner merge joins request the streamed (left) input even for an empty right
+      // partition. Its local sort drains the reader before the join can stop early.
+      sortedInput(j.left)
+    case other => exchange(other)
   }
 
   private def consumerInput(plan: SparkPlan, collectTopK: Boolean): SparkPlan = plan match {

@@ -1189,32 +1189,14 @@ private[spark] class DAGScheduler(
    * before any stage is created (so an unsupported job is rejected
    * fail-fast with no partial scheduler state).
    *
-   * The supported shapes are:
-   *  - all-regular (`hasPipelined` false, nothing pipelined anywhere);
-   *  - all-pipelined (`hasPipelined` true, no regular boundary anywhere);
-   *  - MATERIALIZED-PREFIX MIXED: pipelined shuffles in the region reachable from the final RDD
-   *    without crossing a regular shuffle, where every regular boundary at the edge of that
-   *    region is FULLY MATERIALIZED (all map outputs registered with the MapOutputTracker) and
-   *    no pipelined shuffle sits below any regular boundary. The materialized prefix never
-   *    re-runs, so the job executes exactly like an all-pipelined job whose leaves read
-   *    already-materialized shuffle data; gang admission demand (final stage + suffix producers)
-   *    is unchanged. This is the shape adaptive execution produces: prior map-stage jobs
-   *    materialize the prefix stages, and the final job runs the pipelined tail.
-   *
-   * A single-input graph can materialize its regular prefix in the same job. Only when the
-   * prefix completes is the pipelined suffix admitted. Graphs with multiple inputs still need
-   * their regular boundaries materialized before submission.
+   * A pipelined suffix can read regular shuffle outputs at its boundary. If any are missing,
+   * schedule the regular prefix under the same job before admitting any member of the group.
+   * A pipelined shuffle below a regular boundary cannot belong to the suffix.
    */
   private[scheduler] case class JobShuffleShape(
       hasPipelined: Boolean,
-      hasUnmaterializedRegularBoundary: Boolean,
-      hasPipelinedBelowRegular: Boolean,
-      prefixToSchedule: Seq[Int] = Nil) {
-    /** Mixed in a way the scheduler does not support (see class doc). */
-    def isUnsupportedMix: Boolean =
-      hasPipelinedBelowRegular || (hasPipelined && hasUnmaterializedRegularBoundary &&
-        prefixToSchedule.isEmpty)
-  }
+      prefixToSchedule: Seq[Int],
+      hasPipelinedBelowRegular: Boolean)
 
   /**
    * Which KINDS of shuffle boundary the RDD graph rooted at `finalRDD` contains: any
@@ -1260,12 +1242,11 @@ private[spark] class DAGScheduler(
     if (!hasPipelinedKind || !hasRegularKind) {
       return JobShuffleShape(
         hasPipelined = hasPipelinedKind,
-        hasUnmaterializedRegularBoundary = false,
+        prefixToSchedule = Nil,
         hasPipelinedBelowRegular = false)
     }
     var hasPipelined = false
     var pipelinedBelow = false
-    var singleInput = true
     // Frontier regular shuffle boundaries: those reachable from the final RDD WITHOUT crossing
     // another regular boundary, deduped by shuffle ID. Only these matter for the materialization
     // check (a regular boundary below another one is never a runnable suffix member).
@@ -1290,7 +1271,6 @@ private[spark] class DAGScheduler(
       val rdd = entry._1
       val belowRegular = entry._2
       if (visited.add(entry)) {
-        if (rdd.dependencies.size > 1) singleInput = false
         rdd.dependencies.foreach {
           case pd: PipelinedShuffleDependency[_, _, _] =>
             if (belowRegular) pipelinedBelow = true else hasPipelined = true
@@ -1305,36 +1285,14 @@ private[spark] class DAGScheduler(
       }
     }
 
-    // The materialization check only matters for a pipelined job: `isUnsupportedMix` consumes
-    // `hasUnmaterializedRegularBoundary` only when `hasPipelined` is true (a pipelined shuffle
-    // below an unmaterialized regular boundary is the rejected shape). A job with no pipelined
-    // dependency -- every job on a feature-off deployment -- would otherwise pay K
-    // getNumAvailableOutputs lookups (a read-locked shuffleStatuses count) for a value never read,
-    // on the single-threaded event loop. So skip the loop entirely unless the walk saw a pipelined
-    // dependency; a non-pipelined job reports hasUnmaterialized = false (unused).
-    var hasUnmaterialized = false
-    if (hasPipelined) {
-      regularBoundaries.values.foreach { sd =>
-        // Materialized means every MAP partition has a registered output: the tracker counts map
-        // outputs, so compare against the producer RDD's partition count (matching how
-        // ShuffleMapStage.isAvailable derives completeness), not the reducer-side partitioner.
-        // This is a point-in-time check at job submission. If a materialized prefix's output were
-        // LOST after this classification but before the pipelined suffix finished (executor loss),
-        // the prefix would need to re-run while the gang holds all slots -- the very deadlock this
-        // shape check forbids. That is safe here for two reasons: (1) the only supported deployment
-        // is single-executor local mode, where executor loss does not occur in normal operation;
-        // and (2) if a FetchFailed did strip the prefix, handleTaskCompletion routes it to a
-        // WHOLE-GROUP abort (the failing stage is a pipelined group member), not a lone-stage
-        // resubmit into the held slots. A caller must rematerialize lost prefixes before retrying;
-        // the SQL channel rules exclude this mixed shape.
-        if (mapOutputTracker.getNumAvailableOutputs(sd.shuffleId) != sd.rdd.partitions.length ||
-            !sd.shuffleMergeFinalized) {
-          hasUnmaterialized = true
-        }
-      }
+    // Retain every boundary when waiting: output that was available at submission can be lost
+    // while a different branch is running. Include push-shuffle merge finalization in readiness.
+    val needsPrefix = hasPipelined && !pipelinedBelow && regularBoundaries.values.exists { sd =>
+      mapOutputTracker.getNumAvailableOutputs(sd.shuffleId) != sd.rdd.partitions.length ||
+        !sd.shuffleMergeFinalized
     }
-    val prefix = if (hasUnmaterialized && singleInput) regularBoundaries.keys.toList else Nil
-    JobShuffleShape(hasPipelined, hasUnmaterialized, pipelinedBelow, prefix)
+    JobShuffleShape(hasPipelined, if (needsPrefix) regularBoundaries.keys.toSeq.sorted else Nil,
+      pipelinedBelow)
   }
 
   /**
@@ -1383,7 +1341,7 @@ private[spark] class DAGScheduler(
       // Reuse that result instead of walking the graph again to classify its shuffle shape.
       Some(JobShuffleShape(
         hasPipelined = false,
-        hasUnmaterializedRegularBoundary = false,
+        prefixToSchedule = Nil,
         hasPipelinedBelowRegular = false))
     } else {
       Some(classifyJobShuffleShape(finalRDD))
@@ -2679,22 +2637,14 @@ private[spark] class DAGScheduler(
       case None => return
     }
 
-    // A cold regular prefix can run before admission in a single-input graph.
     val hasPipelined = shape.hasPipelined
-    if (shape.isUnsupportedMix) {
-      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
-        log"a regular shuffle is only supported when every regular shuffle is a materialized " +
-        log"prefix below the pipelined shuffles")
-      // Clear the slot-check retry count an earlier deferral may have left.
+    if (shape.hasPipelinedBelowRegular) {
       barrierJobIdToNumTasksCheckFailures.remove(jobId)
       listener.jobFailed(new SparkException(
-        "A job that mixes a pipelined shuffle dependency with a regular shuffle dependency is " +
-          "only supported when every regular shuffle is a fully-materialized prefix below the " +
-          "pipelined shuffles; otherwise a job must be either all-regular or all-pipelined."))
+        "A pipelined shuffle below a regular shuffle cannot run in the job's pipelined suffix."))
       return
     }
-
-    // A job waiting for ordinary inputs checks group capacity when its last input completes.
+    // Check the whole group when all regular inputs are ready.
     if (hasPipelined && shape.prefixToSchedule.isEmpty &&
         rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions.length)(listener.jobFailed)) {
       // Clear the slot-check retry count an earlier deferral may have left.
