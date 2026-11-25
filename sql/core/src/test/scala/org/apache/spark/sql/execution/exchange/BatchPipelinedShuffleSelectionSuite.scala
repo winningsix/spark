@@ -99,6 +99,22 @@ class BatchPipelinedShuffleSelectionSuite extends QueryTest with SharedSparkSess
     }
   }
 
+  test("a V1 file insert selects only the final-stage hash exchange") {
+    withSQLConf(pipelinedShuffle -> "true", SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+      withTable("write_groups") {
+        sql("CREATE TABLE write_groups (n BIGINT) USING parquet")
+        val query = s"SELECT count(*) FROM ($aggregate) t GROUP BY n"
+        assert(candidates(sql(query).queryExecution.executedPlan).size == 2)
+        val explain = sql(s"EXPLAIN INSERT INTO write_groups $query").head().getString(0)
+        val hashes = explain.linesIterator.filter(_.contains("Exchange hashpartitioning")).toList
+        assert(hashes.size == 2, explain)
+        assert(hashes.head.contains("batchPipelinedCandidate=true"), explain)
+        assert(!hashes.last.contains("batchPipelinedCandidate=true"), explain)
+      }
+    }
+  }
+
   test("an exchange referenced twice without a reuse wrapper also forces fallback") {
     withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
       val plan = sql(

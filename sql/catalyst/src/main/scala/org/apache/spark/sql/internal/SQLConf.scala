@@ -1493,9 +1493,9 @@ object SQLConf {
       .internal()
       .doc("When true and AQE is disabled, a batch SQL job can pipeline one single-reader " +
         "hash shuffle across executors. The reader can consume rows before all map tasks " +
-        "finish. Spark uses this path for supported physical consumers that drain " +
-        "every reader partition and the producer and reader tasks fit in the cluster's " +
-        "concurrent task slots. With AQE enabled, Spark logs a warning and skips distributed " +
+        "finish. The consumer must drain every reader partition, and the producer and reader " +
+        "tasks must fit in the cluster's concurrent task slots. A task failure aborts the " +
+        "pipelined group. With AQE enabled, Spark logs a warning and skips distributed " +
         "pipelined shuffle. Experimental.")
       .version("5.0.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)

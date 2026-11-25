@@ -39,7 +39,6 @@ import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution.{EmptyRDDWithPartitions, ProjectExec, SortExec, SparkPlan, SQLExecution, UnsafeExternalRowSorter}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
-import org.apache.spark.sql.execution.exchange.DistributedBatchShuffle
 import org.apache.spark.util.{SerializableConfiguration, Utils}
 import org.apache.spark.util.ArrayImplicits._
 
@@ -196,27 +195,25 @@ object FileFormatWriter extends Logging {
       //    V1 write command will be empty).
       if (Utils.isTesting) outputOrderingMatched = orderingMatched
 
-      DistributedBatchShuffle.withFullInput(plan) { input =>
-        if (writeFilesOpt.isDefined) {
-          // build `WriteFilesSpec` for `WriteFiles`
-          val concurrentOutputWriterSpecFunc = if (orderingMatched) {
-            (_: SparkPlan) => None
-          } else {
-            (plan: SparkPlan) => {
-              val sortPlan = createSortPlan(plan, requiredOrdering, outputSpec)
-              createConcurrentOutputWriterSpec(sparkSession, sortPlan, sortColumns)
-            }
-          }
-          val writeSpec = WriteFilesSpec(
-            description = description,
-            committer = committer,
-            concurrentOutputWriterSpecFunc = concurrentOutputWriterSpecFunc
-          )
-          executeWrite(sparkSession, input, writeSpec, job)
+      if (writeFilesOpt.isDefined) {
+        // build `WriteFilesSpec` for `WriteFiles`
+        val concurrentOutputWriterSpecFunc = if (orderingMatched) {
+          (_: SparkPlan) => None
         } else {
-          executeWrite(sparkSession, input, job, description, committer, outputSpec,
-            requiredOrdering, partitionColumns, sortColumns, orderingMatched)
+          (plan: SparkPlan) => {
+            val sortPlan = createSortPlan(plan, requiredOrdering, outputSpec)
+            createConcurrentOutputWriterSpec(sparkSession, sortPlan, sortColumns)
+          }
         }
+        val writeSpec = WriteFilesSpec(
+          description = description,
+          committer = committer,
+          concurrentOutputWriterSpecFunc = concurrentOutputWriterSpecFunc
+        )
+        executeWrite(sparkSession, plan, writeSpec, job)
+      } else {
+        executeWrite(sparkSession, plan, job, description, committer, outputSpec,
+          requiredOrdering, partitionColumns, sortColumns, orderingMatched)
       }
     } catch {
       case cause: Throwable =>

@@ -23,7 +23,7 @@ import scala.concurrent.duration._
 
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
+import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster, TaskContext}
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.{QueryExecution, SQLExecution, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.functions.{col, udf}
@@ -40,6 +40,7 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         .appName(getClass.getSimpleName)
         .config("spark.executor.cores", "2")
         .config("spark.executor.memory", "1g")
+        .config("spark.task.maxFailures", "4")
         .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
         .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
         .config(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, "true")
@@ -60,7 +61,9 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
           SparkEnv.get.executorId
         }.asNondeterministic()
         val reader = udf { (producer: String, id: Long, buildId: java.lang.Long) =>
-          if (id == 0 && Files.exists(Path.of(marker + ".fail"))) {
+          // A task retry on its own would succeed and mask the injected failure.
+          if (id == 0 && TaskContext.get().attemptNumber() == 0 &&
+              Files.exists(Path.of(marker + ".fail"))) {
             throw new IllegalStateException("injected reader failure")
           }
           val executor = SparkEnv.get.executorId
@@ -115,7 +118,8 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         assert(query.collectAsList().size() == actual.length)
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         val Seq(second) = observed.filter(_.pipelined)
-        assert(second.shuffleId != probe.shuffleId && !tracker.containsShuffle(second.shuffleId))
+        assert(Set(probe.shuffleId, failed.shuffleId, second.shuffleId).size == 3)
+        assert(!tracker.containsShuffle(second.shuffleId))
 
         Files.delete(Path.of(marker))
         assert(query.orderBy("id").limit(3).collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
@@ -181,6 +185,32 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         val written = spark.read.parquet(output).collect().map(_.getLong(0)).sorted
         assert(written.toSeq == (0L until 10L))
 
+        // Ignore must decide to skip the write before any prefix job is materialized.
+        sc.setJobGroup("skip-existing-output", "write to an existing path")
+        try {
+          query.write.mode("ignore").parquet(output)
+          assert(sc.statusTracker.getJobIdsForGroup("skip-existing-output").isEmpty)
+        } finally {
+          sc.clearJobGroup()
+        }
+
+        val retryPath = dir.toPath.resolve("failed-write")
+        Files.createFile(Path.of(marker + ".fail"))
+        intercept[SparkException](query.write.parquet(retryPath.toString))
+        sc.listenerBus.waitUntilEmpty(30000)
+        val Seq(failedWrite) = observed.filter(_.pipelined)
+        assert(!tracker.containsShuffle(failedWrite.shuffleId))
+        assert(!Files.exists(retryPath.resolve("_SUCCESS")))
+        Files.delete(Path.of(marker + ".fail"))
+
+        query.write.mode("overwrite").parquet(retryPath.toString)
+        sc.listenerBus.waitUntilEmpty(30000)
+        val Seq(retriedWrite) = observed.filter(_.pipelined)
+        assert(retriedWrite.shuffleId != failedWrite.shuffleId)
+        assert(!tracker.containsShuffle(retriedWrite.shuffleId))
+        assert(spark.read.parquet(retryPath.toString).collect().sortBy(_.getLong(0))
+          .sameElements(actual))
+
         assert(ids.take(1).length == 1)
         sc.listenerBus.waitUntilEmpty(30000)
         assert(observed.nonEmpty && !observed.exists(_.pipelined))
@@ -192,7 +222,7 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         assert(ordered.outputOrdering.nonEmpty)
         val orderedTopK = TakeOrderedAndProjectExec(1, ordered.outputOrdering,
           ordered.output, ordered)
-        assert(DistributedBatchShuffle.forFullInput(orderedTopK, collectTopK = true).isEmpty)
+        assert(SelectBatchPipelinedShuffle.forFullInput(orderedTopK, collectTopK = true).isEmpty)
 
         val wide = spark.range(0, 10, 1, 5).repartition(2, col("id"))
         assert(wide.collect().sorted.toSeq == (0L until 10L))
