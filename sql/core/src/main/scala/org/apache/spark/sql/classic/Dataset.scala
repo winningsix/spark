@@ -1636,10 +1636,10 @@ class Dataset[T] private[sql](
     "tail", withTypedPlan(Tail(Literal(n), logicalPlan)).queryExecution)(collectFromPlan)
 
   /** @inheritdoc */
-  def collect(): Array[T] = withCollectAction("collect")(collectFromPlan)
+  def collect(): Array[T] = withAction("collect", queryExecution)(collectFromPlan)
 
   /** @inheritdoc */
-  def collectAsList(): java.util.List[T] = withCollectAction("collectAsList") { plan =>
+  def collectAsList(): java.util.List[T] = withAction("collectAsList", queryExecution) { plan =>
     val values = collectFromPlan(plan)
     java.util.Arrays.asList(values : _*)
   }
@@ -2409,15 +2409,6 @@ class Dataset[T] private[sql](
           qe.executedPlan.resetMetrics()
           action(qe.executedPlan)
         }
-      }
-    }
-  }
-
-  private def withCollectAction[U](name: String)(action: SparkPlan => U): U = {
-    queryExecution.withDistributedShuffleCollect { (qe, prepareInputs) =>
-      withAction(name, qe) { plan =>
-        prepareInputs()
-        action(plan)
       }
     }
   }

@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
-import org.apache.spark.sql.execution.ui.{SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
+import org.apache.spark.sql.execution.ui.{SparkListenerSQLAdaptiveExecutionUpdate, SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.SQL_EVENT_TRUNCATE_LENGTH
 import org.apache.spark.util.{Utils, UUIDv7Generator}
@@ -90,6 +90,15 @@ object SQLExecution extends Logging {
 
   def getQueryExecution(executionId: Long): QueryExecution = {
     executionIdToQueryExecution.get(executionId)
+  }
+
+  /** Publish the physical plan selected at job submission, scoped to this SQL execution ID. */
+  private[execution] def updatePhysicalPlan(id: Long, qe: QueryExecution): Unit = {
+    executionIdToQueryExecution.put(id, qe)
+    val session = qe.sparkSession
+    session.sparkContext.listenerBus.post(SparkListenerSQLAdaptiveExecutionUpdate(
+      id, planDescription(qe, session.sessionState.conf.uiExplainMode),
+      SparkPlanInfo.fromSparkPlan(qe.executedPlan)))
   }
 
   private val testing = sys.props.contains(IS_TESTING.key)
@@ -309,6 +318,7 @@ object SQLExecution extends Logging {
                 ex = Some(e)
                 throw e
             } finally {
+              val executedQuery = getQueryExecution(executionId)
               // `SparkContext.stop()` nulls `dagScheduler` before it stops the listener bus, so the
               // end event may still be posted after the scheduler is unavailable. Keep observation
               // completion in a `finally` so an error in this block never leaves a waiter hung.
@@ -333,7 +343,7 @@ object SQLExecution extends Logging {
                   }
                 }
                 if (queryExecution.shuffleCleanupMode != DoNotCleanup && isExecutedPlanAvailable) {
-                  cleanupShuffleDependencies(queryExecution, executionId)
+                  cleanupShuffleDependencies(executedQuery, executionId)
                 }
                 val event = SparkListenerSQLExecutionEnd(
                   executionId,
@@ -348,7 +358,7 @@ object SQLExecution extends Logging {
                 // `QueryExecutionListener` can track more cases.
                 event.executionName = name
                 event.duration = endTime - startTime
-                event.qe = queryExecution
+                event.qe = executedQuery
                 event.executionFailure = ex
                 // Snapshot the `@volatile` `dagScheduler` once and share it across both reads
                 // below; it is null once `SparkContext.stop()` has run.
@@ -371,7 +381,7 @@ object SQLExecution extends Logging {
                 // Complete the observation whatever the block above threw, so an `Observation.get`
                 // waiter is never left hung. `promise.tryComplete` is idempotent.
                 try {
-                  sparkSession.observationManager.tryComplete(queryExecution)
+                  sparkSession.observationManager.tryComplete(executedQuery)
                 } catch {
                   case NonFatal(e) =>
                     logWarning(log"Failed to complete observations for execution " +

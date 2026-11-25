@@ -47,7 +47,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, Adapti
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
 import org.apache.spark.sql.execution.datasources.v2.{TransactionalExec, V2TableRefreshUtil}
 import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
-import org.apache.spark.sql.execution.exchange.{DistributedBatchShuffle, EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, SelectBatchPipelinedShuffle, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, SelectBatchPipelinedShuffle, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ChoosePerPartitionRuntimeFilters
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
@@ -155,7 +155,7 @@ class QueryExecution(
       }
     }
   }
-  private def transactionOpt: Option[Transaction] = lazyTransactionOpt.get
+  private[execution] def transactionOpt: Option[Transaction] = lazyTransactionOpt.get
 
   // Per-query analyzer: uses a transaction-aware CatalogManager when a transaction is active,
   // so that all catalog lookups and rule applications during analysis see the correct state
@@ -436,29 +436,12 @@ class QueryExecution(
 
   private[sql] def withRegularShuffle: QueryExecution = lazyRegularShuffle.get
 
-  /** Give each full collect its own one-shot transport and SQL execution plan. */
-  private[sql] def withDistributedShuffleCollect[T](
-      run: (QueryExecution, () => Unit) => T): T = {
-    val conf = sparkSession.sessionState.conf
-    if (conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) &&
-        !conf.adaptiveExecutionEnabled && !conf.localPipelinedShuffleEnabled &&
-        transactionOpt.isEmpty) {
-      sparkSession.withActive(DistributedBatchShuffle.forCollect(executedPlan)) match {
-        case Some(group) =>
-          val qe = new QueryExecution(sparkSession, commandExecuted, tracker, mode,
-              shuffleCleanupModeOpt, refreshPhaseEnabled, analyzerOpt = Some(analyzer)) {
-            override def executedPlan: SparkPlan = group.plan
-          }
-          try {
-            return run(qe, () => group.materializeInputs())
-          } finally {
-            group.cleanup()
-          }
-        case None =>
-      }
+  /** Use the physical plan of this execution when reporting a one-shot shuffle to listeners. */
+  private[execution] def withExecutedPlan(plan: SparkPlan): QueryExecution =
+    new QueryExecution(sparkSession, commandExecuted, tracker, mode, shuffleCleanupModeOpt,
+        refreshPhaseEnabled, analyzerOpt = Some(analyzer)) {
+      override def executedPlan: SparkPlan = plan
     }
-    run(this, () => ())
-  }
 
   val lazyToRdd = LazyTry {
     new SQLExecutionRDD(

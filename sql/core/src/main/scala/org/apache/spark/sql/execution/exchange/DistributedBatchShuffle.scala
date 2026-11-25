@@ -27,11 +27,14 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.window.WindowExec
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.ThreadUtils
 
-/** A collect owns its cloned exchanges, including the ordinary inputs to the group. */
+/** A job owns its cloned exchanges, including the ordinary inputs to the group. */
 private[sql] class DistributedBatchShuffle(val plan: SparkPlan) {
   def materializeInputs(): Unit = {
     def prepare(node: SparkPlan): Unit = node match {
@@ -55,7 +58,7 @@ private[sql] class DistributedBatchShuffle(val plan: SparkPlan) {
 }
 
 private[sql] object DistributedBatchShuffle {
-  // These unary operators preserve the task-to-partition mapping and a full collect drains
+  // These unary operators preserve the task-to-partition mapping and consuming all output drains
   // their inputs. In particular a local sort reads its entire input before yielding a row.
   private def boundary(plan: SparkPlan): SparkPlan = plan match {
     case _: ProjectExec | _: FilterExec | _: WholeStageCodegenExec | _: HashAggregateExec |
@@ -110,7 +113,49 @@ private[sql] object DistributedBatchShuffle {
     case other => candidate(other)
   }
 
-  def forCollect(plan: SparkPlan): Option[DistributedBatchShuffle] = {
+  /**
+   * Scope a one-shot shuffle to a synchronous physical job that consumes every partition.
+   * Partial reads and RDDs handed to an unknown consumer keep their materialized exchanges.
+   */
+  def withFullInput[T](
+      plan: SparkPlan,
+      collectTopK: Boolean = false)(run: SparkPlan => T): T = {
+    val conf = plan.conf
+    if (plan.session == null || !conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
+        conf.adaptiveExecutionEnabled || conf.localPipelinedShuffleEnabled) {
+      return run(plan)
+    }
+    val sc = plan.session.sparkContext
+    val execution = Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+      .map(_.toLong).flatMap(id => Option(SQLExecution.getQueryExecution(id)).map(id -> _))
+    execution match {
+      case Some((id, qe)) if qe.transactionOpt.isEmpty =>
+        forFullInput(plan, collectTopK) match {
+          case Some(group) =>
+            // Prefix and broadcast jobs may execute other physical plans under the same ID.
+            // Only activate the root or the file writer's input in this execution.
+            val reportedPlan = qe.executedPlan match {
+              case p if p eq plan => group.plan
+              case w: DataWritingCommandExec if w.child eq plan =>
+                w.withNewChildren(Seq(group.plan))
+              case _ => return run(plan)
+            }
+            try {
+              SQLExecution.updatePhysicalPlan(id, qe.withExecutedPlan(reportedPlan))
+              group.materializeInputs()
+              run(group.plan)
+            } finally {
+              group.cleanup()
+            }
+          case None => run(plan)
+        }
+      case _ => run(plan)
+    }
+  }
+
+  private[exchange] def forFullInput(
+      plan: SparkPlan,
+      collectTopK: Boolean): Option[DistributedBatchShuffle] = {
     val sc = plan.session.sparkContext
     if (sc.isLocal || sc.cleaner.isEmpty || sc.conf.get(config.SPECULATION_ENABLED) ||
         sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
@@ -123,8 +168,9 @@ private[sql] object DistributedBatchShuffle {
     val selected = plan match {
       // Only the root uses TakeOrderedAndProjectExec.executeCollect. With ordered input it
       // takes at most K rows per partition, and nested Top-K can introduce another shuffle.
-      case k: TakeOrderedAndProjectExec if k.limit > 0 &&
+      case k: TakeOrderedAndProjectExec if collectTopK && k.limit > 0 &&
           !SortOrder.orderingSatisfies(k.child.outputOrdering, k.sortOrder) => probe(k.child)
+      case w: WriteFilesExec => probe(w.child)
       case other => probe(other)
     }
     val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)

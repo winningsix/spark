@@ -1491,13 +1491,13 @@ object SQLConf {
   val DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED =
     buildConf("spark.sql.shuffle.distributedPipelined.enabled")
       .internal()
-      .doc("When true and AQE is disabled, a batch Dataset.collect or collectAsList can " +
-        "pipeline one single-reader hash shuffle across executors. The reader can consume " +
-        "rows before all map tasks finish. The action uses this path only when it can drain " +
+      .doc("When true and AQE is disabled, a batch SQL job can pipeline one single-reader " +
+        "hash shuffle across executors. The reader can consume rows before all map tasks " +
+        "finish. Spark uses this path for supported physical consumers that drain " +
         "every reader partition and the producer and reader tasks fit in the cluster's " +
         "concurrent task slots. With AQE enabled, Spark logs a warning and skips distributed " +
         "pipelined shuffle. Experimental.")
-      .version("4.5.0")
+      .version("5.0.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(false)

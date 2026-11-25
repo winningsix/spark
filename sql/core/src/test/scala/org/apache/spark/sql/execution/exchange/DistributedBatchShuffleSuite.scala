@@ -25,7 +25,7 @@ import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.execution.{QueryExecution, TakeOrderedAndProjectExec}
+import org.apache.spark.sql.execution.{QueryExecution, SQLExecution, TakeOrderedAndProjectExec}
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.QueryExecutionListener
@@ -154,11 +154,45 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
         assert(observed.size == 1 && observed.head.pipelined)
 
+        val qe = ids.queryExecution
+        val (size, rows) = SQLExecution.withNewExecutionId(qe, Some("collected iterator")) {
+          qe.executedPlan.executeCollectIterator()
+        }
+        assert(size == 10 && rows.map(_.getLong(0)).toList.sorted == (0L until 10L))
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.count(_.pipelined) == 1)
+
+        // AllTuples for the outer count is already satisfied by the one-partition grouped
+        // aggregate. Its inner hash exchange is in the final job's pipelinable suffix.
+        spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 1)
+        try {
+          val groups = spark.range(0, 10, 1, 2).groupBy(col("id") % 3).count()
+          assert(groups.count() == 3)
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.count(_.pipelined) == 1)
+        } finally {
+          spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+        }
+
+        val output = dir.toPath.resolve("output").toString
+        ids.write.parquet(output)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.count(_.pipelined) == 1)
+        val written = spark.read.parquet(output).collect().map(_.getLong(0)).sorted
+        assert(written.toSeq == (0L until 10L))
+
+        assert(ids.take(1).length == 1)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.nonEmpty && !observed.exists(_.pipelined))
+        assert(ids.toLocalIterator().next() >= 0)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.nonEmpty && !observed.exists(_.pipelined))
+
         val ordered = ids.sortWithinPartitions("id").queryExecution.executedPlan
         assert(ordered.outputOrdering.nonEmpty)
         val orderedTopK = TakeOrderedAndProjectExec(1, ordered.outputOrdering,
           ordered.output, ordered)
-        assert(DistributedBatchShuffle.forCollect(orderedTopK).isEmpty)
+        assert(DistributedBatchShuffle.forFullInput(orderedTopK, collectTopK = true).isEmpty)
 
         val wide = spark.range(0, 10, 1, 5).repartition(2, col("id"))
         assert(wide.collect().sorted.toSeq == (0L until 10L))

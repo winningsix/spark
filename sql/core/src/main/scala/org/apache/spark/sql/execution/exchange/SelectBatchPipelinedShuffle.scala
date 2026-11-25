@@ -25,6 +25,8 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.datasources.{InsertIntoHadoopFsRelationCommand, WriteFilesExec}
 import org.apache.spark.sql.execution.joins.{HashJoin, SortMergeJoinExec}
 import org.apache.spark.sql.execution.window.{WindowExec, WindowGroupLimitExec}
 import org.apache.spark.sql.internal.SQLConf
@@ -39,8 +41,12 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Unit]("batchPipelinedShuffleCandidate")
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
-        plan.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
+    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) return plan
+    val input = plan match {
+      case DataWritingCommandExec(_: InsertIntoHadoopFsRelationCommand, child) => child
+      case other => other
+    }
+    if (input.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
       return plan
     }
 
@@ -74,7 +80,7 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
         visit(s.child, !s.outputPartitioning.isInstanceOf[RangePartitioning])
       case j: HashJoin =>
         visit(if (j.buildSide == BuildLeft) j.right else j.left, singleReader)
-      case _: ProjectExec | _: FilterExec | _: BaseAggregateExec | _: SortExec |
+      case _: WriteFilesExec | _: ProjectExec | _: FilterExec | _: BaseAggregateExec | _: SortExec |
           _: InputAdapter | _: WholeStageCodegenExec | _: ColumnarToRowExec |
           _: ExpandExec | _: GenerateExec | _: WindowExec | _: WindowGroupLimitExec |
           _: SortMergeJoinExec | _: TakeOrderedAndProjectExec =>
@@ -87,7 +93,7 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
         other.children.foreach(visit(_, singleReader = false))
     }
 
-    visit(plan, singleReader = true)
+    visit(input, singleReader = true)
     plan
   }
 }
