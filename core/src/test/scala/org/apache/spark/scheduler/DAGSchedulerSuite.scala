@@ -1951,7 +1951,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     test("a deferred pipelined barrier job rejected up front on re-post clears its retry count " +
         s"(prefixLost=$prefixLost)") {
       conf.set(config.BARRIER_MAX_CONCURRENT_TASKS_CHECK_INTERVAL.key, "1h")
-      conf.set(config.BARRIER_MAX_CONCURRENT_TASKS_CHECK_MAX_FAILURES, 1)
       // A pipelined group with a barrier producer over a materialized regular prefix. The group
       // fits the 1000 slots the test scheduler reports, but its 3 barrier tasks exceed the
       // local[2] backend, so the barrier slot check defers the job.
@@ -1968,8 +1967,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       val jobId = submit(result, Array(0, 1, 2), listener = listener)
       assert(scheduler.deferredBarrierJobs.containsKey(jobId))
       assert(scheduler.barrierJobIdToNumTasksCheckFailures.get(jobId) === 1)
-      // A lost prefix is eligible to run again, but stage creation still checks the barrier.
-      // With the prefix intact the up-front group slot check still runs.
+      // Before the re-post, either the prefix loses its outputs, so the job is an unsupported mix,
+      // or other work takes the free slots, so gang admission rejects it.
       val myScheduler = scheduler.asInstanceOf[MyDAGScheduler]
       try {
         if (prefixLost) {
@@ -1982,11 +1981,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       } finally {
         myScheduler.outstandingTasksForOtherWorkForTest = (_, _) => 0
       }
-      if (prefixLost) {
-        assert(listener.failure.isInstanceOf[BarrierJobSlotsNumberCheckFailed])
-      } else {
-        assert(listener.failure.getMessage.contains("INSUFFICIENT_SLOT"))
-      }
+      val reason = if (prefixLost) "fully-materialized prefix" else "INSUFFICIENT_SLOT"
+      assert(listener.failure.getMessage.contains(reason))
       assert(scheduler.deferredBarrierJobs.isEmpty)
       assert(scheduler.barrierJobIdToNumTasksCheckFailures.isEmpty)
       assertDataStructuresEmpty()
@@ -6929,7 +6925,6 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   }
 
   private def assertDataStructuresEmpty(): Unit = {
-    assert(scheduler.pendingPipelinedPrefixes.isEmpty)
     assert(scheduler.activeJobs.isEmpty)
     assert(scheduler.failedStages.isEmpty)
     assert(scheduler.jobIdToActiveJob.isEmpty)
@@ -7080,20 +7075,28 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assertDataStructuresEmpty()
   }
 
-  test("pipelined shuffle: a regular-shuffle prefix finishes before " +
-      "its pipelined producer starts") {
+  test("pipelined shuffle: a regular-shuffle prefix feeding a pipelined producer is rejected") {
+    // An UNMATERIALIZED regular shuffle in the PREFIX that feeds a pipelined producer
+    // (regularRoot --regular--> producer(pipelined) --pipelined--> consumer) is rejected: the
+    // prefix stage would have to run while gang-admitted producers hold slots blocked on
+    // transport backpressure, which admission does not account for. Once the prefix is
+    // MATERIALIZED the same shape is accepted (see the materialized-prefix test below).
     val regularRoot = new MyRDD(sc, 2, Nil)
     val regularDep = new ShuffleDependency(regularRoot, new HashPartitioner(2))
     val producerRdd = new MyRDD(sc, 2, List(regularDep), tracker = mapOutputTracker)
     val pipelinedDep = new PipelinedShuffleDependency(producerRdd, new HashPartitioner(2))
     val consumerRdd = new MyRDD(sc, 2, List(pipelinedDep), tracker = mapOutputTracker)
-    submit(consumerRdd, Array(0, 1))
-    assert(taskSets.size == 1 && !taskSets.head.isPipelined)
-    completeShuffleMapStageSuccessfully(taskSets.head.stageId, 0, 2)
-    assert(taskSets.size == 3 && taskSets.drop(1).forall(_.isPipelined))
-    completeShuffleMapStageSuccessfully(taskSets(1).stageId, 0, 2)
-    complete(taskSets(2), Seq((Success, 42), (Success, 43)))
-    assert(results === Map(0 -> 42, 1 -> 43))
+    val failure = new java.util.concurrent.atomic.AtomicReference[Exception]()
+    val failListener = new JobListener {
+      override def taskSucceeded(index: Int, result: Any): Unit = {}
+      override def jobFailed(exception: Exception): Unit = failure.set(exception)
+    }
+    submit(consumerRdd, Array(0, 1), listener = failListener)
+
+    assert(failure.get() != null, "a pipelined job with a regular-shuffle prefix must fail")
+    assert(failure.get().getMessage.contains("all-regular or all-pipelined"),
+      s"expected a mixed-job rejection, got: ${failure.get().getMessage}")
+    assert(taskSets.isEmpty, "no stage should be submitted for a rejected mixed job")
     assertDataStructuresEmpty()
   }
 

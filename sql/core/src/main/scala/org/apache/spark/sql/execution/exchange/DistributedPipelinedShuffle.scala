@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import scala.annotation.tailrec
+
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.config
 import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
@@ -37,10 +39,10 @@ import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Plan one distributed pipelined exchange for a full-input batch job after exchange reuse.
+ * Plan an all-pipelined group for a single-source, full-input batch job after exchange reuse.
  * A V1 file insertion has a known consumer, so its child carries the chosen shuffle type.
  * Result queries also support partial reads. Keep their regular plan and prepare a separate
- * full-result plan with the chosen exchange; the scheduler admits the group at submission.
+ * full-result plan with the chosen exchanges; the scheduler admits the group at submission.
  */
 private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Int]("batchPipelinedShuffleCandidate")
@@ -74,24 +76,26 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
 
     val isResult = input eq plan
     val consumer = consumerInput(input, collectTopK = isResult)
-    val exchange = probe(consumer) match {
-      case Some(s) if !s.pipelined && s.outputPartitioning.isInstanceOf[HashPartitioning] => s
-      case _ => return plan
-    }
-    exchange.setTagValue(candidate, exchange.id)
+    val group = singleSourceGroup(consumer)
+    if (group.isEmpty) return plan
+    group.foreach(s => s.setTagValue(candidate, s.id))
     val sc = plan.session.sparkContext
     if (sc.isLocal || sc.cleaner.isEmpty || sc.conf.get(config.SPECULATION_ENABLED) ||
         sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
         !sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED) ||
         !SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager]) return plan
     val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
-    val readers = exchange.outputPartitioning.numPartitions
-    if (!stageWidth(exchange.child).exists(maps =>
-        maps > 0 && readers > 0 && maps.toLong + readers <= slots)) return plan
+    // Count the source once and the reader stage of each exchange once. An intermediate
+    // stage consumes one exchange and produces the next using the same tasks.
+    val widths = group.map(_.outputPartitioning.numPartitions)
+    if (!widths.forall(_ > 0) || !stageWidth(group.head.child).exists { maps =>
+        maps > 0 && maps.toLong + widths.map(_.toLong).sum <= slots
+      }) return plan
+    val ids = group.iterator.map(_.id).toSet
     if (isResult) {
-      PipelinedShuffleResultExec(input, exchange.id)
+      PipelinedShuffleResultExec(input, ids)
     } else {
-      val write = plan.withNewChildren(Seq(pipeline(input, exchange.id).clone()))
+      val write = plan.withNewChildren(Seq(pipeline(input, ids).clone()))
       write.setTagValue(ownsShuffles, ())
       write
     }
@@ -107,15 +111,23 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   }
 
   private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
-    case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
     case r: RangeExec => Some(r.outputPartitioning.numPartitions)
     case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
     case _ => None
   }
 
-  private def probe(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
-    case s: ShuffleExchangeExec => Some(s)
-    case _ => None
+  // Walk from the final reader to the scan. One unsupported edge disqualifies the whole chain.
+  @tailrec
+  private def singleSourceGroup(
+      plan: SparkPlan,
+      downstream: List[ShuffleExchangeExec] = Nil): List[ShuffleExchangeExec] = {
+    boundary(plan) match {
+      case s: ShuffleExchangeExec if !s.pipelined &&
+          s.outputPartitioning.isInstanceOf[HashPartitioning] =>
+        singleSourceGroup(s.child, s :: downstream)
+      case _: RangeExec | _: FileSourceScanExec => downstream
+      case _ => Nil
+    }
   }
 
   private def consumerInput(plan: SparkPlan, collectTopK: Boolean): SparkPlan = plan match {
@@ -127,9 +139,9 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     case other => other
   }
 
-  private[exchange] def pipeline(plan: SparkPlan, exchangeId: Int): SparkPlan = plan.transformUp {
-    case s: ShuffleExchangeExec if s.getTagValue(candidate).contains(exchangeId) =>
-      s.copy(pipelined = true)
+  private[exchange] def pipeline(plan: SparkPlan, ids: Set[Int]): SparkPlan = plan.transformUp {
+    case s: ShuffleExchangeExec if s.getTagValue(candidate).exists(ids.contains) =>
+      s.withPipelinedShuffle
   }
 
   def cleanup(plan: SparkPlan): Unit = {
@@ -144,13 +156,13 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
 }
 
 /** Collect a job-owned copy of the planned pipeline. Partial readers use the ordinary child. */
-private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeId: Int)
+private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeIds: Set[Int])
   extends UnaryExecNode {
   override def output: Seq[Attribute] = child.output
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
-  @transient private val fullInput = DistributedPipelinedShuffle.pipeline(child, exchangeId)
+  @transient private val fullInput = DistributedPipelinedShuffle.pipeline(child, exchangeIds)
 
   private def collectPlan(): SparkPlan = {
     if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||

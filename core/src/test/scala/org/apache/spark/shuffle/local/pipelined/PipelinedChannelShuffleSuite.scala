@@ -585,13 +585,17 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
     }
   }
 
-  test("one result job runs a regular prefix before its pipelined suffix at exact capacity") {
-    withPipelinedSparkContext(cores = 7) { sc =>
+  test("an unmaterialized regular prefix below a pipelined suffix is still rejected") {
+    withPipelinedSparkContext(cores = 8) { sc =>
       val keyed: RDD[(Int, Int)] = sc.parallelize(0 until 100, 2).map(v => (v % 10, v))
       val prefix = new ShuffledRDD[Int, Int, Int](keyed, new HashPartitioner(3))
       // No action on `prefix`: its shuffle is not materialized when the mixed job submits.
       val suffix = new PipelinedShuffledRDD[Int, Int, Int](prefix, new HashPartitioner(4))
-      assert(suffix.collect().map(_._2).sorted.toSeq == (0 until 100))
+      val ex = intercept[org.apache.spark.SparkException] {
+        suffix.collect()
+      }
+      assert(ex.getMessage.contains("fully-materialized prefix"),
+        s"expected the unmaterialized-prefix rejection, got: ${ex.getMessage}")
     }
   }
 
