@@ -2298,15 +2298,9 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * The total concurrent-task demand of a pipelined job's group, computed from the RDD graph
-   * BEFORE any stage is created (so a rejection based on it leaves no partial scheduler state,
-   * exactly as the barrier slot check and the speculation/DA reject do). A pipelined job's group
-   * is the final result stage plus every pipelined producer; a materialized-prefix mixed job (see
-   * JobShuffleShape) contributes no additional members, since its regular prefix never re-runs
-   * and (by the shape check) has no pipelined shuffle below it. Each member's task count is its
-   * RDD's partition count (`rdd.partitions.length`), matching how `createShuffleMapStage` derives
-   * `numTasks`. `finalNumPartitions` is the result stage's task count (the number of partitions
-   * the job runs, which may be a subset of `finalRDD.partitions`).
+   * Compute the concurrent tasks for the result stage and its pipelined producers. Ordinary
+   * prefix stages complete before admission. Each producer contributes its RDD partition count,
+   * and the result stage contributes the number of partitions requested by the job.
    *
    * Count each producer once per SHUFFLE ID, matching what execution schedules: one stage is
    * created per shuffle ID (`getOrCreateShuffleMapStage`), not per dependency edge. A fan-out or
@@ -2325,8 +2319,7 @@ private[spark] class DAGScheduler(
             if (countedShuffleIds.add(pd.shuffleId)) {
               demand += pd.rdd.partitions.length
             }
-          case _ => // narrow deps are not boundaries; a regular dep is a materialized prefix
-                    // boundary (JobShuffleShape), whose stages never run and are not members
+          case _ => // Only pipelined shuffle dependencies contribute producer stages.
         }
         enqueue(dep.rdd)
       }
@@ -2335,28 +2328,9 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * Up-front gang admission for a pipelined job, checked BEFORE any stage exists. A pipelined
-   * job's runnable stage graph is one pipelined group (an unsupported mix is already rejected,
-   * and a materialized-prefix mixed job's regular stages never run -- see JobShuffleShape), so
-   * its full demand is known up front and the group is ready to admit immediately. Checking here
-   * (rather than in `submitStage` once a producer is already running) is true all-or-nothing gang
-   * admission: the whole group is admitted, or the job is failed before any member runs, so a
-   * member is never left running while a sibling cannot get slots -- and, like the barrier slot
-   * check, a rejection leaves no partial scheduler state.
-   *
-   * Free-slot accounting: demand vs. total capacity (`maxNumConcurrentTasks` for the default
-   * profile -- a group is required to be single-profile) minus what OTHER work (other jobs) has
-   * outstanding -- running plus enqueued -- in that profile. Counting enqueued, not just running,
-   * tasks charges a busy neighbor's queued backlog against capacity too, so a group is not admitted
-   * against slots other work is already committed to. Fails the job via `listener` with no retry --
-   * a transient shortfall is the caller's to retry (e.g. the streaming batch loop reruns it).
-   * Returns true (job failed) if it does not fit.
-   *
-   * The likeness to barrier's slot check is only that both reject before any stage is created
-   * (leaving no partial state) and compute demand from the RDD graph. Retry behavior differs
-   * deliberately: barrier RE-POSTS the job and re-runs its check on a timer up to
-   * `spark.scheduler.barrier.maxConcurrentTasksCheck.maxFailures` times; pipelined admission is
-   * TERMINAL (one check, then fail), delegating transient-shortfall retry to the caller.
+   * Admit the whole group once its ordinary inputs are ready and before submitting any group
+   * member. Compare demand against capacity in its resource profile after accounting for running
+   * and queued work. A shortfall fails the job and leaves retry to the caller.
    *
    * The check can be turned off with `spark.scheduler.pipelinedGroup.slotCheck.enabled=false` (for
    * deployments that admit capacity out-of-band, e.g. via a slot reservation).
@@ -2379,8 +2353,7 @@ private[spark] class DAGScheduler(
     val rp = sc.resourceProfileManager.defaultResourceProfile
     val demand = pipelinedJobConcurrentTaskDemand(finalRDD, numPartitions)
     val totalSlots = maxConcurrentTasksForProfile(rp.id)
-    // No stage of this job exists yet, so it has no outstanding tasks of its own to exclude; only
-    // other concurrent jobs' outstanding demand is charged, resource-profile-scoped.
+    // The prefix is ready and no group member has been submitted.
     val outstandingForOthers = outstandingTasksForOtherWork(rp.id, Set.empty)
     val freeSlots = math.max(0, totalSlots - outstandingForOthers)
     if (demand > freeSlots) {
