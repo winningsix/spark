@@ -38,14 +38,13 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
       partitions: Int,
       exchanges: Int,
       innerHint: String = "REPARTITION"): String = {
-    val source = s"SELECT id FROM range(0, 20000, 1, $partitions)"
+    val source = s"SELECT id, producer(id) AS writer FROM range(0, 20000, 1, $partitions)"
     val prefix = (1 until exchanges).foldLeft(source) { (input, salt) =>
-      s"""SELECT /*+ $innerHint(2, bucket) */ id, bucket
-         |FROM (SELECT id, hash(producer(id), id, $salt) AS bucket FROM ($input))""".stripMargin
+      s"""SELECT id, producer(observe(writer, id)) AS writer FROM (
+         |  SELECT /*+ $innerHint(2, bucket) */ id, writer, hash(writer, id, $salt) AS bucket
+         |  FROM ($input))""".stripMargin
     }
-    s"""SELECT observe(writer, id) AS id
-       |FROM (SELECT /*+ REPARTITION(2, id) */ id, producer(id) AS writer FROM ($prefix))"""
-      .stripMargin
+    s"SELECT observe(writer, id) AS id FROM (SELECT /*+ REPARTITION(2, id) */ * FROM ($prefix))"
   }
 
   for (count <- Seq(2, 4)) {
