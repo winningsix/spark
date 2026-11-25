@@ -47,7 +47,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, Adapti
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
 import org.apache.spark.sql.execution.datasources.v2.{TransactionalExec, V2TableRefreshUtil}
 import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
-import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, SelectBatchPipelinedShuffle, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{DistributedPipelinedShuffle, EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ChoosePerPartitionRuntimeFilters
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
@@ -155,7 +155,7 @@ class QueryExecution(
       }
     }
   }
-  private[execution] def transactionOpt: Option[Transaction] = lazyTransactionOpt.get
+  private def transactionOpt: Option[Transaction] = lazyTransactionOpt.get
 
   // Per-query analyzer: uses a transaction-aware CatalogManager when a transaction is active,
   // so that all catalog lookups and rule applications during analysis see the correct state
@@ -475,7 +475,7 @@ class QueryExecution(
   protected def preparations: Seq[Rule[SparkPlan]] = {
     val rules = QueryExecution.preparations(sparkSession,
       Option(InsertAdaptiveSparkPlan(AdaptiveExecutionContext(sparkSession, this))), false)
-    if (transactionOpt.isDefined) rules.filterNot(_ eq SelectBatchPipelinedShuffle) else rules
+    if (transactionOpt.isDefined) rules.filterNot(_ eq DistributedPipelinedShuffle) else rules
   }
 
   protected def executePhase[T](phase: String)(block: => T): T = sparkSession.withActive {
@@ -896,7 +896,7 @@ object QueryExecution {
       (if (subquery) {
         Nil
       } else {
-        Seq(ReuseExchangeAndSubquery, SelectBatchPipelinedShuffle)
+        Seq(ReuseExchangeAndSubquery, DistributedPipelinedShuffle)
       }) ++
       // Opt-in (SPARK-57399): runs last so it observes the final reuse decision (a reused
       // exchange means fan-out, which it refuses to make pipelined).

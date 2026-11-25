@@ -17,16 +17,128 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import org.apache.spark.SparkEnv
+import org.apache.spark.internal.config
+import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
+import org.apache.spark.shuffle.streaming.StreamingShuffleManager
+import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.plans.logical.Command
+import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
+import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
+import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.datasources.{InsertIntoHadoopFsRelationCommand, WriteFilesExec}
+import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
-/** Execute a job-owned copy of the planned shuffle and release its initialized dependencies. */
-private[sql] object DistributedPipelinedShuffle {
+/**
+ * Plan one distributed pipelined exchange for a full-input batch job after exchange reuse.
+ * A V1 file insertion has a known consumer, so its child carries the chosen shuffle type.
+ * Result queries also support partial reads. Keep their regular plan and prepare a separate
+ * full-result plan with the chosen exchange; the scheduler admits the group at submission.
+ */
+private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
+  val candidate = TreeNodeTag[Unit]("batchPipelinedShuffleCandidate")
+
+  // The cached result plan also serves partial/RDD consumers. Plan the full-result variant here
+  // and give each full action a fresh copy. The template is only used on the driver.
+  private[exchange] final class FullResult(
+      @transient val plan: SparkPlan,
+      val supportsIterator: Boolean) extends Serializable
+  private[exchange] val fullResult = TreeNodeTag[FullResult]("batchPipelinedFullResult")
+
+  override def apply(plan: SparkPlan): SparkPlan = {
+    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) return plan
+    val input = plan match {
+      case DataWritingCommandExec(_: InsertIntoHadoopFsRelationCommand, child) => child
+      case other => other
+    }
+    if (input.exists(_.logicalLink.exists(p => p.isStreaming || p.isInstanceOf[Command]))) {
+      return plan
+    }
+
+    if (conf.adaptiveExecutionEnabled) {
+      logWarning(log"Skipping distributed pipelined shuffle for this batch query. " +
+        log"${MDC(CONFIG, SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key)} is enabled, " +
+        log"but it requires ${MDC(CONFIG2, SQLConf.ADAPTIVE_EXECUTION_ENABLED.key)}=false.")
+      return plan
+    }
+    if (conf.localPipelinedShuffleEnabled) {
+      return plan
+    }
+
+    // A single input chain cannot share an exchange. Subqueries and reused exchanges are
+    // additional consumers even when their inputs are hidden from SparkPlan.children.
+    if (input.exists(p => p.children.size > 1 || p.subqueries.nonEmpty ||
+        p.isInstanceOf[ReusedExchangeExec])) return plan
+
+    val isResult = input eq plan
+    plan.unsetTagValue(fullResult)
+    val consumer = consumerInput(input, collectTopK = isResult)
+    val exchange = probe(consumer) match {
+      case Some(s) if !s.pipelined && s.outputPartitioning.isInstanceOf[HashPartitioning] => s
+      case _ => return plan
+    }
+    exchange.setTagValue(candidate, ())
+    val sc = plan.session.sparkContext
+    if (sc.isLocal || sc.cleaner.isEmpty || sc.conf.get(config.SPECULATION_ENABLED) ||
+        sc.conf.get(config.DYN_ALLOCATION_ENABLED) ||
+        !sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED) ||
+        !SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager]) return plan
+    val slots = sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile)
+    val readers = exchange.outputPartitioning.numPartitions
+    if (!stageWidth(exchange.child).exists(maps =>
+        maps > 0 && readers > 0 && maps.toLong + readers <= slots)) return plan
+    val selected = input.transformUp {
+      case s: ShuffleExchangeExec if s eq exchange => s.copy(pipelined = true)
+    }
+    if (isResult) {
+      plan.setTagValue(fullResult, new FullResult(selected,
+        supportsIterator = !plan.isInstanceOf[TakeOrderedAndProjectExec]))
+      plan
+    } else {
+      val write = plan.withNewChildren(Seq(selected.clone()))
+      write.setTagValue(ownsShuffles, ())
+      write
+    }
+  }
+
+  // These unary operators preserve the task-to-partition mapping and consuming all output drains
+  // their inputs. In particular a local sort reads its entire input before yielding a row.
+  private def boundary(plan: SparkPlan): SparkPlan = plan match {
+    case _: ProjectExec | _: FilterExec | _: WholeStageCodegenExec | _: HashAggregateExec |
+        _: WindowExec | _: SortExec | _: ExpandExec | _: InputAdapter | _: ColumnarToRowExec =>
+      boundary(plan.children.head)
+    case other => other
+  }
+
+  private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
+    case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
+    case r: RangeExec => Some(r.outputPartitioning.numPartitions)
+    case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
+    case _ => None
+  }
+
+  private def probe(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
+    case s: ShuffleExchangeExec => Some(s)
+    case _ => None
+  }
+
+  private def consumerInput(plan: SparkPlan, collectTopK: Boolean): SparkPlan = plan match {
+    // Only the root uses TakeOrderedAndProjectExec.executeCollect. With ordered input it
+    // takes at most K rows per partition, and nested Top-K can introduce another shuffle.
+    case k: TakeOrderedAndProjectExec if collectTopK && k.limit > 0 &&
+        !SortOrder.orderingSatisfies(k.child.outputOrdering, k.sortOrder) => k.child
+    case w: WriteFilesExec => w.child
+    case other => other
+  }
+
   val ownsShuffles = TreeNodeTag[Unit]("ownsDistributedPipelinedShuffles")
 
   def resultPlan(plan: SparkPlan, iterator: Boolean = false): SparkPlan = {
-    val template = plan.getTagValue(SelectBatchPipelinedShuffle.fullResult) match {
+    val template = plan.getTagValue(fullResult) match {
       case Some(result) if !iterator || result.supportsIterator => result.plan
       case _ => return plan
     }

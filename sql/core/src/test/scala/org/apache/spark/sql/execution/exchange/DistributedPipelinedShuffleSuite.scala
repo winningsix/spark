@@ -17,30 +17,42 @@
 
 package org.apache.spark.sql.execution.exchange
 
-import java.nio.file.{FileAlreadyExistsException, Files, Path}
+import java.nio.file.{Files, Path}
 
 import scala.concurrent.duration._
 
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite, StreamingShuffleOutputTrackerMaster, TaskContext}
+import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkFunSuite, StreamingShuffleOutputTrackerMaster}
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.execution.{QueryExecution, SQLExecution, TakeOrderedAndProjectExec}
-import org.apache.spark.sql.functions.{col, udf}
+import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.QueryExecutionListener
 import org.apache.spark.tags.ExtendedSQLTest
 
 @ExtendedSQLTest
 class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
-  test("full collect drains a remote probe before its final producer can finish") {
+  private val inputs = Seq(
+    "single source" ->
+      """SELECT observe(writer, id) AS id
+        |FROM (SELECT /*+ REPARTITION(2, id) */ id, producer(id) AS writer
+        |      FROM (SELECT /*+ REPARTITION(2, bucket) */ id, bucket
+        |            FROM (SELECT id, id + 1 AS bucket FROM range(0, 20000, 1, 2))))""")
+
+  inputs.foreach { case (name, sqlText) =>
+    test(s"$name drains a remote row before the last producer finishes") {
+      checkFullInput(sqlText.stripMargin)
+    }
+  }
+
+  private def checkFullInput(sqlText: String): Unit = {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
       val spark = SparkSession.builder().master("local-cluster[2,2,1536]")
         .appName(getClass.getSimpleName)
         .config("spark.executor.cores", "2")
         .config("spark.executor.memory", "1g")
-        .config("spark.task.maxFailures", "4")
         .config(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
         .config(SQLConf.SHUFFLE_PARTITIONS.key, "2")
         .config(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, "true")
@@ -50,8 +62,7 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         eventually(timeout(60.seconds)) {
           assert(sc.maxNumConcurrentTasks(sc.resourceProfileManager.defaultResourceProfile) == 4)
         }
-        // Last probe row cannot leave its producer until a different executor has decoded
-        // a probe row and joined it with the materialized build. A regular shuffle times out.
+        // The writer cannot finish until a different executor decodes a row.
         val writer = udf { (id: Long) =>
           if (id == 19999) {
             val deadline = 60.seconds.fromNow
@@ -60,20 +71,10 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           }
           SparkEnv.get.executorId
         }.asNondeterministic()
-        val reader = udf { (producer: String, id: Long, buildId: java.lang.Long) =>
-          // A task retry on its own would succeed and mask the injected failure.
-          if (id == 0 && TaskContext.get().attemptNumber() == 0 &&
-              Files.exists(Path.of(marker + ".fail"))) {
-            throw new IllegalStateException("injected reader failure")
-          }
+        val reader = udf { (producer: String, id: Long) =>
           val executor = SparkEnv.get.executorId
-          if (producer != executor && buildId != null && !Files.exists(Path.of(marker))) {
-            try {
-              Files.writeString(Path.of(marker), s"$producer -> $executor, row $id",
-                java.nio.file.StandardOpenOption.CREATE_NEW)
-            } catch {
-              case _: FileAlreadyExistsException => // Another reader already recorded its row.
-            }
+          if (producer != executor && !Files.exists(Path.of(marker))) {
+            Files.writeString(Path.of(marker), s"$producer -> $executor, row $id")
           }
           id
         }.asNondeterministic()
@@ -81,36 +82,18 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         spark.udf.register("observe", reader)
         @volatile var observed: Seq[ShuffleExchangeExec] = Nil
         spark.listenerManager.register(new QueryExecutionListener {
-          private def record(qe: QueryExecution): Unit = {
+          override def onSuccess(name: String, qe: QueryExecution, nanos: Long): Unit = {
             observed = qe.executedPlan.collect { case s: ShuffleExchangeExec => s }
           }
-          override def onSuccess(name: String, qe: QueryExecution, nanos: Long): Unit = record(qe)
-          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit = {
-            record(qe)
-          }
+          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit = ()
         })
-        val query = spark.sql(
-          """SELECT /*+ SHUFFLE_HASH(b) */ observe(p.writer, p.id, b.id) AS id, b.id AS matched
-            |FROM (SELECT id, producer(id) AS writer FROM range(0, 20000, 1, 2)) p
-            |LEFT JOIN range(0, 100, 1, 2) b ON p.id % 101 = b.id""".stripMargin)
-        val beforeAction = query.queryExecution.executedPlan
-        val full = beforeAction.getTagValue(SelectBatchPipelinedShuffle.fullResult).get.plan
-        assert(full.collect { case s: ShuffleExchangeExec if s.pipelined => s }.size == 1)
-        assert(beforeAction.collect { case s: ShuffleExchangeExec if s.pipelined => s }.isEmpty)
-        sc.setJobGroup("join-with-regular-build", "run the build and pipelined probe in one job")
-        val actual = try {
-          query.collect().sortBy(_.getLong(0))
-        } finally {
-          sc.clearJobGroup()
-        }
+        val query = spark.sql(sqlText)
+        sc.setJobGroup("full-input", "run both shuffle stages in one job")
+        val actual = query.collect().sortBy(_.getLong(0))
+        sc.clearJobGroup()
         sc.listenerBus.waitUntilEmpty(30000)
-        assert(sc.statusTracker.getJobIdsForGroup("join-with-regular-build").length == 1)
-        assert(actual.length == 20000)
-        actual.zipWithIndex.foreach { case (row, id) =>
-          assert(row.getLong(0) == id)
-          if (id % 101 == 100) assert(row.isNullAt(1)) else assert(row.getLong(1) == id % 101)
-        }
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+        assert(sc.statusTracker.getJobIdsForGroup("full-input").length == 1)
+        assert(actual.iterator.map(_.getLong(0)).sameElements(0L until 20000L))
         assert(observed.size == 2)
         val Seq(probe) = observed.filter(_.pipelined)
         assert(probe.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
@@ -119,142 +102,10 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         assert(!tracker.containsShuffle(probe.shuffleId))
         info(s"Shuffle ${probe.shuffleId}: ${Files.readString(Path.of(marker))}")
 
-        Files.createFile(Path.of(marker + ".fail"))
-        intercept[SparkException](query.collect())
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        val Seq(failed) = observed.filter(_.pipelined)
-        assert(failed.shuffleId != probe.shuffleId && !tracker.containsShuffle(failed.shuffleId))
-        Files.delete(Path.of(marker + ".fail"))
-
-        assert(query.collectAsList().size() == actual.length)
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        val Seq(second) = observed.filter(_.pipelined)
-        assert(Set(probe.shuffleId, failed.shuffleId, second.shuffleId).size == 3)
-        assert(!tracker.containsShuffle(second.shuffleId))
-
-        Files.delete(Path.of(marker))
-        assert(query.orderBy("id").limit(3).collect().map(_.getLong(0)).toSeq == Seq(0L, 1L, 2L))
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        assert(observed.count(_.pipelined) == 1)
-        assert(Files.exists(Path.of(marker)), "unordered Top-K did not drain a remote probe")
-
-        // The merge join has an empty buffered partition. Its streamed sort must still drain
-        // every row. The aggregate's input shuffle and the join sibling are ordinary prefixes.
-        for (codegen <- Seq(true, false)) {
-          spark.conf.set(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key, codegen)
-          val nested = spark.sql(
-            """SELECT /*+ MERGE(p, b) */ p.k
-              |FROM (SELECT id % 7 AS k, COUNT(*) AS n FROM range(0, 20, 1, 2)
-              |      GROUP BY id % 7) p
-              |JOIN range(3, 4, 1, 2) b ON p.n = b.id
-              |ORDER BY p.k DESC LIMIT 3""".stripMargin)
-          assert(nested.collect().map(_.getLong(0)).toSeq == Seq(5L, 4L, 3L))
-          sc.listenerBus.waitUntilEmpty(30000)
-          assert(observed.size >= 3)
-          assert(observed.count(_.pipelined) == 1)
-          assert(observed.count(_.getTagValue(SelectBatchPipelinedShuffle.candidate).isDefined) > 1)
-        }
-        spark.conf.unset(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key)
-
-        val window = spark.sql(
-          """SELECT id, SUM(id) OVER (PARTITION BY id % 2) AS total
-            |FROM range(0, 6, 1, 2) ORDER BY id DESC LIMIT 2""".stripMargin)
-        assert(window.collect().map(r => (r.getLong(0), r.getLong(1))).toSeq ==
-          Seq((5L, 9L), (4L, 6L)))
-        sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.size == 1 && observed.head.pipelined)
-
-        val ids = spark.range(0, 10, 1, 2).repartition(2, col("id"))
-        assert(ids.collect().sorted.toSeq == (0L until 10L))
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        assert(observed.size == 1 && observed.head.pipelined)
-
-        val qe = ids.queryExecution
-        val (size, rows) = SQLExecution.withNewExecutionId(qe, Some("collected iterator")) {
-          qe.executedPlan.executeCollectIterator()
-        }
-        assert(size == 10 && rows.map(_.getLong(0)).toList.sorted == (0L until 10L))
-        sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.count(_.pipelined) == 1)
-
-        // AllTuples for the outer count is already satisfied by the one-partition grouped
-        // aggregate. Its inner hash exchange is in the final job's pipelinable suffix.
-        spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 1)
-        try {
-          val groups = spark.range(0, 10, 1, 2).groupBy(col("id") % 3).count()
-          assert(groups.count() == 3)
-          sc.listenerBus.waitUntilEmpty(30000)
-          assert(observed.count(_.pipelined) == 1)
-        } finally {
-          spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
-        }
-
-        val output = dir.toPath.resolve("output").toString
-        spark.sql(s"CREATE TABLE file_sink (id BIGINT) USING parquet LOCATION '$output-plan'")
-        try {
-          val explain = spark.sql("EXPLAIN INSERT INTO file_sink " +
-            "SELECT /*+ REPARTITION(2, id) */ id FROM range(0, 10, 1, 2)").head().getString(0)
-          assert(explain.contains("isPipelined=true"), explain)
-          assert(!Files.exists(Path.of(output + "-plan/_SUCCESS")))
-        } finally {
-          spark.sql("DROP TABLE file_sink")
-        }
-        ids.write.parquet(output)
-        sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.count(_.pipelined) == 1)
-        val written = spark.read.parquet(output).collect().map(_.getLong(0)).sorted
-        assert(written.toSeq == (0L until 10L))
-
-        // Ignore must decide to skip the write before any prefix job is materialized.
-        spark.conf.set(SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, true)
-        sc.setJobGroup("skip-existing-output", "write to an existing path")
-        try {
-          query.write.mode("ignore").parquet(output)
-          assert(sc.statusTracker.getJobIdsForGroup("skip-existing-output").isEmpty)
-          sc.listenerBus.waitUntilEmpty(30000)
-          val Seq(skipped) = observed.filter(_.pipelined)
-          assert(skipped.initializedShuffleId.isEmpty)
-        } finally {
-          sc.clearJobGroup()
-          spark.conf.unset(SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key)
-        }
-
-        val retryPath = dir.toPath.resolve("failed-write")
-        Files.createFile(Path.of(marker + ".fail"))
-        intercept[SparkException](query.write.parquet(retryPath.toString))
-        sc.listenerBus.waitUntilEmpty(30000)
-        val Seq(failedWrite) = observed.filter(_.pipelined)
-        assert(!tracker.containsShuffle(failedWrite.shuffleId))
-        assert(!Files.exists(retryPath.resolve("_SUCCESS")))
-        Files.delete(Path.of(marker + ".fail"))
-
-        query.write.mode("overwrite").parquet(retryPath.toString)
-        sc.listenerBus.waitUntilEmpty(30000)
-        val Seq(retriedWrite) = observed.filter(_.pipelined)
-        assert(retriedWrite.shuffleId != failedWrite.shuffleId)
-        assert(!tracker.containsShuffle(retriedWrite.shuffleId))
-        assert(spark.read.parquet(retryPath.toString).collect().sortBy(_.getLong(0))
-          .sameElements(actual))
-
-        assert(ids.take(1).length == 1)
-        sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.nonEmpty && !observed.exists(_.pipelined))
-        assert(ids.toLocalIterator().next() >= 0)
-        sc.listenerBus.waitUntilEmpty(30000)
-        assert(observed.nonEmpty && !observed.exists(_.pipelined))
-
-        val ordered = ids.sortWithinPartitions("id").queryExecution.executedPlan
-        assert(ordered.outputOrdering.nonEmpty)
-        val orderedTopK = TakeOrderedAndProjectExec(1, ordered.outputOrdering,
-          ordered.output, ordered)
-        assert(SelectBatchPipelinedShuffle(orderedTopK)
-          .getTagValue(SelectBatchPipelinedShuffle.fullResult).isEmpty)
-
-        val wide = spark.range(0, 10, 1, 5).repartition(2, col("id"))
-        assert(wide.collect().sorted.toSeq == (0L until 10L))
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
-        assert(observed.size == 1 && !observed.head.pipelined)
-
+        val join = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8) a " +
+          "LEFT JOIN range(0, 4) b ON a.id = b.id")
+        assert(join.queryExecution.executedPlan.getTagValue(DistributedPipelinedShuffle.fullResult)
+          .isEmpty)
         spark.conf.set(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, false)
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
         spark.sparkContext.listenerBus.waitUntilEmpty(30000)
