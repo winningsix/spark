@@ -1492,10 +1492,10 @@ object SQLConf {
     buildConf("spark.sql.shuffle.distributedPipelined.enabled")
       .internal()
       .doc("When true and AQE is disabled, a single-source batch job can pipeline a " +
-        "single-reader hash shuffle across executors. The reader can consume rows before all map tasks " +
-        "finish. The consumer must drain every reader partition, and the producer and reader " +
-        "tasks must fit in the cluster's concurrent task slots. A task failure aborts the " +
-        "pipelined group. With AQE enabled, Spark logs a warning and skips distributed " +
+        "single-reader hash shuffle across executors. The reader can consume rows before all " +
+        "map tasks finish. The consumer must drain every reader partition, and the producer and " +
+        "reader tasks must fit in the cluster's concurrent task slots. A task failure aborts " +
+        "the pipelined group. With AQE enabled, Spark logs a warning and skips distributed " +
         "pipelined shuffle. Experimental.")
       .version("5.0.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
