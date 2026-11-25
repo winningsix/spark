@@ -97,7 +97,14 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         val full = beforeAction.getTagValue(SelectBatchPipelinedShuffle.fullResult).get.plan
         assert(full.collect { case s: ShuffleExchangeExec if s.pipelined => s }.size == 1)
         assert(beforeAction.collect { case s: ShuffleExchangeExec if s.pipelined => s }.isEmpty)
-        val actual = query.collect().sortBy(_.getLong(0))
+        sc.setJobGroup("join-with-regular-build", "run the build and pipelined probe in one job")
+        val actual = try {
+          query.collect().sortBy(_.getLong(0))
+        } finally {
+          sc.clearJobGroup()
+        }
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(sc.statusTracker.getJobIdsForGroup("join-with-regular-build").length == 1)
         assert(actual.length == 20000)
         actual.zipWithIndex.foreach { case (row, id) =>
           assert(row.getLong(0) == id)

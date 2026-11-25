@@ -121,11 +121,9 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
       // A file insertion drains its input in one job. Only its final-stage edge is selectable.
       probe(consumerInput(input, collectTopK = false)).foreach(mark)
       forFullInput(input, collectTopK = false).map { selected =>
-        val writeInput = selected.clone() match {
-          case w: WriteFilesExec => w.withNewChildren(Seq(MaterializeShuffleInputsExec(w.child)))
-          case rows => MaterializeShuffleInputsExec(rows)
-        }
-        plan.withNewChildren(Seq(writeInput))
+        val write = plan.withNewChildren(Seq(selected.clone()))
+        write.setTagValue(DistributedPipelinedShuffle.ownsShuffles, ())
+        write
       }.getOrElse(plan)
     }
   }

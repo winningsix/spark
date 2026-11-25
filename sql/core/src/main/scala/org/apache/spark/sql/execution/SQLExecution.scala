@@ -33,7 +33,7 @@ import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
-import org.apache.spark.sql.execution.exchange.{DistributedPipelinedShuffle, MaterializeShuffleInputsExec, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.exchange.{DistributedPipelinedShuffle, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.ui.{SparkListenerSQLAdaptiveExecutionUpdate, SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.SQL_EVENT_TRUNCATE_LENGTH
@@ -148,11 +148,6 @@ object SQLExecution extends Logging {
       val shuffleIds = queryExecution.executedPlan match {
         case command: V2CommandExec =>
           command.children.flatMap(extractShuffleIds)
-        case w: DataWritingCommandExec
-            if w.child.exists(_.isInstanceOf[MaterializeShuffleInputsExec]) =>
-          // The group releases allocated shuffles itself. Reading shuffleId here would create
-          // dependencies even when the command skipped the write.
-          Nil
         case dataWritingCommand: DataWritingCommandExec =>
           extractShuffleIds(dataWritingCommand.child)
         case plan =>
@@ -328,7 +323,6 @@ object SQLExecution extends Logging {
               // end event may still be posted after the scheduler is unavailable. Keep observation
               // completion in a `finally` so an error in this block never leaves a waiter hung.
               try {
-                DistributedPipelinedShuffle.cleanup(executionId)
                 val endTime = System.nanoTime()
                 val errorMessage = ex.map { e =>
                   try {
@@ -348,8 +342,14 @@ object SQLExecution extends Logging {
                       e.getClass.getName
                   }
                 }
-                if (queryExecution.shuffleCleanupMode != DoNotCleanup && isExecutedPlanAvailable) {
-                  cleanupShuffleDependencies(executedQuery, executionId)
+                if (isExecutedPlanAvailable) {
+                  val plan = executedQuery.executedPlan
+                  if (plan.getTagValue(DistributedPipelinedShuffle.ownsShuffles).isDefined) {
+                    // Only clean allocated IDs. An ignored file write has no shuffle to remove.
+                    DistributedPipelinedShuffle.cleanup(plan)
+                  } else if (queryExecution.shuffleCleanupMode != DoNotCleanup) {
+                    cleanupShuffleDependencies(executedQuery, executionId)
+                  }
                 }
                 val event = SparkListenerSQLExecutionEnd(
                   executionId,
