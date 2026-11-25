@@ -32,7 +32,7 @@ import org.apache.spark.sql.util.QueryExecutionListener
 import org.apache.spark.tags.ExtendedSQLTest
 
 @ExtendedSQLTest
-class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
+class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
   test("full collect drains a remote probe before its final producer can finish") {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
@@ -93,6 +93,10 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
           """SELECT /*+ SHUFFLE_HASH(b) */ observe(p.writer, p.id, b.id) AS id, b.id AS matched
             |FROM (SELECT id, producer(id) AS writer FROM range(0, 20000, 1, 2)) p
             |LEFT JOIN range(0, 100, 1, 2) b ON p.id % 101 = b.id""".stripMargin)
+        val beforeAction = query.queryExecution.executedPlan
+        val full = beforeAction.getTagValue(SelectBatchPipelinedShuffle.fullResult).get.plan
+        assert(full.collect { case s: ShuffleExchangeExec if s.pipelined => s }.size == 1)
+        assert(beforeAction.collect { case s: ShuffleExchangeExec if s.pipelined => s }.isEmpty)
         val actual = query.collect().sortBy(_.getLong(0))
         assert(actual.length == 20000)
         actual.zipWithIndex.foreach { case (row, id) =>
@@ -179,6 +183,15 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         }
 
         val output = dir.toPath.resolve("output").toString
+        spark.sql(s"CREATE TABLE file_sink (id BIGINT) USING parquet LOCATION '$output-plan'")
+        try {
+          val explain = spark.sql("EXPLAIN INSERT INTO file_sink " +
+            "SELECT /*+ REPARTITION(2, id) */ id FROM range(0, 10, 1, 2)").head().getString(0)
+          assert(explain.contains("isPipelined=true"), explain)
+          assert(!Files.exists(Path.of(output + "-plan/_SUCCESS")))
+        } finally {
+          spark.sql("DROP TABLE file_sink")
+        }
         ids.write.parquet(output)
         sc.listenerBus.waitUntilEmpty(30000)
         assert(observed.count(_.pipelined) == 1)
@@ -186,12 +199,17 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         assert(written.toSeq == (0L until 10L))
 
         // Ignore must decide to skip the write before any prefix job is materialized.
+        spark.conf.set(SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, true)
         sc.setJobGroup("skip-existing-output", "write to an existing path")
         try {
           query.write.mode("ignore").parquet(output)
           assert(sc.statusTracker.getJobIdsForGroup("skip-existing-output").isEmpty)
+          sc.listenerBus.waitUntilEmpty(30000)
+          val Seq(skipped) = observed.filter(_.pipelined)
+          assert(skipped.initializedShuffleId.isEmpty)
         } finally {
           sc.clearJobGroup()
+          spark.conf.unset(SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key)
         }
 
         val retryPath = dir.toPath.resolve("failed-write")
@@ -222,7 +240,8 @@ class DistributedBatchShuffleSuite extends SparkFunSuite with Eventually {
         assert(ordered.outputOrdering.nonEmpty)
         val orderedTopK = TakeOrderedAndProjectExec(1, ordered.outputOrdering,
           ordered.output, ordered)
-        assert(SelectBatchPipelinedShuffle.forFullInput(orderedTopK, collectTopK = true).isEmpty)
+        assert(SelectBatchPipelinedShuffle(orderedTopK)
+          .getTagValue(SelectBatchPipelinedShuffle.fullResult).isEmpty)
 
         val wide = spark.range(0, 10, 1, 5).repartition(2, col("id"))
         assert(wide.collect().sorted.toSeq == (0L until 10L))

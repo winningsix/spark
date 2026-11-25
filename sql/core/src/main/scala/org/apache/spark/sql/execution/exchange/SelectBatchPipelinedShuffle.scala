@@ -37,13 +37,20 @@ import org.apache.spark.sql.execution.window.{WindowExec, WindowGroupLimitExec}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Select single-reader hash shuffle edges in a prepared batch plan. Run on the main query
- * after exchange reuse, when each physical reader is visible. A candidate describes the
- * topology only. Execution still needs to materialize build inputs and admit the group
- * before it can activate the distributed transport.
+ * Plan one distributed pipelined exchange for a full-input batch job after exchange reuse.
+ * A V1 file insertion has a known consumer, so its child carries the chosen shuffle type.
+ * Result queries also support partial reads. Keep their regular plan and prepare a separate
+ * full-result plan with the chosen exchange; the scheduler admits the group at submission.
  */
 private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Unit]("batchPipelinedShuffleCandidate")
+
+  // The cached result plan also serves partial/RDD consumers. Plan the full-result variant here
+  // and give each full action a fresh copy. The template is only used on the driver.
+  private[exchange] final class FullResult(
+      @transient val plan: SparkPlan,
+      val supportsIterator: Boolean) extends Serializable
+  private[exchange] val fullResult = TreeNodeTag[FullResult]("batchPipelinedFullResult")
 
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) return plan
@@ -103,12 +110,24 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
     }
 
     if (input eq plan) {
+      plan.unsetTagValue(fullResult)
       visit(input, singleReader = true)
+      forFullInput(plan, collectTopK = true).foreach { selected =>
+        plan.setTagValue(fullResult, new FullResult(selected,
+          supportsIterator = !plan.isInstanceOf[TakeOrderedAndProjectExec]))
+      }
+      plan
     } else {
       // A file insertion drains its input in one job. Only its final-stage edge is selectable.
       probe(consumerInput(input, collectTopK = false)).foreach(mark)
+      forFullInput(input, collectTopK = false).map { selected =>
+        val writeInput = selected.clone() match {
+          case w: WriteFilesExec => w.withNewChildren(Seq(MaterializeShuffleInputsExec(w.child)))
+          case rows => MaterializeShuffleInputsExec(rows)
+        }
+        plan.withNewChildren(Seq(writeInput))
+      }.getOrElse(plan)
     }
-    plan
   }
 
   // These unary operators preserve the task-to-partition mapping and consuming all output drains
@@ -124,7 +143,7 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
   // Ordinary exchanges cut the stage. A shuffled join zips two equally partitioned RDDs.
   private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
     case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
-    case r: RangeExec => Some(r.execute().getNumPartitions)
+    case r: RangeExec => Some(r.outputPartitioning.numPartitions)
     case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
     case j: BroadcastHashJoinExec =>
       val (streamed, build) = if (j.buildSide == BuildLeft) (j.right, j.left) else (j.left, j.right)
@@ -174,7 +193,7 @@ private[sql] object SelectBatchPipelinedShuffle extends Rule[SparkPlan] {
   }
 
   /** Select the shuffle mode for this full-input job before creating shuffle IDs. */
-  private[exchange] def forFullInput(
+  private def forFullInput(
       plan: SparkPlan,
       collectTopK: Boolean): Option[SparkPlan] = {
     val sc = plan.session.sparkContext

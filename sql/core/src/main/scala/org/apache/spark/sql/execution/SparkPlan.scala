@@ -38,7 +38,7 @@ import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.datasources.WriteFilesSpec
-import org.apache.spark.sql.execution.exchange.DistributedBatchShuffle
+import org.apache.spark.sql.execution.exchange.DistributedPipelinedShuffle
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -476,7 +476,7 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
    * Runs this query returning the result as an array.
    */
   def executeCollect(): Array[InternalRow] =
-    DistributedBatchShuffle.withFullInput(this, collectTopK = true)(_.doExecuteCollect())
+    DistributedPipelinedShuffle.resultPlan(this).doExecuteCollect()
 
   protected def doExecuteCollect(): Array[InternalRow] = {
     val byteArrayRdd = getByteArrayRdd()
@@ -489,7 +489,8 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   }
 
   private[spark] def executeCollectIterator(): (Long, Iterator[InternalRow]) = {
-    val countsAndBytes = DistributedBatchShuffle.withFullInput(this)(_.getByteArrayRdd().collect())
+    val countsAndBytes = DistributedPipelinedShuffle.resultPlan(this, iterator = true)
+      .getByteArrayRdd().collect()
     val total = countsAndBytes.map(_._1).sum
     val rows = countsAndBytes.iterator.flatMap(countAndBytes => decodeUnsafeRows(countAndBytes._2))
     (total, rows)

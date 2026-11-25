@@ -32,7 +32,6 @@ import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.command._
-import org.apache.spark.sql.execution.exchange.DistributedBatchShuffle
 import org.apache.spark.sql.internal.SQLConf.PartitionOverwriteMode
 import org.apache.spark.sql.util.SchemaUtils
 
@@ -184,10 +183,10 @@ case class InsertIntoHadoopFsRelationCommand(
         qualifiedOutputPath
       }
 
-      val updatedPartitionPaths = DistributedBatchShuffle.withFullInput(child) { input =>
+      val updatedPartitionPaths =
         FileFormatWriter.write(
           sparkSession = sparkSession,
-          plan = input,
+          plan = child,
           fileFormat = fileFormat,
           committer = committer,
           outputSpec = FileFormatWriter.OutputSpec(
@@ -204,7 +203,7 @@ case class InsertIntoHadoopFsRelationCommand(
               deleteMatchingPartitions(fs, qualifiedOutputPath, customPartitionLocations, committer)
             }
           })
-      }
+
 
       // update metastore partition metadata
       if (updatedPartitionPaths.isEmpty && staticPartitions.nonEmpty

@@ -473,8 +473,9 @@ class QueryExecution(
   }
 
   protected def preparations: Seq[Rule[SparkPlan]] = {
-    QueryExecution.preparations(sparkSession,
+    val rules = QueryExecution.preparations(sparkSession,
       Option(InsertAdaptiveSparkPlan(AdaptiveExecutionContext(sparkSession, this))), false)
+    if (transactionOpt.isDefined) rules.filterNot(_ eq SelectBatchPipelinedShuffle) else rules
   }
 
   protected def executePhase[T](phase: String)(block: => T): T = sparkSession.withActive {
