@@ -27,6 +27,7 @@ import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, S
 import org.apache.spark.StreamingShuffleOutputTrackerMaster
 import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
+import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.QueryExecutionListener
@@ -213,6 +214,8 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
             """SELECT /*+ REPARTITION(2, id) */ id, matched FROM (
               |  SELECT /*+ BROADCAST(b) */ a.id, b.id AS matched FROM range(0, 8, 1, 2) a
               |  LEFT JOIN range(0, 4, 1, 2) b ON a.id = b.id)""".stripMargin)
+          val broadcastPlan = broadcast.queryExecution.executedPlan
+          assert(broadcastPlan.exists(_.isInstanceOf[BroadcastHashJoinExec]))
           val rows = broadcast.collect().sortBy(_.getLong(0))
           assert(rows.map(_.getLong(0)).toSeq == (0L until 8L))
           assert(rows.take(4).forall(r => r.getLong(0) == r.getLong(1)))
@@ -220,7 +223,7 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           sc.listenerBus.waitUntilEmpty(30000)
           assert(observed.size == 1 && observed.head.pipelined)
           val reused = spark.sql("SELECT /*+ MERGE(a, b) */ a.id FROM range(0, 8, 1, 2) a " +
-            "JOIN range(0, 8, 1, 2) b ON a.id = b.id")
+            "JOIN range(0, 8, 1, 2) b ON a.id % 17 = b.id % 17")
           assert(reused.queryExecution.executedPlan.exists(_.isInstanceOf[ReusedExchangeExec]))
           assert(reused.collect().map(_.getLong(0)).sorted.toSeq == (0L until 8L))
           sc.listenerBus.waitUntilEmpty(30000)
