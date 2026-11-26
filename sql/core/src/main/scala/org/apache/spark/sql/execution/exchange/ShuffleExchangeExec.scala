@@ -206,6 +206,8 @@ case class ShuffleExchangeExec(
 
   override def nodeName: String = "Exchange"
 
+  // Batch and streaming RTM rules mark existing exchanges. A case-class copy drops TreeNode tags,
+  // including the link to the logical plan, so preserve them when enabling pipelined shuffle.
   private[sql] def withPipelinedShuffle: ShuffleExchangeExec = {
     val marked = copy(pipelined = true)
     marked.copyTagsFrom(this)
