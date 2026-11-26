@@ -52,6 +52,9 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) return plan
     val input = plan match {
+      // A V1 file write drains its child when it writes. Inspect the child for exchanges and
+      // keep the command as the execution root. Other DataWritingCommands decide how much of
+      // their input to consume, so leave them behind the command guard below.
       case DataWritingCommandExec(_: InsertIntoHadoopFsRelationCommand, child) => child
       case other => other
     }
