@@ -20,6 +20,8 @@ package org.apache.spark.sql.execution
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.util.{HashMap, Properties}
 
+import io.netty.buffer.{ByteBufInputStream, ByteBufOutputStream, Unpooled}
+
 import org.apache.spark._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests.TEST_MEMORY
@@ -87,6 +89,37 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     }
     assert(!deserializerIter.hasNext)
     assert(input.closed)
+  }
+
+  test("streaming shuffle frames use the same row encoding as ordinary streams") {
+    val rows = Seq("", "a" * 16000, "last").map(s => toUnsafeRow(Row(s), Array(StringType)))
+    val serializer = new UnsafeRowSerializer(numFields = 1).newInstance()
+    val bytes = new ByteArrayOutputStream()
+    val ordinary = serializer.serializeStream(bytes)
+    val frame = Unpooled.directBuffer()
+    try {
+      val streaming = serializer.serializeStream(new ByteBufOutputStream(frame))
+      rows.foreach { row =>
+        ordinary.writeValue(row)
+        streaming.writeValue(row)
+        streaming.flush()
+      }
+      ordinary.close()
+      streaming.close()
+      val expected = bytes.toByteArray
+      val actual = new Array[Byte](frame.readableBytes())
+      frame.getBytes(frame.readerIndex(), actual)
+      assert(actual.sameElements(expected))
+
+      val input = new ByteBufInputStream(frame)
+      val records = serializer.deserializeStream(input).asKeyValueIterator
+      rows.foreach { row =>
+        assert(records.next()._2.asInstanceOf[UnsafeRow] == row)
+      }
+      assert(!records.hasNext)
+    } finally {
+      frame.release()
+    }
   }
 
   test("close empty input stream") {

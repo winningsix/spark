@@ -187,29 +187,16 @@ class StreamingShuffleWriter[K, V](
     val serializationStream: SerializationStream =
       serializerInstance.serializeStream(new ByteBufOutputStream(buffer))
     private val creationTimeNs = System.nanoTime()
-    private val shuffleChecksum = if (CHECKSUM_ENABLED) new ShuffleChecksum() else null
-
-    // Start from beginning to include serialization stream headers
-    private var lastBufferPosition = 0
 
     def totalByteSize(): Long = buffer.readableBytes()
     def ageMs(): Long = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - creationTimeNs)
-
-    /* Checksum calculation for order-dependent per-row checksums. */
-    def updateChecksum(): Unit = {
-      if (shuffleChecksum != null) {
-        val currentPosition = buffer.writerIndex()
-        val newDataLength = currentPosition - lastBufferPosition
-        shuffleChecksum.updateChecksum(buffer, lastBufferPosition, newDataLength)
-        lastBufferPosition = currentPosition
-      }
-    }
-
-    def getChecksumValue(): Long = if (shuffleChecksum != null) shuffleChecksum.getValue else 0L
   }
 
   // The state for each shuffle destination.
   private[streaming] case class ShardState(id: Int) {
+    // send(timestampedBuffer) is synchronized on this shard.
+    private val checksum = if (CHECKSUM_ENABLED) new ShuffleChecksum() else null
+
     // client may be accessed from other threads via cancel(); @volatile to be safe.
     @volatile private var client: Either[TransportClient, CompletableFuture[TransportClient]] =
       Right(
@@ -296,8 +283,14 @@ class StreamingShuffleWriter[K, V](
       timestampedBuffer.serializationStream.close()
       val rawBuffer = timestampedBuffer.buffer
       val dataSize = rawBuffer.writerIndex()
-      timestampedBuffer.updateChecksum()
-      val checksumValue = timestampedBuffer.getChecksumValue()
+      // Closing the serializer finalizes the complete wire payload, including its header.
+      val checksumValue = if (checksum != null) {
+        checksum.reset()
+        checksum.updateChecksum(rawBuffer, 0, dataSize)
+        checksum.getValue
+      } else {
+        0L
+      }
       val dataMessage = new DataMessage(shuffleWriterId, id, dataSize, rawBuffer, checksumValue)
 
       // We keep a reference to rawBuffer so we can return it to the pool.
@@ -327,7 +320,12 @@ class StreamingShuffleWriter[K, V](
 
     def takeBuffer(): TimestampedBuffer = buffer.getAndSet(null)
 
-    def putBuffer(b: TimestampedBuffer): Unit = assert(buffer.getAndSet(b) == null)
+    // Only the task publishes a buffer. The flush and cleanup threads only take buffers,
+    // so a release store makes the completed row visible to the next thread taking it.
+    def putBuffer(b: TimestampedBuffer): Unit = {
+      assert(buffer.get() == null)
+      buffer.lazySet(b)
+    }
 
     def close(): Unit = {
       send()
@@ -509,8 +507,6 @@ class StreamingShuffleWriter[K, V](
             log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, largeRowThreshold)}. " +
             log"Consider increasing the block size.")
         }
-
-        timestampedBuffer.updateChecksum()
 
         // Flush immediately if the buffer is almost full or stale.
         if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&

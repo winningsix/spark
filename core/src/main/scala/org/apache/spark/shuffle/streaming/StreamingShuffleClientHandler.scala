@@ -25,6 +25,7 @@ import io.netty.channel.{Channel, ChannelOption}
 import io.netty.util.concurrent.{Future, GenericFutureListener}
 
 import org.apache.spark.{SparkException, TaskContext}
+import org.apache.spark.network.buffer.{ManagedBuffer, NettyManagedBuffer}
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient}
 import org.apache.spark.network.server.{RpcHandler, StreamManager}
 import org.apache.spark.network.shuffle.streaming.{CreditControlMessage, DataMessage, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationAckMessage, TerminationControlMessage}
@@ -162,25 +163,36 @@ class StreamingShuffleClientHandler(
     }
   }
 
+  override def receiveOneWay(client: TransportClient, message: ManagedBuffer): Unit = {
+    message match {
+      // convertToNetty retains a view with independent indices. DataMessage retains that
+      // storage until the reader drains it, including when the frame spans multiple buffers.
+      case netty: NettyManagedBuffer =>
+        receiveFrame(client, netty.convertToNetty().asInstanceOf[ByteBuf])
+      case _ => super.receiveOneWay(client, message)
+    }
+  }
+
   override def receive(
       client: TransportClient,
       message: ByteBuffer,
       callback: RpcResponseCallback): Unit = {
-    // The underlying message gets freed after the call to receive, so we need to copy
-    // the underlying data.
-    //
-    // TODO: in the future, the TransportRequestHandler can be modified to
-    //  not free the underlying data.
+    // The ByteBuffer callback supplies borrowed bytes with no reference to retain.
+    receiveFrame(client, Unpooled.copiedBuffer(message))
+  }
+
+  private def receiveFrame(client: TransportClient, frame: => ByteBuf): Unit = {
     var buf: ByteBuf = null
+    var shuffleMessage: StreamingShuffleMessage = null
     try {
-      buf = Unpooled.wrappedBuffer(message).copy()
-      val shuffleMessage = StreamingShuffleMessage.decode(buf)
+      buf = frame
+      val messageSize = buf.readableBytes()
+      shuffleMessage = StreamingShuffleMessage.decode(buf)
       updateLastSeqNum(shuffleMessage.getSeqNum, shuffleMessage.messageType())
       // At this point, the message type has been read, so the decoders will read the (optional)
       // length int, followed by the actual content.
       shuffleMessage match {
         case dataMessage: DataMessage =>
-          val messageSize = buf.capacity()
           updateQuota(messageSize)
           dataMessage.setReleaseCallback(() => updateQuota(-messageSize))
           // we can only release the buf after we have decoded all the rows in the buffer
@@ -196,13 +208,16 @@ class StreamingShuffleClientHandler(
             s"${shuffleMessage.messageType()}");
       }
       queue.put(shuffleMessage)
+      shuffleMessage = null // The queue now owns the decoded message.
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)
         errorNotifier.markError(ex)
     } finally {
+      if (shuffleMessage != null) {
+        shuffleMessage.release()
+      }
       if (buf != null) {
-        // If any StreamingShuffleMessage needs buf, then it would have retained it.
         buf.release()
       }
     }

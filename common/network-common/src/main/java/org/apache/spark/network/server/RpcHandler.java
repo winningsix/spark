@@ -17,10 +17,12 @@
 
 package org.apache.spark.network.server;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import org.apache.spark.internal.SparkLogger;
 import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.client.MergedBlockMetaResponseCallback;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.StreamCallbackWithID;
@@ -101,6 +103,15 @@ public abstract class RpcHandler {
    */
   public void receive(TransportClient client, ByteBuffer message) {
     receive(client, message, ONE_WAY_CALLBACK);
+  }
+
+  /**
+   * Handles a one-way message borrowed from the transport until this call returns. Handlers
+   * that queue the payload can retain a reference and release it after consumption. The
+   * default dispatches to the existing one-way {@link #receive(TransportClient, ByteBuffer)}.
+   */
+  public void receiveOneWay(TransportClient client, ManagedBuffer message) throws IOException {
+    receive(client, message.nioByteBuffer());
   }
 
   public MergedBlockMetaReqHandler getMergedBlockMetaReqHandler() {

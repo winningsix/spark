@@ -30,6 +30,7 @@ import org.apache.spark.internal.SparkLogger;
 import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.internal.MDC;
 import org.apache.spark.network.buffer.FileSegmentManagedBuffer;
+import org.apache.spark.network.buffer.NettyManagedBuffer;
 
 /**
  * Encoder used by the server side to encode server-to-client responses.
@@ -91,15 +92,21 @@ public final class MessageEncoder extends MessageToMessageEncoder<Message> {
     assert header.writableBytes() == 0;
 
     if (body != null) {
-      if (body instanceof FileRegion && in.body() instanceof FileSegmentManagedBuffer) {
+      if (in instanceof OneWayMessage && in.body().getClass() == NettyManagedBuffer.class) {
+        // send(ByteBuf) supplies a retained duplicate. Hand both buffers to Netty so it can
+        // gather the frame header and payload in a socket write. Other ManagedBuffers may
+        // perform additional cleanup on release and must keep their write-completion lifecycle.
+        in.body().release();
+        out.add(header);
+        out.add(body);
+      } else if (body instanceof FileRegion && in.body() instanceof FileSegmentManagedBuffer) {
         // Emit header and FileRegion as separate objects so that native transports
         // (EPOLL, KQUEUE) can apply zero-copy sendfile/splice on the FileRegion directly.
         // When wrapped in MessageWithHeader, native transports fall into a generic
         // FileRegion.transferTo() fallback that copies data through user-space, bypassing
         // the optimized sendfile() path.
         //
-        // This split is only safe when the ManagedBuffer is FileSegmentManagedBuffer,
-        // whose release() is a no-op. Other ManagedBuffer types (e.g.,
+        // FileSegmentManagedBuffer.release() is a no-op. Other ManagedBuffer types (e.g.,
         // BlockManagerManagedBuffer) perform resource cleanup in release() that must be
         // tied to the write lifecycle via MessageWithHeader.deallocate().
         out.add(header);

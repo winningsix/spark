@@ -25,7 +25,8 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
-import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.buffer.{ByteBuf, ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future => NettyFuture}
 import org.scalatest.Assertions.intercept
@@ -42,7 +43,10 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
-import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
+import org.apache.spark.network.buffer.{ManagedBuffer, NettyManagedBuffer}
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory, TransportResponseHandler}
+import org.apache.spark.network.protocol.{MessageEncoder, OneWayMessage}
+import org.apache.spark.network.server.TransportRequestHandler
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.MyRDD
@@ -527,15 +531,58 @@ class StreamingShuffleSuite
     OneReaderOneWriterWithCustomHandler(
       None,
       Some(() => new TestStreamingShuffleClientHandler(0, 0, null, shuffleId, context) {
-        override def receive(
-            client: TransportClient,
-            message: ByteBuffer,
-            callback: RpcResponseCallback): Unit = {
+        override def receiveOneWay(client: TransportClient, message: ManagedBuffer): Unit = {
           this.context.markTaskFailed(testError)
           logError(log"Streaming shuffle client handler receive failed", testError)
           informTaskExecuted()
         }
       }))
+  }
+
+  test("one-way shuffle frames stay live until consumed and are released on sequence errors") {
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    val errors = new ErrorNotifier
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, queue, shuffleId, Long.MaxValue, context = null, errorNotifier = errors)
+    val channel = new EmbeddedChannel(MessageEncoder.INSTANCE)
+    val client = new TransportClient(channel, new TransportResponseHandler(channel))
+    val transport = new TransportRequestHandler(channel, client, handler, Long.MaxValue, null)
+
+    def deliver(seq: Long): ByteBuf = {
+      val alloc = channel.alloc()
+      val first = alloc.directBuffer()
+      first.writeInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id()).writeLong(seq)
+      first.writeInt(0).writeInt(0).writeInt(2).writeLong(0L).writeByte(1)
+      val last = alloc.directBuffer().writeByte(2)
+      val frame = alloc.compositeBuffer().addComponents(true, first, last)
+      transport.handle(new OneWayMessage(new NettyManagedBuffer(frame)))
+      frame
+    }
+
+    try {
+      handler.channelActive(client)
+      val frame = deliver(0)
+      assert(frame.refCnt() == 1)
+      val data = queue.remove().asInstanceOf[DataMessage]
+      try {
+        assert(data.getRecordData().readUnsignedShort() == 0x0102)
+        val checksum = new ShuffleChecksum()
+        val records = data.getRecordData()
+        checksum.updateChecksum(records, records.readerIndex(), records.readableBytes())
+        val expected = new java.util.zip.CRC32C()
+        expected.update(Array[Byte](1, 2))
+        assert(checksum.getValue == expected.getValue)
+      } finally {
+        data.release()
+      }
+      assert(frame.refCnt() == 0)
+
+      assert(deliver(2).refCnt() == 0)
+      assert(queue.isEmpty)
+      assert(errors.getError().isDefined)
+    } finally {
+      channel.finishAndReleaseAll()
+    }
   }
 
   test("client handler records an error when the connection closes before termination") {
