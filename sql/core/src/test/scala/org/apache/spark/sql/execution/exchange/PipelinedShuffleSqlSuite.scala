@@ -883,6 +883,8 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         }.asNondeterministic()
         val query = data.repartition(2, data("id")).select(counted(data("id")))
         val qe = query.queryExecution
+        assert(qe.executedPlan.isInstanceOf[PipelinedShuffleResultExec])
+        spark.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
         SQLExecution.withNewExecutionId(qe, Some("collect iterator")) {
           val (count, rows) = qe.executedPlan.executeCollectIterator()
           assert(count == 12 && rows.map(_.getLong(0)).toList.sorted == (0L until 12L))
@@ -893,7 +895,6 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
           assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
         }
         assert(metric.lastAttemptValueForDataset(query).contains(12L))
-        spark.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
         assert(data.repartition(2, data("id")).queryExecution.executedPlan.nodeName ==
           "AdaptiveSparkPlan")
       }
@@ -1033,7 +1034,10 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         }
         spark.conf.set(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, false)
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
-        spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+        sc.listenerBus.waitUntilEmpty(30000)
+        assert(observed.count(_.pipelined) == pipelinedExchanges)
+        assert(spark.sql(sqlText).collect().sortBy(_.getLong(0)).sameElements(actual))
+        sc.listenerBus.waitUntilEmpty(30000)
         assert(observed.nonEmpty && !observed.exists(_.pipelined))
       }
     }

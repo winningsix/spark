@@ -1491,8 +1491,8 @@ object SQLConf {
   val DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED =
     buildConf("spark.sql.shuffle.distributedPipelined.enabled")
       .internal()
-      .doc("When true and AQE is disabled, a batch job can pipeline single-source hash shuffles " +
-        "or a single-reader join probe across executors. Each consumer must drain its input. " +
+      .doc("When enabled at planning time with AQE off, batch jobs can pipeline single-source " +
+        "hash shuffles or a join probe across executors. Each consumer must drain its input. " +
         "All stages in the group must fit in the available task slots. A task failure aborts " +
         "the group. With AQE enabled, Spark warns and uses ordinary shuffle. Experimental.")
       .version("5.0.0")
