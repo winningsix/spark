@@ -181,12 +181,15 @@ private[adaptive] object SelfWitnessDomain extends Rule[LogicalPlan] with Predic
         case w if (key.semanticEquals(w.leftKey) || key.semanticEquals(w.key)) &&
             Project(Seq(w.leftKey, w.leftValue), left)
               .sameResult(Project(Seq(w.key, w.value), right)) =>
-          val lo = Alias(Min(w.value).toAggregateExpression(), "witness_min")()
-          val hi = Alias(Max(w.value).toAggregateExpression(), "witness_max")()
-          val groups = Aggregate(Seq(w.key), Seq(w.key, lo, hi), right)
-          val keys = Filter(And(IsNotNull(w.key), LessThan(lo.toAttribute, hi.toAttribute)), groups)
-          Project(Seq(Alias(w.key, key.name)(exprId = key.exprId, qualifier = key.qualifier,
-            explicitMetadata = Some(key.metadata))), keys)
+          val (input, value) = if (key.semanticEquals(w.leftKey)) {
+            (left, w.leftValue)
+          } else {
+            (right, w.value)
+          }
+          val lo = Alias(Min(value).toAggregateExpression(), "witness_min")()
+          val hi = Alias(Max(value).toAggregateExpression(), "witness_max")()
+          val groups = Aggregate(Seq(key), Seq(key, lo, hi), input)
+          Project(Seq(key), Filter(And(IsNotNull(key), LessThan(lo.toAttribute, hi.toAttribute)), groups))
       }
     case _ => None
   }

@@ -79,6 +79,9 @@ class SelfWitnessDomainSuite extends SparkFunSuite with SharedSparkSession {
       val raw = cte + "select l.k,l.v from a l where l.k in (select k from pairs) " +
         "and l.k in (select b.k from b join pairs p on b.k=p.k) order by l.k,l.v"
       check(raw, true)
+      val narrowed = raw.replace("from a l where", "from a l join b d on l.v=d.k where")
+      check(narrowed, true)
+      require(spark.sql(narrowed).queryExecution.optimizedPlan.treeString.contains("has_returned_order"))
       check(raw.replace("a y on", "b y on"), false)
       check(raw.replace("b.k=p.k", "b.v=p.k"), false)
     } finally {
