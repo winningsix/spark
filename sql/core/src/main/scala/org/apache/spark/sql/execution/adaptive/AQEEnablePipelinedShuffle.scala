@@ -85,8 +85,13 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
     if (hasRegularPrefix(plan)) return plan
     if (!PipelinedShuffleEligibility.fitsLocalCapacity(plan, toFlip.toSet)) return plan
 
-    // The shared rewrite visits each exchange before its children. Rewriting a nested exchange
-    // first would give its parent a new ID, so toFlip would miss the selected parent.
+    // transformDown, NOT transformUp: candidates can be nested (a SinglePartition candidate
+    // above a hash candidate). transformUp rebuilds children first, so by the time it
+    // reaches the upper candidate its ID has changed. Since toFlip holds the original ID,
+    // the rebuilt exchange is skipped and the upper flip is silently
+    // dropped -- leaving a regular exchange above a pipelined one, which the scheduler then
+    // rejects. transformDown hands each candidate to the pattern before its subtree is
+    // rebuilt, so both nested flips apply.
     PipelinedShuffleEligibility.markExchanges(plan)(s => toFlip.contains(s.id))
   }
 
