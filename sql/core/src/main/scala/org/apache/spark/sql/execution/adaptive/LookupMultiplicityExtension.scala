@@ -22,6 +22,7 @@ import org.apache.spark.sql.{SparkSessionExtensions, SparkSessionExtensionsProvi
 /** Opt-in planning for inequality joins and multiplicity-only outer lookups. */
 class LookupMultiplicityExtension extends SparkSessionExtensionsProvider {
   override def apply(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectPreCBORule(_ => CompositeFactJoin)
     extensions.injectPreCBORule(_ => PruneRelatedLookup)
     extensions.injectPlannerStrategy(_ => PlanExactLookupSummary)
   }
