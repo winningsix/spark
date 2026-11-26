@@ -2223,12 +2223,25 @@ class StreamingShuffleWriter[K, V](
     schedule()
   }
 
+  private def drainOwnedBuffers(): Unit = {
+    if (singleThreadedBuffers != null) {
+      var partitionId = 0
+      while (partitionId < singleThreadedBuffers.length) {
+        val pending = singleThreadedBuffers(partitionId)
+        singleThreadedBuffers(partitionId) = null
+        if (pending != null) shards(partitionId).enqueue(pending)
+        partitionId += 1
+      }
+    }
+  }
+
   private def newBuffer(): TimestampedBuffer = {
     // Back-pressure is accounted per network buffer (BUFFER_SIZE permits each), not by exact
     // byte size, so this bounds in-flight memory only on a best-effort basis: a single
     // serialized row larger than BUFFER_SIZE (rows are not split across buffers, see write())
     // grows its buffer past BUFFER_SIZE and thus exceeds the tracked budget.
     if (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MICROSECONDS)) {
+      drainOwnedBuffers()
       shards.foreach(_.send())
       while (!allocatedBufferBytesSemaphore.tryAcquire(BUFFER_SIZE, 10, TimeUnit.MILLISECONDS)) {
         val spilled = shards.iterator.map(_.spillOnePendingData()).exists(identity)
@@ -2242,6 +2255,11 @@ class StreamingShuffleWriter[K, V](
       sharedExecutorServer match {
         case Some(shared) =>
           buffer = shared.rawBufferPool.tryBorrow()
+          if (buffer == null && singleThreadedBuffers != null) {
+            // The producer is the only thread that can publish its untimed partial buffers.
+            drainOwnedBuffers()
+            shards.foreach(_.send())
+          }
           while (buffer == null) {
             // Retiring a queued frame may return its raw owner to this writer's local deque.
             // Prefer that immediately reusable buffer before waiting on a global pool slot.
@@ -2349,15 +2367,7 @@ class StreamingShuffleWriter[K, V](
         }
       }
       isWriteFinished.countDown()
-      if (!TIME_BASED_FLUSH_ENABLED) {
-        var partitionId = 0
-        while (partitionId < singleThreadedBuffers.length) {
-          val pending = singleThreadedBuffers(partitionId)
-          singleThreadedBuffers(partitionId) = null
-          if (pending != null) shards(partitionId).enqueue(pending)
-          partitionId += 1
-        }
-      }
+      drainOwnedBuffers()
       shards.foreach(_.close())
       armTerminationRetries()
       logDebug(log"StreamingShuffleWriter finished writing data and termination messages for " +

@@ -952,20 +952,58 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  // Builds a single-partition writer against a freshly registered shuffle. The caller must run
+  test("untimed hash writer releases partial routes before waiting for the only shared slab") {
+    val conf = newConf().set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 4096)
+      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS, 0L)
+      .set(STREAMING_SHUFFLE_WRITER_WAIT_FOR_TERMINATION_ACKS, false)
+      .set("spark.shuffle.streaming.rawBufferPoolMaxMemory", "4096")
+    withSpark(new SparkContext("local", "untimed-writer-pressure", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      val server = new StreamingShuffleExecutorServer()
+      val writer = newWriter(sc, context, sharedServer = Some(server), numPartitions = 2)
+      val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+      try {
+        val received = Array.fill(2)(new AtomicInteger())
+        for (id <- 0 until 2) {
+          val client = bindMockClient(writer, id) { sent =>
+            val view = sent.duplicate()
+            while (view.isReadable) {
+              if (StreamingShuffleMessageType.decode(view.getInt(view.readerIndex())) ==
+                  StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW) received(id).incrementAndGet()
+              view.skipBytes(StreamingShuffleUtils.frameLength(view))
+            }
+          }
+          writer.transportServerHandler.handleMessage(
+            client, new CreditControlMessage(0, 0, id, -(1 << 20)))
+        }
+        val finished = worker.submit(new Runnable {
+          override def run(): Unit = writer.write(Iterator((0, 10), (1, 11), (0, 12)))
+        })
+        finished.get(10, TimeUnit.SECONDS)
+        eventually(Timeout(10.seconds)) { assert(received.forall(_.get() > 0)) }
+      } finally {
+        worker.shutdownNow()
+        context.markTaskCompleted(None)
+        server.close()
+      }
+    }
+  }
+
+  // Builds a writer against a freshly registered shuffle. The caller must run
   // this inside a withSpark block and must eventually call context.markTaskCompleted(None) to
   // tear down the Netty server the writer starts in its constructor.
   private def newWriter(
       sc: SparkContext,
       context: TaskContext,
       errorNotifier: ErrorNotifier = new ErrorNotifier(),
-      sharedServer: Option[StreamingShuffleExecutorServer] = None)
+      sharedServer: Option[StreamingShuffleExecutorServer] = None,
+      numPartitions: Int = 1)
       : StreamingShuffleWriter[Int, Int] = {
     SparkEnv.get.streamingShuffleOutputTracker.get
       .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-      .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+      .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = numPartitions, jobId = 0)
     val rdd = sc.parallelize(1 to 4).map(x => (x, x))
-    val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(1))
+    val dep = new ShuffleDependency[Int, Int, Int](rdd, new HashPartitioner(numPartitions))
     val handle = new StreamingShuffleHandle(0, dep)
     new StreamingShuffleWriter[Int, Int](
       handle, 0, context, sharedExecutorServer = sharedServer, errorNotifier = errorNotifier)
