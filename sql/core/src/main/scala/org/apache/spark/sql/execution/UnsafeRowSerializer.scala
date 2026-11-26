@@ -22,6 +22,8 @@ import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
 
+import io.netty.buffer.{ByteBufInputStream, ByteBufOutputStream}
+
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
@@ -57,8 +59,12 @@ private class UnsafeRowSerializerInstance(
    */
   override def serializeStream(out: OutputStream): SerializationStream = new SerializationStream {
     private[this] var writeBuffer: Array[Byte] = new Array[Byte](4096)
-    private[this] val dOut: DataOutputStream =
-      new DataOutputStream(new BufferedOutputStream(out))
+    // Streaming shuffle already batches rows in a ByteBuf and flushes the serializer after
+    // each row to measure its wire size. A second buffer would be drained on every row.
+    private[this] val dOut = new DataOutputStream(out match {
+      case _: ByteBufOutputStream => out
+      case _ => new BufferedOutputStream(out)
+    })
 
     override def writeValue[T: ClassTag](value: T): SerializationStream = {
       val row = value.asInstanceOf[UnsafeRow]
@@ -99,7 +105,11 @@ private class UnsafeRowSerializerInstance(
 
   override def deserializeStream(in: InputStream): DeserializationStream = {
     new DeserializationStream {
-      private[this] val dIn: DataInputStream = new DataInputStream(new BufferedInputStream(in))
+      // A streaming shuffle frame is already in memory. Read directly into the row buffer.
+      private[this] val dIn = new DataInputStream(in match {
+        case _: ByteBufInputStream => in
+        case _ => new BufferedInputStream(in)
+      })
       // 1024 is a default buffer size; this buffer will grow to accommodate larger rows
       private[this] var rowBuffer: Array[Byte] = new Array[Byte](1024)
       private[this] var row: UnsafeRow = new UnsafeRow(numFields)
