@@ -7870,7 +7870,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   test("pipelined shuffle: a group whose demand exactly equals free capacity is admitted") {
     // Boundary: demand == free capacity must be admitted, not rejected by an off-by-one (the check
     // is `demand > freeSlots`, not `>=`). 4 total slots, other-work occupancy 0 -> free 4 >= demand
-    // 4 -> admitted. NOTE: the DAGScheduler up-front admission (pipelinedGroupAdmissionFailure)
+    // 4 -> admitted. NOTE: the DAGScheduler up-front admission (rejectUnadmittablePipelinedGroup)
     // passes excludeStageIds = Set.empty (no job stage exists yet at admission time), so the
     // group's-own-members exclusion is NOT exercised here; that exclusion is genuinely covered by
     // TaskSchedulerImplSuite ("outstandingTasksForOtherWorkInProfile excludes the given stages").
@@ -7899,7 +7899,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     // Fan-out/diamond: ONE PipelinedShuffleDependency (one producer, one shuffle id) is read by TWO
     // consumers that are then narrow-joined into the result. Fan-out is unsupported, so the group
     // is ultimately rejected -- but WHICH rejection it gets proves the admission demand is deduped.
-    // The up-front slot admission (pipelinedGroupAdmissionFailure) runs BEFORE the fan-out idiom
+    // The up-front slot admission (rejectUnadmittablePipelinedGroup) runs BEFORE the fan-out idiom
     // check (checkPipelinedJobSupported). Execution creates ONE producer stage
     // (getOrCreateShuffleMapStage keys on shuffle id), so the real concurrent demand is
     // producer(2) + result(2) = 4. Counting the producer once per consumer EDGE would inflate it

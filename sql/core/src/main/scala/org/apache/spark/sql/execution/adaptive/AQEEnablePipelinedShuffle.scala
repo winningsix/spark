@@ -87,8 +87,8 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
 
     // transformDown, NOT transformUp: candidates can be nested (a SinglePartition candidate
     // above a hash candidate). transformUp rebuilds children first, so by the time it
-    // reaches the upper candidate its ID has changed. Since toFlip holds the original ID,
-    // the rebuilt exchange is skipped and the upper flip is silently
+    // reaches the upper candidate that node is a NEW instance whose (already flipped) child
+    // caused it to be rebuilt with a fresh ID. toFlip holds the original ID, so the upper flip is
     // dropped -- leaving a regular exchange above a pipelined one, which the scheduler then
     // rejects. transformDown hands each candidate to the pattern before its subtree is
     // rebuilt, so both nested flips apply.

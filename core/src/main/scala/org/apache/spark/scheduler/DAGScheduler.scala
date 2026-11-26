@@ -1189,9 +1189,16 @@ private[spark] class DAGScheduler(
    * before any stage is created (so an unsupported job is rejected
    * fail-fast with no partial scheduler state).
    *
-   * A pipelined suffix can read regular shuffle outputs at its boundary. If any are missing,
-   * schedule the regular prefix under the same job before admitting any member of the group.
-   * A pipelined shuffle below a regular boundary cannot belong to the suffix.
+   * The supported shapes are:
+   *  - all-regular (`hasPipelined` false, nothing pipelined anywhere);
+   *  - all-pipelined (`hasPipelined` true, no regular boundary anywhere);
+   *  - a regular prefix feeding a pipelined suffix. The suffix is reachable from the final RDD
+   *    without crossing a regular shuffle. AQE may already have materialized its inputs. For
+   *    missing inputs, the same job runs the prefix before admitting any member of the group.
+   *
+   * Starting the group earlier could occupy the slots needed by a missing prefix while writers
+   * wait for readers. A pipelined shuffle below a regular boundary is outside the suffix group
+   * and cannot be scheduled this way.
    */
   private[scheduler] case class JobShuffleShape(
       hasPipelined: Boolean,
@@ -1285,8 +1292,9 @@ private[spark] class DAGScheduler(
       }
     }
 
-    // Retain every boundary when waiting: output that was available at submission can be lost
-    // while a different branch is running. Include push-shuffle merge finalization in readiness.
+    // Count map outputs against the producer's partitions. Readers also need any push-shuffle
+    // merge to be finalized. Retain every boundary while waiting because an earlier branch
+    // can lose its outputs while a sibling runs.
     val needsPrefix = hasPipelined && !pipelinedBelow && regularBoundaries.values.exists { sd =>
       mapOutputTracker.getNumAvailableOutputs(sd.shuffleId) != sd.rdd.partitions.length ||
         !sd.shuffleMergeFinalized
@@ -1434,9 +1442,8 @@ private[spark] class DAGScheduler(
     // documented assumption: nothing else enforces it.
     //
     // Check only the members' within-stage chains, rooted at the result stage and at each
-    // pipelined producer, the only stages this job runs. A materialized regular prefix (see
-    // JobShuffleShape) never runs, so its profile is not a member's. An RDD's EFFECTIVE profile is
-    // its explicit one, or the default when unset.
+    // pipelined producer. The regular prefix completes before admission and uses its own profile.
+    // An RDD's effective profile is its explicit one, or the default when unset.
     val usesDefaultProfile = (r: RDD[_]) => {
       val rp = r.getResourceProfile()
       rp == null || rp.id == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
@@ -2298,9 +2305,12 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * Compute the concurrent tasks for the result stage and its pipelined producers. Ordinary
-   * prefix stages complete before admission. Each producer contributes its RDD partition count,
-   * and the result stage contributes the number of partitions requested by the job.
+   * The total concurrent-task demand of a pipelined job's group, computed from the RDD graph
+   * once its ordinary inputs are ready. The group contains the final result stage and every
+   * pipelined producer. The regular prefix has finished by then. Each producer contributes its
+   * RDD's partition count (`rdd.partitions.length`), matching how `createShuffleMapStage` derives
+   * `numTasks`. `finalNumPartitions` is the result stage's task count (the number of partitions
+   * the job runs, which may be a subset of `finalRDD.partitions`).
    *
    * Count each producer once per SHUFFLE ID, matching what execution schedules: one stage is
    * created per shuffle ID (`getOrCreateShuffleMapStage`), not per dependency edge. A fan-out or
@@ -2328,9 +2338,19 @@ private[spark] class DAGScheduler(
   }
 
   /**
-   * Admit the whole group once its ordinary inputs are ready and before submitting any group
-   * member. Compare demand against capacity in its resource profile after accounting for running
-   * and queued work. A shortfall fails the job and leaves retry to the caller.
+   * Up-front gang admission for the result stage and its pipelined producers. If the job must
+   * materialize a regular prefix, defer this check until all prefix stages are ready. Checking here
+   * (rather than in `submitStage` once a producer is already running) is true all-or-nothing gang
+   * admission: the whole group is admitted, or the job is failed before any member runs, so a
+   * member is never left waiting for slots held by its siblings.
+   *
+   * Free-slot accounting: demand vs. total capacity (`maxNumConcurrentTasks` for the default
+   * profile -- a group is required to be single-profile) minus what OTHER work (other jobs) has
+   * outstanding -- running plus enqueued -- in that profile. Counting enqueued, not just running,
+   * tasks charges a busy neighbor's queued backlog against capacity too, so a group is not admitted
+   * against slots other work is already committed to. A transient shortfall fails the job and
+   * leaves retry to the caller (e.g. the streaming batch loop). Barrier jobs can instead
+   * re-post their slot check on a timer. Returns true if this check failed the job.
    *
    * The check can be turned off with `spark.scheduler.pipelinedGroup.slotCheck.enabled=false` (for
    * deployments that admit capacity out-of-band, e.g. via a slot reservation).
@@ -2353,7 +2373,7 @@ private[spark] class DAGScheduler(
     val rp = sc.resourceProfileManager.defaultResourceProfile
     val demand = pipelinedJobConcurrentTaskDemand(finalRDD, numPartitions)
     val totalSlots = maxConcurrentTasksForProfile(rp.id)
-    // The prefix is ready and no group member has been submitted.
+    // The prefix is ready and no group member has outstanding tasks of its own to exclude.
     val outstandingForOthers = outstandingTasksForOtherWork(rp.id, Set.empty)
     val freeSlots = math.max(0, totalSlots - outstandingForOthers)
     if (demand > freeSlots) {
@@ -2617,7 +2637,8 @@ private[spark] class DAGScheduler(
         "A pipelined shuffle below a regular shuffle cannot run in the job's pipelined suffix."))
       return
     }
-    // Check the whole group when all regular inputs are ready.
+    // With ready inputs, check the whole group before creating stages. Otherwise
+    // submitPrefixOrGroup checks the free slots after the last regular boundary becomes ready.
     if (hasPipelined && shape.prefixToSchedule.isEmpty &&
         rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions.length)(listener.jobFailed)) {
       // Clear the slot-check retry count an earlier deferral may have left.

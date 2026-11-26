@@ -48,16 +48,20 @@ import org.apache.spark.sql.internal.SQLConf
  * pipelined channel manager and the concurrent-stage scheduler runs the map and reduce stages
  * together.
  *
- * The laptop rule selects the whole group when its exchanges and consumers can use the
- * in-process channel. Distributed batch can instead materialize ordinary inputs before
- * scheduling a pipelined group.
+ * The rewrite considers the whole group. The scheduler can run a regular prefix before a
+ * pipelined suffix, but it rejects a pipelined producer below a regular exchange. The laptop
+ * rule therefore checks the environment gates in [[PipelinedShuffleEligibility]] and the plan
+ * shapes below that force the whole plan back to regular.
  *
  * Enabled only when `spark.sql.shuffle.localPipelined.enabled=true`. It runs in the non-AQE
  * `preparations` list, so it also requires AQE to be off (under AQE the plan is hidden behind
  * an opaque `AdaptiveSparkPlanExec` leaf and this rule sees no exchanges).
  *
- * The channel routes by partition ID and supports SinglePartition and RangePartitioning
- * exchanges as well as hash exchanges.
+ * Rewriting ALL shuffles (not just hash-partitioning ones) keeps the job all-pipelined, which
+ * avoids a pipelined producer below a regular boundary, a shape the scheduler rejects.
+ * SinglePartition and RangePartitioning exchanges pipeline fine -- the channel transport only
+ * routes by `partitioner.getPartition(key)` and does not care which partitioning produced the
+ * id (SinglePartition is the numPartitions == 1 degenerate case).
  *
  * These shapes make the rule leave the whole plan regular:
  *   - the estimated producer and consumer widths cannot fit local task capacity.
