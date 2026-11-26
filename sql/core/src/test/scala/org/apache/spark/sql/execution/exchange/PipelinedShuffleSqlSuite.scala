@@ -26,12 +26,16 @@ import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.{PipelinedShuffleDependency, SparkEnv, SparkException, SparkFunSuite}
 import org.apache.spark.StreamingShuffleOutputTrackerMaster
+import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.local.pipelined.ChannelShuffleRendezvous
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.classic.{SparkSession => ClassicSparkSession}
-import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
+import org.apache.spark.sql.execution.{InputAdapter, QueryExecution, SQLExecution}
+import org.apache.spark.sql.execution.{WholeStageCodegenEvaluatorFactory, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.execution.metric.SQLLastAttemptMetrics
 import org.apache.spark.sql.functions.udf
@@ -866,6 +870,41 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
       body(spark)
     } finally {
       spark.stop()
+    }
+  }
+
+  test("a keyed aggregate waits for pipelined input before reserving execution memory") {
+    withCluster(2) { spark =>
+      val df = spark.sql("SELECT id % 3 AS k, count(*) AS n FROM range(0, 100, 1, 2) GROUP BY k")
+      val root = df.queryExecution.executedPlan.asInstanceOf[PipelinedShuffleResultExec]
+      val plan = DistributedPipelinedShuffle.pipeline(root.child, root.exchangeIds)
+      val Seq(stage) = plan.collect {
+        case w: WholeStageCodegenExec if w.child.isInstanceOf[HashAggregateExec] &&
+            w.child.children.head.isInstanceOf[InputAdapter] => w
+      }
+      val (ctx, code) = stage.doCodeGen()
+      val factory = new WholeStageCodegenEvaluatorFactory(
+        Right(code), stage.longMetric("pipelineTime"), ctx.references.toArray)
+      // Observe the generated reader at the first poll, before a producer has provided a row.
+      val Seq((initial, atFirstPoll, hasOutput)) = spark.sparkContext
+        .parallelize(Seq(0), 1).mapPartitions { _ =>
+          val manager = TaskContext.get().taskMemoryManager()
+          val initial = manager.getMemoryConsumptionForThisTask
+          var atFirstPoll = -1L
+          val input = new Iterator[InternalRow] {
+            override def hasNext: Boolean = {
+              if (atFirstPoll < 0) atFirstPoll = manager.getMemoryConsumptionForThisTask
+              false
+            }
+            override def next(): InternalRow = Iterator.empty.next()
+          }
+          val hasOutput = factory.createEvaluator().eval(0, input).hasNext
+          Iterator.single((initial, atFirstPoll, hasOutput))
+        }.collect().toList
+      assert(atFirstPoll == initial)
+      assert(!hasOutput)
+      assert(df.collect().map(row => row.getLong(0) -> row.getLong(1)).toMap ==
+        Map(0L -> 34L, 1L -> 33L, 2L -> 33L))
     }
   }
 
