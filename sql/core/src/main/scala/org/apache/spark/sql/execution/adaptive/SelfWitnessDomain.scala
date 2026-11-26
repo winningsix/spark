@@ -172,6 +172,57 @@ private[adaptive] object SelfWitnessDomain extends Rule[LogicalPlan] with Predic
     }
   }
 
+  // In a positive membership predicate, the multiplicity of a matching key is immaterial.
+  // For identical scans a key has an unequal pair exactly when its non-null bounds differ.
+  private def distinctPairKeys(plan: LogicalPlan): Option[LogicalPlan] = plan match {
+    case Project(Seq(key: Attribute), Join(left, right, Inner, Some(condition), JoinHint.NONE))
+        if left.deterministic && right.deterministic =>
+      witness(left, right, splitConjunctivePredicates(condition)).collect {
+        case w if (key.semanticEquals(w.leftKey) || key.semanticEquals(w.key)) &&
+            Project(Seq(w.leftKey, w.leftValue), left)
+              .sameResult(Project(Seq(w.key, w.value), right)) =>
+          val lo = Alias(Min(w.value).toAggregateExpression(), "witness_min")()
+          val hi = Alias(Max(w.value).toAggregateExpression(), "witness_max")()
+          val groups = Aggregate(Seq(w.key), Seq(w.key, lo, hi), right)
+          val keys = Filter(And(IsNotNull(w.key), LessThan(lo.toAttribute, hi.toAttribute)), groups)
+          Project(Seq(Alias(w.key, key.name)(exprId = key.exprId, qualifier = key.qualifier,
+            explicitMetadata = Some(key.metadata))), keys)
+      }
+    case _ => None
+  }
+
+  // If K is already required by a separate IN conjunct on the same probe, the second
+  // predicate only needs the other side of B INNER JOIN K. Keep all outer duplicates.
+  private def simplifyPairMemberships(filter: Filter): Filter = {
+    if (!conf.getConfString("spark.sql.optimizer.mergePositiveOrderDomains.enabled", "false")
+        .toBoolean) return filter
+    val terms = splitConjunctivePredicates(filter.condition)
+    val members = terms.collect {
+      case in @ InSubquery(Seq(_: Attribute), q) if q.outerAttrs.isEmpty &&
+          q.joinCond.isEmpty && q.hint.isEmpty && q.numCols == 1 && q.plan.deterministic => in
+    }
+    if (members.size != 2 || !members.head.values.head.semanticEquals(members.last.values.head)) {
+      return filter
+    }
+    val replacement = for {
+      domain <- members.iterator
+      keys <- distinctPairKeys(domain.query.plan).iterator
+      other <- members.iterator.filterNot(_ eq domain)
+      Project(Seq(result: Attribute), Join(left, right, Inner,
+        Some(EqualTo(a: Attribute, b: Attribute)), JoinHint.NONE)) <- Iterator(other.query.plan)
+      (lookup, repeated) <- Iterator((left, right), (right, left))
+      if repeated.output.size == 1 && repeated.sameResult(domain.query.plan) &&
+        lookup.outputSet.contains(result) && ((result.semanticEquals(a) &&
+          repeated.output.head.semanticEquals(b)) || (result.semanticEquals(b) &&
+          repeated.output.head.semanticEquals(a)))
+    } yield terms.map {
+      case t if t eq domain => domain.copy(query = domain.query.withNewPlan(keys))
+      case t if t eq other => other.copy(query = other.query.withNewPlan(Project(Seq(result), lookup)))
+      case t => t
+    }
+    replacement.nextOption().map(ts => filter.copy(condition = ts.reduceLeft(And))).getOrElse(filter)
+  }
+
   def filterMembershipInputs(plan: LogicalPlan): LogicalPlan = {
     if (plan.isStreaming || !conf.getConfString("spark.sql.optimizer.filterMembershipInputs.enabled","false").toBoolean) return plan
     plan.transformUp { case f: Filter =>
@@ -305,7 +356,7 @@ private[adaptive] object SelfWitnessDomain extends Rule[LogicalPlan] with Predic
       if (shared.isDefined) return shared.get
     }
     plan.transformUp {
-      case f: Filter => mergeExclusion(f,plan).transformExpressionsUp {
+      case f: Filter => mergeExclusion(simplifyPairMemberships(f),plan).transformExpressionsUp {
         case e: Exists if e.hint.isEmpty =>
           domain(f.child, e.plan, e.joinCond).map { case (keys, conditions) =>
             e.copy(plan=keys, joinCond=conditions)

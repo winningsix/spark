@@ -75,6 +75,12 @@ class SelfWitnessDomainSuite extends SparkFunSuite with SharedSparkSession {
       val shape=spark.sql(both).queryExecution.optimizedPlan.treeString
       require(shape.contains("candidate_order_filter") && shape.contains("has_returned_order"),shape)
       check(both.replace("v=3","v=99"),true)
+      val cte = "with pairs as (select x.k from a x join a y on x.k=y.k and x.v<>y.v) "
+      val raw = cte + "select l.k,l.v from a l where l.k in (select k from pairs) " +
+        "and l.k in (select b.k from b join pairs p on b.k=p.k) order by l.k,l.v"
+      check(raw, true)
+      check(raw.replace("a y on", "b y on"), false)
+      check(raw.replace("b.k=p.k", "b.v=p.k"), false)
     } finally {
       Seq("a","b").foreach(spark.catalog.dropTempView)
       Utils.deleteRecursively(tmp)
