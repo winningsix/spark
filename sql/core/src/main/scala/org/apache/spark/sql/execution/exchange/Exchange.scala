@@ -24,7 +24,6 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, Expre
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
@@ -103,8 +102,6 @@ private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeIds
   @transient private val fullInput = DistributedPipelinedShuffle.pipeline(child, exchangeIds)
 
   private def collectPlan(): SparkPlan = {
-    if (!conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED) ||
-        conf.adaptiveExecutionEnabled) return child
     val id = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     if (id == null) return child
     val qe = SQLExecution.getQueryExecution(id.toLong)
