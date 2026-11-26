@@ -38,12 +38,7 @@ import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
-/**
- * Plan an all-pipelined group for a single-source, full-input batch job after exchange reuse.
- * A V1 file insertion has a known consumer, so its child carries the chosen shuffle type.
- * Result queries also support partial reads. Keep their regular plan and prepare a separate
- * full-result plan with the chosen exchanges; the scheduler admits the group at submission.
- */
+/** Plan a single-source, full-input pipelined group after exchange reuse. */
 private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Int]("batchPipelinedShuffleCandidate")
 
@@ -150,7 +145,7 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   }
 }
 
-/** Collect a job-owned copy of the planned pipeline. Partial readers use the ordinary child. */
+/** Partial reads use ordinary shuffle because unread partitions can block pipelined writers. */
 private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeIds: Set[Int])
   extends UnaryExecNode {
   override def output: Seq[Attribute] = child.output
@@ -166,6 +161,8 @@ private[sql] case class PipelinedShuffleResultExec(child: SparkPlan, exchangeIds
     if (id == null) return child
     val qe = SQLExecution.getQueryExecution(id.toLong)
     if (qe == null || !(qe.executedPlan eq this)) return child
+    // Exchanges cache their shuffle dependencies. Clone the plan so each SQL execution gets fresh
+    // shuffle IDs even when a previous action on the same Dataset has cleaned up its shuffles.
     val selected = fullInput.clone()
     selected.setTagValue(DistributedPipelinedShuffle.ownsShuffles, ())
     SQLExecution.updatePhysicalPlan(id.toLong, qe.withExecutedPlan(selected))
