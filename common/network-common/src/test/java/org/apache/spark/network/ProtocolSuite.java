@@ -19,6 +19,7 @@ package org.apache.spark.network;
 
 import java.util.List;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.FileRegion;
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import org.apache.spark.network.buffer.NettyManagedBuffer;
 import org.apache.spark.network.protocol.ChunkFetchFailure;
 import org.apache.spark.network.protocol.ChunkFetchRequest;
 import org.apache.spark.network.protocol.ChunkFetchSuccess;
@@ -86,6 +88,33 @@ public class ProtocolSuite {
     testClientToServer(new RpcRequest(12345, new TestManagedBuffer(10)));
     testClientToServer(new StreamRequest("abcde"));
     testClientToServer(new OneWayMessage(new TestManagedBuffer(10)));
+  }
+
+  @Test
+  public void oneWayNettyBuffersCanBeGatheredAndDecoded() throws Exception {
+    EmbeddedChannel sender = new EmbeddedChannel(MessageEncoder.INSTANCE);
+    EmbeddedChannel receiver = new EmbeddedChannel(NettyUtils.createFrameDecoder(),
+      MessageDecoder.INSTANCE);
+    ByteBuf payload = Unpooled.compositeBuffer().addComponents(true,
+      Unpooled.copyShort(1), Unpooled.copyShort(2));
+    try {
+      sender.writeOutbound(new OneWayMessage(new NettyManagedBuffer(payload)));
+      assertEquals(2, sender.outboundMessages().size());
+      while (!sender.outboundMessages().isEmpty()) {
+        ByteBuf part = sender.readOutbound();
+        receiver.writeInbound(part);
+      }
+      OneWayMessage decoded = receiver.readInbound();
+      try {
+        assertEquals(0x00010002, decoded.body().nioByteBuffer().getInt());
+      } finally {
+        decoded.body().release();
+      }
+    } finally {
+      sender.finishAndReleaseAll();
+      receiver.finishAndReleaseAll();
+    }
+    assertEquals(0, payload.refCnt());
   }
 
   @Test

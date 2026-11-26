@@ -18,6 +18,7 @@
 package org.apache.spark.network.shuffle.streaming;
 
 import io.netty.buffer.ByteBuf;
+import java.nio.ByteBuffer;
 import java.util.zip.CRC32C;
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -55,9 +56,13 @@ public final class ShuffleChecksum {
     if (message.hasArray()) {
       // heap-based ByteBuf
       crc.update(message.array(), message.arrayOffset() + startIndex, dataLength);
-    } else {
-      // off-heap ByteBuf
+    } else if (message.nioBufferCount() == 1) {
       crc.update(message.nioBuffer(startIndex, dataLength));
+    } else {
+      // A received frame can span several network buffers. A single NIO view would copy them.
+      for (ByteBuffer part : message.nioBuffers(startIndex, dataLength)) {
+        crc.update(part);
+      }
     }
   }
 

@@ -331,32 +331,34 @@ class StreamingShuffleWriterSuite
         // client future is already resolved.
         bindMockClient(writer, 0) { buf => sentBuffers.add(buf.copy()) }
 
-        // Serialize a record through the writer's own buffer/checksum path and send it.
-        val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
-        tsBuffer.serializationStream.writeKey(1.asInstanceOf[Any])
-        tsBuffer.serializationStream.writeValue(2.asInstanceOf[Any])
-        tsBuffer.serializationStream.flush()
-        writer.shards(0).send(tsBuffer)
+        // Send two frames on the same shard to check that each starts a fresh checksum.
+        for (value <- Seq(2, 3)) {
+          val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
+          tsBuffer.serializationStream.writeKey(1.asInstanceOf[Any])
+          tsBuffer.serializationStream.writeValue(value.asInstanceOf[Any])
+          tsBuffer.serializationStream.flush()
+          writer.shards(0).send(tsBuffer)
+        }
 
-        sentBuffers.size() should be(1)
-        val decoded = StreamingShuffleMessage.decode(sentBuffers.get(0))
-        decoded shouldBe a[DataMessage]
-        val dataMessage = decoded.asInstanceOf[DataMessage]
-
-        // The checksum embedded on the wire must match an independent CRC32C over the payload.
-        // Compute the expected value with java.util.zip.CRC32C directly (not ShuffleChecksum) so
-        // this stays independent of the production checksum wrapper.
-        val payload = dataMessage.getRecordData()
-        val expectedCrc = new CRC32C()
-        expectedCrc.update(payload.nioBuffer(payload.readerIndex(), payload.readableBytes()))
-        dataMessage.checksum should be(expectedCrc.getValue)
-        dataMessage.checksum should not be 0L
+        sentBuffers.size() should be(2)
+        sentBuffers.forEach { buf =>
+          val decoded = StreamingShuffleMessage.decode(buf)
+          try {
+            decoded shouldBe a[DataMessage]
+            val dataMessage = decoded.asInstanceOf[DataMessage]
+            val payload = dataMessage.getRecordData()
+            val expectedCrc = new CRC32C()
+            expectedCrc.update(payload.nioBuffer(payload.readerIndex(), payload.readableBytes()))
+            dataMessage.checksum should be(expectedCrc.getValue)
+            dataMessage.checksum should not be 0L
+          } finally {
+            decoded.release()
+            buf.release()
+          }
+        }
         // The mock released the sent buffer (as the transport would), so the writer's normal
         // recycling path ran (rawBuffer.refCnt() == 1) and recorded no error.
         writer.errorNotifier.getError() shouldBe empty
-
-        dataMessage.release()
-        sentBuffers.forEach(_.release())
       } finally {
         context.markTaskCompleted(None)
       }
