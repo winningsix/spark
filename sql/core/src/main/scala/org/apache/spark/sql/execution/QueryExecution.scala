@@ -422,7 +422,13 @@ class QueryExecution(
       case q: QueryStageExec => hasShuffle(q.plan)
       case other => other.children.exists(hasShuffle)
     }
-    if (!sparkSession.sessionState.conf.localPipelinedShuffleEnabled ||
+    if (!sparkSession.sparkContext.isLocal &&
+        sparkSession.sessionState.conf.getConf(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED)) {
+      executedPlan match {
+        case p: exchange.PipelinedShuffleResultExec => withExecutedPlan(p.child)
+        case _ => this
+      }
+    } else if (!sparkSession.sessionState.conf.localPipelinedShuffleEnabled ||
         !PipelinedShuffleEligibility.enabled(executedPlan, sparkSession.sessionState.conf) ||
         !hasShuffle(executedPlan)) {
       this
@@ -437,7 +443,7 @@ class QueryExecution(
 
   private[sql] def withRegularShuffle: QueryExecution = lazyRegularShuffle.get
 
-  /** Use the physical plan of this execution when reporting a one-shot shuffle to listeners. */
+  /** Use the selected physical plan for execution and SQL listeners. */
   private[execution] def withExecutedPlan(plan: SparkPlan): QueryExecution =
     new QueryExecution(sparkSession, commandExecuted, tracker, mode, shuffleCleanupModeOpt,
         refreshPhaseEnabled, analyzerOpt = Some(analyzer)) {
