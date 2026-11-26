@@ -320,7 +320,12 @@ class StreamingShuffleWriter[K, V](
 
     def takeBuffer(): TimestampedBuffer = buffer.getAndSet(null)
 
-    def putBuffer(b: TimestampedBuffer): Unit = assert(buffer.getAndSet(b) == null)
+    // Only the task publishes a buffer. The flush and cleanup threads only take buffers,
+    // so a release store makes the completed row visible to the next thread taking it.
+    def putBuffer(b: TimestampedBuffer): Unit = {
+      assert(buffer.get() == null)
+      buffer.lazySet(b)
+    }
 
     def close(): Unit = {
       send()
