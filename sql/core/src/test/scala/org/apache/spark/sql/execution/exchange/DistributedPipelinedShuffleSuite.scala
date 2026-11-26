@@ -126,12 +126,10 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         spark.udf.register("observe", reader)
         @volatile var observed: Seq[ShuffleExchangeExec] = Nil
         spark.listenerManager.register(new QueryExecutionListener {
-          override def onSuccess(name: String, qe: QueryExecution, nanos: Long): Unit = {
+          override def onSuccess(name: String, qe: QueryExecution, nanos: Long): Unit =
             observed = qe.executedPlan.collect { case s: ShuffleExchangeExec => s }
-          }
-          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit = {
+          override def onFailure(name: String, qe: QueryExecution, error: Exception): Unit =
             observed = qe.executedPlan.collect { case s: ShuffleExchangeExec => s }
-          }
         })
         val query = spark.sql(sqlText)
         sc.setJobGroup("full-input", "run both shuffle stages in one job")
@@ -171,6 +169,8 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         }
 
         val top = query.orderBy("id").limit(3)
+        val qe = top.queryExecution
+        assert(qe.withRegularShuffle.executedPlan eq qe.executedPlan.children.head)
         assert(top.toLocalIterator().next().getLong(0) == 0L)
         sc.listenerBus.waitUntilEmpty(30000)
         assert(observed.nonEmpty && !observed.exists(_.pipelined))

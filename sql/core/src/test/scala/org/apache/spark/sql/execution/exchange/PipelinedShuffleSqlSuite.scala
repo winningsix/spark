@@ -67,11 +67,9 @@ class PipelinedShuffleSqlSuite extends SparkFunSuite
       spark.conf.set("spark.sql.shuffle.distributedPipelined.enabled", true)
       val ids = spark.range(0, 12, 1, 2)
       val result = ids.repartition(2, ids("id"))
-      val Seq(exchange) = collect(result.queryExecution.executedPlan) {
-        case s: ShuffleExchangeExec => s
-      }
-      assert(exchange.pipelined && !result.queryExecution.executedPlan
-        .isInstanceOf[PipelinedShuffleResultExec])
+      val plan = result.queryExecution.executedPlan
+      assert(!plan.isInstanceOf[PipelinedShuffleResultExec])
+      assert(collect(plan) { case s: ShuffleExchangeExec => s.pipelined } == Seq(true))
       assert(result.collect().sorted.toSeq == (0L until 12L))
     }
   }
