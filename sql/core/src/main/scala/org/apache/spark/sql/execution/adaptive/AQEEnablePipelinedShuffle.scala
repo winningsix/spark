@@ -85,6 +85,8 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
     if (hasRegularPrefix(plan)) return plan
     if (!PipelinedShuffleEligibility.fitsLocalCapacity(plan, toFlip.toSet)) return plan
 
+    // The shared rewrite visits each exchange before its children. Rewriting a nested exchange
+    // first would give its parent a new ID, so toFlip would miss the selected parent.
     PipelinedShuffleEligibility.markExchanges(plan)(s => toFlip.contains(s.id))
   }
 
