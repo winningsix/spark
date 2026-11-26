@@ -145,7 +145,13 @@ object SQLExecution extends Logging {
       executionId: Long): Unit = {
     val sc = queryExecution.sparkSession.sparkContext
     try {
-      val shuffleIds = queryExecution.executedPlan match {
+      val plan = queryExecution.executedPlan
+      if (plan.getTagValue(DistributedPipelinedShuffle.ownsShuffles).isDefined) {
+        DistributedPipelinedShuffle.cleanup(plan)
+        return
+      }
+      if (queryExecution.shuffleCleanupMode == DoNotCleanup) return
+      val shuffleIds = plan match {
         case command: V2CommandExec =>
           command.children.flatMap(extractShuffleIds)
         case dataWritingCommand: DataWritingCommandExec =>
@@ -299,7 +305,9 @@ object SQLExecution extends Logging {
                   val planDesc = planDescription(
                     queryExecution, sparkSession.sessionState.conf.uiExplainMode)
                   val planInfo = try {
-                    SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan)
+                    val plan = queryExecution.executedPlan
+                    isExecutedPlanAvailable = true
+                    SparkPlanInfo.fromSparkPlan(plan)
                   } catch {
                     case NonFatal(e) =>
                       logDebug("Failed to generate SparkPlanInfo", e)
@@ -310,7 +318,6 @@ object SQLExecution extends Logging {
                   }
                   sc.listenerBus.post(
                     startEvent.copy(physicalPlanDescription = planDesc, sparkPlanInfo = planInfo))
-                  isExecutedPlanAvailable = true
                   f()
               }
             } catch {
@@ -343,13 +350,8 @@ object SQLExecution extends Logging {
                   }
                 }
                 if (isExecutedPlanAvailable) {
-                  val plan = executedQuery.executedPlan
-                  if (plan.getTagValue(DistributedPipelinedShuffle.ownsShuffles).isDefined) {
-                    // Only clean allocated IDs. An ignored file write has no shuffle to remove.
-                    DistributedPipelinedShuffle.cleanup(plan)
-                  } else if (queryExecution.shuffleCleanupMode != DoNotCleanup) {
-                    cleanupShuffleDependencies(executedQuery, executionId)
-                  }
+                  cleanupShuffleDependencies(executedQuery, executionId)
+                  Utils.tryLogNonFatalError { executedQuery.recordMetricScopes() }
                 }
                 val event = SparkListenerSQLExecutionEnd(
                   executionId,

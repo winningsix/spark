@@ -838,6 +838,8 @@ class IncrementalExecution(
         val newPlan = p.withNewChildren(results.map(_._1))
         newPlan match {
           case s: ShuffleExchangeExec if onStreamingPath && !s.pipelined =>
+            // A bare case-class copy does not carry the node's tags, which is where the logical
+            // link lives, so copy them over the way the tree transforms do.
             (s.withPipelinedShuffle, true)
           case other => (other, onStreamingPath)
         }

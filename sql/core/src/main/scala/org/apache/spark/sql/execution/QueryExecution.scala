@@ -50,6 +50,7 @@ import org.apache.spark.sql.execution.dynamicpruning.PlanDynamicPruningFilters
 import org.apache.spark.sql.execution.exchange.{EnablePipelinedShuffle, EnsureRequirements, PipelinedShuffleEligibility, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.exchange.DistributedPipelinedShuffle
 import org.apache.spark.sql.execution.joins.ChoosePerPartitionRuntimeFilters
+import org.apache.spark.sql.execution.metric.SQLLastAttemptAccumulator
 import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
 import org.apache.spark.sql.execution.streaming.runtime.{IncrementalExecution, WatermarkPropagator}
@@ -412,7 +413,7 @@ class QueryExecution(
   /**
    * RDD consumers and partition-at-a-time iterators can outlive one SQL job. Give them a
    * separate plan whose shuffles retain output, without changing this execution's plan.
-   * Reuse one fallback per execution and retain its session for lazy planning and AQE.
+   * Distributed batch reuses its ordinary child. The laptop fallback retains its planning session.
    * Closing that session here would stop the shared SparkContext.
    */
   private val lazyRegularShuffle = LazyTry {
@@ -443,11 +444,27 @@ class QueryExecution(
 
   private[sql] def withRegularShuffle: QueryExecution = lazyRegularShuffle.get
 
-  /** Use the selected physical plan for execution and SQL listeners. */
+  // Keep only the last completed action's RDD scopes. Listener views retain their own plan.
+  @volatile private var completedScopes: Option[Either[String, Seq[String]]] = None
+  private[execution] def metricScopes: Either[String, Seq[String]] = completedScopes.getOrElse {
+    val plan = executedPlan match {
+      case p: exchange.PipelinedShuffleResultExec => p.child
+      case other => other
+    }
+    SQLLastAttemptAccumulator.extractStageRDDScopes(plan)
+  }
+  private[execution] def recordMetricScopes(): Unit = {
+    if (completedScopes.isDefined) completedScopes = None
+  }
+
   private[execution] def withExecutedPlan(plan: SparkPlan): QueryExecution =
     new QueryExecution(sparkSession, commandExecuted, tracker, mode, shuffleCleanupModeOpt,
         refreshPhaseEnabled, analyzerOpt = Some(analyzer)) {
       override def executedPlan: SparkPlan = plan
+      override val id: Long = QueryExecution.this.id
+      override def recordMetricScopes(): Unit = {
+        QueryExecution.this.completedScopes = Some(metricScopes)
+      }
     }
 
   val lazyToRdd = LazyTry {
