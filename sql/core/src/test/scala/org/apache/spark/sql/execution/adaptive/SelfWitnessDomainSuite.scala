@@ -18,6 +18,8 @@
 package org.apache.spark.sql.execution.adaptive
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression
+import org.apache.spark.sql.execution.exchange.EnablePipelinedShuffle.MATERIALIZE_FOR_REUSE
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.Utils
 
@@ -67,6 +69,12 @@ class SelfWitnessDomainSuite extends SparkFunSuite with SharedSparkSession {
         "not exists (select 1 from b e where e.k=l.k and e.v=7)"
       check(grouped,true)
       require(spark.sql(grouped).queryExecution.optimizedPlan.treeString.contains("candidate_order_filter"))
+      def markedRepartitions(sql: String): Seq[RepartitionByExpression] =
+        spark.sql(sql).queryExecution.optimizedPlan.collectWithSubqueries {
+          case r: RepartitionByExpression if r.getTagValue(MATERIALIZE_FOR_REUSE).contains(true) => r
+        }
+      assert(markedRepartitions(grouped).nonEmpty)
+      assert(markedRepartitions("select /*+ REPARTITION(54) */ k from a").isEmpty)
       check(grouped.replace("v=3","v=99"),true)
       val both = "select count(distinct l.k),sum(l.v) from a l join (select * from b where v=3) d on l.v=d.k " +
         "where l.k in (select k from a group by k having min(v)<max(v)) " +
