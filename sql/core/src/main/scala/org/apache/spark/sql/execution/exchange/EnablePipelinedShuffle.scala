@@ -55,7 +55,7 @@ import org.apache.spark.sql.internal.SQLConf
  * an opaque `AdaptiveSparkPlanExec` leaf and this rule sees no exchanges).
  *
  * Rewriting ALL shuffles (not just hash-partitioning ones) keeps the job all-pipelined, which
- * the DAGScheduler requires: a mix of pipelined and regular shuffles in one job is rejected.
+ * avoids a pipelined producer below a regular boundary, a shape the scheduler rejects.
  * SinglePartition and RangePartitioning exchanges pipeline fine -- the channel transport only
  * routes by `partitioner.getPartition(key)` and does not care which partitioning produced the
  * id (SinglePartition is the numPartitions == 1 degenerate case).

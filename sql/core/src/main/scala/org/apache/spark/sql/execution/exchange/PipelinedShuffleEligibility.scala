@@ -31,8 +31,16 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * The laptop rules share their environment gate. Batch planning in both modes uses the same
- * full-group capacity check and exchange rewrite; each rule determines its eligible inputs.
+ * Shared environment gate for the two pipelined-shuffle enabling rules
+ * ([[EnablePipelinedShuffle]] non-AQE and `AQEEnablePipelinedShuffle` under AQE). This is a
+ * correctness requirement for laptop mode. Both rules rely on the in-process channel's support
+ * for partial reads. It passes row references between threads and requests detached records so
+ * SQL copies a producer's reusable row before enqueueing it. The RPC writer serializes each row
+ * before advancing the iterator, so its `requiresDetachedRecords = false` is safe.
+ * The opt-in flag alone cannot select the channel manager. The check for the active manager
+ * lives here rather than being copy-pasted into each `apply` (where the two could drift and split
+ * AQE vs non-AQE behavior). Each rule keeps only its own plan-shape logic.
+ * Distributed batch shares the capacity check and exchange rewrite and checks for RPC separately.
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 

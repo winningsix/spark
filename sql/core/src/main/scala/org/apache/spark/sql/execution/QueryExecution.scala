@@ -413,7 +413,8 @@ class QueryExecution(
   /**
    * RDD consumers and partition-at-a-time iterators can outlive one SQL job. Give them a
    * separate plan whose shuffles retain output, without changing this execution's plan.
-   * Distributed batch reuses its ordinary child. The laptop fallback retains its planning session.
+   * Distributed batch reuses the ordinary child prepared by the rule. In laptop mode we replan.
+   * Reuse one fallback per execution and retain its session for lazy planning and AQE.
    * Closing that session here would stop the shared SparkContext.
    */
   private val lazyRegularShuffle = LazyTry {
