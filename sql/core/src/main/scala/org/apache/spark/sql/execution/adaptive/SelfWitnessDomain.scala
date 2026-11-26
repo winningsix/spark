@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.execution.exchange.EnablePipelinedShuffle.MATERIALIZE_FOR_REUSE
 import org.apache.spark.sql.types.IntegralType
 
 class SelfWitnessDomainExtension extends SparkSessionExtensionsProvider {
@@ -341,6 +342,9 @@ private[adaptive] object SelfWitnessDomain extends Rule[LogicalPlan] with Predic
       val rows = sharedRoot.transformDown { case node if node eq f => filtered }
       val width = conf.getConfString("spark.sql.optimizer.sharedCandidateOrders.partitions","54").toInt
       val partitioned = RepartitionByExpression(Seq.empty,rows,Some(width))
+      // The scalar and the semi join run as separate adaptive plans. Give both consumers
+      // the same materialized map output even if either plan is prepared first.
+      partitioned.setTagValue(MATERIALIZE_FOR_REUSE, true)
       val definition = CTERelationDef(partitioned,underSubquery=true,materialized=Some(true))
       def ref = CTERelationRef(definition.id,true,rows.output,false)
       val restricted = e.plan.transformAllExpressions {

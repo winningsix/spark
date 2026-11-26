@@ -23,6 +23,7 @@ import org.apache.spark.{SparkContext, SparkEnv}
 import org.apache.spark.sql.catalyst.optimizer.BuildLeft
 import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
 import org.apache.spark.sql.internal.SQLConf
@@ -38,6 +39,9 @@ import org.apache.spark.sql.internal.SQLConf
  * adaptive plan is visible. [[PipelinedShuffleEligibility]] owns the shared eligibility checks.
  */
 object EnablePipelinedShuffle extends Rule[SparkPlan] {
+
+  private[sql] val MATERIALIZE_FOR_REUSE = TreeNodeTag[Boolean]("materialize_for_shuffle_reuse")
+
 
   override def apply(plan: SparkPlan): SparkPlan = {
     // Shared environment gate (opt-in flag and manager-specific deployment requirements),
@@ -158,8 +162,9 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
     val rangeSampledKeys: Set[Int] = plan.collectWithSubqueries {
       case s: ShuffleExchangeExec if s.outputPartitioning.isInstanceOf[RangePartitioning] => s
     }.iterator.flatMap(s => s.pipelinedReuseKey +: exchangeFrontier(s.child)).toSet
-    def notRangeSampled(exchange: ShuffleExchangeExec): Boolean =
-      !rangeSampledKeys.contains(exchange.pipelinedReuseKey)
+    def canPipeline(exchange: ShuffleExchangeExec): Boolean =
+      !rangeSampledKeys.contains(exchange.pipelinedReuseKey) &&
+        !exchange.logicalLink.exists(_.getTagValue(MATERIALIZE_FOR_REUSE).contains(true))
 
     // A shuffled hash join retains its build relation while it consumes the streamed side. Keep
     // every shuffle in each build subtree regular by default, so those smaller inputs materialize
@@ -198,11 +203,11 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
       logDebug("EnablePipelinedShuffle: using regular build inputs and pipelined streamed " +
         "inputs for shuffled hash joins.")
       return rewriteExchanges(capacityLimited(plan, exchange =>
-        notRangeSampled(exchange) &&
+        canPipeline(exchange) &&
           !regularBuildExchangeKeys.contains(exchange.pipelinedReuseKey)))
     }
 
-    rewriteExchanges(capacityLimited(plan, notRangeSampled))
+    rewriteExchanges(capacityLimited(plan, canPipeline))
   }
 
   /** The nearest shuffle exchanges below `node`, without crossing another exchange. */
