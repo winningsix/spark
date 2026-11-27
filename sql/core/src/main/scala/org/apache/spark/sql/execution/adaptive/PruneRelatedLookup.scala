@@ -110,7 +110,10 @@ private[adaptive] object PruneRelatedLookup extends Rule[LogicalPlan] with Predi
         case LessThan(_:Attribute,_:Attribute) | GreaterThan(_:Attribute,_:Attribute) => true
         case _ => false
       }) None
-    else keys.iterator.flatMap { case (l,r) => restrict(j,l,r) }.nextOption()
+    else keys.iterator.flatMap { case (l,r) => restrict(j,l,r) }.nextOption().map { restricted =>
+      restricted.setTagValue(CompositeFactJoin.DERIVED_FACT_KEYS, true)
+      restricted
+    }
   }
 
   // Move a dimension description to the consumer of a chain of fact joins. Carry the
@@ -141,8 +144,11 @@ private[adaptive] object PruneRelatedLookup extends Rule[LogicalPlan] with Predi
         val compositeOuter = typ == LeftOuter && splitConjunctivePredicates(cond).count(_.isInstanceOf[EqualTo]) >= 2
         delay(child,label,belowOuter || compositeOuter).flatMap { d =>
           val moved = child.outputSet -- d.rows.outputSet
-          Option.when(cond.references.intersect(moved).isEmpty)(
-            d.copy(rows = if (left) j.copy(left = d.rows) else j.copy(right = d.rows)))
+          Option.when(cond.references.intersect(moved).isEmpty) {
+            val rebuilt = if (left) j.copy(left = d.rows) else j.copy(right = d.rows)
+            rebuilt.copyTagsFrom(j)
+            d.copy(rows = rebuilt)
+          }
         }
       }
       detach(l,r).orElse(detach(r,l)).orElse(below(l,true))
