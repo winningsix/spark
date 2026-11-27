@@ -23,10 +23,13 @@ import org.apache.spark.sql.types.{IntegerType, LongType}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 
 /** Restrict the second lookup of a shared dimension to join-key values admitted by the first. */
 private[adaptive] object PruneRelatedLookup extends Rule[LogicalPlan] with PredicateHelper {
+  private[adaptive] val DERIVED_RANGE_BOUND = TreeNodeTag[Boolean]("derived_lookup_range_bound")
+
   private def relation(p: LogicalPlan): Option[LogicalRelation] = p match {
     case Project(cols,c) if cols.forall(_.isInstanceOf[Attribute]) => relation(c)
     case Filter(test,c) if test.deterministic && !SubqueryExpression.hasSubquery(test) => relation(c)
@@ -80,7 +83,13 @@ private[adaptive] object PruneRelatedLookup extends Rule[LogicalPlan] with Predi
         val maximum = Max(amount).toAggregateExpression()
         val upper = cutoff.map(x => Coalesce(Seq(maximum,x))).getOrElse(maximum)
         val bound = Alias(upper,"join_range_max")()
-        val limit = ScalarSubquery(Aggregate(Nil,Seq(bound),checked))
+        // The bound reads one column. Limit task launch overhead independently of
+        // the partitioning needed by the actual fact scan and join.
+        val scanTasks = conf.getConfString("spark.sql.optimizer.rangeMaxScanTasks", "0").toInt
+        val input = if (scanTasks > 0) Repartition(scanTasks, shuffle = false, checked) else checked
+        val aggregate = Aggregate(Nil, Seq(bound), input)
+        aggregate.setTagValue(DERIVED_RANGE_BOUND, true)
+        val limit = ScalarSubquery(aggregate)
         target.transformUp { case n if n eq scan => Filter(LessThan(lo, limit), n) }
       }
     }.nextOption().getOrElse(target)

@@ -296,6 +296,30 @@ case class AdaptiveSparkPlanExec(
     !isSubquery && getExecutionId.exists(SQLExecution.getQueryExecution(_) eq context.qe)
   }
 
+  /** Start the independent range scan while the first stages of the main query materialize. */
+  private def prepareDerivedRangeBounds(): Unit = {
+    initialPlan.foreach { node =>
+      node.expressions.foreach(_.foreach {
+        case scalar: ScalarSubquery =>
+          val subquery = scalar.plan match {
+            case s: SubqueryExec => Some(s)
+            case ReusedSubqueryExec(s: SubqueryExec) => Some(s)
+            case _ => None
+          }
+          subquery.foreach { s =>
+            s.child match {
+              case a: AdaptiveSparkPlanExec if a.context.eq(context) &&
+                  a.inputPlan.logicalLink.exists(_.exists(
+                    _.getTagValue(PruneRelatedLookup.DERIVED_RANGE_BOUND).contains(true))) =>
+                context.subqueryCache.getOrElseUpdate(s.canonicalized, s).prepare()
+              case _ =>
+            }
+          }
+        case _ =>
+      })
+    }
+  }
+
   def finalPhysicalPlan: SparkPlan = withFinalPlanUpdate(identity)
 
   /**
@@ -318,6 +342,8 @@ case class AdaptiveSparkPlanExec(
         val events = new LinkedBlockingQueue[StageMaterializationEvent]()
         val errors = new mutable.ArrayBuffer[Throwable]()
         val obsoleteCancelledStageIds = new mutable.HashSet[Int]
+        var prepareBounds = !isSubquery && executionId.isDefined && conf.subqueryReuseEnabled &&
+          conf.getConfString("spark.sql.adaptive.prepareDerivedRange", "false").toBoolean
         var stagesToReplace = Seq.empty[QueryStageExec]
         while (!result.allChildStagesMaterialized) {
           currentPhysicalPlan = result.newPlan
@@ -365,6 +391,10 @@ case class AdaptiveSparkPlanExec(
           // Wait on the next completed stage, which indicates new stats are available and probably
           // new stages can be created. There might be other stages that finish at around the same
           // time, so we process those stages too in order to reduce re-planning.
+          if (prepareBounds) {
+            prepareBounds = false
+            prepareDerivedRangeBounds()
+          }
           val nextMsg = events.take()
           val rem = new util.ArrayList[StageMaterializationEvent]()
           events.drainTo(rem)
