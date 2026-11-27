@@ -75,4 +75,43 @@ class CompositeFactJoinSuite extends SparkFunSuite {
       }
     } finally s.stop()
   }
+  test("derived range scans preserve upper-bound overflow, nulls and empty inputs") {
+    val session = SparkSession.builder().master("local[3]").appName("derived range bound")
+      .config("spark.ui.enabled", false)
+      .config("spark.sql.shuffle.partitions", 4)
+      .config("spark.sql.extensions", classOf[LookupMultiplicityExtension].getName)
+      .getOrCreate()
+    try withTempDir { dir =>
+      val sources = Map(
+        "sales" -> "select * from values (1,1,3),(1,2,8),(1,2,null),(2,1,1) as t(item,day,qty)",
+        "stock" -> "select * from values (1,1,2),(1,2,6),(1,1,8),(1,1,null) as t(item,day,n)",
+        "cal" -> "select * from values (1,4,0),(1,4,0),(2,4,0),(3,5,1) as t(day,wk,yr)")
+      sources.foreach { case (name, query) =>
+        val path = new java.io.File(dir, name).toString
+        session.sql(query).write.parquet(path)
+        session.read.parquet(path).createOrReplaceTempView(name)
+      }
+      val query = """with a as (select s.item,s.qty,c.wk from sales s join cal c
+                    |on s.day=c.day where c.yr=0), b as (select t.item,t.n,c.wk from stock t
+                    |join cal c on t.day=c.day)
+                    |select a.qty,b.n from a join b on a.item=b.item and a.wk=b.wk
+                    |and b.n<a.qty order by a.qty,b.n""".stripMargin
+      session.conf.set("spark.sql.optimizer.pruneRelatedLookup", false)
+      val expected = session.sql(query).collect().toList
+      assert(expected.exists(_.getInt(1) == 6))
+      session.conf.set("spark.sql.optimizer.pruneRelatedLookup", true)
+      session.conf.set("spark.sql.optimizer.rangeMaxScanTasks", 2)
+      session.conf.set("spark.sql.optimizer.joinRangeCutoff", 4)
+      session.conf.set("spark.sql.adaptive.prepareDerivedRange", true)
+      val range = session.sql(query)
+      assert(range.queryExecution.optimizedPlan.collectWithSubqueries {
+        case a: Aggregate if a.getTagValue(PruneRelatedLookup.DERIVED_RANGE_BOUND).contains(true) => a
+      }.nonEmpty)
+      assert(range.collect().toList == expected)
+      assert(session.sql(query.replace("c.yr=0", "c.yr=99")).collect().isEmpty)
+    } finally {
+      session.stop()
+    }
+  }
+
 }
