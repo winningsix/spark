@@ -22,11 +22,14 @@ import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 
 /** Move dimension lookups below an inner inequality join when they expose another equi-key. */
 private[adaptive] object CompositeFactJoin extends Rule[LogicalPlan] with PredicateHelper {
   val setting = "spark.sql.optimizer.deriveCompositeFactJoinKeys"
+
+  private[adaptive] val DERIVED_FACT_KEYS = TreeNodeTag[Boolean]("derived_composite_fact_keys")
 
   private case class Lookup(input: LogicalPlan, predicates: Seq[Expression])
   private case class Spine(base: Join, lookups: Vector[Lookup])
@@ -105,6 +108,7 @@ private[adaptive] object CompositeFactJoin extends Rule[LogicalPlan] with Predic
     val available = left.outputSet ++ right.outputSet
     val (keys, residual) = pending.partition(_.references.subsetOf(available))
     val joined = Join(left, right, Inner, keys.reduceLeftOption(And), JoinHint.NONE)
+    joined.setTagValue(DERIVED_FACT_KEYS, true)
     val complete = deferred.result().foldLeft[LogicalPlan](joined) { (child, lookup) =>
       Join(child, lookup.input, Inner, lookup.predicates.reduceLeftOption(And), JoinHint.NONE)
     }
@@ -117,6 +121,23 @@ private[adaptive] object CompositeFactJoin extends Rule[LogicalPlan] with Predic
     if (plan.isStreaming || (mode != "keys" && mode != "filters")) return plan
     plan.transformDown {
       case join: Join if join.joinType == Inner => rewrite(join, mode == "filters").getOrElse(join)
+    }
+  }
+}
+
+/** Apply the configured build side after related-lookup pruning has seen the unhinted join. */
+private[adaptive] object PreferCompositeFactBuild extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = {
+    val hash = Some(HintInfo(Some(SHUFFLE_HASH)))
+    val hint = conf.getConfString("spark.sql.optimizer.compositeFactJoin.buildSide", "auto") match {
+      case "left" => JoinHint(hash, None)
+      case "right" => JoinHint(None, hash)
+      case _ => return plan
+    }
+    plan.transformUp {
+      case join @ Join(_, _, Inner, _, JoinHint.NONE)
+          if join.getTagValue(CompositeFactJoin.DERIVED_FACT_KEYS).contains(true) =>
+        join.copy(hint = hint)
     }
   }
 }

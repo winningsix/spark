@@ -24,6 +24,8 @@ class LookupMultiplicityExtension extends SparkSessionExtensionsProvider {
   override def apply(extensions: SparkSessionExtensions): Unit = {
     extensions.injectPreCBORule(_ => CompositeFactJoin)
     extensions.injectPreCBORule(_ => PruneRelatedLookup)
+    extensions.injectPreCBORule(_ => PreferCompositeFactBuild)
+    extensions.injectPreCBORule(_ => CountComplementarySums)
     extensions.injectPlannerStrategy(_ => PlanExactLookupSummary)
   }
 }

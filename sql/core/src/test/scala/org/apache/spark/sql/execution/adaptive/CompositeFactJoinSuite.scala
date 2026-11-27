@@ -50,6 +50,29 @@ class CompositeFactJoinSuite extends SparkFunSuite {
         val outer=sql.replace("from a join b","from a left outer join b")
         val keep=planned(outer,mode);assert(keep._2==planned(outer,"off")._2)
       }
+      s.conf.set("spark.sql.optimizer.compositeFactJoin.buildSide", "left")
+      val (hinted, withHint) = planned(sql, "filters")
+      assert(withHint == rows)
+      assert(hinted.exists {
+        case j: Join => j.hint.leftHint.exists(_.strategy.contains(SHUFFLE_HASH))
+        case _ => false
+      })
+
+      val indicators = "sum(case when week is null then 1 else 0 end) n, " +
+        "sum(case when week is not null then 1 else 0 end) p, count(*) c, count(week) cw"
+      for (filter <- Seq("", " where day=-1")) {
+        val query = "select " + indicators + " from d" + filter
+        s.conf.set("spark.sql.optimizer.countComplementarySums", false)
+        val reference = s.sql(query)
+        val expected = reference.collect().toList
+        s.conf.set("spark.sql.optimizer.countComplementarySums", true)
+        val rewritten = s.sql(query)
+        assert(rewritten.schema == reference.schema && rewritten.collect().toList == expected)
+        if (filter.isEmpty) {
+          val tree = rewritten.queryExecution.optimizedPlan.treeString
+          assert(!tree.contains("count(1)") && tree.contains("count(week"), tree)
+        }
+      }
     } finally s.stop()
   }
 }
