@@ -26,6 +26,7 @@ import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
 import io.netty.buffer.{ByteBufOutputStream, PooledByteBufAllocator}
+import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future => NettyFuture}
 import org.scalatest.Assertions.intercept
@@ -43,6 +44,8 @@ import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
+import org.apache.spark.network.client.TransportResponseHandler
+import org.apache.spark.network.protocol.OneWayMessage
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.MyRDD
@@ -942,6 +945,59 @@ class StreamingShuffleSuite
       checkTestError(intercept[SparkException] {
         ThreadUtils.awaitResult(future, 10.seconds)
       }.getCause.asInstanceOf[SparkException])
+    }
+  }
+
+  test("reader registers once and applies backpressure while consuming data frames") {
+    val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    val errors = new ErrorNotifier()
+    val context = createTaskContext(sparkConf, 0)
+    val handler = new StreamingShuffleClientHandler(0, 0, queue, shuffleId, 1L, context, errors)
+    val channel = new EmbeddedChannel()
+    val client = new TransportClient(channel, new TransportResponseHandler(channel))
+
+    def checkControl(expected: StreamingShuffleMessageType, seq: Option[Long] = None): Unit = {
+      val outgoing = channel.readOutbound[OneWayMessage]()
+      assert(outgoing != null)
+      val body = outgoing.body()
+      try {
+        val header = body.nioByteBuffer()
+        assert(header.getInt() == expected.id())
+        seq.foreach(n => assert(header.getLong() == n))
+      } finally {
+        body.release()
+      }
+      assert(channel.outboundMessages().isEmpty)
+    }
+
+    try {
+      handler.channelActive(client)
+      checkControl(StreamingShuffleMessageType.CREDIT_CONTROL_MESSAGE)
+      for (n <- 0 until 3) {
+        val frame = ByteBuffer.allocate(40)
+          .putInt(StreamingShuffleMessageType.DATA_MESSAGE_UNSAFE_ROW.id()).putLong(n.toLong)
+          .putInt(0).putInt(0).putInt(8).putLong(0L).putLong(n.toLong).flip()
+        handler.receive(client, frame, null)
+        assert(!channel.config().isAutoRead)
+        val data = queue.remove().asInstanceOf[DataMessage]
+        try {
+          assert(data.getRecordData().getLong(0) == n)
+        } finally {
+          data.release()
+        }
+        assert(channel.config().isAutoRead)
+        assert(channel.outboundMessages().isEmpty)
+      }
+      val end = ByteBuffer.allocate(20)
+        .putInt(StreamingShuffleMessageType.TERMINATION_CONTROL_MESSAGE.id()).putLong(3L)
+        .putInt(0).putInt(0).flip()
+      handler.receive(client, end, null)
+      checkControl(StreamingShuffleMessageType.TERMINATION_ACK_MESSAGE, Some(3L))
+      assert(queue.remove().isInstanceOf[TerminationControlMessage])
+      handler.channelInactive(client)
+      assert(errors.getError().isEmpty)
+    } finally {
+      channel.finishAndReleaseAll()
     }
   }
 

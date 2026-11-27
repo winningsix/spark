@@ -32,6 +32,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.classic.{SparkSession => ClassicSparkSession}
 import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.execution.metric.SQLLastAttemptMetrics
 import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.internal.SQLConf
@@ -828,6 +829,24 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
     }
   }
 
+  private val inputs = Seq(
+    "right build" ->
+      """SELECT /*+ SHUFFLE_HASH(b) */ observe(p.writer, p.id) AS id, b.id AS matched
+        |FROM (SELECT id, producer(id) AS writer FROM range(0, 20000, 1, 2)) p
+        |LEFT JOIN range(0, 100, 1, 2) b ON p.id % 101 = b.id""",
+    "left build" ->
+      """SELECT /*+ SHUFFLE_HASH(b) */ observe(p.writer, p.id) AS id, b.id AS matched
+        |FROM range(0, 100, 1, 2) b RIGHT JOIN
+        |  (SELECT id, producer(id) AS writer FROM range(0, 20000, 1, 2)) p
+        |ON p.id % 101 = b.id""")
+
+  inputs.foreach { case (name, sqlText) =>
+    test(s"$name drains a remote row before the last producer finishes") {
+      checkFullInput(sqlText.stripMargin, pipelinedExchanges = 1,
+        rightBuild = name == "right build")
+    }
+  }
+
   private def withCluster(cores: Int)(body: ClassicSparkSession => Unit): Unit = {
     val spark = ClassicSparkSession.builder().master(s"local-cluster[2,$cores,1536]")
       .appName(getClass.getSimpleName)
@@ -882,7 +901,10 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
     }
   }
 
-  private def checkFullInput(sqlText: String, pipelinedExchanges: Int): Unit = {
+  private def checkFullInput(
+      sqlText: String,
+      pipelinedExchanges: Int,
+      rightBuild: Boolean = false): Unit = {
     withTempDir { dir =>
       val marker = dir.toPath.resolve("remote-reader").toString
       withCluster(pipelinedExchanges + 1) { spark =>
@@ -922,15 +944,23 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         sc.listenerBus.waitUntilEmpty(30000)
         assert(sc.statusTracker.getJobIdsForGroup("full-input").length == 1)
         assert(actual.iterator.map(_.getLong(0)).sameElements(0L until 20000L))
-        assert(observed.size == pipelinedExchanges)
-        assert(observed.forall(_.pipelined))
+        if (pipelinedExchanges == 1) {
+          assert(observed.size == 2)
+          actual.zipWithIndex.foreach { case (row, id) =>
+            if (id % 101 == 100) assert(row.isNullAt(1)) else assert(row.getLong(1) == id % 101)
+          }
+        } else {
+          assert(observed.size == pipelinedExchanges)
+        }
+        val active = observed.filter(_.pipelined)
+        assert(active.size == pipelinedExchanges)
         val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
           .asInstanceOf[StreamingShuffleOutputTrackerMaster]
-        observed.foreach { exchange =>
+        active.foreach { exchange =>
           assert(exchange.shuffleDependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
           assert(!tracker.containsShuffle(exchange.shuffleId))
         }
-        info(s"Shuffles ${observed.map(_.shuffleId)}: ${Files.readString(Path.of(marker))}")
+        info(s"Shuffles ${active.map(_.shuffleId)}: ${Files.readString(Path.of(marker))}")
         if (pipelinedExchanges == 2) {
           val fail = Files.createFile(Path.of(marker + ".fail"))
           intercept[SparkException](query.collect())
@@ -961,9 +991,47 @@ class DistributedPipelinedShuffleSuite extends SparkFunSuite with Eventually {
         sc.listenerBus.waitUntilEmpty(30000)
         assert(observed.count(_.pipelined) == pipelinedExchanges)
 
-        val join = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8) a " +
-          "LEFT JOIN range(0, 4) b ON a.id = b.id")
-        assert(!join.queryExecution.executedPlan.isInstanceOf[PipelinedShuffleResultExec])
+        if (rightBuild) {
+          val broadcast = spark.sql(
+            """SELECT /*+ REPARTITION(2, id) */ id, matched FROM (
+              |  SELECT /*+ BROADCAST(b) */ a.id, b.id AS matched FROM range(0, 8, 1, 2) a
+              |  LEFT JOIN range(0, 4, 1, 2) b ON a.id = b.id)""".stripMargin)
+          val broadcastPlan = broadcast.queryExecution.executedPlan
+          assert(broadcastPlan.exists(_.isInstanceOf[BroadcastHashJoinExec]))
+          val rows = broadcast.collect().sortBy(_.getLong(0))
+          assert(rows.map(_.getLong(0)).toSeq == (0L until 8L))
+          assert(rows.take(4).forall(r => r.getLong(0) == r.getLong(1)))
+          assert(rows.drop(4).forall(_.isNullAt(1)))
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.size == 1 && observed.head.pipelined)
+          val reused = spark.sql("SELECT /*+ MERGE(a, b) */ a.id FROM range(0, 8, 1, 2) a " +
+            "JOIN range(0, 8, 1, 2) b ON a.id % 17 = b.id % 17")
+          assert(reused.queryExecution.executedPlan.exists(_.isInstanceOf[ReusedExchangeExec]))
+          assert(reused.collect().map(_.getLong(0)).sorted.toSeq == (0L until 8L))
+          sc.listenerBus.waitUntilEmpty(30000)
+          assert(observed.nonEmpty && !observed.exists(_.pipelined))
+          val inner = spark.sql("SELECT /*+ SHUFFLE_HASH(b) */ a.id FROM range(0, 8, 1, 2) a " +
+            "JOIN range(0, 4, 1, 2) b ON a.id % 5 = b.id")
+          val innerPlan = inner.queryExecution.executedPlan
+          assert(innerPlan.collect { case s: ShuffleExchangeExec => s }.size == 2)
+          assert(!innerPlan.isInstanceOf[PipelinedShuffleResultExec])
+          // The merge join has an empty buffered partition. Its streamed sort must still drain
+          // every row. The aggregate's input shuffle and the join sibling are ordinary prefixes.
+          for (codegen <- Seq(true, false)) {
+            spark.conf.set(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key, codegen)
+            val nested = spark.sql(
+              """SELECT /*+ MERGE(p, b) */ p.k
+                |FROM (SELECT id % 7 AS k, COUNT(*) AS n FROM range(0, 20, 1, 2)
+                |      GROUP BY id % 7) p
+                |JOIN range(3, 4, 1, 2) b ON p.n = b.id
+                |ORDER BY p.k DESC LIMIT 3""".stripMargin)
+            assert(nested.collect().map(_.getLong(0)).toSeq == Seq(5L, 4L, 3L))
+            sc.listenerBus.waitUntilEmpty(30000)
+            assert(observed.size >= 3)
+            assert(observed.count(_.pipelined) == 1)
+          }
+          spark.conf.unset(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key)
+        }
         spark.conf.set(SQLConf.DISTRIBUTED_PIPELINED_SHUFFLE_ENABLED.key, false)
         assert(query.collect().sortBy(_.getLong(0)).sameElements(actual))
         sc.listenerBus.waitUntilEmpty(30000)

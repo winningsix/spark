@@ -181,10 +181,10 @@ class StreamingShuffleClientHandler(
       shuffleMessage match {
         case dataMessage: DataMessage =>
           val messageSize = buf.capacity()
+          // The initial credit registered this channel with the writer. Pause and resume reads
+          // as payloads enter and leave the queue to enforce this connection's byte limit.
           updateQuota(messageSize)
           dataMessage.setReleaseCallback(() => updateQuota(-messageSize))
-          // we can only release the buf after we have decoded all the rows in the buffer
-          sendCreditControlMessage(client, dataMessage.shuffleWriterId, 1)
         case controlMessage: TerminationControlMessage =>
           // Record termination before sending the ack: the writer only closes its connection
           // after it receives this ack, so setting the flag here guarantees it is visible before

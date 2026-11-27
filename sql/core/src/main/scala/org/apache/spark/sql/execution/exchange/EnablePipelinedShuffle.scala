@@ -24,6 +24,8 @@ import org.apache.spark.internal.LogKeys.{CONFIG, CONFIG2}
 import org.apache.spark.internal.config
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager
 import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.Command
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -33,6 +35,8 @@ import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.InsertIntoHadoopFsRelationCommand
 import org.apache.spark.sql.execution.datasources.WriteFilesExec
+import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec}
+import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 
@@ -42,11 +46,10 @@ import org.apache.spark.sql.internal.SQLConf
  * pipelined channel manager and the concurrent-stage scheduler runs the map and reduce stages
  * together.
  *
- * The rewrite considers the whole group: the scheduler requires a job to
- * be all-pipelined (or a materialized prefix below a pipelined suffix), so choosing per exchange
- * would produce exactly the mixed shapes it rejects. What the rule does decide is ELIGIBILITY --
- * the environment gates in [[PipelinedShuffleEligibility]] and the plan shapes below that force the
- * whole plan back to regular.
+ * The rewrite considers the whole group. The scheduler can run a regular prefix before a
+ * pipelined suffix, but it rejects a pipelined producer below a regular exchange. The laptop
+ * rule therefore checks the environment gates in [[PipelinedShuffleEligibility]] and the plan
+ * shapes below that force the whole plan back to regular.
  *
  * Enabled only when `spark.sql.shuffle.localPipelined.enabled=true`. It runs in the non-AQE
  * `preparations` list, so it also requires AQE to be off (under AQE the plan is hidden behind
@@ -163,7 +166,7 @@ object EnablePipelinedShuffle extends Rule[SparkPlan] {
   }
 }
 
-/** Plan a single-source, full-input pipelined group after exchange reuse. */
+/** Plan a single-source pipeline or a join with one pipelined probe after exchange reuse. */
 private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
   val candidate = TreeNodeTag[Int]("batchPipelinedShuffleCandidate")
 
@@ -190,12 +193,17 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     }
     if (conf.localPipelinedShuffleEnabled && plan.session.sparkContext.isLocal) return plan
 
-    // Subqueries and reused exchanges can introduce another reader outside the unary chain.
     if (input.exists(p => p.subqueries.nonEmpty || p.isInstanceOf[ReusedExchangeExec])) return plan
-
     val isResult = input eq plan
     val consumer = consumerInput(input, collectTopK = isResult)
-    val group = singleSourceGroup(consumer)
+    val group = if (input.exists(_.isInstanceOf[BaseJoinExec])) {
+      // An exchange can also be referenced twice without a reuse wrapper.
+      val ids = input.collect { case s: ShuffleExchangeExec => s.id }
+      probe(consumer).filter(s => !s.pipelined &&
+        s.outputPartitioning.isInstanceOf[HashPartitioning] && ids.count(_ == s.id) == 1).toList
+    } else {
+      singleSourceGroup(consumer)
+    }
     if (group.isEmpty) return plan
     group.foreach(s => s.setTagValue(candidate, s.id))
     val sc = plan.session.sparkContext
@@ -227,10 +235,50 @@ private[sql] object DistributedPipelinedShuffle extends Rule[SparkPlan] {
     case other => other
   }
 
+  // Get the producer task count without executing the joins (which could start broadcast jobs).
+  // Ordinary exchanges cut the stage. A shuffled join zips two equally partitioned RDDs.
   private def stageWidth(plan: SparkPlan): Option[Int] = boundary(plan) match {
+    case s: ShuffleExchangeExec => Some(s.outputPartitioning.numPartitions)
     case r: RangeExec => Some(r.outputPartitioning.numPartitions)
     case f: FileSourceScanExec => Some(f.inputRDD.getNumPartitions)
+    case j: BroadcastHashJoinExec =>
+      val (streamed, build) = if (j.buildSide == BuildLeft) (j.right, j.left) else (j.left, j.right)
+      boundary(build) match {
+        case _: BroadcastExchangeExec => stageWidth(streamed)
+        case _ => None
+      }
+    case j @ (_: SortMergeJoinExec | _: ShuffledHashJoinExec) =>
+      stageWidth(j.children.head).filter(n => stageWidth(j.children.last).contains(n))
     case _ => None
+  }
+
+  private def exchange(plan: SparkPlan): Option[ShuffleExchangeExec] = boundary(plan) match {
+    case s: ShuffleExchangeExec => Some(s)
+    case _ => None
+  }
+
+  private def sortedInput(plan: SparkPlan): Option[ShuffleExchangeExec] = plan match {
+    case s: SortExec if !s.global => exchange(s.child)
+    case _: WholeStageCodegenExec | _: InputAdapter => sortedInput(plan.children.head)
+    case _ => None
+  }
+
+  private def probe(input: SparkPlan): Option[ShuffleExchangeExec] = boundary(input) match {
+    case j: ShuffledHashJoinExec =>
+      // An outer join drains the preserved probe even when the build partition is empty.
+      // An inner hash join may skip the probe and leave its pipelined writer blocked.
+      (j.joinType, j.buildSide) match {
+        case (LeftOuter, BuildRight) if boundary(j.right).isInstanceOf[ShuffleExchangeExec] =>
+          exchange(j.left)
+        case (RightOuter, BuildLeft) if boundary(j.left).isInstanceOf[ShuffleExchangeExec] =>
+          exchange(j.right)
+        case _ => None
+      }
+    case j: SortMergeJoinExec if j.joinType == Inner && stageWidth(j.right).isDefined =>
+      // Inner merge joins request the streamed (left) input even for an empty right
+      // partition. Its local sort drains the reader before the join can stop early.
+      sortedInput(j.left)
+    case other => exchange(other)
   }
 
   // Walk from the final reader to the scan. One unsupported edge disqualifies the whole chain.
