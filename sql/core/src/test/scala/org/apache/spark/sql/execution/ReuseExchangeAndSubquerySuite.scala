@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, IdentityBroadcastMode}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ReusedExchangeExec, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.reuse.ReuseExchangeAndSubquery
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -25,6 +27,20 @@ import org.apache.spark.sql.test.SharedSparkSession
 class ReuseExchangeAndSubquerySuite extends SharedSparkSession {
 
   val tableFormat: String = "parquet"
+
+  test("pipelined AQE reuses shuffle inputs before broadcast stage preparation") {
+    withSQLConf(SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true") {
+      val leaf = spark.range(4).queryExecution.sparkPlan
+      def broadcast = BroadcastExchangeExec(IdentityBroadcastMode, leaf)
+      def shuffle = ShuffleExchangeExec(HashPartitioning(leaf.output, 2), leaf)
+      val plan = UnionExec(Seq(broadcast, broadcast, shuffle, shuffle))
+      val early = ReuseExchangeAndSubquery.reuseShufflesAndSubqueries(plan)
+      assert(early.children.take(2).forall(_.isInstanceOf[BroadcastExchangeExec]))
+      assert(early.children.last.asInstanceOf[ReusedExchangeExec].child eq early.children(2))
+      val normal = ReuseExchangeAndSubquery(plan)
+      assert(normal.children(1).asInstanceOf[ReusedExchangeExec].child eq normal.children.head)
+    }
+  }
 
   test("SPARK-32041: No reuse interference inside ReuseExchange") {
     withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {

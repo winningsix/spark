@@ -51,7 +51,10 @@ object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
       // let the distributed transport attach every logical consumer to the shared producer.
       // This changes only exchange wrappers and transport flags; join algorithms and build sides
       // are untouched.
-      EnablePipelinedShuffle.apply(ReuseExchangeAndSubquery(plan))
+      // AQE owns broadcast stage reuse. Its stage preparation inserts columnar-to-row
+      // transitions before a broadcast is collected. An eager ReusedExchangeExec is a
+      // leaf and can retain the original broadcast child before those transitions run.
+      EnablePipelinedShuffle.apply(ReuseExchangeAndSubquery.reuseShufflesAndSubqueries(plan))
     } else {
       flipEligibleExchanges(plan)
     }
