@@ -35,6 +35,7 @@ import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.{truncatedString, UnsafeRowUtils}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.exchange.{DistributedPipelinedShuffle, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.MutableColumnarRow
 import org.apache.spark.sql.internal.SQLConf
@@ -811,9 +812,18 @@ case class HashAggregateExec(
          |$outputFromRegularHashMap
        """.stripMargin
     }
+    // A batch reader can start while its producer is still sorting. Wait for the
+    // input before reserving execution memory for the keyed aggregate's hash maps.
+    val awaitInput = child match {
+      case InputAdapter(s: ShuffleExchangeExec) if !isStreaming && s.pipelined &&
+          s.getTagValue(DistributedPipelinedShuffle.candidate).isDefined =>
+        "inputs[0].hasNext();"
+      case _ => ""
+    }
     s"""
        |if (!$initAgg) {
        |  $initAgg = true;
+       |  $awaitInput
        |  $createFastHashMap
        |  $addHookToCloseFastHashMap
        |  $hashMapTerm = $aggHelper.createHashMap();
